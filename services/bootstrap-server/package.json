@@ -1,0 +1,33 @@
+{
+  "name": "@syncplay/bootstrap-server",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "engines": {
+    "node": ">=22.0.0"
+  },
+  "scripts": {
+    "build": "tsc",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "dev": "tsx watch src/server.ts",
+    "start": "node dist/server.js"
+  },
+  "dependencies": {
+    "@syncplay/protocol": "*",
+    "express": "^5.1.0",
+    "socket.io": "^4.8.0",
+    "nanoid": "^5.1.5",
+    "zod": "^4.6.6"
+  },
+  "devDependencies": {
+    "typescript": "^5.8.0",
+    "vitest": "^5.0.0",
+    "tsx": "^4.19.0",
+    "@types/express": "^5.0.0",
+    "socket.io-client": "^4.8.0",
+    "supertest": "^7.1.0",
+    "@types/supertest": "^6.0.0"
+  }
+}
