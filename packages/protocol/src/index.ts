@@ -83,5 +83,6 @@ export {
   validateMessage,
   validatePayload,
   checkMessageSize,
+  checkPayloadSize,
   parseAndValidateMessage,
 } from './validation.js';

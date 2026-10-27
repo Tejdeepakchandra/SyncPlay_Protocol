@@ -38,6 +38,7 @@ import {
   validateMessage,
   validatePayload,
   checkMessageSize,
+  checkPayloadSize,
   parseAndValidateMessage,
 } from '../index.js';
 
@@ -137,6 +138,7 @@ describe('Public exports', () => {
     expect(typeof validateMessage).toBe('function');
     expect(typeof validatePayload).toBe('function');
     expect(typeof checkMessageSize).toBe('function');
+    expect(typeof checkPayloadSize).toBe('function');
     expect(typeof parseAndValidateMessage).toBe('function');
   });
 

@@ -13,6 +13,7 @@ export type ValidationErrorCode =
   | 'UNKNOWN_MESSAGE_TYPE'
   | 'INVALID_PAYLOAD'
   | 'MESSAGE_TOO_LARGE'
+  | 'PAYLOAD_TOO_LARGE'
   | 'INVALID_JSON'
   | 'MISSING_LOGICAL_EVENT_ID';
 

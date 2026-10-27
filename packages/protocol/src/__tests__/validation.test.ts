@@ -9,9 +9,10 @@ import {
   validateMessage,
   validatePayload,
   checkMessageSize,
+  checkPayloadSize,
   parseAndValidateMessage,
 } from '../validation.js';
-import { PROTOCOL_VERSION, MAX_MESSAGE_BYTES } from '../constants.js';
+import { PROTOCOL_VERSION, MAX_MESSAGE_BYTES, MAX_PAYLOAD_BYTES } from '../constants.js';
 import { MessageType } from '../message-types.js';
 
 /** Helper: create a valid full message object. */
@@ -511,5 +512,125 @@ describe('parseAndValidateMessage', () => {
     if (!result.ok) {
       expect(result.error.code).toBe('MESSAGE_TOO_LARGE');
     }
+  });
+});
+
+// ── checkPayloadSize ─────────────────────────────────────────
+
+describe('checkPayloadSize', () => {
+  it('should accept a small payload', () => {
+    const result = checkPayloadSize({ targetPositionMs: 5000 });
+    expect(result.ok).toBe(true);
+  });
+
+  it('should reject a payload exceeding MAX_PAYLOAD_BYTES', () => {
+    // Create a payload larger than 32 KB but that would fit in 64 KB total
+    const largePayload = { data: 'X'.repeat(MAX_PAYLOAD_BYTES + 1) };
+    const result = checkPayloadSize(largePayload);
+    expect(result.ok).toBe(false);
+    if (!result.ok) {
+      expect(result.error.code).toBe('PAYLOAD_TOO_LARGE');
+    }
+  });
+
+  it('should accept a payload at exactly MAX_PAYLOAD_BYTES', () => {
+    // Dynamically compute JSON overhead so we don't miscount
+    const overhead = new TextEncoder().encode(JSON.stringify({ d: '' })).byteLength;
+    const exactPayload = { d: 'A'.repeat(MAX_PAYLOAD_BYTES - overhead) };
+    const serialized = JSON.stringify(exactPayload);
+    const byteLen = new TextEncoder().encode(serialized).byteLength;
+    expect(byteLen).toBe(MAX_PAYLOAD_BYTES);
+    const result = checkPayloadSize(exactPayload);
+    expect(result.ok).toBe(true);
+  });
+
+  it('should reject a payload 1 byte over MAX_PAYLOAD_BYTES', () => {
+    const overhead = new TextEncoder().encode(JSON.stringify({ d: '' })).byteLength;
+    const overPayload = { d: 'A'.repeat(MAX_PAYLOAD_BYTES - overhead + 1) };
+    const serialized = JSON.stringify(overPayload);
+    const byteLen = new TextEncoder().encode(serialized).byteLength;
+    expect(byteLen).toBe(MAX_PAYLOAD_BYTES + 1);
+    const result = checkPayloadSize(overPayload);
+    expect(result.ok).toBe(false);
+    if (!result.ok) {
+      expect(result.error.code).toBe('PAYLOAD_TOO_LARGE');
+    }
+  });
+
+  it('should respect a custom maxBytes limit', () => {
+    const payload = { x: 'hello' };
+    expect(checkPayloadSize(payload, 1000).ok).toBe(true);
+    expect(checkPayloadSize(payload, 5).ok).toBe(false);
+  });
+});
+
+// ── Payload size in validateMessage ──────────────────────────
+
+describe('validateMessage payload size enforcement', () => {
+  it('should reject oversized payload even when total message is under 64 KB', () => {
+    // Payload > 32 KB but total message < 64 KB
+    const bigPayloadData = 'X'.repeat(MAX_PAYLOAD_BYTES + 100);
+    const msg = fullMessage(MessageType.STATE_SNAPSHOT, {
+      snapshotId: 'snap-1',
+      stateVersion: 1,
+      state: { bulk: bigPayloadData },
+    });
+
+    // Verify total message is under 64 KB
+    const totalBytes = new TextEncoder().encode(JSON.stringify(msg)).byteLength;
+    expect(totalBytes).toBeLessThan(MAX_MESSAGE_BYTES);
+
+    // But payload alone exceeds 32 KB
+    const payloadBytes = new TextEncoder().encode(JSON.stringify(msg.payload)).byteLength;
+    expect(payloadBytes).toBeGreaterThan(MAX_PAYLOAD_BYTES);
+
+    const result = validateMessage(msg);
+    expect(result.ok).toBe(false);
+    if (!result.ok) {
+      expect(result.error.code).toBe('PAYLOAD_TOO_LARGE');
+    }
+  });
+
+  it('should accept a payload at exactly MAX_PAYLOAD_BYTES via validateMessage', () => {
+    // Build a STATE_SNAPSHOT whose payload serializes to exactly MAX_PAYLOAD_BYTES
+    // {"snapshotId":"s","stateVersion":0,"state":"AAA..."}
+    // Overhead: {"snapshotId":"s","stateVersion":0,"state":""} = 46 bytes
+    const filler = 'A'.repeat(MAX_PAYLOAD_BYTES - 46);
+    const msg = fullMessage(MessageType.STATE_SNAPSHOT, {
+      snapshotId: 's',
+      stateVersion: 0,
+      state: filler,
+    });
+
+    const payloadBytes = new TextEncoder().encode(JSON.stringify(msg.payload)).byteLength;
+    expect(payloadBytes).toBe(MAX_PAYLOAD_BYTES);
+
+    const result = validateMessage(msg);
+    expect(result.ok).toBe(true);
+  });
+
+  it('should reject oversized payload through parseAndValidateMessage', () => {
+    const bigPayloadData = 'Y'.repeat(MAX_PAYLOAD_BYTES + 100);
+    const msg = fullMessage(MessageType.STATE_SNAPSHOT, {
+      snapshotId: 'snap-2',
+      stateVersion: 2,
+      state: { bulk: bigPayloadData },
+    });
+    const json = JSON.stringify(msg);
+
+    // Total under 64 KB
+    expect(new TextEncoder().encode(json).byteLength).toBeLessThan(MAX_MESSAGE_BYTES);
+
+    const result = parseAndValidateMessage(json);
+    expect(result.ok).toBe(false);
+    if (!result.ok) {
+      expect(result.error.code).toBe('PAYLOAD_TOO_LARGE');
+    }
+  });
+
+  it('should accept small payload in normal control message', () => {
+    const msg = fullMessage(MessageType.PLAY, { targetPositionMs: 5000 });
+    const result = validateMessage(msg);
+    expect(result.ok).toBe(true);
   });
 });

@@ -11,14 +11,16 @@
  * 3. Envelope structure (Zod)
  * 4. Protocol version check
  * 5. Message type check
- * 6. Payload schema validation
+ * 6. logicalEventId required for control events
+ * 7. Payload schema validation
+ * 8. Payload size check (independent of total message size)
  *
  * Returns typed Result<T> — no exceptions for expected invalid input.
  */
 import type { z } from 'zod';
 import { ProtocolMessageSchema } from './envelope.js';
 import type { ProtocolMessage } from './envelope.js';
-import { PROTOCOL_VERSION, MAX_MESSAGE_BYTES } from './constants.js';
+import { PROTOCOL_VERSION, MAX_MESSAGE_BYTES, MAX_PAYLOAD_BYTES } from './constants.js';
 import { KNOWN_MESSAGE_TYPES, REQUIRES_LOGICAL_EVENT_ID } from './message-types.js';
 import { PAYLOAD_SCHEMAS } from './payloads/index.js';
 import type { Result, ValidationError, ValidationErrorCode } from './result.js';
@@ -44,10 +46,15 @@ function formatZodError(zodError: z.ZodError): string {
 
 function zodErrorPath(zodError: z.ZodError): ReadonlyArray<string | number> {
   const firstIssue = zodError.issues[0];
-  return firstIssue ? firstIssue.path : [];
+  if (!firstIssue) return [];
+  // Zod v4 paths may include symbols; filter to string|number only
+  return firstIssue.path.filter(
+    (segment): segment is string | number =>
+      typeof segment === 'string' || typeof segment === 'number',
+  );
 }
 
-// ── Size check ───────────────────────────────────────────────
+// ── Size checks ──────────────────────────────────────────────
 
 /**
  * Check whether a serialized message is within the size limit.
@@ -70,6 +77,33 @@ export function checkMessageSize(
     return fail(
       'MESSAGE_TOO_LARGE',
       `Message is ${byteLength} bytes, exceeding the ${maxBytes} byte limit`,
+    );
+  }
+
+  return { ok: true, value: undefined };
+}
+
+/**
+ * Check whether a payload is within the payload size limit.
+ *
+ * Called AFTER payload schema validation on the serialized payload.
+ * This is independent of the total message size check.
+ *
+ * @param payload - The validated payload value.
+ * @param maxBytes - Override the default MAX_PAYLOAD_BYTES limit.
+ */
+export function checkPayloadSize(
+  payload: unknown,
+  maxBytes: number = MAX_PAYLOAD_BYTES,
+): Result<void> {
+  const serialized = JSON.stringify(payload);
+  const byteLength = new TextEncoder().encode(serialized).byteLength;
+
+  if (byteLength > maxBytes) {
+    return fail(
+      'PAYLOAD_TOO_LARGE',
+      `Payload is ${byteLength} bytes, exceeding the ${maxBytes} byte payload limit`,
+      ['payload'],
     );
   }
 
@@ -121,7 +155,8 @@ export function validatePayload(
  * 2. Protocol version (must equal PROTOCOL_VERSION)
  * 3. Message type (must be in KNOWN_MESSAGE_TYPES)
  * 4. logicalEventId required for control events (PLAY, PAUSE, SEEK, RATE_CHANGE)
- * 5. Payload (validated against type-specific schema)
+ * 5. Payload schema validation (type-specific Zod schema)
+ * 6. Payload size check (independent of total message size)
  *
  * @param raw - The parsed (but unvalidated) message object.
  * @returns The validated ProtocolMessage on success.
@@ -175,6 +210,12 @@ export function validateMessage(raw: unknown): Result<ProtocolMessage> {
     return payloadResult as Result<never>;
   }
 
+  // 6. Check payload size independently
+  const payloadSizeResult = checkPayloadSize(payloadResult.value);
+  if (!payloadSizeResult.ok) {
+    return payloadSizeResult as Result<never>;
+  }
+
   // Return with the validated payload
   const validated: ProtocolMessage = {
     ...message,
@@ -189,7 +230,8 @@ export function validateMessage(raw: unknown): Result<ProtocolMessage> {
 /**
  * Parse a raw JSON string and validate it as a protocol message.
  *
- * Combines size check, JSON parsing, and full message validation.
+ * Combines size check, JSON parsing, and full message validation
+ * (including independent payload size check).
  * Use this at network boundaries (DataChannel onmessage, etc.).
  *
  * @param raw - The raw JSON string received from the network.
@@ -200,7 +242,7 @@ export function parseAndValidateMessage(
   raw: string,
   maxBytes: number = MAX_MESSAGE_BYTES,
 ): Result<ProtocolMessage> {
-  // 1. Check size
+  // 1. Check total message size
   const sizeResult = checkMessageSize(raw, maxBytes);
   if (!sizeResult.ok) {
     return sizeResult as Result<never>;
@@ -214,6 +256,6 @@ export function parseAndValidateMessage(
     return fail('INVALID_JSON', 'Failed to parse message as JSON');
   }
 
-  // 3. Validate
+  // 3. Validate (includes payload size check)
   return validateMessage(parsed);
 }
