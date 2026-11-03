@@ -1,0 +1,84 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>SyncPlay — WebRTC Peer Mesh Demo</title>
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body { font-family: system-ui, -apple-system, sans-serif; background: #0a0a0a; color: #e0e0e0; padding: 20px; }
+    h1 { text-align: center; margin-bottom: 20px; color: #4fc3f7; }
+    .container { display: flex; gap: 20px; max-width: 1200px; margin: 0 auto; }
+    .panel { flex: 1; border: 1px solid #333; border-radius: 8px; padding: 16px; background: #1a1a1a; }
+    .panel h2 { color: #81c784; margin-bottom: 12px; font-size: 1.1rem; }
+    .config { margin-bottom: 12px; }
+    .config label { display: block; margin-bottom: 4px; font-size: 0.85rem; color: #999; }
+    .config input { width: 100%; padding: 6px 8px; background: #222; border: 1px solid #444; border-radius: 4px; color: #e0e0e0; font-size: 0.9rem; }
+    button { padding: 8px 16px; margin: 4px; border: none; border-radius: 4px; cursor: pointer; font-size: 0.9rem; }
+    .btn-create { background: #4fc3f7; color: #000; }
+    .btn-join { background: #81c784; color: #000; }
+    .btn-ping { background: #ffb74d; color: #000; }
+    .btn-disconnect { background: #ef5350; color: #fff; }
+    button:disabled { opacity: 0.4; cursor: not-allowed; }
+    .log { margin-top: 12px; background: #111; border: 1px solid #333; border-radius: 4px; padding: 8px; height: 300px; overflow-y: auto; font-family: monospace; font-size: 0.8rem; line-height: 1.4; }
+    .log .info { color: #4fc3f7; }
+    .log .success { color: #81c784; }
+    .log .error { color: #ef5350; }
+    .log .msg { color: #ffb74d; }
+    .status { margin-top: 8px; padding: 8px; border-radius: 4px; font-size: 0.85rem; }
+    .status-new { background: #222; }
+    .status-connected { background: #1b5e20; }
+    .status-signaling { background: #33691e; }
+    .status-failed { background: #b71c1c; }
+    .footer { text-align: center; margin-top: 20px; font-size: 0.8rem; color: #666; }
+  </style>
+</head>
+<body>
+  <h1>🔄 SyncPlay — WebRTC Peer Mesh Demo</h1>
+
+  <div class="container">
+    <!-- Peer A (Creator) -->
+    <div class="panel" id="panel-a">
+      <h2>Peer A (Room Creator)</h2>
+      <div class="config">
+        <label>Bootstrap Server URL</label>
+        <input id="server-url-a" value="http://localhost:3000" />
+      </div>
+      <div>
+        <button class="btn-create" id="btn-create-a">Create Room</button>
+        <button class="btn-ping" id="btn-ping-a" disabled>Send PING</button>
+        <button class="btn-disconnect" id="btn-disconnect-a" disabled>Disconnect</button>
+      </div>
+      <div class="status status-new" id="status-a">Status: Not connected</div>
+      <div class="log" id="log-a"></div>
+    </div>
+
+    <!-- Peer B (Joiner) -->
+    <div class="panel" id="panel-b">
+      <h2>Peer B (Room Joiner)</h2>
+      <div class="config">
+        <label>Bootstrap Server URL</label>
+        <input id="server-url-b" value="http://localhost:3000" />
+        <label style="margin-top: 8px;">Room ID</label>
+        <input id="room-id-b" placeholder="Paste Room ID from Peer A" />
+        <label style="margin-top: 8px;">Membership Token</label>
+        <input id="token-b" placeholder="Paste token from Peer A" />
+      </div>
+      <div>
+        <button class="btn-join" id="btn-join-b">Join Room</button>
+        <button class="btn-ping" id="btn-ping-b" disabled>Send PING</button>
+        <button class="btn-disconnect" id="btn-disconnect-b" disabled>Disconnect</button>
+      </div>
+      <div class="status status-new" id="status-b">Status: Not connected</div>
+      <div class="log" id="log-b"></div>
+    </div>
+  </div>
+
+  <div class="footer">
+    <p>Phase 3 Demo — WebRTC DataChannel transport verification. No playback state. No SyncEngine.</p>
+  </div>
+
+  <script type="module" src="/src/main.ts"></script>
+</body>
+</html>
+
