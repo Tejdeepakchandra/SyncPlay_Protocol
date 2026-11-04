@@ -221,9 +221,17 @@ export class PeerManager implements PeerMesh {
     const entry = this.peers.get(event.fromPeerId);
     if (!entry) return;
 
-    // Reject stale generation
+    // Reject stale generation — answer is for an obsolete connection
     if (event.senderGeneration < entry.generation) return;
 
+    // Reject newer generation — an answer is a response to an offer WE sent.
+    // If the remote peer reconnected (generation advanced), our outstanding
+    // offer was addressed to the old incarnation. This answer does not belong
+    // to any negotiation with the new incarnation. Discard it; the correct
+    // new offer will arrive via handleSignalOffer and start a fresh transport.
+    if (event.senderGeneration > entry.generation) return;
+
+    // Generation matches — apply the answer to the current transport
     const payload = event.payload as { type: string; sdp: string };
     entry.transport.handleAnswer(payload.sdp).catch(() => {
       // Non-fatal: answer processing can fail
@@ -236,9 +244,18 @@ export class PeerManager implements PeerMesh {
     const entry = this.peers.get(event.fromPeerId);
     if (!entry) return;
 
-    // Reject stale generation
+    // Reject stale generation — candidate is for an obsolete connection
     if (event.senderGeneration < entry.generation) return;
 
+    // Reject newer generation — ICE candidates belong to a specific
+    // negotiation. If the remote peer reconnected (generation advanced),
+    // these candidates are for a negotiation we haven't started yet or
+    // for the old transport that will be replaced. Discard them; the new
+    // offer will create the correct transport and matching-generation
+    // candidates will follow.
+    if (event.senderGeneration > entry.generation) return;
+
+    // Generation matches — apply the candidate to the current transport
     const payload = event.payload as Record<string, unknown>;
     if (payload['done']) return; // ICE gathering complete, no candidate
 

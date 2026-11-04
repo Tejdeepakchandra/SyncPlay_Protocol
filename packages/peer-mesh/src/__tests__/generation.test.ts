@@ -200,6 +200,52 @@ describe('generation validation', () => {
       // Should not be in a corrupted state
       expect(status!.generation).toBe(2);
     });
+
+    it('should discard answer with newer generation (remote peer reconnected)', async () => {
+      const signaling = createMockSignalingWithCapture();
+      // 'aaa' < 'zzz', so 'aaa' is the initial offerer — will send offers
+      const pm = new PeerManager('aaa', 'session-1', 1, signaling);
+      pm.bindToRoom('room-1');
+
+      // Connect with generation 1 — sends offer to 'zzz'
+      await pm.connect({ peerId: 'zzz', sessionId: 'session-1', generation: 1 });
+      expect(signaling.sendOffer).toHaveBeenCalled();
+
+      // Remote peer reconnected with generation 2 — but we haven't received
+      // the new offer yet. An answer with gen 2 arrives for our gen-1 offer.
+      // This answer does not belong to any negotiation with the new incarnation.
+      for (const handler of signaling._answerHandlers) {
+        handler(makeAnswerEvent('zzz', 2));
+      }
+
+      await new Promise((r) => setTimeout(r, 50));
+      const status = pm.getPeerStatus('zzz');
+      expect(status).toBeDefined();
+      // Entry should still be at generation 1 — not bumped by the newer answer
+      expect(status!.generation).toBe(1);
+    });
+
+    it('should accept answer with matching generation', async () => {
+      const signaling = createMockSignalingWithCapture();
+      // 'aaa' < 'zzz', so 'aaa' is the initial offerer
+      const pm = new PeerManager('aaa', 'session-1', 1, signaling);
+      pm.bindToRoom('room-1');
+
+      // Connect with generation 1 — sends offer to 'zzz'
+      await pm.connect({ peerId: 'zzz', sessionId: 'session-1', generation: 1 });
+
+      // Send matching-generation answer — should be applied without error
+      for (const handler of signaling._answerHandlers) {
+        handler(makeAnswerEvent('zzz', 1));
+      }
+
+      await new Promise((r) => setTimeout(r, 50));
+      const status = pm.getPeerStatus('zzz');
+      expect(status).toBeDefined();
+      expect(status!.generation).toBe(1);
+      // The peer entry should still exist (not removed by an error)
+      expect(pm.listPeers()).toHaveLength(1);
+    });
   });
 
   describe('ICE candidate generation validation', () => {
@@ -238,6 +284,27 @@ describe('generation validation', () => {
       // Should accept — no error
       await new Promise((r) => setTimeout(r, 50));
       expect(pm.getPeerStatus('aaa')).toBeDefined();
+    });
+
+    it('should discard ICE candidate with newer generation (remote peer reconnected)', async () => {
+      const signaling = createMockSignalingWithCapture();
+      const pm = new PeerManager('zzz', 'session-1', 1, signaling);
+      pm.bindToRoom('room-1');
+
+      // Establish with generation 1
+      await pm.connect({ peerId: 'aaa', sessionId: 'session-1', generation: 1 });
+
+      // ICE candidate arrives with newer generation 2 — belongs to a
+      // negotiation we haven't started yet. Must be discarded.
+      for (const handler of signaling._iceHandlers) {
+        handler(makeIceCandidateEvent('aaa', 2));
+      }
+
+      await new Promise((r) => setTimeout(r, 50));
+      const status = pm.getPeerStatus('aaa');
+      expect(status).toBeDefined();
+      // Entry should remain at generation 1 — not bumped
+      expect(status!.generation).toBe(1);
     });
   });
 
@@ -291,6 +358,166 @@ describe('generation validation', () => {
       }
 
       expect(pm.listPeers()).toHaveLength(0);
+    });
+  });
+
+  describe('newer-generation signals for unknown peer', () => {
+    it('should not create entry for answer from unknown peer', async () => {
+      const signaling = createMockSignalingWithCapture();
+      const pm = new PeerManager('aaa', 'session-1', 1, signaling);
+      pm.bindToRoom('room-1');
+
+      // No connect() call — 'zzz' is unknown to PeerManager.
+      // A newer-gen answer arrives. handleSignalAnswer does peers.get()
+      // which returns undefined, so it returns early without creating an entry.
+      for (const handler of signaling._answerHandlers) {
+        handler(makeAnswerEvent('zzz', 5));
+      }
+
+      await new Promise((r) => setTimeout(r, 50));
+      expect(pm.getPeerStatus('zzz')).toBeUndefined();
+      expect(pm.listPeers()).toHaveLength(0);
+    });
+
+    it('should not create entry for ICE candidate from unknown peer', async () => {
+      const signaling = createMockSignalingWithCapture();
+      const pm = new PeerManager('aaa', 'session-1', 1, signaling);
+      pm.bindToRoom('room-1');
+
+      // No connect() call — 'zzz' is unknown.
+      // A newer-gen ICE candidate arrives. handleSignalIceCandidate does
+      // peers.get() which returns undefined, so it returns early.
+      for (const handler of signaling._iceHandlers) {
+        handler(makeIceCandidateEvent('zzz', 5));
+      }
+
+      await new Promise((r) => setTimeout(r, 50));
+      expect(pm.getPeerStatus('zzz')).toBeUndefined();
+      expect(pm.listPeers()).toHaveLength(0);
+    });
+  });
+
+  describe('transport lifecycle during reconnection', () => {
+    it('should recreate transport on newer-gen offer, then reject stale answer', async () => {
+      const signaling = createMockSignalingWithCapture();
+      // 'zzz' > 'aaa', so 'zzz' is NOT the initial offerer — receives offers
+      const pm = new PeerManager('zzz', 'session-1', 1, signaling);
+      pm.bindToRoom('room-1');
+
+      // Step 1: establish connection with generation 1
+      await pm.connect({ peerId: 'aaa', sessionId: 'session-1', generation: 1 });
+      expect(pm.getPeerStatus('aaa')!.generation).toBe(1);
+
+      // Step 2: receive newer-gen offer (gen 2) — transport should be recreated
+      vi.mocked(signaling.sendAnswer).mockClear();
+      for (const handler of signaling._offerHandlers) {
+        handler(makeOfferEvent('aaa', 2));
+      }
+      await new Promise((r) => setTimeout(r, 50));
+
+      // Should have answered the gen-2 offer (transport was recreated)
+      expect(signaling.sendAnswer).toHaveBeenCalled();
+      expect(pm.getPeerStatus('aaa')!.generation).toBe(2);
+
+      // Step 3: stale gen-1 answer arrives — must be discarded
+      for (const handler of signaling._answerHandlers) {
+        handler(makeAnswerEvent('aaa', 1));
+      }
+      await new Promise((r) => setTimeout(r, 50));
+      // Entry should remain at generation 2
+      expect(pm.getPeerStatus('aaa')!.generation).toBe(2);
+    });
+
+    it('should recreate transport on newer-gen offer, then reject stale ICE', async () => {
+      const signaling = createMockSignalingWithCapture();
+      const pm = new PeerManager('zzz', 'session-1', 1, signaling);
+      pm.bindToRoom('room-1');
+
+      // Step 1: establish connection with generation 1
+      await pm.connect({ peerId: 'aaa', sessionId: 'session-1', generation: 1 });
+
+      // Step 2: receive newer-gen offer (gen 2)
+      for (const handler of signaling._offerHandlers) {
+        handler(makeOfferEvent('aaa', 2));
+      }
+      await new Promise((r) => setTimeout(r, 50));
+      expect(pm.getPeerStatus('aaa')!.generation).toBe(2);
+
+      // Step 3: stale gen-1 ICE candidate — must be discarded
+      for (const handler of signaling._iceHandlers) {
+        handler(makeIceCandidateEvent('aaa', 1));
+      }
+      await new Promise((r) => setTimeout(r, 50));
+      // Entry should remain at generation 2, no error
+      expect(pm.getPeerStatus('aaa')!.generation).toBe(2);
+      expect(pm.listPeers()).toHaveLength(1);
+    });
+
+    it('should accept gen-2 ICE after gen-2 offer recreates transport', async () => {
+      const signaling = createMockSignalingWithCapture();
+      const pm = new PeerManager('zzz', 'session-1', 1, signaling);
+      pm.bindToRoom('room-1');
+
+      // Step 1: establish connection with generation 1
+      await pm.connect({ peerId: 'aaa', sessionId: 'session-1', generation: 1 });
+
+      // Step 2: receive newer-gen offer (gen 2) — transport recreated
+      for (const handler of signaling._offerHandlers) {
+        handler(makeOfferEvent('aaa', 2));
+      }
+      await new Promise((r) => setTimeout(r, 50));
+      expect(pm.getPeerStatus('aaa')!.generation).toBe(2);
+
+      // Step 3: matching gen-2 ICE candidate — should be accepted
+      for (const handler of signaling._iceHandlers) {
+        handler(makeIceCandidateEvent('aaa', 2));
+      }
+      await new Promise((r) => setTimeout(r, 50));
+      // Peer should still exist (no error from applying candidate)
+      expect(pm.getPeerStatus('aaa')).toBeDefined();
+      expect(pm.getPeerStatus('aaa')!.generation).toBe(2);
+    });
+
+    it('full reconnection lifecycle: gen1 → gen2 offer → discard gen1 signals → accept gen2 signals', async () => {
+      const signaling = createMockSignalingWithCapture();
+      const pm = new PeerManager('zzz', 'session-1', 1, signaling);
+      pm.bindToRoom('room-1');
+
+      // Phase 1: initial connection at generation 1
+      await pm.connect({ peerId: 'aaa', sessionId: 'session-1', generation: 1 });
+      expect(pm.getPeerStatus('aaa')!.generation).toBe(1);
+
+      // Phase 2: peer reconnects — gen-2 offer arrives, transport is recreated
+      vi.mocked(signaling.sendAnswer).mockClear();
+      for (const handler of signaling._offerHandlers) {
+        handler(makeOfferEvent('aaa', 2));
+      }
+      await new Promise((r) => setTimeout(r, 50));
+      expect(signaling.sendAnswer).toHaveBeenCalledTimes(1);
+      expect(pm.getPeerStatus('aaa')!.generation).toBe(2);
+
+      // Phase 3: stale gen-1 answer arrives — discarded
+      for (const handler of signaling._answerHandlers) {
+        handler(makeAnswerEvent('aaa', 1));
+      }
+      await new Promise((r) => setTimeout(r, 50));
+      expect(pm.getPeerStatus('aaa')!.generation).toBe(2);
+
+      // Phase 4: stale gen-1 ICE arrives — discarded
+      for (const handler of signaling._iceHandlers) {
+        handler(makeIceCandidateEvent('aaa', 1));
+      }
+      await new Promise((r) => setTimeout(r, 50));
+      expect(pm.getPeerStatus('aaa')!.generation).toBe(2);
+
+      // Phase 5: matching gen-2 ICE arrives — accepted
+      for (const handler of signaling._iceHandlers) {
+        handler(makeIceCandidateEvent('aaa', 2));
+      }
+      await new Promise((r) => setTimeout(r, 50));
+      expect(pm.getPeerStatus('aaa')).toBeDefined();
+      expect(pm.getPeerStatus('aaa')!.generation).toBe(2);
+      expect(pm.listPeers()).toHaveLength(1);
     });
   });
 
