@@ -19,7 +19,7 @@ const store = new InMemoryRoomStore();
 const roomService = new RoomService(store, config);
 
 // ── Express app ──────────────────────────────────────────────
-const app = createApp(roomService);
+const app = createApp(roomService, { allowedOrigins: config.ALLOWED_ORIGINS });
 const httpServer = createServer(app);
 
 // ── Socket.IO ────────────────────────────────────────────────
