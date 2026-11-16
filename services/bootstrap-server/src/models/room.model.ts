@@ -101,5 +101,6 @@ export interface PeerSnapshot {
     readonly peerId: PeerId;
     readonly role: PeerRole;
     readonly presence: PeerPresence;
+    readonly generation: ConnectionGeneration;
   }>;
 }

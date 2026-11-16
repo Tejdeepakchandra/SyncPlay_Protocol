@@ -74,6 +74,35 @@ export function createRoomRoutes(roomService: RoomService): Router {
     }
   });
 
+  // ── POST /api/v1/rooms/:roomId/join ────────────────────
+
+  router.post('/rooms/:roomId/join', async (req: Request, res: Response) => {
+    const requestId = nanoid(8);
+
+    try {
+      const params = RoomParamsSchema.parse(req.params);
+      const result = await roomService.joinRoom(params.roomId);
+
+      res.status(200).json({
+        roomId: result.roomId,
+        peerId: result.peerId,
+        membershipToken: result.membershipToken,
+        expiresAt: result.expiresAt,
+        maxPeers: result.maxPeers,
+      });
+    } catch (err) {
+      if (err instanceof ZodError) {
+        res.status(400).json(errorBody('INVALID_REQUEST', err.message, requestId));
+        return;
+      }
+      if (err instanceof RoomError) {
+        res.status(errorToStatus(err.code)).json(errorBody(err.code, err.message, requestId));
+        return;
+      }
+      res.status(500).json(errorBody('INTERNAL_ERROR', 'Internal server error', requestId));
+    }
+  });
+
   // ── GET /api/v1/rooms/:roomId ──────────────────────────
 
   router.get('/rooms/:roomId', (req: Request, res: Response) => {

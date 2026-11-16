@@ -56,9 +56,12 @@ export function registerSignalingGateway(
         socket.emit('session:joined', snapshot);
 
         // Notify other peers in the room
+        const member = snapshot.peers.find((p) => p.peerId === peerId);
         socket.to(roomId).emit('session:peer-joined', {
+          roomId,
           peerId,
-          role: snapshot.peers.find((p) => p.peerId === peerId)?.role ?? 'MEMBER',
+          role: member?.role ?? 'MEMBER',
+          generation: member?.generation ?? 1,
         });
       } catch (err) {
         const error = toSessionError(err);
@@ -159,11 +162,11 @@ function relaySignal(
   socket: Socket,
   roomService: RoomService,
   event: string,
-  data: { roomId: string; targetPeerId: string; negotiationId: string; payload: unknown },
+  data: { roomId: string; targetPeerId: string; negotiationId: string; declaredGeneration?: number; payload: unknown },
   ack?: (response: unknown) => void,
 ): void {
   try {
-    const auth = roomService.authorizeSignaling(socket.id, data.targetPeerId);
+    const auth = roomService.authorizeSignaling(socket.id, data.targetPeerId, data.declaredGeneration);
 
     // Forward with server-derived fromPeerId and generation (never trust client)
     socket.to(auth.targetSocketId).emit(event, {
@@ -189,11 +192,11 @@ function relaySignal(
 function relayIceCandidate(
   socket: Socket,
   roomService: RoomService,
-  data: { roomId: string; targetPeerId: string; negotiationId: string; payload: unknown },
+  data: { roomId: string; targetPeerId: string; negotiationId: string; declaredGeneration?: number; payload: unknown },
   ack?: (response: unknown) => void,
 ): void {
   try {
-    const auth = roomService.authorizeSignaling(socket.id, data.targetPeerId);
+    const auth = roomService.authorizeSignaling(socket.id, data.targetPeerId, data.declaredGeneration);
 
     socket.to(auth.targetSocketId).emit('signal:ice-candidate', {
       roomId: auth.roomId,

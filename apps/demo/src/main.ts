@@ -118,26 +118,36 @@ async function joinRoom(): Promise<void> {
   log('b', `Joining room ${roomId}...`);
 
   try {
-    // Join via HTTP to get peerId
-    const res = await fetch(`${serverUrl}/api/v1/rooms/${roomId}/join`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ membershipToken: token }),
-    });
-
-    // If there's no join endpoint, we create our own peerId
     let peerId: string;
-    if (res.ok) {
-      const data = await res.json();
-      peerId = data.peerId;
-    } else {
-      // The bootstrap server creates peers at room creation or via Socket.IO join
-      peerId = `peer-${generateId()}`;
-    }
+    let peerToken = token;
 
-    stateB.roomId = roomId;
-    stateB.peerId = peerId;
-    stateB.token = token;
+    // If reconnecting an existing peer, reuse its peerId and token so the server increments generation
+    if (stateB.peerId && stateB.token && stateB.roomId === roomId) {
+      peerId = stateB.peerId;
+      peerToken = stateB.token;
+      log('b', `Reconnecting as existing peer ${peerId}...`);
+    } else {
+      // First time join via HTTP to get peerId and member token
+      const res = await fetch(`${serverUrl}/api/v1/rooms/${roomId}/join`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ membershipToken: token }),
+      });
+
+      if (res.ok) {
+        const data = await res.json();
+        peerId = data.peerId;
+        if (data.membershipToken) {
+          peerToken = data.membershipToken;
+        }
+      } else {
+        peerId = `peer-${generateId()}`;
+      }
+
+      stateB.roomId = roomId;
+      stateB.peerId = peerId;
+      stateB.token = peerToken;
+    }
 
     // Connect signaling
     stateB.signaling = new SignalingClient();
@@ -176,8 +186,10 @@ async function joinAndSetup(panelId: string, state: PeerState): Promise<void> {
 
   log(panelId, 'Joined room via Socket.IO', 'success');
 
-  // Get generation from ack data
-  const generation = (ack.data?.['generation'] as number) ?? 1;
+  // Get generation from ack snapshot or data
+  const snapshotPeers = (ack as any).snapshot?.peers as Array<{ peerId: string; generation?: number }> | undefined;
+  const myMember = snapshotPeers?.find((p) => p.peerId === state.peerId);
+  const generation = myMember?.generation ?? (ack.data?.['generation'] as number) ?? 1;
   log(panelId, `Generation: ${generation}`);
 
   // Create PeerManager
@@ -243,7 +255,8 @@ async function joinAndSetup(panelId: string, state: PeerState): Promise<void> {
   });
 
   // If peers already in room from the ack snapshot, connect to them
-  const peers = ack.data?.['peers'] as Array<{ peerId: string; generation?: number }> | undefined;
+  const peers = (ack as any).snapshot?.peers as Array<{ peerId: string; generation?: number }> | undefined
+    ?? ack.data?.['peers'] as Array<{ peerId: string; generation?: number }> | undefined;
   if (peers) {
     for (const peer of peers) {
       if (peer.peerId !== state.peerId) {

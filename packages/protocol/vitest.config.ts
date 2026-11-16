@@ -1,8 +1,9 @@
 import { defineConfig } from 'vitest/config';
+import path from 'path';
 
 export default defineConfig({
   test: {
-    root: './packages/protocol',
+    root: path.resolve(import.meta.dirname),
     include: ['src/**/*.test.ts', 'src/**/__tests__/**/*.test.ts'],
   },
 });

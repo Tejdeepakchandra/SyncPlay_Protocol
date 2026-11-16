@@ -24,6 +24,7 @@ export const SignalOfferAnswerSchema = z.strictObject({
   roomId: z.string().min(1).max(128),
   targetPeerId: z.string().min(1).max(128),
   negotiationId: z.string().min(1).max(128),
+  declaredGeneration: z.number().int().positive().optional(),
   payload: z.object({
     type: z.enum(['offer', 'answer']),
     sdp: z.string().min(1).max(65536),
@@ -35,6 +36,7 @@ export const SignalIceCandidateSchema = z.strictObject({
   roomId: z.string().min(1).max(128),
   targetPeerId: z.string().min(1).max(128),
   negotiationId: z.string().min(1).max(128),
+  declaredGeneration: z.number().int().positive().optional(),
   payload: z.union([
     z.object({
       candidate: z.string(),

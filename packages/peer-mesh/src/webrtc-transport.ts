@@ -71,6 +71,14 @@ export class WebRTCTransport {
     return this.dc?.readyState ?? null;
   }
 
+  get signalingState(): RTCSignalingState | null {
+    return this.pc?.signalingState ?? null;
+  }
+
+  get isMakingOffer(): boolean {
+    return this.makingOffer;
+  }
+
   /**
    * Initialize the RTCPeerConnection and set up event handlers.
    * If this peer is the initial offerer, also creates the DataChannel.

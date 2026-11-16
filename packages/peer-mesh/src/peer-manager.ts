@@ -302,6 +302,12 @@ export class PeerManager implements PeerMesh {
   // ── Negotiation ──────────────────────────────────────────────
 
   private async startNegotiation(entry: PeerEntry): Promise<void> {
+    if (entry.transport.isMakingOffer) {
+      return;
+    }
+    if (entry.transport.signalingState && entry.transport.signalingState !== 'stable') {
+      return;
+    }
     try {
       const offerSdp = await entry.transport.createOffer();
       if (this.roomId) {
@@ -313,8 +319,8 @@ export class PeerManager implements PeerMesh {
           this.localGeneration,
         );
       }
-    } catch (err) {
-      this.removePeer(entry.peerId, 'offer-creation-error');
+    } catch {
+      // Non-fatal: transient negotiation collisions should not destroy the connection
     }
   }
 
@@ -419,7 +425,7 @@ export class PeerManager implements PeerMesh {
       },
       onNegotiationNeeded: () => {
         const entry = this.peers.get(remotePeerId);
-        if (entry) {
+        if (entry && !entry.transport.isMakingOffer && entry.transport.signalingState === 'stable') {
           this.startNegotiation(entry).catch(() => {
             // Non-fatal
           });

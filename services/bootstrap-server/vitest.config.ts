@@ -1,8 +1,9 @@
 import { defineConfig } from 'vitest/config';
+import path from 'path';
 
 export default defineConfig({
   test: {
-    root: './services/bootstrap-server',
+    root: path.resolve(import.meta.dirname),
     globals: false,
     environment: 'node',
     include: ['src/**/*.test.ts', 'src/**/__tests__/**/*.test.ts'],

@@ -223,12 +223,13 @@ export class RoomService {
 
     // Bind socket
     const oldSocketId = peer.socketId;
+    const wasDisconnected = peer.presence === 'DISCONNECTED';
     peer.socketId = socketId;
     peer.presence = 'CONNECTED';
     peer.lastSeenAt = Date.now();
 
     // If rebinding (reconnect), increment generation
-    if (oldSocketId !== null) {
+    if (oldSocketId !== null || wasDisconnected) {
       peer.generation += 1;
     }
 
@@ -314,6 +315,7 @@ export class RoomService {
         peerId: p.peerId,
         role: p.role,
         presence: p.presence,
+        generation: p.generation,
       })),
     };
   }
