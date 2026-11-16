@@ -1,26 +1,27 @@
 /**
- * SyncPlay WebRTC Peer Mesh & Control Events Demo.
+ * SyncPlay WebRTC Peer Mesh, Control Events & Baseline SyncEngine Demo.
  *
- * Two peers (A = creator, B = joiner) connect through the Bootstrap Server,
- * negotiate WebRTC, open a DataChannel, and exchange:
- * 1. PING/PONG messages (Phase 4 RTT Engine)
- * 2. Control events: PLAY, PAUSE, SEEK, RATE_CHANGE, and RETRY (Phase 5 Control Events Layer)
- *
- * This demo demonstrates transport and event propagation only.
- * No playback state authority. No SyncEngine. No HTMLMediaElement.
+ * Demonstrates:
+ * 1. WebRTC DataChannel full mesh via Bootstrap Server.
+ * 2. PING/PONG and monotonic RTT measurement.
+ * 3. Bidirectional control events (PLAY, PAUSE, SEEK, RATE_CHANGE, RETRY).
+ * 4. Locally authoritative SyncEngine state reduction and continuous position extrapolation.
  */
 import { SignalingClient, PeerManager } from '@syncplay/peer-mesh';
 import type { PeerStatus, InboundMessage } from '@syncplay/peer-mesh';
+import { PROTOCOL_VERSION, MessageType } from '@syncplay/protocol';
 import { ControlEventServiceImpl } from '@syncplay/control-events';
 import type {
   ControlEventService,
   SyncPlayControls,
   AnyControlSyncEvent,
 } from '@syncplay/control-events';
+import { BaselineSyncEngine } from '@syncplay/sync-engine';
+import type { SyncEngine, PlaybackState } from '@syncplay/sync-engine';
 
-// ── Logging ──────────────────────────────────────────────────
+// ── Logging & UI Helpers ─────────────────────────────────────
 
-function log(panelId: string, text: string, cls: 'info' | 'success' | 'error' | 'msg' = 'info'): void {
+function log(panelId: string, text: string, cls: 'info' | 'success' | 'error' | 'msg' | 'engine' = 'info'): void {
   const el = document.getElementById(`log-${panelId}`);
   if (!el) return;
   const line = document.createElement('div');
@@ -39,10 +40,44 @@ function setStatus(panelId: string, text: string, state: string = 'new'): void {
 }
 
 function setControlButtonsState(panelId: string, enabled: boolean): void {
-  const ids = ['play', 'pause', 'seek', 'rate', 'retry', 'err', 'stats'];
+  const ids = ['play', 'pause', 'seek', 'seek0', 'rate', 'retry', 'err', 'stats'];
   for (const id of ids) {
     const el = document.getElementById(`btn-${id}-${panelId}`) as HTMLButtonElement | null;
     if (el) el.disabled = !enabled;
+  }
+}
+
+function formatTime(ms: number): string {
+  const totalSeconds = Math.max(0, ms / 1000);
+  const minutes = Math.floor(totalSeconds / 60);
+  const seconds = (totalSeconds % 60).toFixed(1);
+  return `${minutes.toString().padStart(2, '0')}:${seconds.padStart(4, '0')}`;
+}
+
+function renderEngineState(panelId: string, playbackState: PlaybackState): void {
+  const badge = document.getElementById(`engine-status-badge-${panelId}`);
+  if (badge) {
+    badge.textContent = playbackState.status.toUpperCase();
+    badge.className = playbackState.status === 'playing' ? 'badge badge-playing' : 'badge badge-paused';
+  }
+
+  const rateEl = document.getElementById(`engine-rate-${panelId}`);
+  if (rateEl) rateEl.textContent = `${playbackState.playbackRate.toFixed(2)}x`;
+
+  const verEl = document.getElementById(`engine-ver-${panelId}`);
+  if (verEl) verEl.textContent = `v${playbackState.stateVersion}`;
+
+  const anchorEl = document.getElementById(`engine-anchor-${panelId}`);
+  if (anchorEl) anchorEl.textContent = `${playbackState.anchorPositionMs.toFixed(0)} ms`;
+
+  const lastOpEl = document.getElementById(`engine-last-op-${panelId}`);
+  if (lastOpEl) {
+    if (playbackState.lastAppliedEvent) {
+      const op = playbackState.lastAppliedEvent;
+      lastOpEl.textContent = `${op.messageType} (${op.senderPeerId}) [${op.logicalEventId.slice(0, 8)}...]`;
+    } else {
+      lastOpEl.textContent = 'none (initial state)';
+    }
   }
 }
 
@@ -52,6 +87,7 @@ export interface PeerState {
   signaling: SignalingClient | null;
   manager: PeerManager | null;
   controlService: ControlEventService | null;
+  syncEngine: SyncEngine | null;
   controls: SyncPlayControls | null;
   roomId: string | null;
   peerId: string | null;
@@ -66,6 +102,7 @@ export const stateA: PeerState = {
   signaling: null,
   manager: null,
   controlService: null,
+  syncEngine: null,
   controls: null,
   roomId: null,
   peerId: null,
@@ -80,6 +117,7 @@ export const stateB: PeerState = {
   signaling: null,
   manager: null,
   controlService: null,
+  syncEngine: null,
   controls: null,
   roomId: null,
   peerId: null,
@@ -98,34 +136,30 @@ function generateId(): string {
 
 async function createRoom(): Promise<void> {
   const serverUrl = (document.getElementById('server-url-a') as HTMLInputElement).value;
-  log('a', `Connecting to ${serverUrl}...`);
+  log('a', `Creating room at ${serverUrl}...`);
 
   try {
-    // Create room via HTTP
     const res = await fetch(`${serverUrl}/api/v1/rooms`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ maxPeers: 4 }),
     });
 
     if (!res.ok) {
-      const err = await res.json();
-      log('a', `Failed: ${JSON.stringify(err)}`, 'error');
+      log('a', `Failed to create room: ${res.statusText}`, 'error');
       return;
     }
 
     const data = await res.json();
     stateA.roomId = data.roomId;
-    stateA.peerId = data.peerId;
-    stateA.token = data.membershipToken;
+    stateA.peerId = data.peerId ?? data.creatorPeerId;
+    stateA.token = data.membershipToken ?? data.creatorToken;
 
     log('a', `Room created: ${data.roomId}`, 'success');
-    log('a', `Peer ID: ${data.peerId}`);
-    log('a', `Token: ${data.membershipToken}`);
+    log('a', `Peer ID: ${stateA.peerId}`);
 
-    // Pre-fill Peer B's fields
+    // Auto-fill Peer B inputs for easy testing
     (document.getElementById('room-id-b') as HTMLInputElement).value = data.roomId;
-    (document.getElementById('token-b') as HTMLInputElement).value = data.membershipToken;
+    (document.getElementById('token-b') as HTMLInputElement).value = stateA.token ?? '';
 
     // Connect signaling
     stateA.signaling = new SignalingClient();
@@ -152,41 +186,34 @@ async function createRoom(): Promise<void> {
 
 async function joinRoom(): Promise<void> {
   const serverUrl = (document.getElementById('server-url-b') as HTMLInputElement).value;
-  const roomId = (document.getElementById('room-id-b') as HTMLInputElement).value;
-  const token = (document.getElementById('token-b') as HTMLInputElement).value;
+  const roomId = (document.getElementById('room-id-b') as HTMLInputElement).value.trim();
+  const token = (document.getElementById('token-b') as HTMLInputElement).value.trim();
 
-  if (!roomId || !token) {
-    log('b', 'Room ID and token required', 'error');
+  if (!roomId) {
+    log('b', 'Please enter a Room ID', 'error');
     return;
   }
 
-  log('b', `Joining room ${roomId}...`);
+  log('b', `Joining room ${roomId} at ${serverUrl}...`);
 
   try {
-    let peerId: string;
-    let peerToken = token;
-
-    // If reconnecting an existing peer, reuse its peerId and token so the server increments generation
-    if (stateB.peerId && stateB.token && stateB.roomId === roomId) {
-      peerId = stateB.peerId;
-      peerToken = stateB.token;
-      log('b', `Reconnecting as existing peer ${peerId}...`);
-    } else {
-      // First time join via HTTP to get peerId and member token
-      const res = await fetch(`${serverUrl}/api/v1/rooms/${roomId}/join`, {
+    // If stateB already has peerId (reconnect scenario), preserve it
+    if (!stateB.peerId) {
+      const joinRes = await fetch(`${serverUrl}/api/v1/rooms/${encodeURIComponent(roomId)}/join`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ membershipToken: token }),
       });
 
-      if (res.ok) {
-        const data = await res.json();
-        peerId = data.peerId;
-        if (data.membershipToken) {
-          peerToken = data.membershipToken;
-        }
+      let peerId = generateId();
+      let peerToken = token;
+
+      if (joinRes.ok) {
+        const joinData = await joinRes.json();
+        peerId = joinData.peerId;
+        peerToken = joinData.membershipToken ?? joinData.peerToken ?? token;
+        log('b', `Registered with bootstrap: peerId=${peerId}`);
       } else {
-        peerId = `peer-${generateId()}`;
+        log('b', 'Join API route not available, using client-generated peerId', 'info');
       }
 
       stateB.roomId = roomId;
@@ -215,7 +242,7 @@ async function joinRoom(): Promise<void> {
   }
 }
 
-// ── Join via Socket.IO and setup PeerManager & ControlEvents ─
+// ── Join via Socket.IO and setup PeerManager, ControlEvents & SyncEngine ─
 
 async function joinAndSetup(panelId: string, state: PeerState): Promise<void> {
   if (!state.signaling || !state.roomId || !state.peerId || !state.token) return;
@@ -260,30 +287,61 @@ async function joinAndSetup(panelId: string, state: PeerState): Promise<void> {
   });
   state.controls = state.controlService.getControls();
 
-  // Register SyncEventReceiver
-  state.controlService.setReceiver({
-    receive(event: AnyControlSyncEvent) {
-      if (state.simulateReceiverError) {
-        log(panelId, `💥 Receiver threw error on ${event.message.messageType}!`, 'error');
-        throw new Error(`Simulated receiver failure on ${event.message.messageType}`);
-      }
-      log(
-        panelId,
-        `🎯 Received ${event.message.messageType} [${event.origin}]: from=${event.message.senderPeerId}, msgId=${event.message.messageId.slice(0, 8)}..., evtId=${event.message.logicalEventId?.slice(0, 8)}..., payload=${JSON.stringify(event.message.payload)}`,
-        'success',
-      );
-      state.lastReceivedEvent = event;
-    },
+  // Initialize Phase 6 BaselineSyncEngine
+  state.syncEngine = new BaselineSyncEngine({
+    sessionId: state.roomId,
+    localPeerId: state.peerId,
   });
+
+  // Connect ControlEventService to BaselineSyncEngine via SyncEventReceiver
+  if (state.simulateReceiverError) {
+    // Intercept receiver to simulate failure
+    state.controlService.setReceiver({
+      receive(event: AnyControlSyncEvent) {
+        log(panelId, `💥 Simulated receiver failure on ${event.message.messageType}!`, 'error');
+        throw new Error(`Simulated receiver failure on ${event.message.messageType}`);
+      },
+    });
+  } else {
+    state.controlService.setReceiver(state.syncEngine);
+  }
+
+  // Subscribe UI to SyncEngine state mutations
+  state.syncEngine.onStateChange((playbackState) => {
+    renderEngineState(panelId, playbackState);
+    log(
+      panelId,
+      `🎬 State Mutated [v${playbackState.stateVersion}]: ${playbackState.status.toUpperCase()} at ${playbackState.anchorPositionMs.toFixed(0)}ms (${playbackState.playbackRate}x)`,
+      'engine',
+    );
+  });
+
+  // Subscribe UI to SyncEngine decision logging
+  state.syncEngine.onDecision((event, decision) => {
+    const originTag = event.origin === 'local' ? 'LOCAL' : 'REMOTE';
+    log(
+      panelId,
+      `🎯 Decision [${decision.code}] on ${event.message.messageType} (${originTag}, from=${event.message.senderPeerId}) -> accepted=${decision.accepted}, v${decision.stateVersion}`,
+      decision.accepted ? 'success' : 'error',
+    );
+    state.lastReceivedEvent = event;
+  });
+
+  // Render initial clean state
+  renderEngineState(panelId, state.syncEngine.getState());
 
   // Handle peer status changes
   state.manager.onPeerStatus((status: PeerStatus) => {
-    log(panelId, `Peer ${status.peerId}: ${status.state} (DC: ${status.dataChannelState ?? 'N/A'})`, 
-      status.state === 'CONNECTED' ? 'success' : 'info');
-    
+    log(
+      panelId,
+      `Peer ${status.peerId}: ${status.state} (DC: ${status.dataChannelState ?? 'N/A'})`,
+      status.state === 'CONNECTED' ? 'success' : 'info',
+    );
+
     if (status.state === 'CONNECTED' || status.dataChannelState === 'open') {
       setStatus(panelId, `Connected to ${status.peerId}`, 'connected');
       (document.getElementById(`btn-ping-${panelId}`) as HTMLButtonElement).disabled = false;
+      (document.getElementById(`btn-disconnect-${panelId}`) as HTMLButtonElement).disabled = false;
       setControlButtonsState(panelId, true);
     } else if (status.state === 'CLOSED' || status.state === 'FAILED') {
       setStatus(panelId, `${status.state}: ${status.peerId}`, 'failed');
@@ -291,91 +349,80 @@ async function joinAndSetup(panelId: string, state: PeerState): Promise<void> {
     }
   });
 
-  // Handle RTT samples and statistics
+  // Handle RTT samples
   state.manager.getRttService().onSample((sample) => {
     const est = state.manager?.getRttService().getEstimate(sample.peerId);
     if (est) {
       log(
         panelId,
-        `⏱ RTT [${sample.peerId}]: latest=${sample.rttMs.toFixed(1)}ms, min=${est.minRttMs.toFixed(1)}ms, max=${est.maxRttMs.toFixed(1)}ms, avg=${est.avgRttMs.toFixed(1)}ms, med=${est.medianRttMs.toFixed(1)}ms, p90=${est.p90RttMs.toFixed(1)}ms (n=${est.sampleCount}, gen=${est.generation})`,
+        `⏱ RTT [${sample.peerId}]: latest=${sample.rttMs.toFixed(1)}ms, avg=${est.avgRttMs.toFixed(1)}ms (n=${est.sampleCount})`,
         'success',
       );
     }
   });
 
-  // Handle peer joined events — connect to new peers
+  // Handle peer joined events
   state.signaling.onPeerJoined((event) => {
     log(panelId, `Peer joined: ${event.peerId} (gen: ${event.generation})`);
     if (event.peerId !== state.peerId && state.manager) {
-      state.manager.connect({
-        peerId: event.peerId,
-        sessionId: state.roomId!,
-        generation: event.generation,
-      }).then(() => {
-        log(panelId, `Initiated connection to ${event.peerId}`, 'info');
-      }).catch((err) => {
-        log(panelId, `Connection failed: ${err}`, 'error');
-      });
+      state.manager
+        .connect({
+          peerId: event.peerId,
+          sessionId: state.roomId!,
+          generation: event.generation,
+        })
+        .then(() => {
+          log(panelId, `Initiated connection to ${event.peerId}`, 'info');
+        })
+        .catch((err) => {
+          log(panelId, `Connection failed: ${err}`, 'error');
+        });
     }
   });
 
-  // If peers already in room from the ack snapshot, connect to them
-  const peers = (ack as any).snapshot?.peers as Array<{ peerId: string; generation?: number }> | undefined
-    ?? ack.data?.['peers'] as Array<{ peerId: string; generation?: number }> | undefined;
+  // If peers already in room from snapshot, connect to them
+  const peers =
+    ((ack as any).snapshot?.peers as Array<{ peerId: string; generation?: number }> | undefined) ??
+    (ack.data?.['peers'] as Array<{ peerId: string; generation?: number }> | undefined);
   if (peers) {
     for (const peer of peers) {
       if (peer.peerId !== state.peerId) {
         log(panelId, `Existing peer found: ${peer.peerId}`);
-        state.manager.connect({
-          peerId: peer.peerId,
-          sessionId: state.roomId,
-          generation: peer.generation ?? 1,
-        }).then(() => {
-          log(panelId, `Initiated connection to ${peer.peerId}`, 'info');
-        }).catch((err) => {
-          log(panelId, `Connection failed: ${err}`, 'error');
-        });
+        state.manager
+          .connect({
+            peerId: peer.peerId,
+            sessionId: state.roomId,
+            generation: peer.generation ?? 1,
+          })
+          .then(() => {
+            log(panelId, `Initiated connection to existing peer ${peer.peerId}`, 'info');
+          })
+          .catch((err) => {
+            log(panelId, `Connection to existing peer failed: ${err}`, 'error');
+          });
       }
     }
   }
 
-  setStatus(panelId, 'In room, waiting for peer...', 'signaling');
-  (document.getElementById(`btn-disconnect-${panelId}`) as HTMLButtonElement).disabled = false;
+  // Handle messages from peers
+  state.manager.onMessage((inbound: InboundMessage) => {
+    log(
+      panelId,
+      `📩 DataChannel message from ${inbound.fromPeerId}: type=${inbound.message.messageType}`,
+      'msg',
+    );
+  });
 }
 
-// ── Send PING / Check RTT ────────────────────────────────────
+// ── Control Operations ───────────────────────────────────────
 
-function sendPing(panelId: string, state: PeerState): void {
-  if (!state.manager) return;
-
-  const peers = state.manager.listPeers();
-  if (peers.length === 0) {
-    log(panelId, 'No peers connected', 'error');
-    return;
-  }
-
-  for (const peer of peers) {
-    const est = state.manager.getRttService().getEstimate(peer.peerId);
-    if (est) {
-      log(
-        panelId,
-        `📊 Current RTT [${peer.peerId}]: latest=${est.latestRttMs.toFixed(1)}ms, min=${est.minRttMs.toFixed(1)}ms, max=${est.maxRttMs.toFixed(1)}ms, avg=${est.avgRttMs.toFixed(1)}ms, med=${est.medianRttMs.toFixed(1)}ms, p90=${est.p90RttMs.toFixed(1)}ms (n=${est.sampleCount}, gen=${est.generation}, stale=${est.isStale})`,
-        'info',
-      );
-    } else {
-      log(panelId, `📊 Current RTT [${peer.peerId}]: collecting samples...`, 'info');
-    }
-  }
-}
-
-// ── Phase 5 Control Event Actions ────────────────────────────
-
-async function handlePlay(panelId: string, state: PeerState): Promise<void> {
+async function handlePlay(panelId: string, state: PeerState, targetPositionMs?: number): Promise<void> {
   if (!state.controls) return;
-  const res = await state.controls.play(1000);
+  const posLabel = targetPositionMs !== undefined ? `(${targetPositionMs}ms)` : '';
+  const res = await state.controls.play(targetPositionMs);
   log(
     panelId,
-    `▶ Play(1000ms) -> accepted=${res.accepted}, peers=${res.deliveredCount}/${res.peerCount}, evtId=${res.logicalEventId?.slice(0, 8)}...${res.error ? ', err=' + res.error.message : ''}`,
+    `▶ Play${posLabel} -> accepted=${res.accepted}, peers=${res.deliveredCount}/${res.peerCount}, evtId=${res.logicalEventId?.slice(0, 8)}...${res.error ? ', err=' + res.error.message : ''}`,
     res.accepted ? 'success' : 'error',
   );
   if (res.accepted && state.lastReceivedEvent) {
@@ -385,10 +432,10 @@ async function handlePlay(panelId: string, state: PeerState): Promise<void> {
 
 async function handlePause(panelId: string, state: PeerState): Promise<void> {
   if (!state.controls) return;
-  const res = await state.controls.pause(2500);
+  const res = await state.controls.pause();
   log(
     panelId,
-    `⏸ Pause(2500ms) -> accepted=${res.accepted}, peers=${res.deliveredCount}/${res.peerCount}, evtId=${res.logicalEventId?.slice(0, 8)}...${res.error ? ', err=' + res.error.message : ''}`,
+    `⏸ Pause -> accepted=${res.accepted}, peers=${res.deliveredCount}/${res.peerCount}, evtId=${res.logicalEventId?.slice(0, 8)}...${res.error ? ', err=' + res.error.message : ''}`,
     res.accepted ? 'success' : 'error',
   );
   if (res.accepted && state.lastReceivedEvent) {
@@ -396,12 +443,12 @@ async function handlePause(panelId: string, state: PeerState): Promise<void> {
   }
 }
 
-async function handleSeek(panelId: string, state: PeerState): Promise<void> {
+async function handleSeek(panelId: string, state: PeerState, targetPositionMs: number = 15000): Promise<void> {
   if (!state.controls) return;
-  const res = await state.controls.seek(15000);
+  const res = await state.controls.seek(targetPositionMs);
   log(
     panelId,
-    `⏩ Seek(15000ms) -> accepted=${res.accepted}, peers=${res.deliveredCount}/${res.peerCount}, evtId=${res.logicalEventId?.slice(0, 8)}...${res.error ? ', err=' + res.error.message : ''}`,
+    `⏩ Seek(${targetPositionMs}ms) -> accepted=${res.accepted}, peers=${res.deliveredCount}/${res.peerCount}, evtId=${res.logicalEventId?.slice(0, 8)}...${res.error ? ', err=' + res.error.message : ''}`,
     res.accepted ? 'success' : 'error',
   );
   if (res.accepted && state.lastReceivedEvent) {
@@ -409,12 +456,12 @@ async function handleSeek(panelId: string, state: PeerState): Promise<void> {
   }
 }
 
-async function handleRate(panelId: string, state: PeerState): Promise<void> {
+async function handleRate(panelId: string, state: PeerState, playbackRate: number = 1.5): Promise<void> {
   if (!state.controls) return;
-  const res = await state.controls.setPlaybackRate(1.5);
+  const res = await state.controls.setPlaybackRate(playbackRate);
   log(
     panelId,
-    `⚡ Rate(1.5x) -> accepted=${res.accepted}, peers=${res.deliveredCount}/${res.peerCount}, evtId=${res.logicalEventId?.slice(0, 8)}...${res.error ? ', err=' + res.error.message : ''}`,
+    `⚡ Rate(${playbackRate}x) -> accepted=${res.accepted}, peers=${res.deliveredCount}/${res.peerCount}, evtId=${res.logicalEventId?.slice(0, 8)}...${res.error ? ', err=' + res.error.message : ''}`,
     res.accepted ? 'success' : 'error',
   );
   if (res.accepted && state.lastReceivedEvent) {
@@ -440,6 +487,21 @@ function handleToggleError(panelId: string, state: PeerState): void {
   state.simulateReceiverError = !state.simulateReceiverError;
   const btn = document.getElementById(`btn-err-${panelId}`);
   if (btn) btn.textContent = state.simulateReceiverError ? 'Sim Error: ON' : 'Sim Error: OFF';
+
+  // Toggle receiver on ControlEventService
+  if (state.controlService) {
+    if (state.simulateReceiverError) {
+      state.controlService.setReceiver({
+        receive(event: AnyControlSyncEvent) {
+          log(panelId, `💥 Simulated receiver failure on ${event.message.messageType}!`, 'error');
+          throw new Error(`Simulated receiver failure on ${event.message.messageType}`);
+        },
+      });
+    } else if (state.syncEngine) {
+      state.controlService.setReceiver(state.syncEngine);
+    }
+  }
+
   log(
     panelId,
     `Simulate receiver failure: ${state.simulateReceiverError ? 'ON' : 'OFF'}`,
@@ -448,18 +510,31 @@ function handleToggleError(panelId: string, state: PeerState): void {
 }
 
 function handleStats(panelId: string, state: PeerState): void {
-  if (!state.controlService) return;
-  const s = state.controlService.getStats();
-  log(
-    panelId,
-    `📊 Stats: inRecv=${s.inboundReceivedCount}, inDisp=${s.inboundDispatchedCount}, inDrop=${s.inboundDroppedCount}, outCreated=${s.outboundCreatedCount}, outDisp=${s.outboundDispatchedCount}, dedupSize=${s.deduplication.size}, dedupDups=${s.deduplication.duplicateCount}`,
-    'info',
-  );
+  if (state.controlService) {
+    const s = state.controlService.getStats();
+    log(
+      panelId,
+      `📊 Control Stats: inRecv=${s.inboundReceivedCount}, inDisp=${s.inboundDispatchedCount}, inDrop=${s.inboundDroppedCount}, outCreated=${s.outboundCreatedCount}, outDisp=${s.outboundDispatchedCount}, dedupSize=${s.deduplication.size}, dedupDups=${s.deduplication.duplicateCount}`,
+      'info',
+    );
+  }
+  if (state.syncEngine) {
+    const es = state.syncEngine.getStats();
+    log(
+      panelId,
+      `🎬 Engine Stats: recv=${es.eventsReceivedCount}, applied=${es.eventsAppliedCount}, noOp=${es.eventsNoOpCount}, rej=${es.eventsRejectedCount}, errs=${es.listenerErrorCount}`,
+      'info',
+    );
+  }
 }
 
 // ── Disconnect ───────────────────────────────────────────────
 
 async function disconnectPeer(panelId: string, state: PeerState): Promise<void> {
+  if (state.syncEngine) {
+    state.syncEngine.dispose();
+    state.syncEngine = null;
+  }
   if (state.controlService) {
     state.controlService.dispose();
     state.controlService = null;
@@ -473,59 +548,128 @@ async function disconnectPeer(panelId: string, state: PeerState): Promise<void> 
     state.signaling.dispose();
     state.signaling = null;
   }
-  setStatus(panelId, 'Disconnected', 'new');
-  log(panelId, 'Disconnected', 'info');
+
+  log(panelId, 'Disconnected and cleaned up resources');
+  setStatus(panelId, 'Disconnected', 'failed');
+  setControlButtonsState(panelId, false);
+
   (document.getElementById(`btn-ping-${panelId}`) as HTMLButtonElement).disabled = true;
   (document.getElementById(`btn-disconnect-${panelId}`) as HTMLButtonElement).disabled = true;
-  setControlButtonsState(panelId, false);
 
   if (panelId === 'a') {
     (document.getElementById('btn-create-a') as HTMLButtonElement).disabled = false;
   } else {
     (document.getElementById('btn-join-b') as HTMLButtonElement).disabled = false;
   }
+
+  // Reset state box
+  const badge = document.getElementById(`engine-status-badge-${panelId}`);
+  if (badge) {
+    badge.textContent = 'DISPOSED';
+    badge.className = 'badge badge-paused';
+  }
 }
 
-// ── Wire up buttons ──────────────────────────────────────────
+function sendPing(panelId: string, state: PeerState): void {
+  if (!state.manager || !state.roomId || !state.peerId) return;
+  state.pingCount++;
+  const peers = state.manager.listPeers().filter((p) => p.dataChannelState === 'open');
+  if (peers.length === 0) {
+    log(panelId, 'No peers with open DataChannel', 'error');
+    return;
+  }
+  const probeId = `probe-${panelId}-${state.pingCount}`;
+  for (const peer of peers) {
+    const msg = {
+      protocolVersion: PROTOCOL_VERSION,
+      messageType: MessageType.PING,
+      sessionId: state.roomId,
+      senderPeerId: state.peerId,
+      messageId: `msg-${generateId()}`,
+      payload: { probeId },
+    };
+    const res = state.manager.send(peer.peerId, msg);
+    if (res.ok) {
+      log(panelId, `→ PING sent to ${peer.peerId} (probeId: ${probeId})`, 'msg');
+    } else {
+      log(panelId, `PING failed: ${res.error}`, 'error');
+    }
+  }
+}
 
-document.getElementById('btn-create-a')?.addEventListener('click', () => createRoom());
-document.getElementById('btn-join-b')?.addEventListener('click', () => joinRoom());
+// ── Continuous Playback Position Animation Loop ──────────────
+
+setInterval(() => {
+  const updatePos = (panelId: string, state: PeerState) => {
+    if (state.syncEngine && !state.syncEngine.isDisposed) {
+      const currentMs = state.syncEngine.getCurrentPositionMs();
+      const posEl = document.getElementById(`engine-pos-${panelId}`);
+      if (posEl) {
+        posEl.textContent = `${currentMs.toFixed(0)} ms (${formatTime(currentMs)})`;
+      }
+    }
+  };
+
+  updatePos('a', stateA);
+  updatePos('b', stateB);
+}, 100);
+
+// ── Bind Event Listeners ─────────────────────────────────────
+
+document.getElementById('btn-create-a')?.addEventListener('click', createRoom);
+document.getElementById('btn-join-b')?.addEventListener('click', joinRoom);
+
 document.getElementById('btn-ping-a')?.addEventListener('click', () => sendPing('a', stateA));
 document.getElementById('btn-ping-b')?.addEventListener('click', () => sendPing('b', stateB));
+
 document.getElementById('btn-disconnect-a')?.addEventListener('click', () => disconnectPeer('a', stateA));
 document.getElementById('btn-disconnect-b')?.addEventListener('click', () => disconnectPeer('b', stateB));
 
+// Phase 6 Controls
 document.getElementById('btn-play-a')?.addEventListener('click', () => handlePlay('a', stateA));
-document.getElementById('btn-pause-a')?.addEventListener('click', () => handlePause('a', stateA));
-document.getElementById('btn-seek-a')?.addEventListener('click', () => handleSeek('a', stateA));
-document.getElementById('btn-rate-a')?.addEventListener('click', () => handleRate('a', stateA));
-document.getElementById('btn-retry-a')?.addEventListener('click', () => handleRetry('a', stateA));
-document.getElementById('btn-err-a')?.addEventListener('click', () => handleToggleError('a', stateA));
-document.getElementById('btn-stats-a')?.addEventListener('click', () => handleStats('a', stateA));
-
 document.getElementById('btn-play-b')?.addEventListener('click', () => handlePlay('b', stateB));
+
+document.getElementById('btn-pause-a')?.addEventListener('click', () => handlePause('a', stateA));
 document.getElementById('btn-pause-b')?.addEventListener('click', () => handlePause('b', stateB));
-document.getElementById('btn-seek-b')?.addEventListener('click', () => handleSeek('b', stateB));
-document.getElementById('btn-rate-b')?.addEventListener('click', () => handleRate('b', stateB));
+
+document.getElementById('btn-seek-a')?.addEventListener('click', () => handleSeek('a', stateA, 15000));
+document.getElementById('btn-seek-b')?.addEventListener('click', () => handleSeek('b', stateB, 15000));
+
+document.getElementById('btn-seek0-a')?.addEventListener('click', () => handleSeek('a', stateA, 0));
+document.getElementById('btn-seek0-b')?.addEventListener('click', () => handleSeek('b', stateB, 0));
+
+document.getElementById('btn-rate-a')?.addEventListener('click', () => {
+  const cur = stateA.syncEngine?.getState().playbackRate ?? 1.0;
+  const next = cur === 1.0 ? 1.5 : cur === 1.5 ? 2.0 : 1.0;
+  handleRate('a', stateA, next);
+});
+document.getElementById('btn-rate-b')?.addEventListener('click', () => {
+  const cur = stateB.syncEngine?.getState().playbackRate ?? 1.0;
+  const next = cur === 1.0 ? 1.5 : cur === 1.5 ? 2.0 : 1.0;
+  handleRate('b', stateB, next);
+});
+
+document.getElementById('btn-retry-a')?.addEventListener('click', () => handleRetry('a', stateA));
 document.getElementById('btn-retry-b')?.addEventListener('click', () => handleRetry('b', stateB));
+
+document.getElementById('btn-err-a')?.addEventListener('click', () => handleToggleError('a', stateA));
 document.getElementById('btn-err-b')?.addEventListener('click', () => handleToggleError('b', stateB));
+
+document.getElementById('btn-stats-a')?.addEventListener('click', () => handleStats('a', stateA));
 document.getElementById('btn-stats-b')?.addEventListener('click', () => handleStats('b', stateB));
 
-// Expose state and helper functions on window for automated browser verification
+// ── Export for Browser Verification / CDP ────────────────────
+
 (window as any).syncplayDemo = {
   stateA,
   stateB,
   createRoom,
   joinRoom,
+  disconnectPeer,
   handlePlay,
   handlePause,
   handleSeek,
   handleRate,
   handleRetry,
-  handleToggleError,
-  handleStats,
-  disconnectPeer,
+  sendPing,
 };
-
-log('a', 'Peer A ready. Click "Create Room" to start.');
-log('b', 'Peer B ready. Paste Room ID and Token, then click "Join Room".');
