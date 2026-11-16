@@ -150,3 +150,4 @@ Every component developed in Phase 7 must maintain the following six system inva
 - **$I_4$ (Bounded Resource Safety):** Operation histories, deduplication sets, anti-entropy digests, and retransmission buffers must enforce strict, configurable upper bounds to prevent browser memory exhaustion.
 - **$I_5$ (Conditional Eventual Convergence):** Replicas converge to identical playback states once message delivery quiesces across all connected, non-partitioned peers.
 - **$I_6$ (Absence of False Authority):** Neither the Bootstrap Server, the WebRTC transport layer, nor local system wall-clock timestamps can unilaterally dictate playback state or override logical distributed ordering.
+

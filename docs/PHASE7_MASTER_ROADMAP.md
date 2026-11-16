@@ -246,3 +246,4 @@ The Phase 7 research strategy is grounded in established distributed systems lit
 4. **Optimistic Replication & Anti-Entropy:**
    - Saito, Y., & Shapiro, M. (2005). *"Optimistic Replication."* ACM Computing Surveys, 37(1), 42–81. [DOI: 10.1145/1057977.1057980](https://doi.org/10.1145/1057977.1057980).
    - DeCandia, G., et al. (2007). *"Dynamo: Amazon's Highly Available Key-value Store."* ACM SIGOPS Operating Systems Review, 41(6), 205–220.
+

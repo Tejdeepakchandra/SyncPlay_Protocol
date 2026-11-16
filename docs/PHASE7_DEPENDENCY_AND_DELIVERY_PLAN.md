@@ -150,3 +150,4 @@ Phase 8 will bridge this logical state to actual browser media hardware:
 3. **Continuous Drift Controller:** Implements a PID or bounded-threshold controller:
    - For small time drift ($|p_{\text{media}} - p_{\text{logical}}| \in [25\text{ms}, 250\text{ms}]$): micro-adjust playback rate ($\pm 0.5\% - 1.0\%$) to smoothly align without audio pitch distortion.
    - For large displacements ($> 250\text{ms}$): execute hard seek snaps.
+

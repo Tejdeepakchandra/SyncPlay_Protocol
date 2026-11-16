@@ -172,3 +172,4 @@ classDiagram
 5. **Dwork, C., Lynch, N., & Stockmeyer, L. (1988).** *"Consensus in the Presence of Partial Synchrony."* Journal of the ACM, 35(2), 288–323.
 6. **Saito, Y., & Shapiro, M. (2005).** *"Optimistic Replication."* ACM Computing Surveys (CSUR), 37(1), 42–81.
 7. **Kulkarni, S., et al. (2014).** *"Logical Physical Clocks and Consistent Snapshots in Globally Distributed Databases."* Technical Report, University of Texas at Austin.
+

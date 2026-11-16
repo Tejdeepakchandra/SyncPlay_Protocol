@@ -23,4 +23,14 @@ The master planning suite for Phase 7 is located at the root of the `docs/` dire
 - `docs/PHASE7_RISK_REGISTER.md`: Architectural and technical risk register, failure modes, triggers, and contingency plans.
 - `docs/PHASE7_DEPENDENCY_AND_DELIVERY_PLAN.md`: Dependency graph, upstream inputs, governance review gates, and transition plan to Phase 8.
 
+### Milestone P7.1 Research & Formal Problem Specifications
+- `docs/PHASE7_1_DISTRIBUTED_SYNC_PROBLEM.md`: Formal problem specification across 12 concurrent, delayed, and failure scenarios.
+- `docs/PHASE7_1_CONSISTENCY_MODEL.md`: Formal consistency model (SEC under quiescence), network model, and CAP theorem analysis.
+- `docs/PHASE7_1_ALGORITHM_EVALUATION.md`: Multi-dimensional evaluation of 8 candidate distributed synchronization paradigms.
+- `docs/PHASE7_1_EVENT_ORDERING_RESEARCH.md`: Deep investigation of Lamport logical clocks, strict total order proofs, and integer safety.
+- `docs/PHASE7_1_ANTI_ENTROPY_RESEARCH.md`: Multi-origin reconciliation, version vectors, bounded history horizon ($K=256$), and stable frontier compaction.
+- `docs/PHASE7_1_CONFLICT_SEMANTICS.md`: Operation-specific conflict semantics for `PLAY`, `PAUSE`, `SEEK`, and `RATE_CHANGE`.
+- `docs/PHASE7_1_ARCHITECTURE_RECOMMENDATION.md`: Proposed modular architecture (`LeaderlessSyncEngine`) and component responsibility matrix.
+- `docs/PHASE7_1_FINAL_RECOMMENDATION.md`: Answers to 10 core architectural decisions, alternative rejections, and P7.2 scope.
+
 Use the consistency review and interface contracts as cross-module references; module LLDs provide task-specific detail.

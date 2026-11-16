@@ -133,3 +133,4 @@
   2. Verify that TURN relays packets transparently without acting as an application authority (Principle 3).
 - **Trigger / Detection:** WebRTC connection state transitioning to `'failed'`.
 - **Contingency Plan:** Fault Manager alerts application to supply valid TURN relay credentials.
+

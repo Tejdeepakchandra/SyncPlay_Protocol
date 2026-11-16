@@ -151,3 +151,4 @@ To maintain architectural focus and avoid scope creep, the following capabilitie
 3. **Hardware Frame-Accurate A/V Synchronization:** Micro-second audio sample synchronization or video decoder drift compensation (reserved for Phase 8).
 4. **Persistent Server-Side Global History:** Storing playback event logs in a server database (violates the server-minimized principle).
 5. **Decentralized NAT Traversal:** Eliminating the need for STUN/TURN relays (standard WebRTC ICE infrastructure remains necessary).
+
