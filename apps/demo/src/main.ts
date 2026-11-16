@@ -209,13 +209,21 @@ async function joinAndSetup(panelId: string, state: PeerState): Promise<void> {
     }
   });
 
-  // Handle incoming messages
+  // Handle RTT samples and statistics
+  state.manager.getRttService().onSample((sample) => {
+    const est = state.manager?.getRttService().getEstimate(sample.peerId);
+    if (est) {
+      log(
+        panelId,
+        `⏱ RTT [${sample.peerId}]: latest=${sample.rttMs.toFixed(1)}ms, min=${est.minRttMs.toFixed(1)}ms, max=${est.maxRttMs.toFixed(1)}ms, avg=${est.avgRttMs.toFixed(1)}ms, med=${est.medianRttMs.toFixed(1)}ms, p90=${est.p90RttMs.toFixed(1)}ms (n=${est.sampleCount}, gen=${est.generation})`,
+        'success',
+      );
+    }
+  });
+
+  // Handle incoming application messages
   state.manager.onMessage((inbound: InboundMessage) => {
     log(panelId, `← Received ${inbound.message.messageType} from ${inbound.fromPeerId}`, 'msg');
-    if (inbound.message.messageType === MessageType.PONG) {
-      const payload = inbound.message.payload as { probeId: string };
-      log(panelId, `  PONG probeId: ${payload.probeId}`, 'success');
-    }
   });
 
   // Handle peer joined events — connect to new peers
@@ -257,7 +265,7 @@ async function joinAndSetup(panelId: string, state: PeerState): Promise<void> {
   (document.getElementById(`btn-disconnect-${panelId}`) as HTMLButtonElement).disabled = false;
 }
 
-// ── Send PING ────────────────────────────────────────────────
+// ── Send PING / Check RTT ────────────────────────────────────
 
 function sendPing(panelId: string, state: PeerState): void {
   if (!state.manager) return;
@@ -268,24 +276,16 @@ function sendPing(panelId: string, state: PeerState): void {
     return;
   }
 
-  state.pingCount++;
-  const probeId = `probe-${panelId}-${state.pingCount}`;
-
   for (const peer of peers) {
-    const msg = {
-      protocolVersion: PROTOCOL_VERSION,
-      messageType: MessageType.PING,
-      sessionId: state.roomId!,
-      senderPeerId: state.peerId!,
-      messageId: `msg-${generateId()}`,
-      payload: { probeId },
-    };
-
-    const result = state.manager.send(peer.peerId, msg);
-    if (result.ok) {
-      log(panelId, `→ PING sent to ${peer.peerId} (probeId: ${probeId})`, 'msg');
+    const est = state.manager.getRttService().getEstimate(peer.peerId);
+    if (est) {
+      log(
+        panelId,
+        `📊 Current RTT [${peer.peerId}]: latest=${est.latestRttMs.toFixed(1)}ms, min=${est.minRttMs.toFixed(1)}ms, max=${est.maxRttMs.toFixed(1)}ms, avg=${est.avgRttMs.toFixed(1)}ms, med=${est.medianRttMs.toFixed(1)}ms, p90=${est.p90RttMs.toFixed(1)}ms (n=${est.sampleCount}, gen=${est.generation}, stale=${est.isStale})`,
+        'info',
+      );
     } else {
-      log(panelId, `PING failed: ${result.error}`, 'error');
+      log(panelId, `📊 Current RTT [${peer.peerId}]: collecting samples...`, 'info');
     }
   }
 }
@@ -305,6 +305,12 @@ async function disconnectPeer(panelId: string, state: PeerState): Promise<void> 
   log(panelId, 'Disconnected', 'info');
   (document.getElementById(`btn-ping-${panelId}`) as HTMLButtonElement).disabled = true;
   (document.getElementById(`btn-disconnect-${panelId}`) as HTMLButtonElement).disabled = true;
+
+  if (panelId === 'a') {
+    (document.getElementById('btn-create-a') as HTMLButtonElement).disabled = false;
+  } else {
+    (document.getElementById('btn-join-b') as HTMLButtonElement).disabled = false;
+  }
 }
 
 // ── Wire up buttons ──────────────────────────────────────────
