@@ -274,5 +274,130 @@ describe('PeerManager', () => {
       expect(peers[0]!.generation).toBe(2);
     });
   });
+
+  // ── RTT Service Integration ──────────────────────────────────
+
+  describe('RTT service integration', () => {
+    it('should expose RTT service via getRttService()', () => {
+      const signaling = createMockSignaling();
+      const pm = new PeerManager('local', 'session-1', 1, signaling);
+      const rtt = pm.getRttService();
+      expect(rtt).toBeDefined();
+      expect(typeof rtt.start).toBe('function');
+      expect(typeof rtt.stop).toBe('function');
+      expect(typeof rtt.getEstimate).toBe('function');
+      expect(typeof rtt.onSample).toBe('function');
+    });
+
+    it('should handle incoming PING by sending PONG without exposing to onMessage', async () => {
+      const signaling = createMockSignaling();
+      const pm = new PeerManager('aaa', 'session-1', 1, signaling);
+      pm.bindToRoom('room-1');
+
+      const messages: InboundMessage[] = [];
+      pm.onMessage((m) => messages.push(m));
+
+      await pm.connect({ peerId: 'zzz', sessionId: 'session-1', generation: 1 });
+
+      // Spy on pm.send to check the PONG response
+      const sendSpy = vi.spyOn(pm, 'send');
+
+      // Simulate incoming PING message on DataChannel
+      const pingMsg = JSON.stringify({
+        protocolVersion: PROTOCOL_VERSION,
+        messageType: MessageType.PING,
+        sessionId: 'session-1',
+        senderPeerId: 'zzz',
+        messageId: 'ping-1',
+        payload: {
+          probeId: 'probe-from-zzz-1',
+          senderTimestamp: 1000,
+        },
+      });
+
+      // Retrieve DataChannel from WebRTC mock
+      // @ts-expect-error accessing private peers map for test simulation
+      const entry = pm.peers.get('zzz');
+      expect(entry).toBeDefined();
+
+      // Trigger message via transport
+      // @ts-expect-error accessing private transport adapter events
+      entry.transport.events.onDataChannelMessage(pingMsg);
+
+      // PING must NOT be forwarded to application onMessage
+      expect(messages).toHaveLength(0);
+
+      // PONG must have been sent
+      expect(sendSpy).toHaveBeenCalledWith(
+        'zzz',
+        expect.objectContaining({
+          messageType: MessageType.PONG,
+          payload: { probeId: 'probe-from-zzz-1' },
+        }),
+      );
+    });
+
+    it('should route incoming PONG to RttEngine without exposing to onMessage', async () => {
+      const signaling = createMockSignaling();
+      const pm = new PeerManager('aaa', 'session-1', 1, signaling);
+      pm.bindToRoom('room-1');
+
+      const messages: InboundMessage[] = [];
+      pm.onMessage((m) => messages.push(m));
+
+      await pm.connect({ peerId: 'zzz', sessionId: 'session-1', generation: 1 });
+
+      const rtt = pm.getRttService();
+      // @ts-expect-error accessing private rttEngine method for spy
+      const pongSpy = vi.spyOn(rtt, 'handlePong');
+
+      const pongMsg = JSON.stringify({
+        protocolVersion: PROTOCOL_VERSION,
+        messageType: MessageType.PONG,
+        sessionId: 'session-1',
+        senderPeerId: 'zzz',
+        messageId: 'pong-1',
+        payload: {
+          probeId: 'probe-test-1',
+        },
+      });
+
+      // @ts-expect-error accessing private peers map for test simulation
+      const entry = pm.peers.get('zzz');
+      // @ts-expect-error accessing private transport adapter events
+      entry.transport.events.onDataChannelMessage(pongMsg);
+
+      // PONG must NOT be delivered to application onMessage
+      expect(messages).toHaveLength(0);
+
+      // PONG must be routed to RttEngine
+      expect(pongSpy).toHaveBeenCalledWith('zzz', { probeId: 'probe-test-1' });
+    });
+
+    it('should start RTT probing on DataChannel open and stop on close', async () => {
+      const signaling = createMockSignaling();
+      const pm = new PeerManager('aaa', 'session-1', 1, signaling);
+      pm.bindToRoom('room-1');
+
+      await pm.connect({ peerId: 'zzz', sessionId: 'session-1', generation: 2 });
+
+      const rtt = pm.getRttService();
+      const startSpy = vi.spyOn(rtt, 'start');
+      const stopSpy = vi.spyOn(rtt, 'stop');
+
+      // @ts-expect-error accessing private peers map for test simulation
+      const entry = pm.peers.get('zzz');
+
+      // Simulate DataChannel open
+      // @ts-expect-error accessing private transport adapter events
+      entry.transport.events.onDataChannelOpen();
+      expect(startSpy).toHaveBeenCalledWith('zzz', 2);
+
+      // Simulate DataChannel close
+      // @ts-expect-error accessing private transport adapter events
+      entry.transport.events.onDataChannelClose();
+      expect(stopSpy).toHaveBeenCalledWith('zzz');
+    });
+  });
 });
 

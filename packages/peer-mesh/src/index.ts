@@ -22,9 +22,17 @@ export type {
   PeerMeshConfig,
   SignalingOffer,
   SignalingIceCandidate,
+  Clock,
+  RttSample,
+  RttEstimate,
+  RttEngineConfig,
+  RttService,
 } from './types.js';
 
-export { DEFAULT_PEER_MESH_CONFIG } from './types.js';
+export { DEFAULT_PEER_MESH_CONFIG, DEFAULT_RTT_ENGINE_CONFIG } from './types.js';
+
+// ── RTT Engine ───────────────────────────────────────────────
+export { RttEngine, RttHistory, isValidRtt, calculateMedian, calculateP90 } from './rtt/index.js';
 
 // ── PeerManager ──────────────────────────────────────────────
 export { PeerManager } from './peer-manager.js';

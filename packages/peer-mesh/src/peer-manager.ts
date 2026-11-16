@@ -29,11 +29,13 @@ import type {
   InboundMessage,
   Unsubscribe,
   PeerMeshConfig,
+  RttService,
 } from './types.js';
 import { DEFAULT_PEER_MESH_CONFIG } from './types.js';
 import { WebRTCTransport, type TransportEvents } from './webrtc-transport.js';
 import { SignalingClient, type SignalEvent } from './signaling-client.js';
 import { isInitialOfferer } from './offerer-policy.js';
+import { RttEngine } from './rtt/index.js';
 
 // ── Internal peer entry ──────────────────────────────────────
 
@@ -56,6 +58,7 @@ export class PeerManager implements PeerMesh {
   private readonly localPeerId: PeerId;
   private readonly sessionId: SessionId;
   private readonly localGeneration: ConnectionGeneration;
+  private readonly rttEngine: RttEngine;
   private roomId: SessionId | null = null;
   private disposed = false;
   private signalingCleanup: Unsubscribe[] = [];
@@ -66,12 +69,26 @@ export class PeerManager implements PeerMesh {
     localGeneration: ConnectionGeneration,
     signaling: SignalingClient,
     config: Partial<PeerMeshConfig> = {},
+    rttEngine?: RttEngine,
   ) {
     this.localPeerId = localPeerId;
     this.sessionId = sessionId;
     this.localGeneration = localGeneration;
     this.signaling = signaling;
     this.config = { ...DEFAULT_PEER_MESH_CONFIG, ...config };
+    this.rttEngine = rttEngine ?? new RttEngine(
+      this.localPeerId,
+      this.sessionId,
+      (peerId, message) => this.send(peerId, message),
+      this.config.rtt,
+    );
+  }
+
+  /**
+   * Access the RTT measurement service.
+   */
+  getRttService(): RttService {
+    return this.rttEngine;
   }
 
   /**
@@ -157,6 +174,8 @@ export class PeerManager implements PeerMesh {
 
     for (const unsub of this.signalingCleanup) unsub();
     this.signalingCleanup = [];
+
+    this.rttEngine.dispose();
 
     for (const [peerId] of this.peers) {
       this.removePeer(peerId, 'dispose');
@@ -343,6 +362,7 @@ export class PeerManager implements PeerMesh {
       entry.disconnectTimer = null;
     }
 
+    this.rttEngine.removePeer(peerId);
     entry.transport.close();
     this.peers.delete(peerId);
 
@@ -371,12 +391,14 @@ export class PeerManager implements PeerMesh {
             clearTimeout(entry.disconnectTimer);
             entry.disconnectTimer = null;
           }
+          this.rttEngine.start(remotePeerId, entry.generation);
           this.emitPeerStatus(this.toPeerStatus(entry));
         }
       },
       onDataChannelClose: () => {
         const entry = this.peers.get(remotePeerId);
         if (entry) {
+          this.rttEngine.stop(remotePeerId);
           this.emitPeerStatus(this.toPeerStatus(entry));
         }
       },
@@ -426,8 +448,9 @@ export class PeerManager implements PeerMesh {
     }
 
     if (message.messageType === MessageType.PONG) {
-      // Future: RTT engine will handle this
-      // For now, emit as a regular message
+      const pongPayload = message.payload as { probeId: string };
+      this.rttEngine.handlePong(fromPeerId, pongPayload);
+      return;
     }
 
     // Deliver to application handlers

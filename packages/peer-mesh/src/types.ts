@@ -10,6 +10,17 @@ import type {
   ConnectionGeneration,
   ProtocolMessage,
 } from '@syncplay/protocol';
+import type { RttEngineConfig } from './rtt/types.js';
+
+// ── Re-export RTT types ───────────────────────────────────────
+export type {
+  Clock,
+  RttSample,
+  RttEstimate,
+  RttEngineConfig,
+  RttService,
+} from './rtt/types.js';
+export { DEFAULT_RTT_ENGINE_CONFIG } from './rtt/types.js';
 
 // ── Peer connection state machine (LLD §4) ───────────────────
 
@@ -117,6 +128,8 @@ export interface PeerMeshConfig {
   readonly dataChannelLabel: string;
   /** Grace period (ms) before marking disconnected peer as failed. Default: 5000 */
   readonly disconnectGraceMs: number;
+  /** Optional RTT engine configuration. */
+  readonly rtt?: Partial<RttEngineConfig>;
 }
 
 export const DEFAULT_PEER_MESH_CONFIG: PeerMeshConfig = {
