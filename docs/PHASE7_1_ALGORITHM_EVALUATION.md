@@ -145,3 +145,4 @@ flowchart TD
 1. **Event Ordering:** **Lamport Logical Clocks with Deterministic Tie-Breaking** ($\langle L, \text{peerId}, \text{eventId} \rangle$) provides the exact total ordering required without vector resizing overhead or leader election fragility.
 2. **State Convergence:** **Optimistic State Machine Replication with Bounded Rollback** preserves $0\text{ ms}$ local UI responsiveness while ensuring identical converged states upon quiescence.
 3. **Replication & Repair:** **Version-Vector Anti-Entropy** is adopted specifically for background digest exchange and missing event repair.
+

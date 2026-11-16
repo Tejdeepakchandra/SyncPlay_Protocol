@@ -122,3 +122,4 @@ flowchart LR
   - If a peer falls further behind than the maximum ring buffer capacity ($K = 256$), the active peers **evict the lagging peer from the stable frontier calculation**.
   - Peers A and B compact their logs regardless of Peer C.
   - When Peer C eventually reconnects, its gap ($> 256$) cannot be repaired via operation replay. Peer C is served an authoritative `StateSnapshotPayload` (`importSnapshot`), fast-forwarding it cleanly to the current room base state.
+

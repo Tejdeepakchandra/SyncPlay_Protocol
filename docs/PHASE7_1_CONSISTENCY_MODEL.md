@@ -149,3 +149,4 @@ The guarantees defined above hold **strictly** under the stated assumptions. Con
 1. **Permanent Network Partition:** If two peers remain permanently disconnected and never exchange anti-entropy digests, their states will remain divergent.
 2. **Continuous Conflicting Inputs (Lack of Quiescence):** If two users continuously scrub the seek bar without pause, the system is in active conflict and convergence is deferred until input ceases for $\tau > 2\Delta$.
 3. **Byzantine Faults:** If a compromised client intentionally fabricates conflicting Lamport timestamps or emits invalid data designed to exploit parser vulnerabilities, consistency guarantees are voided. (Protection against Byzantine peers is an explicit non-goal for MVP).
+

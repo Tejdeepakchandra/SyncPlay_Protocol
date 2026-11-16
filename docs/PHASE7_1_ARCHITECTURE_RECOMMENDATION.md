@@ -129,3 +129,4 @@ The proposed architecture requires **zero breaking changes** to existing public 
    - `dispose(): void`
 3. **Reference Implementation Untouched:**
    `BaselineSyncEngine` remains completely intact in `packages/sync-engine/src/baseline-sync-engine.ts`, guaranteeing backwards compatibility, safety fallbacks, and benchmark comparisons.
+

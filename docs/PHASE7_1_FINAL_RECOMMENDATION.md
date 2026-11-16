@@ -95,3 +95,4 @@ Upon review and approval of P7.1 deliverables, Milestone P7.2 will execute:
 4. Headless simulation test harness architecture specification.
 
 **Gate 2 Sign-Off:** Formal user authorization must be obtained after P7.2 before any source code is modified in P7.3.
+

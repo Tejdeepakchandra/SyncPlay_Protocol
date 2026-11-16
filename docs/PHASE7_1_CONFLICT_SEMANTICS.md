@@ -104,3 +104,4 @@ The following exhaustive matrix defines the reducer outcome for every pair of co
    - If a peer emits an auto-pause due to video buffering while another peer seeks, the seek takes precedence because a seek establishes a new playback timeline origin.
 3. **Floating-Point Extrapolation Epsilon:**
    - In accordance with Phase 6 configuration, positions within $\epsilon = 5.0\text{ ms}$ are considered identical to prevent floating-point representation noise from triggering false state version advances.
+

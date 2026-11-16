@@ -112,3 +112,4 @@ A dangerous fallacy in distributed systems is assuming that choosing Lamport Clo
 
 > [!IMPORTANT]
 > **Key Finding:** Lamport clocks provide an unambiguous, deterministic rule for ordering events that a peer has received. They do **not** ensure that all peers receive the same set of events. An orthogonal dissemination and anti-entropy mechanism (P7.4) is strictly required to guarantee event-set completeness across all replicas.
+

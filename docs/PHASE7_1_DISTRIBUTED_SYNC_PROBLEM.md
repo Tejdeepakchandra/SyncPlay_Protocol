@@ -206,3 +206,4 @@ From these 12 scenarios, five mandatory requirements emerge for Phase 7:
 3. **Anti-Entropy Dissemination:** A gossip or digest exchange protocol to detect and repair dropped or partially delivered events.
 4. **Bounded History with Snapshot Fallback:** A strictly bounded operation ring buffer coupled with snapshots for long-term catch-up.
 5. **Generation & Lifecycle Gating:** Integration with monotonic connection generations to prevent zombie and reload corruption.
+

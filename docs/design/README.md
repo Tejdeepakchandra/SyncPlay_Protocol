@@ -33,4 +33,13 @@ The master planning suite for Phase 7 is located at the root of the `docs/` dire
 - `docs/PHASE7_1_ARCHITECTURE_RECOMMENDATION.md`: Proposed modular architecture (`LeaderlessSyncEngine`) and component responsibility matrix.
 - `docs/PHASE7_1_FINAL_RECOMMENDATION.md`: Answers to 10 core architectural decisions, alternative rejections, and P7.2 scope.
 
+### Milestone P7.2 Architecture & Interface Specifications
+- `docs/PHASE7_2_HLD.md`: High-Level Design for `LeaderlessSyncEngine`, trust boundaries, data flows, and module responsibilities.
+- `docs/PHASE7_2_LLD.md`: Low-Level Design covering ordering keys, conflict policies, bounded ring buffer ($K=256$), and anti-entropy version vectors.
+- `docs/PHASE7_2_PROTOCOL_EVOLUTION_RFC.md`: Wire protocol schemas for `logicalTimestamp`, `STATE_DIGEST`, `REPAIR_REQUEST`, and `OPERATION_BATCH`.
+- `docs/design/PHASE7_INTERFACE_CONTRACTS.md`: Formal TypeScript interface contracts for engine components and public compatibility.
+- `docs/PHASE7_2_SIMULATION_TEST_STRATEGY.md`: Headless deterministic simulation harness with virtual clock, seedable PRNG, and network impairment injection.
+- `docs/PHASE7_2_COMPATIBILITY_AND_MIGRATION.md`: Package compatibility, wire version migration, snapshot migration, and zero-risk rollback plan.
+- `docs/PHASE7_2_FINAL_DESIGN_REVIEW.md`: Final design review, decisions summary, AC-7.2.1–7.2.5 assessment, and implementation sequence for P7.3+.
+
 Use the consistency review and interface contracts as cross-module references; module LLDs provide task-specific detail.
