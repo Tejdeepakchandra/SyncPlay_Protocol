@@ -409,4 +409,34 @@ describe('reduceState — RATE_CHANGE semantics', () => {
     expect(reduceState(pausedState, makeEvent(5.0), 1500, config).decision.code).toBe('REJECTED_INVALID');
     expect(reduceState(pausedState, makeEvent(-1.0), 1500, config).decision.code).toBe('REJECTED_INVALID');
   });
+
+  it('Rejects control events missing logicalEventId without silent fallback to messageId', () => {
+    const pausedState: PlaybackState = Object.freeze({
+      status: 'paused',
+      anchorPositionMs: 1000,
+      anchorLocalTimestamp: 1000,
+      playbackRate: 1.0,
+      stateVersion: 1,
+    });
+
+    const eventWithoutLogicalId = {
+      message: {
+        protocolVersion: 1,
+        messageType: MessageType.PLAY,
+        sessionId: 'session-1',
+        senderPeerId: 'peer-1',
+        messageId: 'msg-fallback-attempt',
+        // logicalEventId is missing!
+        payload: {},
+      },
+      localTimestamp: 1000,
+      origin: 'local',
+    } as AnyControlSyncEvent;
+
+    const result = reduceState(pausedState, eventWithoutLogicalId, 1500, config);
+    expect(result.decision.code).toBe('REJECTED_INVALID');
+    expect(result.decision.accepted).toBe(false);
+    expect(result.decision.message).toContain('requires a mandatory, non-empty logicalEventId');
+    expect(result.nextState).toBe(pausedState);
+  });
 });

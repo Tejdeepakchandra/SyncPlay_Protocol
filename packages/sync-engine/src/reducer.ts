@@ -56,10 +56,25 @@ export function reduceState(
 ): ReducerResult {
   const messageType = event.message.messageType;
 
+  // Validate that control events carry a mandatory, non-empty logicalEventId
+  const logicalEventId = event.message.logicalEventId;
+  if (!logicalEventId || typeof logicalEventId !== 'string' || logicalEventId.trim().length === 0) {
+    return {
+      nextState: currentState,
+      decision: {
+        accepted: false,
+        code: 'REJECTED_INVALID',
+        stateVersion: currentState.stateVersion,
+        decidedAt: now,
+        message: `Control event ${messageType} requires a mandatory, non-empty logicalEventId`,
+      },
+    };
+  }
+
   // Create operation details helper
   const createOpDetails = (): LastAppliedOperation =>
     Object.freeze({
-      logicalEventId: event.message.logicalEventId ?? event.message.messageId,
+      logicalEventId,
       senderPeerId: event.message.senderPeerId,
       messageType,
       appliedAtLocalTimestamp: now,
