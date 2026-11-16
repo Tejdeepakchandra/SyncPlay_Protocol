@@ -78,3 +78,4 @@ describe('SyncPlayControls (ControlsImpl)', () => {
     expect(executor.executeRetry).toHaveBeenCalledWith(mockEvent);
   });
 });
+

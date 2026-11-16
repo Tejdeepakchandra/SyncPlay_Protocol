@@ -16,6 +16,7 @@ import type {
   SeekPayload,
   RateChangePayload,
 } from '@syncplay/protocol';
+import type { InboundMessage } from '@syncplay/peer-mesh';
 import type { CommandError } from './errors.js';
 
 // ── Clock ────────────────────────────────────────────────────
@@ -228,6 +229,9 @@ export interface ControlEventService {
 
   /** Broadcast a validated event to connected peers in the mesh. */
   publish(event: AnyControlSyncEvent): Promise<PublishResult>;
+
+  /** Handle an inbound message from the transport mesh. */
+  handleInbound(inbound: InboundMessage): void;
 
   /** Inspect service statistics and deduplication diagnostics. */
   getStats(): ServiceStats;

@@ -308,7 +308,7 @@ export class ControlEventServiceImpl implements ControlEventService, IntentExecu
 
   // ── Inbound Pipeline ─────────────────────────────────────────
 
-  private handleInbound(inbound: InboundMessage): void {
+  public handleInbound(inbound: InboundMessage): void {
     if (this.disposed) return;
     this.stats.inboundReceivedCount++;
 

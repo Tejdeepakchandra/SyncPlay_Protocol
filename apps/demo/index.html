@@ -19,6 +19,7 @@
     .btn-join { background: #81c784; color: #000; }
     .btn-ping { background: #ffb74d; color: #000; }
     .btn-disconnect { background: #ef5350; color: #fff; }
+    .btn-ctrl { background: #7e57c2; color: #fff; font-size: 0.8rem; padding: 5px 10px; margin: 2px; }
     button:disabled { opacity: 0.4; cursor: not-allowed; }
     .log { margin-top: 12px; background: #111; border: 1px solid #333; border-radius: 4px; padding: 8px; height: 300px; overflow-y: auto; font-family: monospace; font-size: 0.8rem; line-height: 1.4; }
     .log .info { color: #4fc3f7; }
@@ -49,6 +50,16 @@
         <button class="btn-ping" id="btn-ping-a" disabled>Send PING</button>
         <button class="btn-disconnect" id="btn-disconnect-a" disabled>Disconnect</button>
       </div>
+      <div style="margin-top: 8px; border-top: 1px solid #333; padding-top: 8px;">
+        <span style="font-size: 0.8rem; color: #b39ddb; display: block; margin-bottom: 4px;">Phase 5 Control Events:</span>
+        <button class="btn-ctrl" id="btn-play-a" disabled>Play (1s)</button>
+        <button class="btn-ctrl" id="btn-pause-a" disabled>Pause (2.5s)</button>
+        <button class="btn-ctrl" id="btn-seek-a" disabled>Seek (15s)</button>
+        <button class="btn-ctrl" id="btn-rate-a" disabled>Rate (1.5x)</button>
+        <button class="btn-ctrl" id="btn-retry-a" disabled>Retry Last</button>
+        <button class="btn-ctrl" id="btn-err-a" disabled>Sim Error: OFF</button>
+        <button class="btn-ctrl" id="btn-stats-a" disabled>Stats</button>
+      </div>
       <div class="status status-new" id="status-a">Status: Not connected</div>
       <div class="log" id="log-a"></div>
     </div>
@@ -69,13 +80,23 @@
         <button class="btn-ping" id="btn-ping-b" disabled>Send PING</button>
         <button class="btn-disconnect" id="btn-disconnect-b" disabled>Disconnect</button>
       </div>
+      <div style="margin-top: 8px; border-top: 1px solid #333; padding-top: 8px;">
+        <span style="font-size: 0.8rem; color: #b39ddb; display: block; margin-bottom: 4px;">Phase 5 Control Events:</span>
+        <button class="btn-ctrl" id="btn-play-b" disabled>Play (1s)</button>
+        <button class="btn-ctrl" id="btn-pause-b" disabled>Pause (2.5s)</button>
+        <button class="btn-ctrl" id="btn-seek-b" disabled>Seek (15s)</button>
+        <button class="btn-ctrl" id="btn-rate-b" disabled>Rate (1.5x)</button>
+        <button class="btn-ctrl" id="btn-retry-b" disabled>Retry Last</button>
+        <button class="btn-ctrl" id="btn-err-b" disabled>Sim Error: OFF</button>
+        <button class="btn-ctrl" id="btn-stats-b" disabled>Stats</button>
+      </div>
       <div class="status status-new" id="status-b">Status: Not connected</div>
       <div class="log" id="log-b"></div>
     </div>
   </div>
 
   <div class="footer">
-    <p>Phase 3 Demo — WebRTC DataChannel transport verification. No playback state. No SyncEngine.</p>
+    <p>Phase 5 Demo — WebRTC Peer Mesh & Control Events Layer verification. Demonstrates event propagation, deduplication, and retry. No HTMLMediaElement or playback state authority.</p>
   </div>
 
   <script type="module" src="/src/main.ts"></script>

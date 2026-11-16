@@ -34,7 +34,7 @@ const ConfigSchema = z.object({
   MAX_SIGNALING_BYTES: z.coerce.number().int().positive().default(65_536),
 
   /** Comma-separated list of allowed CORS origins. */
-  ALLOWED_ORIGINS: z.string().default('http://localhost:3000,http://localhost:5173'),
+  ALLOWED_ORIGINS: z.string().default('http://localhost:3000,http://localhost:5173,http://127.0.0.1:5173,http://127.0.0.1:3000'),
 
   /** Node environment. */
   NODE_ENV: z.enum(['development', 'production', 'test']).default('development'),

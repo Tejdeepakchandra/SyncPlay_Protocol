@@ -89,3 +89,4 @@ describe('DeduplicationCache', () => {
     expect(cache.checkAndRecord('peer-local', 'evt-failed')).toBe(false);
   });
 });
+

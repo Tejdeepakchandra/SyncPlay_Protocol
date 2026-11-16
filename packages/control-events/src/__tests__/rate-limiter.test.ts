@@ -76,3 +76,4 @@ describe('BoundedRateLimiter', () => {
     expect(limiter.getTrackedPeerCount()).toBe(0);
   });
 });
+

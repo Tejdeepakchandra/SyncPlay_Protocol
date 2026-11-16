@@ -40,3 +40,4 @@ export class ControlsImpl implements SyncPlayControls {
     return this.executor.executeRetry(event);
   }
 }
+
