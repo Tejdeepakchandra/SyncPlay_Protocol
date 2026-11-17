@@ -84,6 +84,7 @@ export {
   CompactedCheckpointItemSchema,
   StateSnapshotPayloadV2Schema,
   REPAIR_REJECTION_REASONS,
+  validateContiguousSequenceBatch,
 } from './repair.js';
 export type {
   StateDigestPayload,
@@ -97,6 +98,7 @@ export type {
   RepairRejectionReason,
   CompactedCheckpointItem,
   StateSnapshotPayloadV2,
+  ContiguousSequenceBatchData,
 } from './repair.js';
 
 /**

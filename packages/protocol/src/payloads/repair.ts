@@ -41,9 +41,138 @@ export const SerializedControlOperationSchema = z.object({
 export type SerializedControlOperation = z.infer<typeof SerializedControlOperationSchema>;
 
 /**
+ * Interface representing common fields required for contiguous sequence batch validation.
+ */
+export interface ContiguousSequenceBatchData {
+  originPeerId: string;
+  membershipEpoch: number;
+  fromSequence: number;
+  toSequence: number;
+  operations: ReadonlyArray<SerializedControlOperation>;
+}
+
+/**
+ * Validates contiguous sequence coverage, origin matching, epoch matching,
+ * and boundary conditions for operation batches.
+ *
+ * Invariants enforced:
+ * 1. toSequence >= fromSequence.
+ * 2. Empty batches are strictly prohibited. Suppliers unable to satisfy requests
+ *    must send REPAIR_REJECTED with an appropriate reason code (e.g. OUTSIDE_HORIZON,
+ *    ORIGIN_UNKNOWN, RATE_LIMITED, EPOCH_MISMATCH, BUSY).
+ * 3. Range count (toSequence - fromSequence + 1) does not exceed MAX_OPERATIONS_PER_BATCH (32).
+ * 4. operations.length exactly equals declared range count (toSequence - fromSequence + 1).
+ * 5. operations[0].originSequenceNumber === fromSequence.
+ * 6. operations[last].originSequenceNumber === toSequence.
+ * 7. For each operation i in operations:
+ *    - op.originPeerId === originPeerId (no origin rewriting/cross-author mixing).
+ *    - op.membershipEpoch === membershipEpoch (no cross-epoch mixing).
+ *    - op.originSequenceNumber === fromSequence + i (strictly ascending, contiguous, no gaps, no duplicates).
+ */
+export function validateContiguousSequenceBatch(
+  data: ContiguousSequenceBatchData,
+  ctx: z.RefinementCtx,
+): void {
+  // 1. Range bounds check
+  if (data.toSequence < data.fromSequence) {
+    ctx.addIssue({
+      code: z.ZodIssueCode.custom,
+      message: `toSequence (${data.toSequence}) must be greater than or equal to fromSequence (${data.fromSequence})`,
+      path: ['toSequence'],
+    });
+    return;
+  }
+
+  // 2. Empty batch check
+  if (data.operations.length === 0) {
+    ctx.addIssue({
+      code: z.ZodIssueCode.custom,
+      message:
+        'Empty operation batches are prohibited. Suppliers unable to satisfy requests must send REPAIR_REJECTED with an appropriate reason code.',
+      path: ['operations'],
+    });
+    return;
+  }
+
+  // 3. Expected count based on sequence range
+  const expectedCount = data.toSequence - data.fromSequence + 1;
+
+  // 4. Batch size cap
+  if (expectedCount > MAX_OPERATIONS_PER_BATCH) {
+    ctx.addIssue({
+      code: z.ZodIssueCode.custom,
+      message: `Batch sequence range ${data.fromSequence}..${data.toSequence} (${expectedCount} operations) exceeds maximum allowed ${MAX_OPERATIONS_PER_BATCH}`,
+      path: ['toSequence'],
+    });
+    return;
+  }
+
+  // 5. Operation count must exactly match expected count
+  if (data.operations.length !== expectedCount) {
+    ctx.addIssue({
+      code: z.ZodIssueCode.custom,
+      message: `Operation count (${data.operations.length}) does not match declared sequence range ${data.fromSequence}..${data.toSequence} (expected ${expectedCount})`,
+      path: ['operations'],
+    });
+  }
+
+  // 6. First operation sequence
+  const firstOp = data.operations[0];
+  if (firstOp && firstOp.originSequenceNumber !== data.fromSequence) {
+    ctx.addIssue({
+      code: z.ZodIssueCode.custom,
+      message: `First operation originSequenceNumber (${firstOp.originSequenceNumber}) does not match fromSequence (${data.fromSequence})`,
+      path: ['operations', 0, 'originSequenceNumber'],
+    });
+  }
+
+  // 7. Last operation sequence
+  const lastOp = data.operations[data.operations.length - 1];
+  if (lastOp && lastOp.originSequenceNumber !== data.toSequence) {
+    ctx.addIssue({
+      code: z.ZodIssueCode.custom,
+      message: `Last operation originSequenceNumber (${lastOp.originSequenceNumber}) does not match toSequence (${data.toSequence})`,
+      path: ['operations', data.operations.length - 1, 'originSequenceNumber'],
+    });
+  }
+
+  // 8. Strict contiguous sequence, origin matching, and epoch matching for every operation
+  for (let i = 0; i < data.operations.length; i++) {
+    const op = data.operations[i];
+    if (!op) continue;
+    const expectedSeq = data.fromSequence + i;
+
+    if (op.originSequenceNumber !== expectedSeq) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        message: `Operation at index ${i} has originSequenceNumber ${op.originSequenceNumber}, expected strictly contiguous ${expectedSeq}`,
+        path: ['operations', i, 'originSequenceNumber'],
+      });
+    }
+
+    if (op.originPeerId !== data.originPeerId) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        message: `Operation at index ${i} has originPeerId '${op.originPeerId}', which does not match batch originPeerId '${data.originPeerId}'`,
+        path: ['operations', i, 'originPeerId'],
+      });
+    }
+
+    if (op.membershipEpoch !== data.membershipEpoch) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        message: `Operation at index ${i} has membershipEpoch ${op.membershipEpoch}, which does not match batch membershipEpoch ${data.membershipEpoch}`,
+        path: ['operations', i, 'membershipEpoch'],
+      });
+    }
+  }
+}
+
+/**
  * Request-driven Operation Batch Payload Schema (Phase 7.4).
- * Enforces mandatory UUID v4 requestId for request-response correlation
- * and sessionId to prevent cross-room repair pollution.
+ * Enforces mandatory UUID v4 requestId for request-response correlation,
+ * sessionId to prevent cross-room repair pollution, explicit membershipEpoch,
+ * and contiguous sequence coverage.
  */
 export const OperationBatchPayloadSchema = z
   .object({
@@ -68,19 +197,19 @@ export const OperationBatchPayloadSchema = z
     /** Last sequence number in this batch (inclusive). */
     toSequence: z.number().int().positive().max(Number.MAX_SAFE_INTEGER),
 
+    /** Membership epoch under which operations are authorized. */
+    membershipEpoch: z.number().int().positive().max(Number.MAX_SAFE_INTEGER),
+
     /** Contained operations ordered by sequence number (at most 32). */
     operations: z.array(SerializedControlOperationSchema).max(MAX_OPERATIONS_PER_BATCH),
   })
-  .refine((data) => data.toSequence >= data.fromSequence, {
-    message: 'toSequence must be greater than or equal to fromSequence',
-    path: ['toSequence'],
-  });
+  .superRefine(validateContiguousSequenceBatch);
 
 export type OperationBatchPayload = z.infer<typeof OperationBatchPayloadSchema>;
 
 /**
  * Push-based Operation Batch Payload Schema (unsolicited delivery).
- * Requires sessionId for room scoping, but has no correlating requestId.
+ * Requires sessionId for room scoping and membershipEpoch, but has no correlating requestId.
  */
 export const PushOperationBatchPayloadSchema = z
   .object({
@@ -99,13 +228,13 @@ export const PushOperationBatchPayloadSchema = z
     /** Last sequence number in this batch (inclusive). */
     toSequence: z.number().int().positive().max(Number.MAX_SAFE_INTEGER),
 
+    /** Membership epoch under which operations are authorized. */
+    membershipEpoch: z.number().int().positive().max(Number.MAX_SAFE_INTEGER),
+
     /** Contained operations ordered by sequence number (at most 32). */
     operations: z.array(SerializedControlOperationSchema).max(MAX_OPERATIONS_PER_BATCH),
   })
-  .refine((data) => data.toSequence >= data.fromSequence, {
-    message: 'toSequence must be greater than or equal to fromSequence',
-    path: ['toSequence'],
-  });
+  .superRefine(validateContiguousSequenceBatch);
 
 export type PushOperationBatchPayload = z.infer<typeof PushOperationBatchPayloadSchema>;
 

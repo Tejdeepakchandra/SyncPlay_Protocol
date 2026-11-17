@@ -337,6 +337,7 @@ describe('Phase 7.3 Deterministic Simulation Test Suite', () => {
         originPeerId: 'peer-A',
         fromSequence: 10,
         toSequence: 10,
+        membershipEpoch: 1,
         operations: [
           {
             logicalEventId: 'a-10',

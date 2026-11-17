@@ -67,6 +67,7 @@ describe('Phase 7.3-R5-G: Final Supplier Authorization Closure', () => {
       originPeerId,
       fromSequence: seq,
       toSequence: seq,
+      membershipEpoch: 1,
       operations: [
         {
           logicalEventId: `op-${originPeerId}-${seq}`,

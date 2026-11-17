@@ -92,6 +92,7 @@ export type {
   RepairRejectionReason,
   CompactedCheckpointItem,
   StateSnapshotPayloadV2,
+  ContiguousSequenceBatchData,
 } from './payloads/repair.js';
 export {
   UUID_V4_REGEX,
@@ -113,6 +114,7 @@ export {
   CompactedCheckpointItemSchema,
   StateSnapshotPayloadV2Schema,
   REPAIR_REJECTION_REASONS,
+  validateContiguousSequenceBatch,
 } from './payloads/repair.js';
 
 // ── Payload schema registry ─────────────────────────────────

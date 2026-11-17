@@ -759,6 +759,71 @@ describe('StateDigestPayloadSchema (Phase 7.4 V2 Multi-Vector Digest)', () => {
     }
   });
 
+  describe('Standalone Vector Schemas Boundary Tests (MAX_VECTOR_ENTRIES = 64)', () => {
+    it('accepts ReplicationVectorSchema with exactly 64 entries and rejects 65 entries', () => {
+      const atBound: Record<string, number> = {};
+      const overBound: Record<string, number> = {};
+      for (let i = 1; i <= MAX_VECTOR_ENTRIES; i++) {
+        atBound[`p${i}`] = i;
+        overBound[`p${i}`] = i;
+      }
+      overBound[`p65`] = 65;
+
+      const okResult = ReplicationVectorSchema.safeParse(atBound);
+      expect(okResult.success).toBe(true);
+
+      const errResult = ReplicationVectorSchema.safeParse(overBound);
+      expect(errResult.success).toBe(false);
+      if (!errResult.success) {
+        expect(errResult.error.issues[0]?.message).toContain(
+          `Replication vector cannot exceed ${MAX_VECTOR_ENTRIES} origin entries`,
+        );
+      }
+    });
+
+    it('accepts SnapshotFrontierSchema with exactly 64 entries and rejects 65 entries', () => {
+      const atBound: Record<string, number> = {};
+      const overBound: Record<string, number> = {};
+      for (let i = 1; i <= MAX_VECTOR_ENTRIES; i++) {
+        atBound[`p${i}`] = i;
+        overBound[`p${i}`] = i;
+      }
+      overBound[`p65`] = 65;
+
+      const okResult = SnapshotFrontierSchema.safeParse(atBound);
+      expect(okResult.success).toBe(true);
+
+      const errResult = SnapshotFrontierSchema.safeParse(overBound);
+      expect(errResult.success).toBe(false);
+      if (!errResult.success) {
+        expect(errResult.error.issues[0]?.message).toContain(
+          `Snapshot frontier cannot exceed ${MAX_VECTOR_ENTRIES} origin entries`,
+        );
+      }
+    });
+
+    it('accepts HistoryFingerprintsSchema with exactly 64 entries and rejects 65 entries', () => {
+      const atBound: Record<string, string> = {};
+      const overBound: Record<string, string> = {};
+      for (let i = 1; i <= MAX_VECTOR_ENTRIES; i++) {
+        atBound[`p${i}`] = sha256A;
+        overBound[`p${i}`] = sha256A;
+      }
+      overBound[`p65`] = sha256A;
+
+      const okResult = HistoryFingerprintsSchema.safeParse(atBound);
+      expect(okResult.success).toBe(true);
+
+      const errResult = HistoryFingerprintsSchema.safeParse(overBound);
+      expect(errResult.success).toBe(false);
+      if (!errResult.success) {
+        expect(errResult.error.issues[0]?.message).toContain(
+          `History fingerprints cannot exceed ${MAX_VECTOR_ENTRIES} origin entries`,
+        );
+      }
+    });
+  });
+
   // ── Timestamp and RTT Semantics Tests ──────────────────────
 
   it('should accept valid non-negative finite sentAt timestamp', () => {
@@ -910,6 +975,7 @@ describe('OperationBatchPayloadSchema (Phase 7.4 Request-Driven)', () => {
     originPeerId: 'peer-author-1',
     fromSequence: 1,
     toSequence: 2,
+    membershipEpoch: 1,
     operations: [createTestOp(1), createTestOp(2)],
   };
 
@@ -994,6 +1060,168 @@ describe('OperationBatchPayloadSchema (Phase 7.4 Request-Driven)', () => {
     expect(result.success).toBe(false);
   });
 
+  it('should reject batch with missing middle sequence', () => {
+    const result = OperationBatchPayloadSchema.safeParse({
+      ...validBatch,
+      fromSequence: 1,
+      toSequence: 3,
+      operations: [createTestOp(1), createTestOp(3)],
+    });
+    expect(result.success).toBe(false);
+    if (!result.success) {
+      const messages = result.error.issues.map((i) => i.message).join('; ');
+      expect(messages).toContain('Operation count (2) does not match declared sequence range 1..3 (expected 3)');
+    }
+  });
+
+  it('should reject batch with duplicate sequence numbers', () => {
+    const result = OperationBatchPayloadSchema.safeParse({
+      ...validBatch,
+      fromSequence: 1,
+      toSequence: 2,
+      operations: [createTestOp(1), createTestOp(1)],
+    });
+    expect(result.success).toBe(false);
+    if (!result.success) {
+      const messages = result.error.issues.map((i) => i.message).join('; ');
+      expect(messages).toMatch(/Last operation originSequenceNumber \(1\) does not match toSequence \(2\)|strictly contiguous/);
+    }
+  });
+
+  it('should reject batch with out-of-order sequence numbers', () => {
+    const result = OperationBatchPayloadSchema.safeParse({
+      ...validBatch,
+      fromSequence: 1,
+      toSequence: 2,
+      operations: [createTestOp(2), createTestOp(1)],
+    });
+    expect(result.success).toBe(false);
+    if (!result.success) {
+      const messages = result.error.issues.map((i) => i.message).join('; ');
+      expect(messages).toMatch(/First operation originSequenceNumber \(2\) does not match fromSequence \(1\)|strictly contiguous/);
+    }
+  });
+
+  it('should reject batch with an operation belonging to a different originPeerId', () => {
+    const mixedOps = [
+      createTestOp(1),
+      {
+        ...createTestOp(2),
+        originPeerId: 'peer-impostor-99',
+      },
+    ];
+    const result = OperationBatchPayloadSchema.safeParse({
+      ...validBatch,
+      operations: mixedOps,
+    });
+    expect(result.success).toBe(false);
+    if (!result.success) {
+      const messages = result.error.issues.map((i) => i.message).join('; ');
+      expect(messages).toContain("does not match batch originPeerId 'peer-author-1'");
+    }
+  });
+
+  it('should reject batch with an operation belonging to a different membershipEpoch', () => {
+    const mixedEpochOps = [
+      createTestOp(1),
+      {
+        ...createTestOp(2),
+        membershipEpoch: 2,
+      },
+    ];
+    const result = OperationBatchPayloadSchema.safeParse({
+      ...validBatch,
+      membershipEpoch: 1,
+      operations: mixedEpochOps,
+    });
+    expect(result.success).toBe(false);
+    if (!result.success) {
+      const messages = result.error.issues.map((i) => i.message).join('; ');
+      expect(messages).toContain('does not match batch membershipEpoch 1');
+    }
+  });
+
+  it('should reject batch missing declared membershipEpoch', () => {
+    const { membershipEpoch, ...withoutEpoch } = validBatch;
+    const result = OperationBatchPayloadSchema.safeParse(withoutEpoch);
+    expect(result.success).toBe(false);
+  });
+
+  it('should reject batch where fromSequence does not match the first operation', () => {
+    const result = OperationBatchPayloadSchema.safeParse({
+      ...validBatch,
+      fromSequence: 2,
+      toSequence: 2,
+      operations: [createTestOp(1)],
+    });
+    expect(result.success).toBe(false);
+    if (!result.success) {
+      const messages = result.error.issues.map((i) => i.message).join('; ');
+      expect(messages).toContain('First operation originSequenceNumber (1) does not match fromSequence (2)');
+    }
+  });
+
+  it('should reject batch where toSequence does not match the last operation', () => {
+    const result = OperationBatchPayloadSchema.safeParse({
+      ...validBatch,
+      fromSequence: 1,
+      toSequence: 2,
+      operations: [createTestOp(1), createTestOp(3)],
+    });
+    expect(result.success).toBe(false);
+    if (!result.success) {
+      const messages = result.error.issues.map((i) => i.message).join('; ');
+      expect(messages).toMatch(/Last operation originSequenceNumber \(3\) does not match toSequence \(2\)|strictly contiguous/);
+    }
+  });
+
+  it('should reject batch where operation count does not match toSequence - fromSequence + 1', () => {
+    const result = OperationBatchPayloadSchema.safeParse({
+      ...validBatch,
+      fromSequence: 1,
+      toSequence: 5,
+      operations: [createTestOp(1), createTestOp(2)],
+    });
+    expect(result.success).toBe(false);
+    if (!result.success) {
+      const messages = result.error.issues.map((i) => i.message).join('; ');
+      expect(messages).toContain('Operation count (2) does not match declared sequence range 1..5 (expected 5)');
+    }
+  });
+
+  it('should reject empty batch with explicit REPAIR_REJECTED guidance', () => {
+    const result = OperationBatchPayloadSchema.safeParse({
+      ...validBatch,
+      fromSequence: 1,
+      toSequence: 1,
+      operations: [],
+    });
+    expect(result.success).toBe(false);
+    if (!result.success) {
+      const messages = result.error.issues.map((i) => i.message).join('; ');
+      expect(messages).toContain(
+        'Empty operation batches are prohibited. Suppliers unable to satisfy requests must send REPAIR_REJECTED',
+      );
+    }
+  });
+
+  it('should accept valid partial contiguous batch (e.g. 5 of 10 requested ops)', () => {
+    const partialOps = Array.from({ length: 5 }, (_, i) => createTestOp(i + 1));
+    const result = OperationBatchPayloadSchema.safeParse({
+      ...validBatch,
+      fromSequence: 1,
+      toSequence: 5,
+      membershipEpoch: 1,
+      operations: partialOps,
+    });
+    expect(result.success).toBe(true);
+    if (result.success) {
+      expect(result.data.fromSequence).toBe(1);
+      expect(result.data.toSequence).toBe(5);
+      expect(result.data.operations.length).toBe(5);
+    }
+  });
+
   it('should verify delivery path type guards distinguish request-driven vs push batches', () => {
     expect(isRequestDrivenOperationBatch(validBatch)).toBe(true);
     expect(isPushOperationBatch(validBatch)).toBe(false);
@@ -1004,6 +1232,7 @@ describe('OperationBatchPayloadSchema (Phase 7.4 Request-Driven)', () => {
       originPeerId: 'peer-author-1',
       fromSequence: 1,
       toSequence: 2,
+      membershipEpoch: 1,
       operations: [createTestOp(1), createTestOp(2)],
     };
 
@@ -1032,6 +1261,7 @@ describe('PushOperationBatchPayloadSchema & Compatibility Schema', () => {
     originPeerId: 'peer-author-1',
     fromSequence: 1,
     toSequence: 1,
+    membershipEpoch: 1,
     operations: [createTestOp(1)],
   };
 
@@ -1043,6 +1273,34 @@ describe('PushOperationBatchPayloadSchema & Compatibility Schema', () => {
   it('should reject push batch missing sessionId', () => {
     const { sessionId, ...withoutSession } = validPushBatch;
     expect(PushOperationBatchPayloadSchema.safeParse(withoutSession).success).toBe(false);
+  });
+
+  it('should reject push batch missing membershipEpoch', () => {
+    const { membershipEpoch, ...withoutEpoch } = validPushBatch;
+    expect(PushOperationBatchPayloadSchema.safeParse(withoutEpoch).success).toBe(false);
+  });
+
+  it('should reject push batch with sequence coverage defect (e.g. duplicate sequence)', () => {
+    const result = PushOperationBatchPayloadSchema.safeParse({
+      ...validPushBatch,
+      fromSequence: 1,
+      toSequence: 2,
+      operations: [createTestOp(1), createTestOp(1)],
+    });
+    expect(result.success).toBe(false);
+  });
+
+  it('should reject push batch with empty operations array', () => {
+    const result = PushOperationBatchPayloadSchema.safeParse({
+      ...validPushBatch,
+      fromSequence: 1,
+      toSequence: 1,
+      operations: [],
+    });
+    expect(result.success).toBe(false);
+    if (!result.success) {
+      expect(result.error.issues[0]?.message).toContain('Empty operation batches are prohibited');
+    }
   });
 
   it('should validate Phase 7.3 compatibility batch without requestId or sessionId', () => {

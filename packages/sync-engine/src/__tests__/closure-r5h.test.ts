@@ -74,6 +74,7 @@ describe('Phase 7.3-R5-H: Final Transport Context Issuer Authorization', () => {
       originPeerId,
       fromSequence: seq,
       toSequence: seq,
+      membershipEpoch: 1,
       operations: [
         {
           logicalEventId: `op-${originPeerId}-${seq}`,

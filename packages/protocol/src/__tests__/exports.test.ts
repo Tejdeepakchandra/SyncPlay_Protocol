@@ -59,6 +59,7 @@ import {
   isStateDigestV2,
   isRequestDrivenOperationBatch,
   isPushOperationBatch,
+  validateContiguousSequenceBatch,
 
   // Validation
   validateMessage,
@@ -194,6 +195,7 @@ describe('Public exports', () => {
     expect(typeof isStateDigestV2).toBe('function');
     expect(typeof isRequestDrivenOperationBatch).toBe('function');
     expect(typeof isPushOperationBatch).toBe('function');
+    expect(typeof validateContiguousSequenceBatch).toBe('function');
   });
 
   it('should export PAYLOAD_SCHEMAS map with entry for each message type', () => {

@@ -21,6 +21,11 @@ import {
   MAX_BATCH_PAYLOAD_BYTES,
 } from '../constants.js';
 import { MessageType, SYNC_MESSAGE_TYPES } from '../message-types.js';
+import {
+  PAYLOAD_SCHEMAS,
+  OperationBatchPayloadSchema,
+  CompatibilityOperationBatchPayloadSchema,
+} from '../payloads/index.js';
 
 /** Helper: create a valid full message object. */
 function fullMessage(
@@ -678,6 +683,7 @@ describe('Phase 7.4 Message Envelope & Payload Validation', () => {
     originPeerId: 'peer-orig-1',
     fromSequence: 1,
     toSequence: 2,
+    membershipEpoch: 1,
     operations: [
       {
         logicalEventId: 'op-1',
@@ -839,6 +845,7 @@ describe('Phase 7.4 Batch Payload Size & WebRTC Limits', () => {
       originPeerId: 'peer-orig-1',
       fromSequence: 1,
       toSequence: 10,
+      membershipEpoch: 1,
       operations: ops,
     };
 
@@ -885,6 +892,7 @@ describe('Phase 7.4 Batch Payload Size & WebRTC Limits', () => {
       originPeerId: 'peer-orig-1',
       fromSequence: 1,
       toSequence: 12,
+      membershipEpoch: 1,
       operations: ops,
     };
 
@@ -965,6 +973,73 @@ describe('computeUtf8ByteLength & serializeAndCheckSize', () => {
     expect(result.ok).toBe(false);
     if (!result.ok) {
       expect(result.error.code).toBe('SERIALIZATION_FAILED');
+    }
+  });
+});
+
+describe('Compatibility Schema Isolation & Inbound Wire Validation', () => {
+  const validUuidV4 = 'f47ac10b-58cc-4372-a567-0e02b2c3d479';
+
+  const validBatchPayload = {
+    requestId: validUuidV4,
+    sessionId: 'session-room-1',
+    supplierPeerId: 'peer-supplier-1',
+    originPeerId: 'peer-orig-1',
+    fromSequence: 1,
+    toSequence: 1,
+    membershipEpoch: 1,
+    operations: [
+      {
+        logicalEventId: 'op-1',
+        originPeerId: 'peer-orig-1',
+        membershipEpoch: 1,
+        messageType: 'PLAY' as const,
+        logicalTimestamp: 1,
+        originSequenceNumber: 1,
+        causalContext: {},
+        payload: { targetPositionMs: 1000 },
+      },
+    ],
+  };
+
+  it('verifies PAYLOAD_SCHEMAS registers OperationBatchPayloadSchema, NOT CompatibilityOperationBatchPayloadSchema', () => {
+    expect(PAYLOAD_SCHEMAS.get(MessageType.OPERATION_BATCH)).toBe(OperationBatchPayloadSchema);
+    expect(PAYLOAD_SCHEMAS.get(SYNC_MESSAGE_TYPES.OPERATION_BATCH)).toBe(OperationBatchPayloadSchema);
+    expect(PAYLOAD_SCHEMAS.get(MessageType.OPERATION_BATCH)).not.toBe(CompatibilityOperationBatchPayloadSchema);
+  });
+
+  it('rejects inbound OPERATION_BATCH wire message lacking requestId and does NOT fall back to compatibility schema', () => {
+    const { requestId, ...batchWithoutRequestId } = validBatchPayload;
+    const msg = fullMessage(MessageType.OPERATION_BATCH, batchWithoutRequestId);
+
+    const result = validateMessage(msg);
+    expect(result.ok).toBe(false);
+    if (!result.ok) {
+      expect(result.error.code).toBe('INVALID_PAYLOAD');
+      expect(result.error.message).toContain('requestId');
+    }
+  });
+
+  it('rejects inbound OPERATION_BATCH wire message lacking sessionId and does NOT fall back to compatibility schema', () => {
+    const { sessionId, ...batchWithoutSessionId } = validBatchPayload;
+    const msg = fullMessage(MessageType.OPERATION_BATCH, batchWithoutSessionId);
+
+    const result = validateMessage(msg);
+    expect(result.ok).toBe(false);
+    if (!result.ok) {
+      expect(result.error.code).toBe('INVALID_PAYLOAD');
+      expect(result.error.message).toContain('sessionId');
+    }
+  });
+
+  it('rejects inbound OPERATION_BATCH wire message lacking both requestId and sessionId', () => {
+    const { requestId, sessionId, ...legacyBatchPayload } = validBatchPayload;
+    const msg = fullMessage(MessageType.OPERATION_BATCH, legacyBatchPayload);
+
+    const result = validateMessage(msg);
+    expect(result.ok).toBe(false);
+    if (!result.ok) {
+      expect(result.error.code).toBe('INVALID_PAYLOAD');
     }
   });
 });
