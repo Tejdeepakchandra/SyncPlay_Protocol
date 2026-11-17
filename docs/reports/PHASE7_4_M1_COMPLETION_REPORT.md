@@ -5,6 +5,8 @@
 **Date:** 2026-11-17  
 **Base Architecture Specification Commit:** `0289ad5` (`0289ad5a62e03264b30a10b429d29eb0ca1691a1`)  
 **Previous Implementation Commit:** `2224f6d` (`2224f6deed761d15bf05494d451a9415c4d32a18`)  
+**Final Corrections Commit:** `2df6973` (`2df69735d4d38c64cf4f4751be6cb7ce3a2d53bf`)  
+**Parent Commit:** `02f6836`  
 **Approved Architecture Baseline:** Phase 7.2-R9 (`1825de1`)  
 **Frozen Previous Implementation:** Phase 7.3-R5-H (`e49b81a`)  
 **Scope Status:** Milestone M1 Final Corrections Complete — M2–M5 Strictly Deferred  
