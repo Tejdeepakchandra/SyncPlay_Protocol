@@ -125,7 +125,7 @@ describe('ReplicationComparator', () => {
       expect(result.unverifiedHistoryOrigins).toHaveLength(0);
     });
 
-    it('classifies matching non-empty vectors (k > 1) with matching fingerprints as IDENTICAL at frontier, but FRONTIER_IDENTICAL with unverified intermediate history', () => {
+    it('classifies matching non-empty vectors (k > 1) with matching fingerprints as FRONTIER_AGREEMENT_ONLY with unverified intermediate history', () => {
       const local = makeDigest({
         replicationVector: { 'peer-A': 5, 'peer-B': 3 },
         historyFingerprints: { 'peer-A': sampleFp1, 'peer-B': sampleFpB },
@@ -137,7 +137,9 @@ describe('ReplicationComparator', () => {
       });
 
       const result = compareDigests(local, remote);
-      expect(result.classification).toBe('IDENTICAL');
+      // INVARIANT: When k > 1 intermediate history is unverified, aggregate classification MUST NOT be IDENTICAL!
+      expect(result.classification).toBe('FRONTIER_AGREEMENT_ONLY');
+      expect(result.classification).not.toBe('IDENTICAL');
       expect(result.forkDetected).toBe(false);
       expect(result.missingFromLocal).toHaveLength(0);
       expect(result.missingFromRemote).toHaveLength(0);
@@ -329,9 +331,11 @@ describe('ReplicationComparator', () => {
 
       // Demonstrates Option 1 property:
       // The state digest compares the tail operation at the replication frontier (sequence 12).
-      // Since both peers have identical op C at sequence 12, the comparison classifies as IDENTICAL at the frontier.
+      // Since both peers have identical op C at sequence 12, the comparison classifies as FRONTIER_AGREEMENT_ONLY.
       // It does NOT detect that Peer A had op B at seq 11 while Peer B had op X at seq 11!
-      expect(result.classification).toBe('IDENTICAL');
+      // INVARIANT: Aggregate classification MUST NOT be IDENTICAL when intermediate history is unverified!
+      expect(result.classification).toBe('FRONTIER_AGREEMENT_ONLY');
+      expect(result.classification).not.toBe('IDENTICAL');
       expect(result.forkDetected).toBe(false);
 
       // Under Phase 7.4 M2 correction, the comparator explicitly marks intermediate history unverified:
@@ -361,7 +365,9 @@ describe('ReplicationComparator', () => {
       });
 
       const result = compareDigests(local, remote);
-      expect(result.classification).toBe('IDENTICAL');
+      // INVARIANT: When k > 1 intermediate history is unverified, aggregate classification MUST NOT be IDENTICAL!
+      expect(result.classification).toBe('FRONTIER_AGREEMENT_ONLY');
+      expect(result.classification).not.toBe('IDENTICAL');
       expect(result.forkDetected).toBe(false);
 
       // Crucial: Property A (frontier agreement) is true, but Property B (history verified) is false
@@ -396,6 +402,9 @@ describe('ReplicationComparator', () => {
       expect(detail.status).toBe('CONFLICT_FORK');
       expect(detail.frontierAgreement).toBe(false);
       expect(detail.historyVerified).toBe(false);
+      // Invariant: Whenever historyVerified === false, origin is in unverifiedHistoryOrigins
+      expect(result.unverifiedHistoryOrigins).toEqual(['peer-A']);
+      expect(result.hasUnverifiedHistory).toBe(true);
     });
 
     it('3. equal vectors + missing fingerprints remain historically unverified', () => {
@@ -410,6 +419,7 @@ describe('ReplicationComparator', () => {
 
       const result = compareDigests(local, remote);
       expect(result.classification).toBe('INCONCLUSIVE');
+      expect(result.classification).not.toBe('IDENTICAL');
       expect(result.forkDetected).toBe(false);
       expect(result.unprovableOrigins).toEqual(['peer-A']);
       expect(result.unverifiedHistoryOrigins).toEqual(['peer-A']);
@@ -438,14 +448,15 @@ describe('ReplicationComparator', () => {
       const result = compareDigests(local, remote);
       // Correctly classified as behind (REMOTE_DOMINATES)
       expect(result.classification).toBe('REMOTE_DOMINATES');
+      expect(result.classification).not.toBe('IDENTICAL');
       expect(result.missingFromLocal).toEqual([
         { originPeerId: 'peer-A', fromSequence: 3, toSequence: 7 },
       ]);
       expect(result.missingFromRemote).toHaveLength(0);
 
-      // Separate historical uncertainty on origin B is strictly preserved!
+      // Both peer-A (lag) and peer-B (k=5 unverified history) have historyVerified === false
       expect(result.hasUnverifiedHistory).toBe(true);
-      expect(result.unverifiedHistoryOrigins).toEqual(['peer-B']);
+      expect(result.unverifiedHistoryOrigins).toEqual(['peer-A', 'peer-B']);
     });
 
     it('5. a multi-origin comparison with one verified frontier and another unverified history preserves that uncertainty', () => {
@@ -473,7 +484,9 @@ describe('ReplicationComparator', () => {
       });
 
       const result = compareDigests(local, remote);
-      expect(result.classification).toBe('IDENTICAL');
+      // INVARIANT: Aggregate classification MUST NOT be IDENTICAL when Origin B history is unverified!
+      expect(result.classification).toBe('FRONTIER_AGREEMENT_ONLY');
+      expect(result.classification).not.toBe('IDENTICAL');
 
       // Origin A has verified frontier and verified history
       const detailA = result.originDetails.find((d) => d.originPeerId === 'peer-A')!;
@@ -492,27 +505,48 @@ describe('ReplicationComparator', () => {
       expect(result.unverifiedHistoryOrigins).toEqual(['peer-B']);
     });
 
-    it('6. a confirmed fork still takes precedence over ordinary dominance', () => {
-      // Origin A: conflicting fingerprints at sequence 5 -> CONFLICT_FORK
-      // Origin B: local has 2, remote has 8 -> REMOTE_AHEAD (ordinary dominance)
+    it('6. mixed fork + unverified history + ordinary missing range preserves fork precedence and all uncertainty fields', () => {
+      // Origin A: Confirmed frontier fork (seq 5, divergent fp)
+      // Origin B: Matching frontier, unverified history (seq 10, matching tail fp)
+      // Origin C: Ordinary missing range (local 2, remote 8)
+      const fpB10 = computeOperationFingerprint({
+        originPeerId: 'peer-B',
+        originSequenceNumber: 10,
+        logicalEventId: 'evt-b-10',
+        logicalTimestamp: 20,
+        causalContext: {},
+        messageType: 'PAUSE',
+        payload: {},
+        membershipEpoch: 1,
+      });
+
       const local = makeDigest({
-        replicationVector: { 'peer-A': 5, 'peer-B': 2 },
-        historyFingerprints: { 'peer-A': sampleFp1 },
+        replicationVector: { 'peer-A': 5, 'peer-B': 10, 'peer-C': 2 },
+        historyFingerprints: { 'peer-A': sampleFp1, 'peer-B': fpB10 },
       });
       const remote = makeDigest({
         senderPeerId: 'peer-remote',
-        replicationVector: { 'peer-A': 5, 'peer-B': 8 },
-        historyFingerprints: { 'peer-A': sampleFp2, 'peer-B': sampleFpB },
+        replicationVector: { 'peer-A': 5, 'peer-B': 10, 'peer-C': 8 },
+        historyFingerprints: { 'peer-A': sampleFp2, 'peer-B': fpB10, 'peer-C': sampleFp1 },
       });
 
       const result = compareDigests(local, remote);
-      // Fork takes absolute precedence over ordinary dominance!
+
+      // Fork takes absolute precedence for aggregate classification!
       expect(result.classification).toBe('DIVERGENT_FORK');
+      expect(result.classification).not.toBe('IDENTICAL');
       expect(result.forkDetected).toBe(true);
       expect(result.conflictingOrigins).toEqual(['peer-A']);
+
+      // All 3 origins have historyVerified === false, so all appear in unverifiedHistoryOrigins
+      expect(result.unverifiedHistoryOrigins).toEqual(['peer-A', 'peer-B', 'peer-C']);
+      expect(result.hasUnverifiedHistory).toBe(true);
+
+      // Ordinary missing range on peer-C is accurately retained
       expect(result.missingFromLocal).toEqual([
-        { originPeerId: 'peer-B', fromSequence: 3, toSequence: 8 },
+        { originPeerId: 'peer-C', fromSequence: 3, toSequence: 8 },
       ]);
+      expect(result.missingFromRemote).toHaveLength(0);
     });
 
     it('7. snapshot recovery requirements remain correctly represented', () => {
@@ -528,6 +562,7 @@ describe('ReplicationComparator', () => {
 
       const result = compareDigests(local, remote);
       expect(result.classification).toBe('REQUIRES_SNAPSHOT_RECOVERY');
+      expect(result.classification).not.toBe('IDENTICAL');
       expect(result.outsideRemoteHorizon).toBe(true);
       expect(result.requiresSnapshotRecovery).toBe(true);
 
@@ -535,6 +570,43 @@ describe('ReplicationComparator', () => {
       expect(detail.status).toBe('OUTSIDE_REMOTE_HORIZON');
       expect(detail.frontierAgreement).toBe(false);
       expect(detail.historyVerified).toBe(false);
+      expect(result.unverifiedHistoryOrigins).toEqual(['peer-A']);
+      expect(result.hasUnverifiedHistory).toBe(true);
+    });
+
+    it('8. public caller invariant regression: aggregate classification can NEVER be IDENTICAL when hasUnverifiedHistory is true', () => {
+      // Multi-scenario matrix testing:
+      // Scenario A: k = 12 on single origin with matching tail fingerprint
+      const resA = compareDigests(
+        makeDigest({ replicationVector: { 'peer-A': 12 }, historyFingerprints: { 'peer-A': sampleFp1 } }),
+        makeDigest({ senderPeerId: 'remote', replicationVector: { 'peer-A': 12 }, historyFingerprints: { 'peer-A': sampleFp1 } }),
+      );
+      expect(resA.hasUnverifiedHistory).toBe(true);
+      expect(resA.classification).toBe('FRONTIER_AGREEMENT_ONLY');
+      expect(resA.classification).not.toBe('IDENTICAL');
+
+      // Scenario B: k = 1 on single origin with matching fingerprint
+      const fp1 = computeOperationFingerprint({
+        originPeerId: 'peer-A',
+        originSequenceNumber: 1,
+        logicalEventId: 'evt-1',
+        logicalTimestamp: 10,
+        causalContext: {},
+        messageType: 'PLAY',
+        payload: { positionMs: 1000 },
+        membershipEpoch: 1,
+      });
+      const resB = compareDigests(
+        makeDigest({ replicationVector: { 'peer-A': 1 }, historyFingerprints: { 'peer-A': fp1 } }),
+        makeDigest({ senderPeerId: 'remote', replicationVector: { 'peer-A': 1 }, historyFingerprints: { 'peer-A': fp1 } }),
+      );
+      expect(resB.hasUnverifiedHistory).toBe(false);
+      expect(resB.classification).toBe('IDENTICAL');
+
+      // Scenario C: Empty vector (k = 0)
+      const resC = compareDigests(makeDigest(), makeDigest({ senderPeerId: 'remote' }));
+      expect(resC.hasUnverifiedHistory).toBe(false);
+      expect(resC.classification).toBe('IDENTICAL');
     });
   });
 
@@ -684,9 +756,10 @@ describe('ReplicationComparator', () => {
         { originPeerId: 'peer-A', fromSequence: 3, toSequence: 5 },
       ]);
 
-      // ...BUT completeness indicator explicitly warns caller that historical equality is unverified on peer-B!
+      // ...BUT completeness indicator explicitly warns caller that historical equality is unverified!
       expect(result.hasUnverifiedHistory).toBe(true);
       expect(result.unprovableOrigins).toEqual(['peer-B']);
+      expect(result.unverifiedHistoryOrigins).toEqual(['peer-A', 'peer-B']);
     });
 
     it('prioritizes DIVERGENT_FORK when fork on one origin is combined with normal missing range on another', () => {

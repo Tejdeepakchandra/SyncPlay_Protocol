@@ -19,9 +19,16 @@ export type { MissingSequenceRange };
 
 /**
  * High-level classification of a state digest comparison.
+ *
+ * INVARIANT:
+ * The aggregate classification MUST NOT be 'IDENTICAL' whenever hasUnverifiedHistory is true,
+ * or when any origin has missing ranges, outside-horizon uncertainty, or unresolved conditions.
+ * When replication vectors and tail fingerprints match but intermediate historical equality
+ * cannot be proven (e.g. k > 1 with single tail fingerprints), 'FRONTIER_AGREEMENT_ONLY' is returned.
  */
 export type DigestComparisonClassification =
   | 'IDENTICAL'
+  | 'FRONTIER_AGREEMENT_ONLY'
   | 'LOCAL_DOMINATES'
   | 'REMOTE_DOMINATES'
   | 'CONCURRENT_INCOMPARABLE'
@@ -125,18 +132,18 @@ export interface DigestComparisonResult {
   readonly unprovableOrigins: ReadonlyArray<string>;
 
   /**
-   * Origins where historical equality has not been verified.
-   * Includes origins with status FRONTIER_IDENTICAL (k > 1 where only a single tail fingerprint is present)
-   * or HISTORICAL_EQUALITY_UNPROVABLE (missing tail fingerprints).
+   * Origins whose complete historical equality has not been established.
+   * INVARIANT: Whenever originDetail.historyVerified === false, the origin MUST appear in unverifiedHistoryOrigins.
+   * Origins with confirmed forks (CONFLICT_FORK) additionally appear in conflictingOrigins.
    */
   readonly unverifiedHistoryOrigins: ReadonlyArray<string>;
 
   /**
    * Completeness indicator: true if one or more origins had unverified historical equality
-   * (e.g. equal sequence numbers with k > 1 under single tail fingerprints, missing tail fingerprints,
-   * or compacted history without checkpoints).
-   * When true, global dominance classifications (LOCAL_DOMINATES / REMOTE_DOMINATES) or IDENTICAL
-   * do NOT imply complete historical equality across unverified origins.
+   * (i.e. unverifiedHistoryOrigins.length > 0).
+   * INVARIANT: classification CAN NEVER be 'IDENTICAL' when hasUnverifiedHistory is true.
+   * When true, global dominance classifications (LOCAL_DOMINATES / REMOTE_DOMINATES)
+   * do NOT imply complete historical equality across origins.
    */
   readonly hasUnverifiedHistory: boolean;
 

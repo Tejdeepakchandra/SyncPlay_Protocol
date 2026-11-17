@@ -164,7 +164,6 @@ export function compareDigests(
         } else {
           status = 'HISTORICAL_EQUALITY_UNPROVABLE';
           unprovableOrigins.push(origin);
-          unverifiedHistoryOrigins.push(origin);
           reason = `Historical equality at sequence 1 cannot be verified: missing tail fingerprint`;
         }
       } else {
@@ -175,7 +174,6 @@ export function compareDigests(
             status = 'FRONTIER_IDENTICAL';
             frontierAgreement = true;
             historyVerified = false;
-            unverifiedHistoryOrigins.push(origin);
             reason = `Frontier fingerprint matches at sequence ${localSeq}, but intermediate history (1..${localSeq - 1}) is unverified`;
           } else {
             status = 'CONFLICT_FORK';
@@ -186,7 +184,6 @@ export function compareDigests(
         } else {
           status = 'HISTORICAL_EQUALITY_UNPROVABLE';
           unprovableOrigins.push(origin);
-          unverifiedHistoryOrigins.push(origin);
           reason = `Historical equality at sequence ${localSeq} cannot be verified: missing tail fingerprint`;
         }
       }
@@ -225,6 +222,11 @@ export function compareDigests(
       }
     }
 
+    // INVARIANT: Whenever historyVerified === false, the origin MUST appear in unverifiedHistoryOrigins.
+    if (!historyVerified) {
+      unverifiedHistoryOrigins.push(origin);
+    }
+
     originDetails.push(
       Object.freeze({
         originPeerId: origin,
@@ -243,9 +245,12 @@ export function compareDigests(
     );
   }
 
+  const hasUnverifiedHistory = unverifiedHistoryOrigins.length > 0;
+
   // 4. Derive overall vector classification
   let classification: DigestComparisonClassification;
   if (forkDetected) {
+    // Confirmed frontier fork takes highest precedence
     classification = 'DIVERGENT_FORK';
   } else if (requiresSnapshotRecovery) {
     classification = 'REQUIRES_SNAPSHOT_RECOVERY';
@@ -256,7 +261,12 @@ export function compareDigests(
   ) {
     classification = 'INCONCLUSIVE';
   } else if (missingFromLocal.length === 0 && missingFromRemote.length === 0) {
-    classification = 'IDENTICAL';
+    // INVARIANT: The aggregate result MUST NOT be 'IDENTICAL' whenever hasUnverifiedHistory is true!
+    if (hasUnverifiedHistory) {
+      classification = 'FRONTIER_AGREEMENT_ONLY';
+    } else {
+      classification = 'IDENTICAL';
+    }
   } else if (missingFromLocal.length === 0 && missingFromRemote.length > 0) {
     classification = 'LOCAL_DOMINATES';
   } else if (missingFromLocal.length > 0 && missingFromRemote.length === 0) {
@@ -264,8 +274,6 @@ export function compareDigests(
   } else {
     classification = 'CONCURRENT_INCOMPARABLE';
   }
-
-  const hasUnverifiedHistory = unverifiedHistoryOrigins.length > 0;
 
   return Object.freeze({
     remotePeerId,
