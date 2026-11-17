@@ -63,6 +63,7 @@ export function compareDigests(
       outsideRemoteHorizon: false,
       requiresSnapshotRecovery: false,
       unprovableOrigins: Object.freeze([]),
+      unverifiedHistoryOrigins: Object.freeze([]),
       hasUnverifiedHistory: false,
       originDetails: Object.freeze([]),
       diagnosticReasons: Object.freeze([
@@ -84,6 +85,7 @@ export function compareDigests(
       outsideRemoteHorizon: false,
       requiresSnapshotRecovery: false,
       unprovableOrigins: Object.freeze([]),
+      unverifiedHistoryOrigins: Object.freeze([]),
       hasUnverifiedHistory: false,
       originDetails: Object.freeze([]),
       diagnosticReasons: Object.freeze([
@@ -105,6 +107,7 @@ export function compareDigests(
   const missingFromRemote: MissingSequenceRange[] = [];
   const conflictingOrigins: string[] = [];
   const unprovableOrigins: string[] = [];
+  const unverifiedHistoryOrigins: string[] = [];
   const originDetails: OriginComparisonDetail[] = [];
   const diagnosticReasons: string[] = [];
 
@@ -136,28 +139,54 @@ export function compareDigests(
     let status: OriginComparisonStatus;
     let missingRange: MissingSequenceRange | undefined;
     let reason: string | undefined;
+    let frontierAgreement = false;
+    let historyVerified = false;
 
     if (localSeq === remoteSeq) {
       if (localSeq === 0) {
         status = 'IDENTICAL';
-      } else {
-        // Both peers have observed the exact same sequence count
+        frontierAgreement = true;
+        historyVerified = true;
+      } else if (localSeq === 1) {
+        // At sequence 1, the operation is the replication frontier AND has no preceding intermediate history.
+        // Therefore, matching fingerprint at sequence 1 verifies complete historical equality (1..1).
         if (localFp !== undefined && remoteFp !== undefined) {
           if (localFp === remoteFp) {
             status = 'IDENTICAL';
+            frontierAgreement = true;
+            historyVerified = true;
           } else {
-            // Sequence collision or fork detected! Identical sequence number, divergent fingerprint
+            status = 'CONFLICT_FORK';
+            forkDetected = true;
+            conflictingOrigins.push(origin);
+            reason = `Fingerprint mismatch at sequence 1: local '${localFp}' vs remote '${remoteFp}'`;
+          }
+        } else {
+          status = 'HISTORICAL_EQUALITY_UNPROVABLE';
+          unprovableOrigins.push(origin);
+          unverifiedHistoryOrigins.push(origin);
+          reason = `Historical equality at sequence 1 cannot be verified: missing tail fingerprint`;
+        }
+      } else {
+        // localSeq > 1: tail fingerprint hashes only sequence k, not intermediate operations 1..(k-1).
+        // Property A (frontier agreement) holds if fingerprints match, but Property B (history verified) does NOT!
+        if (localFp !== undefined && remoteFp !== undefined) {
+          if (localFp === remoteFp) {
+            status = 'FRONTIER_IDENTICAL';
+            frontierAgreement = true;
+            historyVerified = false;
+            unverifiedHistoryOrigins.push(origin);
+            reason = `Frontier fingerprint matches at sequence ${localSeq}, but intermediate history (1..${localSeq - 1}) is unverified`;
+          } else {
             status = 'CONFLICT_FORK';
             forkDetected = true;
             conflictingOrigins.push(origin);
             reason = `Fingerprint mismatch at sequence ${localSeq}: local '${localFp}' vs remote '${remoteFp}'`;
           }
         } else {
-          // One or both tail fingerprints missing.
-          // In Phase 7.4, matching replication vectors cannot prove equality across compacted history
-          // if fingerprints are absent.
           status = 'HISTORICAL_EQUALITY_UNPROVABLE';
           unprovableOrigins.push(origin);
+          unverifiedHistoryOrigins.push(origin);
           reason = `Historical equality at sequence ${localSeq} cannot be verified: missing tail fingerprint`;
         }
       }
@@ -208,6 +237,8 @@ export function compareDigests(
         remoteFingerprint: remoteFp,
         missingRange,
         reason,
+        frontierAgreement,
+        historyVerified,
       }),
     );
   }
@@ -234,7 +265,7 @@ export function compareDigests(
     classification = 'CONCURRENT_INCOMPARABLE';
   }
 
-  const hasUnverifiedHistory = unprovableOrigins.length > 0;
+  const hasUnverifiedHistory = unverifiedHistoryOrigins.length > 0;
 
   return Object.freeze({
     remotePeerId,
@@ -247,6 +278,7 @@ export function compareDigests(
     outsideRemoteHorizon,
     requiresSnapshotRecovery,
     unprovableOrigins: Object.freeze(unprovableOrigins),
+    unverifiedHistoryOrigins: Object.freeze(unverifiedHistoryOrigins),
     hasUnverifiedHistory,
     originDetails: Object.freeze(originDetails),
     ...(diagnosticReasons.length > 0 ? { diagnosticReasons: Object.freeze(diagnosticReasons) } : {}),

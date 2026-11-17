@@ -34,6 +34,7 @@ export type DigestComparisonClassification =
  */
 export type OriginComparisonStatus =
   | 'IDENTICAL'
+  | 'FRONTIER_IDENTICAL'
   | 'LOCAL_AHEAD'
   | 'REMOTE_AHEAD'
   | 'LOCAL_ONLY'
@@ -67,6 +68,18 @@ export interface OriginComparisonDetail {
   readonly remoteFingerprint?: string;
   readonly missingRange?: MissingSequenceRange;
   readonly reason?: string;
+  /**
+   * Property A: Frontier fingerprint agreement.
+   * True if the operation at the current replication frontier has matching fingerprints (or both at sequence 0).
+   */
+  readonly frontierAgreement: boolean;
+  /**
+   * Property B: Historical equality verification.
+   * True ONLY if all preceding operation history has been independently verified to match.
+   * For single tail fingerprints without cumulative hashes, intermediate history (1..k-1) is unverified.
+   * Therefore, historyVerified is true ONLY when k = 0, or k = 1 with matching fingerprint.
+   */
+  readonly historyVerified: boolean;
 }
 
 /**
@@ -108,14 +121,22 @@ export interface DigestComparisonResult {
   /** True if either side requires snapshot catch-up because operations are compacted. */
   readonly requiresSnapshotRecovery: boolean;
 
-  /** Origins where historical equality cannot be proven because checkpoints/ops were compacted. */
+  /** Origins where historical equality cannot be proven because checkpoints/ops were compacted or missing. */
   readonly unprovableOrigins: ReadonlyArray<string>;
 
   /**
+   * Origins where historical equality has not been verified.
+   * Includes origins with status FRONTIER_IDENTICAL (k > 1 where only a single tail fingerprint is present)
+   * or HISTORICAL_EQUALITY_UNPROVABLE (missing tail fingerprints).
+   */
+  readonly unverifiedHistoryOrigins: ReadonlyArray<string>;
+
+  /**
    * Completeness indicator: true if one or more origins had unverified historical equality
-   * (e.g. equal sequence numbers but missing tail fingerprints, or compacted history without checkpoints).
-   * When true, global dominance classifications (LOCAL_DOMINATES / REMOTE_DOMINATES) do NOT imply
-   * complete historical equality across unverified origins.
+   * (e.g. equal sequence numbers with k > 1 under single tail fingerprints, missing tail fingerprints,
+   * or compacted history without checkpoints).
+   * When true, global dominance classifications (LOCAL_DOMINATES / REMOTE_DOMINATES) or IDENTICAL
+   * do NOT imply complete historical equality across unverified origins.
    */
   readonly hasUnverifiedHistory: boolean;
 

@@ -1574,6 +1574,7 @@ export class LeaderlessSyncEngine implements SyncEngine {
         outsideRemoteHorizon: false,
         requiresSnapshotRecovery: false,
         unprovableOrigins: Object.freeze([]),
+        unverifiedHistoryOrigins: Object.freeze([]),
         hasUnverifiedHistory: false,
         originDetails: Object.freeze([]),
         diagnosticReasons: Object.freeze([
@@ -1598,6 +1599,7 @@ export class LeaderlessSyncEngine implements SyncEngine {
         outsideRemoteHorizon: false,
         requiresSnapshotRecovery: false,
         unprovableOrigins: Object.freeze([]),
+        unverifiedHistoryOrigins: Object.freeze([]),
         hasUnverifiedHistory: false,
         originDetails: Object.freeze([]),
         diagnosticReasons: Object.freeze([
@@ -1620,6 +1622,7 @@ export class LeaderlessSyncEngine implements SyncEngine {
         outsideRemoteHorizon: false,
         requiresSnapshotRecovery: false,
         unprovableOrigins: Object.freeze([]),
+        unverifiedHistoryOrigins: Object.freeze([]),
         hasUnverifiedHistory: false,
         originDetails: Object.freeze([]),
         diagnosticReasons: Object.freeze(
