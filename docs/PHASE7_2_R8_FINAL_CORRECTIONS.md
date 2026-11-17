@@ -1,11 +1,18 @@
 # Phase 7.2-R8 — Receive-Side Lamport Clock Correction and Exact Event Creation Consistency
 
-> **Document Version:** 1.0.0  
-> **Status:** AUTHORITATIVE ARCHITECTURAL SPECIFICATION (Revision P7.2-R8)  
-> **Baseline Commit:** `80339e6`  
+> **Document Version:** 1.1.0  
+> **Status:** AMENDED & REFINED IN PART BY REVISION P7.2-R9 (See [`PHASE7_2_R9_FINAL_CORRECTIONS.md`](file:///c:/Users/tejde/OneDrive/Desktop/SyncPlay_Protocol/SyncPlay_Protocol/docs/PHASE7_2_R9_FINAL_CORRECTIONS.md))  
+> **Baseline Commit:** `80339e6` (Amended in `8d6f675`, Reconciled in P7.2-R9)  
 > **Preceding Baselines:** `a809612` (P7.2-R2), `c7188fc` (P7.2-R3), `16dfe7a` (P7.2-R4), `990b3f4` (P7.2-R5), `c420cae` (P7.2-R6), `094541d` / `80339e6` (P7.2-R7)  
 > **Mode:** Specification & Architecture Only — Strict Stop Condition Observed  
 > **Target Subsystems:** `@syncplay/sync-engine`, `@syncplay/protocol`, `@syncplay/control-events`, `@syncplay/peer-mesh`  
+
+> [!NOTE]
+> Revision P7.2-R9 corrects the multi-event arithmetic in Walkthrough 2:
+> 1. **$A_{11}$ Exact Timestamp:** $1 + \max(12, 8, 13) = \mathbf{14}$ (strictly 14, not 15).
+> 2. **Consistent Initial State:** Peer C begins with $\{ A: 10, B: 5 \}$ ($L=12$), avoiding premature missing-dependency violations.
+> 3. **$C_1$ Exact Timestamp:** $1 + \max(14, 8, 13) = \mathbf{15}$ (strictly 15, not 16).
+> 4. **Missing-Dependency Buffering:** The $\{ A: 9, B: 5 \}$ scenario is formalized as a negative buffering and repair test.  
 
 ---
 
@@ -190,51 +197,52 @@ sequenceDiagram
     participant A as Peer A
     participant C as Peer C
 
-    Note over C: Initial State of C:<br/>L_local(C) = 10<br/>localCausalContext = {A: 9, B: 5}
+    Note over C: Initial State of C:<br/>L_local(C) = 12<br/>localCausalContext = {A: 10, B: 5}
     
     D->>C: Event D1 (L=13, causalContext={A: 10, B: 5})
-    Note over C: 1. Validate D1: expected = 1 + max(12, 8) = 13 -> PASS<br/>2. Update clock: L_local(C) := max(10, 13) = 13 (NO +1!)<br/>3. localCausalContext := {A: 10, B: 5, D: 1}
+    Note over C: 1. Validate D1: expected = 1 + max(12, 8) = 13 -> PASS<br/>2. Update clock: L_local(C) := max(12, 13) = 13 (NO +1!)<br/>3. localCausalContext := {A: 10, B: 5, D: 1}
 
-    A->>C: Event A11 (L=15, causalContext={A: 10, B: 5, D: 1})
-    Note over C: 4. Validate A11: expected = 1 + max(12, 8, 13) = 14 or 15 (if A ticked twice) -> PASS<br/>5. Update clock: L_local(C) := max(13, 15) = 15 (NO +1!)<br/>6. localCausalContext := {A: 11, B: 5, D: 1}
+    A->>C: Event A11 (L=14, causalContext={A: 10, B: 5, D: 1})
+    Note over C: 4. Validate A11: expected = 1 + max(12, 8, 13) = 14 -> PASS<br/>5. Update clock: L_local(C) := max(13, 14) = 14 (NO +1!)<br/>6. localCausalContext := {A: 11, B: 5, D: 1}
 
-    Note over C: Peer C Authors Event C1:<br/>causalContext = {A: 11, B: 5, D: 1}<br/>max dependency timestamp = max(15, 8, 13) = 15<br/>Clock tick: L(C1) := 1 + L_local(C) = 1 + 15 = 16<br/>L_local(C) advances to 16
-    C->>A: Broadcast C1 (L=16)
+    Note over C: Peer C Authors Event C1:<br/>causalContext = {A: 11, B: 5, D: 1}<br/>max dependency timestamp = max(14, 8, 13) = 14<br/>Clock tick: L(C1) := 1 + L_local(C) = 1 + 14 = 15<br/>L_local(C) advances to 15
+    C->>A: Broadcast C1 (L=15)
 
-    Note over A: Peer A validates C1:<br/>expected = 1 + max(15, 8, 13) = 16<br/>16 === 16 -> PASS!
+    Note over A: Peer A validates C1:<br/>expected = 1 + max(14, 8, 13) = 15<br/>15 === 15 -> PASS!
 ```
 
 #### Step-by-Step Analysis
-1. **Initial State of Peer C:** $L_{\text{local}}(C) = 10$.
+1. **Initial State of Peer C:** $L_{\text{local}}(C) = 12$, with frontier $\{A: 10, B: 5\}$ ($L(A, 10)=12, L(B, 5)=8$).
 2. **First Event Arrives ($D_1$, $L=13$):**
    - Receiver C validates $D_1$: expected $1 + \max(12, 8) = 13$. Valid!
    - Receiver C updates clock:
-     $$L_{\text{local}}(C) \leftarrow \max(10, 13) = 13 \quad \mathbf{(no\ +1)}$$
+     $$L_{\text{local}}(C) \leftarrow \max(12, 13) = 13 \quad \mathbf{(no\ +1)}$$
    - C's causal context becomes: $\{A: 10, B: 5, D: 1\}$.
-3. **Second Event Arrives ($A_{11}$, $L=15$):**
-   - Receiver C validates $A_{11}$ ($L=15$, whose dependencies had max timestamp 14). Valid!
+3. **Second Event Arrives ($A_{11}$, $L=14$):**
+   - Peer A authored $A_{11}$ after observing $D_1$: expected $1 + \max(12, 8, 13) = 14$.
+   - Receiver C validates $A_{11}$: expected $1 + \max(12, 8, 13) = 14$. Valid!
    - Receiver C updates clock:
-     $$L_{\text{local}}(C) \leftarrow \max(13, 15) = 15 \quad \mathbf{(no\ +1)}$$
+     $$L_{\text{local}}(C) \leftarrow \max(13, 14) = 14 \quad \mathbf{(no\ +1)}$$
    - C's causal context becomes: $\{A: 11, B: 5, D: 1\}$.
 4. **Peer C Authors Local Event $C_1$:**
    - $C_1.\text{causalContext} = \{A: 11, B: 5, D: 1\}$.
-   - Dependency timestamps: $L(A, 11) = 15, L(B, 5) = 8, L(D, 1) = 13$.
-   - Maximum dependency timestamp: $\max(15, 8, 13) = 15$.
+   - Dependency timestamps: $L(A, 11) = 14, L(B, 5) = 8, L(D, 1) = 13$.
+   - Maximum dependency timestamp: $\max(14, 8, 13) = 14$.
    - Clock tick on authoring:
-     $$L(C_1) = 1 + L_{\text{local}}(C) = 1 + 15 = \mathbf{16}$$
-   - Peer C stamps $C_1.\text{logicalTimestamp} = 16$ and advances clock to $16$.
+     $$L(C_1) = 1 + L_{\text{local}}(C) = 1 + 14 = \mathbf{15}$$
+   - Peer C stamps $C_1.\text{logicalTimestamp} = 15$ and advances clock to $15$.
 5. **Receiver Independent Validation:**
    - Any receiving peer independently computes:
-     $$\text{expectedTimestamp}(C_1) = 1 + \max(15, 8, 13) = 1 + 15 = 16 === 16 \implies \mathbf{EXACT\ MATCH\ (PASS)}$$
+     $$\text{expectedTimestamp}(C_1) = 1 + \max(14, 8, 13) = 1 + 14 = 15 === 15 \implies \mathbf{EXACT\ MATCH\ (PASS)}$$
 
 #### Contrasting Analysis: Why the Legacy $+1$ Rule Failed
 If Peer C had applied the legacy `+ 1` rule on message receipt:
-1. Upon receiving $D_1$: $L_{\text{local}} \leftarrow \max(10, 13) + 1 = 14$.
-2. Upon receiving $A_{11}$: $L_{\text{local}} \leftarrow \max(14, 15) + 1 = 16$.
-3. Upon authoring $C_1$: $L(C_1) = 1 + 16 = 17$!
-4. But the causal frontier declared by $C_1$ has maximum timestamp $15$.
-5. All other room peers calculate expected timestamp $1 + 15 = 16$.
-6. Every peer in the room rejects $C_1$ because $17 \neq 16$!
+1. Upon receiving $D_1$: $L_{\text{local}} \leftarrow \max(12, 13) + 1 = 14$.
+2. Upon receiving $A_{11}$: $L_{\text{local}} \leftarrow \max(14, 14) + 1 = 15$.
+3. Upon authoring $C_1$: $L(C_1) = 1 + 15 = 16$!
+4. But the causal frontier declared by $C_1$ has maximum timestamp $14$.
+5. All other room peers calculate expected timestamp $1 + 14 = 15$.
+6. Every peer in the room rejects $C_1$ because $16 \neq 15$!
 7. This failure demonstrates why the receive-side $+1$ rule was fatal to distributed consensus and proves the necessity of the R8 correction.
 
 ---
@@ -246,7 +254,7 @@ The deterministic simulation test suite in `docs/PHASE7_2_SIMULATION_TEST_STRATE
 1. **Test 12.1 (Receive Operation Does Not Increment Clock):** Peer B with local clock $L=10$ receives and admits remote event $D_1$ with $L=13$. Assert that Peer B's local clock advances to exactly $13$ (not $14$).
 2. **Test 12.2 (Single Remote Receipt Followed by Local Authoring):** Following Test 12.1, Peer B authors local event $B_1$ with causal context including $D_1$. Assert that $B_1$ is stamped with $L=14$ ($1 + 13$).
 3. **Test 12.3 (Independent Receiver Validation of Post-Receive Event):** Peer A receives $B_1$ from Test 12.2, independently calculates expected timestamp $1 + \max(12, 8, 13) = 14$, asserts exact match $14 === 14$, and admits $B_1$.
-4. **Test 12.4 (Multiple Remote Receipts Before Local Authoring):** Peer C receives $D_1$ ($L=13$) and then $A_{11}$ ($L=15$) before authoring $C_1$. Assert that C's clock updates to $\max(13, 15) = 15$ without intermediate increments, and that $C_1$ is stamped with exactly $L=16$ ($1 + 15$). Receiver independently validates and accepts $C_1$.
+4. **Test 12.4 (Multiple Remote Receipts Before Local Authoring):** Peer C receives $D_1$ ($L=13$) and then $A_{11}$ ($L=14$) before authoring $C_1$. Assert that C's clock updates to $\max(13, 14) = 14$ without intermediate increments, and that $C_1$ is stamped with exactly $L=15$ ($1 + 14$). Receiver independently validates and accepts $C_1$.
 5. **Test 12.5 (No Silent Clock Inflation Beyond Causal Frontier):** Assert that a peer whose internal clock is artificially inflated beyond its declared causal frontier is prevented from authoring an event with an unrepresented timestamp. Verify that receiver asserts exact equality with the maximum declared dependency.
 6. **Test 12.6 (Rejected Events Never Mutate Clock or Replication Vector):** Inject an invalid remote event (e.g., $L(e) = \text{expected} + 1$). Assert that upon rejection (`INVALID_LOGICAL_TIMESTAMP`), the receiver's local Lamport clock and replication vector remain 100% unchanged.
 7. **Test 12.7 (Unified Lifecycle Consistency):** Verify that across snapshot import ($L = M$), remote event receipt ($L = \max(L, L_r)$), and local event authoring ($L = 1 + L$), all peers deterministically reach identical logical clocks and converge to identical playback state.

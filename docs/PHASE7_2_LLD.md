@@ -105,6 +105,13 @@ Incoming remote operations are verified against five strict mathematical invaria
      - If $L(e) < \text{expectedTimestamp}(e)$: rejected with `INVALID_CAUSAL_TIMESTAMP`.
      - If $L(e) > \text{expectedTimestamp}(e)$: rejected with `INVALID_LOGICAL_TIMESTAMP` (unwarranted clock inflation).
      - On any mismatch, the local clock and replication vector **NEVER advance**.
+   - *Component-Wise Frontier Merge (Revision P7.2-R9):*
+     Upon admitting an accepted operation $e$, the receiver updates its local causal frontier by component-wise merging the accepted sequence:
+     $$\text{localCausalContext}[p] \leftarrow e.\text{originSequenceNumber} \quad \text{for } p = e.\text{originPeerId}$$
+     $$\text{replicationVector}[p] \leftarrow e.\text{originSequenceNumber} \quad \text{for } p = e.\text{originPeerId}$$
+     Entries for all unrelated origins $q \neq e.\text{originPeerId}$ remain strictly unchanged.
+   - *Receiver-Only Observation Isolation Invariant (Revision P7.2-R9):*
+     A receiver may have observed concurrent events from other origins (e.g. origin $E$) that are absent from $e.\text{causalContext}$. The receiver **MUST NOT** substitute its own wider frontier or higher clock into $e$'s timestamp validation. Validation evaluates strictly and exclusively against $e.\text{causalContext}$.
 3. **Collision Detection & Duplicate Handling:** If $e.\text{originSequence} \le \text{replicationVector}[e.\text{originPeerId}]$:
    - If $e.\text{logicalEventId} == \text{storedOperation}.\text{logicalEventId}$ AND canonical payloads match: resolve as `IGNORED_DUPLICATE` (idempotent NO-OP; clock does not advance).
    - If $e.\text{logicalEventId} \neq \text{storedOperation}.\text{logicalEventId}$ OR payloads differ: reject with `SEQUENCE_COLLISION_DETECTED` (critical origin defect; peer quarantined). Duplicate detection **never** masks a sequence collision.

@@ -101,6 +101,8 @@ export interface ILogicalClockManager {
    * If any causal dependency is missing (s > replicationVector[p]), caller MUST buffer in PendingDependencyQueue
    * and MUST NOT call validateAndAdvanceRemote (clock does not advance).
    * Exact validation invariant: remoteClock MUST EQUAL 1 + max(lastOriginClock, maxDepClock).
+   * Receiver isolation: Validation evaluates dependencies strictly from causalContext; receiver concurrent observations are never substituted.
+   * Frontier merge: Upon admission, caller updates replicationVector and localCausalContext component-wise for originPeerId, preserving all other origins.
    * Throws SyncEngineError('INVALID_CAUSAL_TIMESTAMP') if remoteClock < expected.
    * Throws SyncEngineError('INVALID_LOGICAL_TIMESTAMP') if remoteClock > expected (unwarranted clock inflation).
    * When context === 'LIVE_BROADCAST': strictly evaluates token-bucket arrival throttling ($10\text{ ops/sec}$, burst $50$).

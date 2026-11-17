@@ -105,6 +105,7 @@ export interface ProtocolMessageV2<TPayload = unknown> {
 >   - *Non-Substitution Invariant:* The receiver **NEVER** substitutes the latest frontier timestamp or `maxLogicalTimestamp` as the timestamp of an earlier dependency $s$.
 >   - *Pre-Horizon Checkpoint Unavailable:* If $s$ predates the retained checkpoint horizon ($> K=256$), rejected with `REJECTED_OUTSIDE_HORIZON`.
 > - **Receive-Side Clock Advancement (Revision P7.2-R8):** Upon admitting an accepted event, the receiver advances its observed clock to $L_{\text{local}} = \max(L_{\text{local}}, L(e))$ WITHOUT an extra $+1$. Receiving an event is not a local event creation.
+> - **Component-Wise Frontier Merge & Receiver Isolation (Revision P7.2-R9):** Admitting an operation updates the receiver's frontier component-wise: $\text{replicationVector}[p] = e.\text{originSequenceNumber}$ for $p = e.\text{originPeerId}$, strictly preserving all other origin entries. Receiver-only concurrent observations from other origins are isolated and never substituted into $e$'s timestamp validation.
 > - Token-bucket rate limiting restricts arrival frequency over wall-clock time, not timestamp magnitude.
 > 
 > **Superseding Single Predecessor Pointers:**
