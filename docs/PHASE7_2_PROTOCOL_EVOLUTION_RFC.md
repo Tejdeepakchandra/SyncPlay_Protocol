@@ -89,12 +89,21 @@ export interface ProtocolMessageV2<TPayload = unknown> {
 > $$\text{originPeerId} \equiv \text{senderPeerId}$$
 > Relaying or rebroadcasting live control operations authored by another peer is strictly forbidden. Any incoming live message where `originPeerId !== senderPeerId` is rejected at the transport boundary with `REJECTED_UNAUTHORIZED_ORIGIN`. Multi-hop live relaying is deferred beyond Phase 7.
 > 
-> **Exact Timestamp Integrity & Causal Frontier Evaluation:**
-> A receiving peer validates $L(e)$ against the causal dependency frontier defined by `causalContext`:
-> $$L(e) > \max_{(p, s) \in e.\text{causalContext}} L(p, s) \quad \land \quad L(e) > L_{\text{prev}}(e.\text{originPeerId})$$
-> - If any dependency $(p, s)$ is missing from local history ($s > \text{replicationVector}[p]$), the event is **BUFFERED** in `PendingDependencyQueue`. Local clock and replication vector **DO NOT ADVANCE**.
-> - If all dependencies are present in log or base snapshot, $L(e)$ is evaluated. If $L(e) \le L_{\text{max\_dep}}$, rejected with `INVALID_CAUSAL_TIMESTAMP`.
-> - If an event predates the compaction horizon ($K=256$) and cannot be verified via base snapshot, rejected with `REJECTED_OUTSIDE_HORIZON`.
+> **Exact Timestamp Invariant & Causal Frontier Evaluation:**
+> A receiving peer computes the **exact expected timestamp** from the author's observed dependency frontier (`causalContext`):
+> $$\text{expectedTimestamp}(e) = \begin{cases} 
+> 1 & \text{if } e.\text{causalContext} \text{ is empty (Genesis)} \\
+> 1 + \max_{(p, s) \in e.\text{causalContext}} L(p, s) & \text{otherwise}
+> \end{cases}$$
+> - The receiver asserts exact equality: $L(e) \equiv \text{expectedTimestamp}(e)$.
+> - If $L(e) < \text{expectedTimestamp}(e)$: rejected with `INVALID_CAUSAL_TIMESTAMP`.
+> - If $L(e) > \text{expectedTimestamp}(e)$: rejected with `INVALID_LOGICAL_TIMESTAMP` (unwarranted clock inflation).
+> - **Dependency Resolution Across Tiers:**
+>   - *Missing Dependency in Flight ($s > \text{replicationVector}[p]$):* Event is **BUFFERED** in `PendingDependencyQueue`. Local clock and replication vector **DO NOT ADVANCE**.
+>   - *Retained in Log:* Looked up directly from `OrderedOperationLog`.
+>   - *Compacted Base Snapshot:* Looked up from `compactedCheckpoints` (retaining exact timestamps of the last $K=256$ compacted operations).
+>   - *Non-Substitution Invariant:* The receiver **NEVER** substitutes the latest frontier timestamp or `maxLogicalTimestamp` as the timestamp of an earlier dependency $s$.
+>   - *Pre-Horizon Checkpoint Unavailable:* If $s$ predates the retained checkpoint horizon ($> K=256$), rejected with `REJECTED_OUTSIDE_HORIZON`.
 > - Token-bucket rate limiting restricts arrival frequency over wall-clock time, not timestamp magnitude.
 > 
 > **Superseding Single Predecessor Pointers:**
@@ -297,13 +306,19 @@ export const OperationBatchPayloadSchema = z.object({
 - **Purpose:** Full authoritative baseline snapshot transfer for rejoining peers or peers whose gap exceeds the retained history horizon ($> K$).
 - **Direction:** Targeted unicast over WebRTC DataChannel in response to `STATE_REQUEST`.
 - **Integrity vs. Semantic Truth:**
-  - `stateDigestSha256` computed via RFC 8785 canonical JSON proves **byte-level payload integrity** across the network. The digest pre-image strictly binds `{ formatVersion: 2, sessionId, membershipEpoch, snapshotAuthorPeerId, snapshotFrontier, maxLogicalTimestamp, state }` (excluding `snapshotId` and `stateDigestSha256` itself).
+  - `stateDigestSha256` computed via RFC 8785 canonical JSON proves **byte-level payload integrity** across the network. The digest pre-image strictly binds `{ formatVersion: 2, sessionId, membershipEpoch, snapshotAuthorPeerId, snapshotFrontier, maxLogicalTimestamp, originFrontierTimestamps, compactedCheckpoints, state }` (excluding `snapshotId` and `stateDigestSha256` itself).
   - Byte integrity and vector dominance do **NOT** prove semantic correctness (truthfulness of the computed playback state). Semantic correctness relies on the Cooperative Non-Byzantine Trust Model (Option C).
 - **Supplier vs. Author Decoupling:** The transport peer supplying the snapshot (`supplierPeerId`) is explicitly distinguished from the author who computed the snapshot (`snapshotAuthorPeerId`). Neither is a permanent authority.
 - **Incomparable Snapshot Policy:** Incomparable snapshots ($V_{\text{snap}} \parallel V_{\text{local}}$) that cannot be repaired via log history trigger transition to `DEGRADED_OUT_OF_SYNC` (no arbitrary tie-breaking). Local operations newer than the snapshot frontier are replayed atomically.
 
 #### Proposed TypeScript Schema (Documentation Only):
 ```ts
+export interface CompactedCheckpointItem {
+  readonly originPeerId: string;
+  readonly sequenceNumber: number;
+  readonly logicalTimestamp: number;
+}
+
 export interface StateSnapshotPayloadV2 {
   readonly snapshotId: string;
   readonly sessionId: string;
@@ -312,6 +327,8 @@ export interface StateSnapshotPayloadV2 {
   readonly snapshotAuthorPeerId: string; // Peer that authored and digested the snapshot
   readonly snapshotFrontier: Record<string, number>;
   readonly maxLogicalTimestamp: number;
+  readonly originFrontierTimestamps: Record<string, number>;
+  readonly compactedCheckpoints: ReadonlyArray<CompactedCheckpointItem>;
   readonly stateDigestSha256: string;
   readonly state: {
     readonly formatVersion: 2;
@@ -333,6 +350,12 @@ export interface StateSnapshotPayloadV2 {
 
 #### Proposed Zod Schema (Documentation Only):
 ```ts
+export const CompactedCheckpointItemSchema = z.object({
+  originPeerId: z.string().min(1).max(128),
+  sequenceNumber: z.number().int().positive(),
+  logicalTimestamp: z.number().int().nonnegative(),
+});
+
 export const StateSnapshotPayloadV2Schema = z.object({
   snapshotId: z.string().min(1).max(128),
   sessionId: z.string().min(1).max(128),
@@ -341,6 +364,8 @@ export const StateSnapshotPayloadV2Schema = z.object({
   snapshotAuthorPeerId: z.string().min(1).max(128),
   snapshotFrontier: z.record(z.string().min(1).max(128), z.number().int().nonnegative()),
   maxLogicalTimestamp: z.number().int().nonnegative(),
+  originFrontierTimestamps: z.record(z.string().min(1).max(128), z.number().int().nonnegative()),
+  compactedCheckpoints: z.array(CompactedCheckpointItemSchema).max(256),
   stateDigestSha256: z.string().min(64).max(64),
   state: z.object({
     formatVersion: z.literal(2),

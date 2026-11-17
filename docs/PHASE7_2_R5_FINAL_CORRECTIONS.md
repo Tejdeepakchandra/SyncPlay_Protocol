@@ -1,11 +1,16 @@
 # Phase 7.2-R5 — Logical Timestamp Integrity & Replay Boundaries
 
-> **Document Version:** 1.0.0  
-> **Status:** AUTHORITATIVE ARCHITECTURAL SPECIFICATION (Revision P7.2-R5)  
-> **Baseline Commit:** `16dfe7a`  
-> **Preceding Baselines:** `a809612` (P7.2-R2), `c7188fc` (P7.2-R3), `16dfe7a` (P7.2-R4)  
+> **Document Version:** 1.1.0  
+> **Status:** SUPERSEDED WHERE AMENDED BY REVISION P7.2-R6 (See [`PHASE7_2_R6_FINAL_CORRECTIONS.md`](file:///c:/Users/tejde/OneDrive/Desktop/SyncPlay_Protocol/SyncPlay_Protocol/docs/PHASE7_2_R6_FINAL_CORRECTIONS.md))  
+> **Baseline Commit:** `16dfe7a` (Amended in `990b3f4`, Final Freeze in P7.2-R6)  
 > **Mode:** Specification & Architecture Only — Strict Stop Condition Observed  
 > **Target Subsystems:** `@syncplay/sync-engine`, `@syncplay/protocol`, `@syncplay/control-events`, `@syncplay/peer-mesh`  
+
+> [!NOTE]
+> Revision P7.2-R6 establishes the definitive mathematical specifications:
+> 1. **Exact Timestamp Equality:** Replaces lower-bound validation ($L(e) > \max L(d)$) with exact deterministic equality: $L(e) \equiv \text{expectedTimestamp}(e) = 1 + \max_{(p, s) \in e.\text{causalContext}} L(p, s)$. Any deviation is rejected with `INVALID_LOGICAL_TIMESTAMP`.
+> 2. **Bounded Sequence Checkpoints:** Replaces the scalar `originFrontierTimestamps` heuristic with exact bounded sequence checkpoints ($K=256$) to resolve arbitrary historical dependencies without substituting later frontier timestamps.
+> 3. **Global Maximum Timestamp Role:** Strictly bounds `maxLogicalTimestamp` as a snapshot diagnostic/reseeding ceiling, prohibiting its substitution for individual dependency sequences.  
 
 ---
 
@@ -183,3 +188,4 @@ In `OrderedOperationLog.insert(operation)`:
 | `docs/PHASE7_2_SIMULATION_TEST_STRATEGY.md` | Suite 10 updated to assert exact 3-tier dependency timestamp validation and sequence collision rejection. | Updated |
 | `docs/PHASE7_2_FINAL_DESIGN_REVIEW.md` | AD-701, AD-706, AD-709 updated with R5 exact validation rules and replay boundary contracts. | Updated |
 | `docs/design/README.md` | Index updated to feature `PHASE7_2_R5_FINAL_CORRECTIONS.md` as the definitive final specification freeze. | Updated |
+

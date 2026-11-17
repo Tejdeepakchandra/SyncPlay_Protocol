@@ -83,20 +83,28 @@ $$L(e) = 1 + \max\left(L_{\text{local}}, \max_{d \in \text{dependencies}} L(d)\r
 - **Remote Event Reception:**
   $$L_{\text{local}} \leftarrow 1 + \max(L_{\text{local}}, L(e))$$
 
-#### 2. Rigorous Multi-Factor Clock & Monotonicity Validation
+#### 2. Rigorous Multi-Factor Clock & Exact Monotonicity Validation
 Incoming remote operations are verified against five strict mathematical invariants:
 1. **Per-Origin Monotonicity:** Successive operations from origin $p$ must satisfy:
    $$L(e_{k+1}) > L(e_k) \quad \land \quad \text{originSequence}_{k+1} = \text{originSequence}_k + 1$$
    If $L(e) \le L_{\text{prev}}(p)$, rejected with `CLOCK_REGRESSION`.
-2. **Causal Timestamp Integrity & 3-Tier Dependency Lookup:**
-   For every dependency entry $(p, s) \in e.\text{causalContext}$, the receiver resolves $L(d)$ across three storage tiers:
-   - *Tier 1 (Missing Dependency: $s > \text{replicationVector}[p]$):* Operation $s$ has not yet arrived. The event $e$ **CANNOT be verified or evaluated yet**. It is buffered in `PendingDependencyQueue`, and a `REPAIR_REQUEST` is dispatched. **The local Lamport clock and replication vector DO NOT advance.**
-   - *Tier 2 (Retained in Log: $s \in \text{OrderedOperationLog}$):* Direct lookup from log: $L(d) = \text{log.get}(p, s).\text{logicalTimestamp}$.
-   - *Tier 3 (Compacted in Base Snapshot: $s \le W_{\text{stable}}[p]$):* Operation was folded into base state during safe compaction. $L(d)$ is bounded by `originFrontierTimestamps[p]` (or `baseSnapshot.maxLogicalTimestamp`).
-   - *Tier 4 (Unverifiable Pre-Horizon):* If $s$ predates the retained log horizon and base snapshot metadata, $e$ is rejected with `REJECTED_OUTSIDE_HORIZON`.
-   - *Integrity Condition:* The operation must satisfy:
-     $$L(e) > \max_{(p, s) \in e.\text{causalContext}} L(p, s)$$
-     If $L(e) \le L(d)$, the operation violates causal precedence and is rejected with `INVALID_CAUSAL_TIMESTAMP`.
+2. **Exact Expected Lamport Validation & 3-Tier Checkpoint Lookup:**
+   Under SyncPlay's deterministic model, an author's clock advances exclusively through accepted operations reflected in its `causalContext` (which includes the author's own previous sequence). Therefore, the receiver computes the **exact expected timestamp**:
+   $$\text{expectedTimestamp}(e) = \begin{cases} 
+   1 & \text{if } e.\text{causalContext} \text{ is empty (Genesis)} \\
+   1 + \max_{(p, s) \in e.\text{causalContext}} L(p, s) & \text{otherwise}
+   \end{cases}$$
+   To resolve the exact timestamp $L(p, s)$ for each dependency entry $(p, s) \in e.\text{causalContext}$, the receiver queries across storage tiers:
+   - *Tier 1 (Missing Dependency: $s > \text{replicationVector}[p]$):* Operation $s$ has not yet arrived. The receiver **CANNOT evaluate expectedTimestamp yet**. The event $e$ is buffered in `PendingDependencyQueue`, and a `REPAIR_REQUEST` is dispatched. **The local Lamport clock and replication vector DO NOT advance.**
+   - *Tier 2 (Retained in Log: $s \in \text{OrderedOperationLog}$):* Direct lookup from log: $L(p, s) = \text{log.get}(p, s).\text{logicalTimestamp}$.
+   - *Tier 3 (Compacted in Base Snapshot: $s \le W_{\text{stable}}[p]$):* Exact lookup in `compactedCheckpoints: Map<string, number>` (retaining the exact timestamps of the last $K = 256$ compacted operations). Returns exact authentic timestamp $L(p, s)$.
+   - *Non-Substitution Invariant:* The receiver **NEVER** substitutes the latest frontier timestamp $W_{\text{stable}}[p]$ or `maxLogicalTimestamp` as the timestamp of an earlier dependency $s$. Doing so would artificially inflate $\text{expectedTimestamp}$ and reject valid concurrent events!
+   - *Tier 4 (Unverifiable Pre-Horizon: $s < \text{minRetainedSequence}[p]$):* If $s$ predates the retained checkpoint horizon ($> K=256$), the exact dependency timestamp is unavailable. The operation cannot be verified and is rejected with `REJECTED_OUTSIDE_HORIZON`.
+   - *Exact Equality Condition:*
+     $$L(e) \equiv \text{expectedTimestamp}(e)$$
+     - If $L(e) < \text{expectedTimestamp}(e)$: rejected with `INVALID_CAUSAL_TIMESTAMP`.
+     - If $L(e) > \text{expectedTimestamp}(e)$: rejected with `INVALID_LOGICAL_TIMESTAMP` (unwarranted clock inflation).
+     - On any mismatch, the local clock and replication vector **NEVER advance**.
 3. **Collision Detection & Duplicate Handling:** If $e.\text{originSequence} \le \text{replicationVector}[e.\text{originPeerId}]$:
    - If $e.\text{logicalEventId} == \text{storedOperation}.\text{logicalEventId}$ AND canonical payloads match: resolve as `IGNORED_DUPLICATE` (idempotent NO-OP; clock does not advance).
    - If $e.\text{logicalEventId} \neq \text{storedOperation}.\text{logicalEventId}$ OR payloads differ: reject with `SEQUENCE_COLLISION_DETECTED` (critical origin defect; peer quarantined). Duplicate detection **never** masks a sequence collision.
@@ -179,14 +187,20 @@ class LogicalClockManager {
       );
     }
 
-    // 2. Causal timestamp integrity check
-    for (const depClock of dependencyClocks) {
-      if (remoteClock <= depClock) {
-        throw new SyncEngineError(
-          'INVALID_CAUSAL_TIMESTAMP',
-          `Remote timestamp ${remoteClock} does not exceed declared dependency timestamp ${depClock}`
-        );
-      }
+    // 2. Exact Expected Lamport Timestamp Calculation & Validation
+    const maxDepClock = dependencyClocks.length > 0 ? Math.max(...dependencyClocks) : 0;
+    const expectedTimestamp = 1 + Math.max(lastOriginClock, maxDepClock);
+    if (remoteClock < expectedTimestamp) {
+      throw new SyncEngineError(
+        'INVALID_CAUSAL_TIMESTAMP',
+        `Remote timestamp ${remoteClock} does not satisfy causal precedence (expected ${expectedTimestamp})`
+      );
+    }
+    if (remoteClock > expectedTimestamp) {
+      throw new SyncEngineError(
+        'INVALID_LOGICAL_TIMESTAMP',
+        `Remote timestamp ${remoteClock} violates exact Lamport creation invariant (expected ${expectedTimestamp})`
+      );
     }
 
     // 3. Token-bucket rate check (LIVE_BROADCAST only; REPAIR_BATCH is exempt)
@@ -489,7 +503,7 @@ When `RecoveryManager.installSnapshot(payload)` is called:
 1. Validates that `payload.sessionId == this.config.sessionId`.
 2. Validates that `payload.membershipEpoch >= this.currentMembershipEpoch`.
 3. Validates that `payload.state.anchorPositionMs` is non-negative and finite, and `payload.state.playbackRate` is within $[minRate, maxRate]$.
-4. **Byte-Level Integrity Verification (RFC 8785):** Recomputes SHA-256 over the canonical JSON serialization of the digest input binding `{ formatVersion: 2, sessionId, membershipEpoch, snapshotAuthorPeerId, snapshotFrontier, maxLogicalTimestamp, state }`.
+4. **Byte-Level Integrity Verification (RFC 8785):** Recomputes SHA-256 over the canonical JSON serialization of the digest input binding `{ formatVersion: 2, sessionId, membershipEpoch, snapshotAuthorPeerId, snapshotFrontier, maxLogicalTimestamp, originFrontierTimestamps, compactedCheckpoints, state }`.
    - *Guarantee:* Proves bytes were not corrupted in transit.
    - *Limitation:* Does **NOT** prove semantic correctness of the state; receiver relies on the Cooperative Non-Byzantine Trust Model for the truthfulness of the author's state computation.
 5. **Frontier Monotonicity Verification:** Verifies that `payload.snapshotFrontier` dominates or matches known history ($V_{\text{snap}} \ge V_{\text{rep, local}}$). Rejects stale snapshots ($V_{\text{snap}} < V_{\text{rep, local}}$) with `SNAPSHOT_STALE`.
@@ -500,7 +514,10 @@ When `RecoveryManager.installSnapshot(payload)` is called:
      - *Host Re-Seek:* Host issues an explicit seek to establish a new agreed baseline.
      - *Room Reload:* Client reloads session and obtains a fresh identity and snapshot from Bootstrap.
 7. **No Permanent Authority:** The snapshot author or supplier never becomes a permanent playback authority; snapshot installation is strictly an atomic catch-up re-anchor.
-8. Re-seeds local `LogicalClockManager` to $\max(L_{\text{local}}, \text{payload.maxLogicalTimestamp}) + 1$.
+8. **Checkpoint Ingestion & Clock Reseeding:**
+   - Populates local `compactedCheckpoints` map from `payload.compactedCheckpoints` (retaining the exact timestamps of recent compacted sequences).
+   - Re-seeds local `LogicalClockManager` to $\max(L_{\text{local}}, \text{payload.maxLogicalTimestamp}) + 1$.
+   - *Non-Substitution Invariant:* `maxLogicalTimestamp` is strictly a global snapshot ceiling for clock reseeding and diagnostics; it is **never** substituted as the timestamp of an individual origin sequence dependency.
 9. Installs base state atomically:
    $$v_{\text{local}} = v_{\text{current}} + 1$$
    *(Never copies remote version as local version; maintains local engine monotonicity).*

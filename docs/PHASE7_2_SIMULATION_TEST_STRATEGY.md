@@ -191,14 +191,16 @@ interface NetworkImpairmentConfig {
   4. Receiver transitions engine to `'DEGRADED_OUT_OF_SYNC'` lifecycle state.
   5. Assert explicit host re-seek or room reload recovers synchrony and returns engine to active state.
 
-### Suite 10: Token-Bucket Clock Inflation, Causal Integrity & Strict No-Forwarding
-- **Execution:**
-  1. **Integrity Violation:** Peer B emits operation with $L(e) = 5$, but declares dependency with $L(d) = 10$.
-  2. Assert receiver rejects with `INVALID_CAUSAL_TIMESTAMP`.
-  3. **Inflation Violation:** Peer attempts to advance Lamport clock faster than token-bucket capacity (refill 10 tokens/sec, burst 50 tokens).
-  4. Assert receiver rejects with `REJECTED_CLOCK_INFLATION` without state corruption, and **verifies that rejected events NEVER advance the local Lamport clock**.
-  5. **Repair Exemption & Invariant Enforcement:** Replay 100 historical operations via repair batch (`context: 'REPAIR_BATCH'`); assert all 100 operations are accepted and clocks advance without triggering `REJECTED_CLOCK_INFLATION`. Inject a repaired operation with non-monotonic Lamport timestamp ($L \le L_{\text{prev}}$); assert receiver rejects with `CLOCK_REGRESSION` and verifies local Lamport clock and replication vector do NOT advance.
-  6. **Strict No-Forwarding Violation:** Peer C sends a live control event with `originPeerId = "peerA"` and `senderPeerId = "peerB"`. Assert receiver rejects with `REJECTED_UNAUTHORIZED_ORIGIN`.
-  7. **Sequence Collision Test:** Inject an operation with an already reduced sequence number but a differing `logicalEventId` or payload. Assert receiver rejects with `SEQUENCE_COLLISION_DETECTED` (verifies duplicate detection never masks sequence collisions).
-  8. **Missing Dependency Buffering:** Inject an operation referencing dependency $(p, s)$ where $s > \text{replicationVector}[p]$. Assert operation is buffered in `PendingDependencyQueue`, and local Lamport clock and replication vector do NOT advance while held in buffer.
+### Suite 10: Exact Lamport Validation, Compacted Checkpoints & Replay Boundaries
+- **Objective:** Formally verify the exact Lamport creation invariant, bounded checkpoint lookups, and replay boundaries across 9 explicit specification scenarios:
+- **Execution & Assertions:**
+  1. **Case 1 (Exact Expected Timestamp Accepted):** Peer B emits operation where $L(e) \equiv \text{expectedTimestamp}(e) = 1 + \max_{(p, s) \in e.\text{causalContext}} L(p, s)$. Assert receiver accepts operation, local Lamport clock advances to $\max(L_{\text{local}}, L(e)) + 1$, and replication vector advances.
+  2. **Case 2 (Off-by-One Inflated Timestamp Rejected):** Peer B emits operation where $L(e) = \text{expectedTimestamp}(e) + 1$. Assert receiver rejects with `INVALID_LOGICAL_TIMESTAMP`. Verify local Lamport clock and replication vector do NOT advance.
+  3. **Case 3 (Arbitrary Inflated Timestamp Rejected):** Peer B emits operation with $L(e) = 1,000,000$ where $\text{expectedTimestamp}(e) = 6$. Although $L(e) > \max L(d)$ (satisfying lower bound), assert receiver rejects with `INVALID_LOGICAL_TIMESTAMP`. Verify zero clock advancement.
+  4. **Case 4 (Compacted Checkpoint Resolution):** History is compacted up to sequence $W_{\text{stable}}[A] = 10$. Incoming event $B_1$ references $B_1.\text{causalContext}[A] = 10$. Receiver looks up $L(A, 10)$ in `compactedCheckpoints` ($L=10$), computes expected timestamp $11$, and accepts $B_1$.
+  5. **Case 5 (Earlier Sequence in Compacted Frontier):** Receiver has compacted $A_1 \dots A_{10}$. Peer C (delayed branch) emits $C_1$ with $C_1.\text{causalContext}[A] = 5$. Receiver queries `compactedCheckpoints.get("A:5")`, resolves exact $L(A, 5) = 5$, and computes expected timestamp $6$. Assert $C_1$ is accepted.
+  6. **Case 6 (Non-Substitution Invariant):** In Case 5, verify receiver **never** substitutes frontier timestamp $L(A, 10) = 10$ or `maxLogicalTimestamp` for $A_5$. Assert that substituting $L(A, 10)$ would have erroneously expected $11$ and rejected valid event $C_1$.
+  7. **Case 7 (Missing Checkpoint / Pre-Horizon Recovery):** Peer D emits operation referencing dependency sequence $s$ older than the retained checkpoint horizon ($K=256$). Checkpoint is absent. Receiver rejects with `REJECTED_OUTSIDE_HORIZON`. Assert receiver enters `DEGRADED_OUT_OF_SYNC` without clock advancement.
+  8. **Case 8 (Concurrent Event Validity):** Peer B emits event concurrent with $A_6 \dots A_{10}$ ($B_1.\text{causalContext}[A] = 5$). Receiver has already observed and reduced $A_6 \dots A_{10}$. Assert receiver accepts $B_1$, successfully executes speculative rollback/replay, and converges.
+  9. **Case 9 (Universal Clock & Vector Non-Advancement):** In all rejection cases (Cases 2, 3, 7, causal regressions, and sequence collisions), assert receiver's local Lamport clock ($L_{\text{local}}$) and `replicationVector` remain 100% untouched.
 

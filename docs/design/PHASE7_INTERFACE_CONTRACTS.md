@@ -96,15 +96,17 @@ export interface ILogicalClockManager {
   /**
    * Validates and advances local clock upon receiving a remote operation.
    * Advances: L = max(L_local, remoteClock) + 1.
-   * Validates non-negative integer, per-origin monotonicity, causal timestamp integrity, and safe integer bounds.
-   * The caller evaluates dependencies in causalContext across the 3 tiers (Log, Snapshot, or PendingBuffer).
+   * Validates non-negative integer, per-origin monotonicity, and safe integer bounds.
+   * The caller evaluates dependencies in causalContext across the 3 tiers (Log, Compacted Checkpoints, or PendingBuffer).
    * If any causal dependency is missing (s > replicationVector[p]), caller MUST buffer in PendingDependencyQueue
    * and MUST NOT call validateAndAdvanceRemote (clock does not advance).
-   * When context === 'LIVE_BROADCAST': strictly evaluates token-bucket rate limiter ($10\text{ ops/sec}$, burst $50$).
+   * Exact validation invariant: remoteClock MUST EQUAL 1 + max(lastOriginClock, maxDepClock).
+   * Throws SyncEngineError('INVALID_CAUSAL_TIMESTAMP') if remoteClock < expected.
+   * Throws SyncEngineError('INVALID_LOGICAL_TIMESTAMP') if remoteClock > expected (unwarranted clock inflation).
+   * When context === 'LIVE_BROADCAST': strictly evaluates token-bucket arrival throttling ($10\text{ ops/sec}$, burst $50$).
    * When context === 'REPAIR_BATCH': bypasses token bucket rate limiter, but strictly evaluates all causal, monotonic, and integer bounds.
    * When context === 'LOCAL_REPLAY': trusted internal replay of already accepted immutable events; returns current clock without mutation.
    * Critical safety invariant: If validation fails, the local clock is NEVER advanced.
-   * Throws SyncEngineError('INVALID_CLOCK'), 'CLOCK_REGRESSION', 'INVALID_CAUSAL_TIMESTAMP', or 'REJECTED_CLOCK_INFLATION'.
    */
   validateAndAdvanceRemote(
     originPeerId: string,
@@ -186,6 +188,12 @@ export interface IOrderedOperationLog {
 
   /** Returns slice of operations originating from originPeerId in range [fromSeq, toSeq]. */
   getRange(originPeerId: string, fromSeq: number, toSeq: number): ReadonlyArray<StoredOperation>;
+
+  /**
+   * Retrieves the exact Lamport timestamp for a sequence compacted into the base state.
+   * Returns undefined if sequence predates the retained checkpoint horizon (K = 256).
+   */
+  getCompactedCheckpoint(originPeerId: string, sequenceNumber: number): number | undefined;
 
   /**
    * Prunes operations older than stable frontier sequence numbers.
@@ -332,7 +340,8 @@ The existing `SyncEngineError` is extended with standardized Phase 7 error codes
 | :--- | :--- | :--- |
 | `'CLOCK_OVERFLOW'` | Lamport clock reached `Number.MAX_SAFE_INTEGER`. | Local clock manager |
 | `'CLOCK_REGRESSION'` | Remote timestamp does not strictly exceed previous timestamp from same origin. | Clock validation |
-| `'INVALID_CAUSAL_TIMESTAMP'` | Remote timestamp does not strictly exceed declared dependency timestamps. | Causal verification |
+| `'INVALID_CAUSAL_TIMESTAMP'` | Remote timestamp is strictly less than expected causal dependency timestamp. | Causal verification |
+| `'INVALID_LOGICAL_TIMESTAMP'` | Remote timestamp violates exact creation invariant (L(e) > expectedTimestamp). | Lamport validation |
 | `'REJECTED_CLOCK_INFLATION'` | Remote clock advances faster than per-origin/per-epoch token bucket rate limit. | Rate inflation check |
 | `'REJECTED_UNAUTHORIZED_ORIGIN'` | Live broadcast received where originPeerId !== senderPeerId (Strict No-Forwarding violation). | Origin validation |
 | `'SEQUENCE_REGRESSION'` | Operation sequence number is lower than known sequence for origin. | Sequence validation |
