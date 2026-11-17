@@ -144,7 +144,9 @@ export class LeaderlessSyncEngine implements SyncEngine {
     this.state = initialState;
     this.baseSnapshot = initialState;
 
-    this.authorizedEpochCapability = config.epochCapability;
+    this.authorizedEpochCapability = config.epochCapability
+      ? Object.freeze(config.epochCapability)
+      : undefined;
 
     const logCapacity = config.logCapacity ?? 256;
     this.clockManager = new LogicalClockManager(config.initialClock ?? 0);
@@ -206,12 +208,9 @@ export class LeaderlessSyncEngine implements SyncEngine {
     capability: EpochTransitionCapability,
   ): void {
     if (
-      !capability ||
-      typeof capability !== 'object' ||
       !this.authorizedEpochCapability ||
-      capability.token !== this.authorizedEpochCapability.token ||
-      capability.sessionId !== this.config.sessionId ||
-      capability.authority !== this.authorizedEpochCapability.authority
+      !capability ||
+      capability !== this.authorizedEpochCapability
     ) {
       throw new SyncEngineError(
         'UNAUTHORIZED',
@@ -893,7 +892,9 @@ export class LeaderlessSyncEngine implements SyncEngine {
    * Ingests a repair batch supplying missing historical operations.
    *
    * Authenticated transport binding:
-   * - Resolves the trusted transport supplier identity (from AuthenticatedSupplierContext or payload).
+   * - Requires mandatory AuthenticatedSupplierContext supplied by the trusted transport layer.
+   * - Resolves the trusted transport supplier identity strictly from AuthenticatedSupplierContext.
+   * - Requires valid connectionGeneration from the local peer lifecycle; absent/invalid is rejected.
    * - Rejects forged supplier identities if the payload claims a supplier differing from transport identity.
    * - Validates supplier connection generation against authorized peerGenerations.
    * - Stale or unannounced supplier generations are rejected with REJECTED_INVALID.
@@ -903,31 +904,19 @@ export class LeaderlessSyncEngine implements SyncEngine {
    */
   public ingestRepairBatch(
     batch: OperationBatchPayload,
-    transportContext?: AuthenticatedSupplierContext | number,
+    transportContext?: AuthenticatedSupplierContext,
   ): EngineDecision[] {
     const now = this.clock.now();
     const decisions: EngineDecision[] = [];
 
-    // 1. Resolve authenticated transport supplier identity and connection generation
-    const isContextObj = typeof transportContext === 'object' && transportContext !== null;
-    const transportSupplierPeerId = isContextObj
-      ? transportContext.supplierPeerId
-      : batch.supplierPeerId;
-
-    const transportSupplierGen = isContextObj
-      ? transportContext.connectionGeneration
-      : typeof transportContext === 'number'
-        ? transportContext
-        : undefined;
-
-    // 2. Reject forged supplier identity if payload claims a different peer than authenticated transport
-    if (isContextObj && batch.supplierPeerId && batch.supplierPeerId !== transportContext.supplierPeerId) {
+    // 1. Validate mandatory authenticated supplier transport context
+    if (!transportContext || typeof transportContext !== 'object') {
       const decision: EngineDecision = {
         accepted: false,
         code: 'REJECTED_INVALID',
         stateVersion: this.state.stateVersion,
         decidedAt: now,
-        message: `Forged supplier identity: payload claims ${batch.supplierPeerId} but authenticated transport supplier is ${transportContext.supplierPeerId}`,
+        message: 'Repair batch requires authenticated supplier transport context',
       };
       this.lastDecision = decision;
       this.mutableStats.eventsReceivedCount += Math.max(1, batch.operations.length);
@@ -935,35 +924,87 @@ export class LeaderlessSyncEngine implements SyncEngine {
       return [decision];
     }
 
-    // 3. Validate supplier connection generation against authorized peerGenerations
+    if (
+      !transportContext.supplierPeerId ||
+      typeof transportContext.supplierPeerId !== 'string'
+    ) {
+      const decision: EngineDecision = {
+        accepted: false,
+        code: 'REJECTED_INVALID',
+        stateVersion: this.state.stateVersion,
+        decidedAt: now,
+        message: 'Repair batch requires valid supplierPeerId in transport context',
+      };
+      this.lastDecision = decision;
+      this.mutableStats.eventsReceivedCount += Math.max(1, batch.operations.length);
+      this.mutableStats.eventsRejectedCount += Math.max(1, batch.operations.length);
+      return [decision];
+    }
+
+    // 2. Validate mandatory supplier connection generation from local peer lifecycle
+    if (
+      typeof transportContext.connectionGeneration !== 'number' ||
+      !Number.isInteger(transportContext.connectionGeneration) ||
+      transportContext.connectionGeneration < 1
+    ) {
+      const decision: EngineDecision = {
+        accepted: false,
+        code: 'REJECTED_INVALID',
+        stateVersion: this.state.stateVersion,
+        decidedAt: now,
+        message: 'Repair batch requires valid supplier connectionGeneration',
+      };
+      this.lastDecision = decision;
+      this.mutableStats.eventsReceivedCount += Math.max(1, batch.operations.length);
+      this.mutableStats.eventsRejectedCount += Math.max(1, batch.operations.length);
+      return [decision];
+    }
+
+    const transportSupplierPeerId = transportContext.supplierPeerId;
+    const transportSupplierGen = transportContext.connectionGeneration;
+
+    // 3. Reject forged supplier identity if payload claims a different peer than authenticated transport
+    if (batch.supplierPeerId && batch.supplierPeerId !== transportSupplierPeerId) {
+      const decision: EngineDecision = {
+        accepted: false,
+        code: 'REJECTED_INVALID',
+        stateVersion: this.state.stateVersion,
+        decidedAt: now,
+        message: `Forged supplier identity: payload claims ${batch.supplierPeerId} but authenticated transport supplier is ${transportSupplierPeerId}`,
+      };
+      this.lastDecision = decision;
+      this.mutableStats.eventsReceivedCount += Math.max(1, batch.operations.length);
+      this.mutableStats.eventsRejectedCount += Math.max(1, batch.operations.length);
+      return [decision];
+    }
+
+    // 4. Validate supplier connection generation against authorized peerGenerations
     const activeSupplierGen = this.peerGenerations.get(transportSupplierPeerId) ?? 1;
-    if (transportSupplierGen !== undefined) {
-      if (transportSupplierGen < activeSupplierGen) {
-        const decision: EngineDecision = {
-          accepted: false,
-          code: 'REJECTED_INVALID',
-          stateVersion: this.state.stateVersion,
-          decidedAt: now,
-          message: `Repair batch from stale supplier connection generation ${transportSupplierGen} < active ${activeSupplierGen}`,
-        };
-        this.lastDecision = decision;
-        this.mutableStats.eventsReceivedCount += Math.max(1, batch.operations.length);
-        this.mutableStats.eventsRejectedCount += Math.max(1, batch.operations.length);
-        return [decision];
-      }
-      if (transportSupplierGen > activeSupplierGen) {
-        const decision: EngineDecision = {
-          accepted: false,
-          code: 'REJECTED_INVALID',
-          stateVersion: this.state.stateVersion,
-          decidedAt: now,
-          message: `Repair batch claims unannounced supplier connection generation ${transportSupplierGen} > authorized ${activeSupplierGen}`,
-        };
-        this.lastDecision = decision;
-        this.mutableStats.eventsReceivedCount += Math.max(1, batch.operations.length);
-        this.mutableStats.eventsRejectedCount += Math.max(1, batch.operations.length);
-        return [decision];
-      }
+    if (transportSupplierGen < activeSupplierGen) {
+      const decision: EngineDecision = {
+        accepted: false,
+        code: 'REJECTED_INVALID',
+        stateVersion: this.state.stateVersion,
+        decidedAt: now,
+        message: `Repair batch from stale supplier connection generation ${transportSupplierGen} < active ${activeSupplierGen}`,
+      };
+      this.lastDecision = decision;
+      this.mutableStats.eventsReceivedCount += Math.max(1, batch.operations.length);
+      this.mutableStats.eventsRejectedCount += Math.max(1, batch.operations.length);
+      return [decision];
+    }
+    if (transportSupplierGen > activeSupplierGen) {
+      const decision: EngineDecision = {
+        accepted: false,
+        code: 'REJECTED_INVALID',
+        stateVersion: this.state.stateVersion,
+        decidedAt: now,
+        message: `Repair batch claims unannounced supplier connection generation ${transportSupplierGen} > authorized ${activeSupplierGen}`,
+      };
+      this.lastDecision = decision;
+      this.mutableStats.eventsReceivedCount += Math.max(1, batch.operations.length);
+      this.mutableStats.eventsRejectedCount += Math.max(1, batch.operations.length);
+      return [decision];
     }
 
     // Sort batch operations by sequence number to ensure contiguous ingestion

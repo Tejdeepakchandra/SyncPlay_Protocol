@@ -100,7 +100,10 @@ describe('Phase 7.3-R4: Final Trust-Boundary Verification', () => {
         ],
       };
 
-      const decisions = engine.ingestRepairBatch(batch, 2);
+      const decisions = engine.ingestRepairBatch(batch, {
+        supplierPeerId: 'peer-S',
+        connectionGeneration: 2,
+      });
       expect(decisions).toHaveLength(1);
       expect(decisions[0]!.accepted).toBe(true);
       expect(decisions[0]!.code).toBe('APPLIED');
@@ -132,7 +135,10 @@ describe('Phase 7.3-R4: Final Trust-Boundary Verification', () => {
       };
 
       // Supplier claims stale generation 2
-      const decisions = engine.ingestRepairBatch(batch, 2);
+      const decisions = engine.ingestRepairBatch(batch, {
+        supplierPeerId: 'peer-S',
+        connectionGeneration: 2,
+      });
       expect(decisions).toHaveLength(1);
       expect(decisions[0]!.accepted).toBe(false);
       expect(decisions[0]!.code).toBe('REJECTED_INVALID');
@@ -165,7 +171,10 @@ describe('Phase 7.3-R4: Final Trust-Boundary Verification', () => {
       };
 
       // Supplier claims unannounced generation 2
-      const decisions = engine.ingestRepairBatch(batch, 2);
+      const decisions = engine.ingestRepairBatch(batch, {
+        supplierPeerId: 'peer-S',
+        connectionGeneration: 2,
+      });
       expect(decisions).toHaveLength(1);
       expect(decisions[0]!.accepted).toBe(false);
       expect(decisions[0]!.code).toBe('REJECTED_INVALID');
@@ -199,7 +208,10 @@ describe('Phase 7.3-R4: Final Trust-Boundary Verification', () => {
       };
 
       // Supplier generation 2 is validated; author Peer A's current generation 3 is NOT compared
-      const decisions = engine.ingestRepairBatch(batch, 2);
+      const decisions = engine.ingestRepairBatch(batch, {
+        supplierPeerId: 'peer-S',
+        connectionGeneration: 2,
+      });
       expect(decisions).toHaveLength(1);
       expect(decisions[0]!.accepted).toBe(true);
       expect(decisions[0]!.code).toBe('APPLIED');
@@ -228,7 +240,10 @@ describe('Phase 7.3-R4: Final Trust-Boundary Verification', () => {
         ],
       };
 
-      engine.ingestRepairBatch(batch, 1);
+      engine.ingestRepairBatch(batch, {
+        supplierPeerId: 'peer-S',
+        connectionGeneration: 1,
+      });
 
       // Replication vector tracks origin 'peer-A', NOT supplier 'peer-S'
       expect(engine.replicationFrontier['peer-A']).toBe(1);
@@ -268,7 +283,10 @@ describe('Phase 7.3-R4: Final Trust-Boundary Verification', () => {
         ],
       };
 
-      const decisions = engine.ingestRepairBatch(batch, 1);
+      const decisions = engine.ingestRepairBatch(batch, {
+        supplierPeerId: 'peer-S',
+        connectionGeneration: 1,
+      });
       expect(decisions).toHaveLength(2);
       expect(decisions[0]!.accepted).toBe(true);
       expect(decisions[0]!.code).toBe('APPLIED');
@@ -302,7 +320,10 @@ describe('Phase 7.3-R4: Final Trust-Boundary Verification', () => {
           },
         ],
       };
-      const d1 = engine.ingestRepairBatch(opOriginal, 1);
+      const d1 = engine.ingestRepairBatch(opOriginal, {
+        supplierPeerId: 'peer-S',
+        connectionGeneration: 1,
+      });
       expect(d1[0]!.accepted).toBe(true);
 
       // Malicious supplier sends op-1 with altered payload
@@ -324,7 +345,10 @@ describe('Phase 7.3-R4: Final Trust-Boundary Verification', () => {
           },
         ],
       };
-      const d2 = engine.ingestRepairBatch(opTampered, 1);
+      const d2 = engine.ingestRepairBatch(opTampered, {
+        supplierPeerId: 'peer-S',
+        connectionGeneration: 1,
+      });
       expect(d2[0]!.accepted).toBe(false);
       expect(d2[0]!.code).toBe('REJECTED_IDENTITY_CONFLICT');
     });

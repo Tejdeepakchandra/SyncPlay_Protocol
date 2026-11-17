@@ -342,7 +342,10 @@ describe('Phase 7.3 Deterministic Simulation Test Suite', () => {
         ],
       };
 
-      peerC.ingestRepairBatch(repairBatch);
+      peerC.ingestRepairBatch(repairBatch, {
+        supplierPeerId: repairBatch.supplierPeerId,
+        connectionGeneration: 1,
+      });
 
       // D1 should now be unblocked and applied!
       expect(peerC.pendingQueueSize).toBe(0);

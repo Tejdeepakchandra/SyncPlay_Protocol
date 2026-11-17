@@ -137,6 +137,93 @@ describe('Phase 7.3-R5: Final Authorization & Canonicalization Closure', () => {
       expect(engine.epoch).toBe(1);
     });
 
+    it('separately created capability with matching field values is rejected with UNAUTHORIZED', () => {
+      const duplicateCapability = createEpochTransitionCapability(
+        'peer-coordinator',
+        'test-session',
+        'coordinator-secret-key-999',
+      );
+      expect(() => engine.transitionEpoch(2, duplicateCapability)).toThrow(SyncEngineError);
+      try {
+        engine.transitionEpoch(2, duplicateCapability);
+      } catch (err: any) {
+        expect(err.code).toBe('UNAUTHORIZED');
+        expect(err.message).toContain('Epoch transition requires authorized EpochTransitionCapability');
+      }
+      expect(engine.epoch).toBe(1);
+    });
+
+    it('cloned capability object with identical properties is rejected with UNAUTHORIZED', () => {
+      const clonedCapability = { ...coordinatorCapability };
+      expect(() => engine.transitionEpoch(2, clonedCapability as any)).toThrow(SyncEngineError);
+      try {
+        engine.transitionEpoch(2, clonedCapability as any);
+      } catch (err: any) {
+        expect(err.code).toBe('UNAUTHORIZED');
+        expect(err.message).toContain('Epoch transition requires authorized EpochTransitionCapability');
+      }
+      expect(engine.epoch).toBe(1);
+    });
+
+    it('capability from another session or engine is rejected with UNAUTHORIZED', () => {
+      const foreignCapability = createEpochTransitionCapability(
+        'peer-coordinator',
+        'other-session-777',
+        'coordinator-secret-key-999',
+      );
+      expect(() => engine.transitionEpoch(2, foreignCapability)).toThrow(SyncEngineError);
+      try {
+        engine.transitionEpoch(2, foreignCapability);
+      } catch (err: any) {
+        expect(err.code).toBe('UNAUTHORIZED');
+        expect(err.message).toContain('Epoch transition requires authorized EpochTransitionCapability');
+      }
+      expect(engine.epoch).toBe(1);
+    });
+
+    it('capability object is frozen to prevent accidental or malicious mutation', () => {
+      expect(Object.isFrozen(coordinatorCapability)).toBe(true);
+      expect(Object.isFrozen((engine as any).authorizedEpochCapability)).toBe(true);
+      expect(() => {
+        (coordinatorCapability as any).token = 'tampered';
+      }).toThrow();
+    });
+
+    it('unauthorized transition attempts do not mutate epoch, pending operations, causal frontier, replication vector, clock, or playback state', () => {
+      const ev1 = makeRemoteEvent('ev-init', 'peer-A', 'PLAY', {}, 1, 1, {}, 1);
+      engine.receive(ev1);
+      expect(engine.getState().status).toBe('playing');
+      expect(engine.logicalClock).toBe(1);
+
+      const pendingOp = makeRemoteEvent('pending-gap', 'peer-A', 'PAUSE', {}, 3, 3, { 'peer-A': 2 }, 1);
+      engine.receive(pendingOp);
+      expect(engine.pendingQueueSize).toBe(1);
+
+      const initialEpoch = engine.epoch;
+      const initialPendingSize = engine.pendingQueueSize;
+      const initialClock = engine.logicalClock;
+      const initialLocalFrontier = { ...engine.localFrontier };
+      const initialReplicationFrontier = { ...engine.replicationFrontier };
+      const initialPlaybackState = { ...engine.getState() };
+
+      const cloned = { ...coordinatorCapability };
+      const fake = createEpochTransitionCapability('rogue', 'test-session', 'fake');
+      const matching = createEpochTransitionCapability('peer-coordinator', 'test-session', 'coordinator-secret-key-999');
+
+      expect(() => engine.transitionEpoch(2, cloned as any)).toThrow();
+      expect(() => engine.transitionEpoch(2, fake)).toThrow();
+      expect(() => engine.transitionEpoch(2, matching)).toThrow();
+      expect(() => (engine as any).transitionEpoch(2, null)).toThrow();
+      expect(() => (engine as any).transitionEpoch(2)).toThrow();
+
+      expect(engine.epoch).toBe(initialEpoch);
+      expect(engine.pendingQueueSize).toBe(initialPendingSize);
+      expect(engine.logicalClock).toBe(initialClock);
+      expect(engine.localFrontier).toEqual(initialLocalFrontier);
+      expect(engine.replicationFrontier).toEqual(initialReplicationFrontier);
+      expect(engine.getState()).toEqual(initialPlaybackState);
+    });
+
     it('forged capability with wrong token is rejected with UNAUTHORIZED', () => {
       const forgedCapability = createEpochTransitionCapability(
         'peer-coordinator',
@@ -525,6 +612,178 @@ describe('Phase 7.3-R5: Final Authorization & Canonicalization Closure', () => {
       const d2 = engine.ingestRepairBatch(tamperedBatch, transportContext);
       expect(d2[0]!.accepted).toBe(false);
       expect(d2[0]!.code).toBe('REJECTED_IDENTITY_CONFLICT');
+    });
+
+    it('rejects repair batch when transport context is missing completely', () => {
+      engine.authorizePeerGeneration('peer-S', 1);
+
+      const batch: OperationBatchPayload = {
+        supplierPeerId: 'peer-S',
+        originPeerId: 'peer-A',
+        fromSequence: 1,
+        toSequence: 1,
+        operations: [
+          {
+            logicalEventId: 'op-a1',
+            originPeerId: 'peer-A',
+            membershipEpoch: 1,
+            messageType: 'PLAY',
+            logicalTimestamp: 1,
+            originSequenceNumber: 1,
+            causalContext: {},
+            payload: {},
+          },
+        ],
+      };
+
+      const decisions = (engine as any).ingestRepairBatch(batch);
+      expect(decisions).toHaveLength(1);
+      expect(decisions[0]!.accepted).toBe(false);
+      expect(decisions[0]!.code).toBe('REJECTED_INVALID');
+      expect(decisions[0]!.message).toContain(
+        'Repair batch requires authenticated supplier transport context',
+      );
+    });
+
+    it('rejects repair batch when connectionGeneration is missing from transport context', () => {
+      engine.authorizePeerGeneration('peer-S', 1);
+
+      const batch: OperationBatchPayload = {
+        supplierPeerId: 'peer-S',
+        originPeerId: 'peer-A',
+        fromSequence: 1,
+        toSequence: 1,
+        operations: [
+          {
+            logicalEventId: 'op-a1',
+            originPeerId: 'peer-A',
+            membershipEpoch: 1,
+            messageType: 'PLAY',
+            logicalTimestamp: 1,
+            originSequenceNumber: 1,
+            causalContext: {},
+            payload: {},
+          },
+        ],
+      };
+
+      // Context with missing connectionGeneration
+      const transportContext: AuthenticatedSupplierContext = {
+        supplierPeerId: 'peer-S',
+      };
+
+      const decisions = engine.ingestRepairBatch(batch, transportContext);
+      expect(decisions).toHaveLength(1);
+      expect(decisions[0]!.accepted).toBe(false);
+      expect(decisions[0]!.code).toBe('REJECTED_INVALID');
+      expect(decisions[0]!.message).toContain(
+        'Repair batch requires valid supplier connectionGeneration',
+      );
+    });
+
+    it('rejects repair batch when connectionGeneration is invalid or non-integer', () => {
+      engine.authorizePeerGeneration('peer-S', 1);
+
+      const batch: OperationBatchPayload = {
+        supplierPeerId: 'peer-S',
+        originPeerId: 'peer-A',
+        fromSequence: 1,
+        toSequence: 1,
+        operations: [
+          {
+            logicalEventId: 'op-a1',
+            originPeerId: 'peer-A',
+            membershipEpoch: 1,
+            messageType: 'PLAY',
+            logicalTimestamp: 1,
+            originSequenceNumber: 1,
+            causalContext: {},
+            payload: {},
+          },
+        ],
+      };
+
+      const decisions1 = engine.ingestRepairBatch(batch, {
+        supplierPeerId: 'peer-S',
+        connectionGeneration: 0,
+      });
+      expect(decisions1[0]!.accepted).toBe(false);
+      expect(decisions1[0]!.code).toBe('REJECTED_INVALID');
+
+      const decisions2 = engine.ingestRepairBatch(batch, {
+        supplierPeerId: 'peer-S',
+        connectionGeneration: 1.5,
+      });
+      expect(decisions2[0]!.accepted).toBe(false);
+      expect(decisions2[0]!.code).toBe('REJECTED_INVALID');
+    });
+
+    it('rejects untrusted wire callers attempting to pass raw numbers as transport context', () => {
+      engine.authorizePeerGeneration('peer-S', 2);
+
+      const batch: OperationBatchPayload = {
+        supplierPeerId: 'peer-S',
+        originPeerId: 'peer-A',
+        fromSequence: 1,
+        toSequence: 1,
+        operations: [
+          {
+            logicalEventId: 'op-a1',
+            originPeerId: 'peer-A',
+            membershipEpoch: 1,
+            messageType: 'PLAY',
+            logicalTimestamp: 1,
+            originSequenceNumber: 1,
+            causalContext: {},
+            payload: {},
+          },
+        ],
+      };
+
+      const decisions = (engine as any).ingestRepairBatch(batch, 2);
+      expect(decisions).toHaveLength(1);
+      expect(decisions[0]!.accepted).toBe(false);
+      expect(decisions[0]!.code).toBe('REJECTED_INVALID');
+      expect(decisions[0]!.message).toContain(
+        'Repair batch requires authenticated supplier transport context',
+      );
+    });
+
+    it('historical author old generation does not conflict with valid current supplier generation', () => {
+      // Historical author Peer A had generation 1 when creating op
+      engine.authorizePeerGeneration('peer-A', 1);
+      // Supplier Peer S is currently at generation 5
+      engine.authorizePeerGeneration('peer-S', 5);
+
+      const batch: OperationBatchPayload = {
+        supplierPeerId: 'peer-S',
+        originPeerId: 'peer-A',
+        fromSequence: 1,
+        toSequence: 1,
+        operations: [
+          {
+            logicalEventId: 'op-hist-a1',
+            originPeerId: 'peer-A',
+            membershipEpoch: 1,
+            messageType: 'PLAY',
+            logicalTimestamp: 1,
+            originSequenceNumber: 1,
+            causalContext: {},
+            payload: {},
+          },
+        ],
+      };
+
+      const transportContext: AuthenticatedSupplierContext = {
+        supplierPeerId: 'peer-S',
+        connectionGeneration: 5,
+      };
+
+      const decisions = engine.ingestRepairBatch(batch, transportContext);
+      expect(decisions).toHaveLength(1);
+      expect(decisions[0]!.accepted).toBe(true);
+      expect(decisions[0]!.code).toBe('APPLIED');
+      expect(engine.replicationFrontier['peer-A']).toBe(1);
     });
   });
 

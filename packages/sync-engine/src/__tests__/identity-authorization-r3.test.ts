@@ -554,7 +554,10 @@ describe('Phase 7.3-R3 Final Identity & Authorization Audit', () => {
           },
         ],
       };
-      const decisions = engine.ingestRepairBatch(batchPayload as any);
+      const decisions = engine.ingestRepairBatch(batchPayload as any, {
+        supplierPeerId: (batchPayload as any).supplierPeerId,
+        connectionGeneration: 4,
+      });
 
       expect(decisions.length).toBe(1);
       expect(decisions[0]?.accepted).toBe(true);
