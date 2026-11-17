@@ -26,7 +26,7 @@ Milestones M3 (Repair Request Pipeline), M4 (Supplier Servicing), M5 (Transport 
 - **Approved Phase 7.2-R9 Causal Baseline:** `1825de1`
 - **Frozen Phase 7.3-R5-H Trust Boundary Baseline:** `e49b81a`
 - **Milestone M1 Baseline:** Commit `309b808` (amending `5cadc03`)
-- **Milestone M2 Implementation:** Current commit (to be committed)
+- **Milestone M2 Implementation:** Commit `7049ca6`
 
 ---
 
