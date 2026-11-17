@@ -51,4 +51,22 @@ The master planning suite for Phase 7 is located at the root of the `docs/` dire
 - `docs/PHASE7_2_COMPATIBILITY_AND_MIGRATION.md`: Package compatibility, wire version migration, snapshot migration, and zero-risk rollback plan.
 - `docs/PHASE7_2_FINAL_DESIGN_REVIEW.md`: Final design review, decisions summary, AC-7.2.1–7.2.5 assessment, and implementation sequence for P7.3+.
 
+### Milestone P7.3 Implementation Reports & Closure
+- `docs/reports/PHASE7_3_COMPLETION_REPORT.md`: Baseline implementation of the Event Ordering & Conflict Engine (P7.3).
+- `docs/reports/PHASE7_3_R1_ARCHITECTURAL_AUDIT_REPORT.md`: P7.3-R1 audit findings and corrections.
+- `docs/reports/PHASE7_3_R2_FINAL_BOUNDARY_VERIFICATION.md`: Resource bounds and epoch fencing closure.
+- `docs/reports/PHASE7_3_R3_FINAL_IDENTITY_AUTHORIZATION_AUDIT.md`: Immutable operation fingerprinting and epoch transition semantics.
+- `docs/reports/PHASE7_3_R4_FINAL_TRUST_BOUNDARY_VERIFICATION.md`: Transport supplier authorization and RFC 8785 canonicalization.
+- `docs/reports/PHASE7_3_R5_FINAL_AUTHORIZATION_CANONICALIZATION_CLOSURE.md`: Capability-based epoch transition authorization.
+- `docs/reports/PHASE7_3_R5F_FINAL_CAPABILITY_AND_TRANSPORT_CLOSURE.md`: Exact referential capability identity and transport context enforcement.
+- `docs/reports/PHASE7_3_R5G_FINAL_SUPPLIER_AUTHORIZATION_CLOSURE.md`: Elimination of implicit supplier generation defaulting (`?? 1`).
+- `docs/reports/PHASE7_3_R5H_FINAL_TRANSPORT_CONTEXT_ISSUER_CLOSURE.md`: Transport registration capability gating and formal Phase 7.3 freeze.
+
+### Milestone P7.4 State Replication & Anti-Entropy (Planning & Specification)
+- `docs/PHASE7_4_ARCHITECTURE.md`: High-level and low-level architecture for decentralized anti-entropy, replication knowledge model, vector comparison, missing range detection, supplier selection, and multi-peer convergence dynamics.
+- `docs/PHASE7_4_INTERFACE_SPECIFICATION.md`: Wire protocol contracts (`STATE_DIGEST`, `REPAIR_REQUEST`, `OPERATION_BATCH`, `REPAIR_REJECTED`), SyncEngine subsystem interfaces (`IAntiEntropyManager`), and transport adapter binding.
+- `docs/PHASE7_4_IMPLEMENTATION_ROADMAP.md`: Five-stage staged delivery plan (M1–M5), file-by-file changes, verification gates, and non-regression safeguards.
+- `docs/PHASE7_4_ACCEPTANCE_CRITERIA.md`: Seven levels of state agreement, 10 mandatory acceptance criteria (AC-1–AC-10), performance thresholds, and test verification matrix.
+- `docs/PHASE7_4_RISK_REGISTER.md`: Risk inventory (amplification storms, silent forks, stale replay, memory bloat, churn, buffer starvation), trigger conditions, automated mitigations, and telemetry counters.
+
 Use the consistency review and interface contracts as cross-module references; module LLDs provide task-specific detail.
