@@ -51,11 +51,16 @@ export { BaselineSyncEngine } from './baseline-sync-engine.js';
 export {
   LeaderlessSyncEngine,
   createEpochTransitionCapability,
+  createTransportRegistrationCapability,
+  createSupplierContextRegistrationCapability,
   createAuthenticatedSupplierContext,
+  TrustedTransportAdapter,
 } from './engine/leaderless-sync-engine.js';
 export type {
   LeaderlessSyncEngineConfig,
   EpochTransitionCapability,
+  TransportRegistrationCapability,
+  SupplierContextRegistrationCapability,
   AuthenticatedSupplierContext,
 } from './engine/leaderless-sync-engine.js';
 

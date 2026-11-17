@@ -21,8 +21,10 @@ import { describe, it, expect, beforeEach } from 'vitest';
 import {
   LeaderlessSyncEngine,
   createEpochTransitionCapability,
+  createTransportRegistrationCapability,
   createAuthenticatedSupplierContext,
   type EpochTransitionCapability,
+  type TransportRegistrationCapability,
   type AuthenticatedSupplierContext,
 } from '../index.js';
 import type { OperationBatchPayload } from '@syncplay/protocol';
@@ -30,6 +32,7 @@ import type { OperationBatchPayload } from '@syncplay/protocol';
 describe('Phase 7.3-R5-G: Final Supplier Authorization Closure', () => {
   let engine: LeaderlessSyncEngine;
   let coordinatorCap: EpochTransitionCapability;
+  let transportCap: TransportRegistrationCapability;
 
   beforeEach(() => {
     coordinatorCap = createEpochTransitionCapability(
@@ -37,11 +40,17 @@ describe('Phase 7.3-R5-G: Final Supplier Authorization Closure', () => {
       'session-r5g',
       'secret-r5g-coord',
     );
+    transportCap = createTransportRegistrationCapability(
+      'transport-adapter',
+      'session-r5g',
+      'secret-r5g-transport',
+    );
     engine = new LeaderlessSyncEngine({
       sessionId: 'session-r5g',
       localPeerId: 'peer-local',
       clock: { now: () => 1000 },
       epochCapability: coordinatorCap,
+      transportCapability: transportCap,
     });
   });
 
@@ -79,7 +88,7 @@ describe('Phase 7.3-R5-G: Final Supplier Authorization Closure', () => {
       // Note: 'peer-unknown' was NEVER registered via authorizePeerGeneration.
       // In R5, this would have fallen back to ?? 1 and been accepted.
       const batch = makeSampleBatch('peer-unknown', 'peer-A', 1, 1);
-      const transportCtx = engine.registerInboundSupplierContext('peer-unknown', 1);
+      const transportCtx = engine.registerInboundSupplierContext('peer-unknown', 1, transportCap);
 
       const decisions = engine.ingestRepairBatch(batch, transportCtx);
 
@@ -94,7 +103,7 @@ describe('Phase 7.3-R5-G: Final Supplier Authorization Closure', () => {
       // Test generations 2, 5, 100
       for (const gen of [2, 5, 100]) {
         const batch = makeSampleBatch('peer-ghost', 'peer-A', 1, 1);
-        const transportCtx = engine.registerInboundSupplierContext('peer-ghost', gen);
+        const transportCtx = engine.registerInboundSupplierContext('peer-ghost', gen, transportCap);
 
         const decisions = engine.ingestRepairBatch(batch, transportCtx);
 
@@ -110,7 +119,7 @@ describe('Phase 7.3-R5-G: Final Supplier Authorization Closure', () => {
       engine.authorizePeerGeneration('peer-authorized-supplier', 3);
 
       const batch = makeSampleBatch('peer-authorized-supplier', 'peer-A', 1, 1);
-      const transportCtx = engine.registerInboundSupplierContext('peer-authorized-supplier', 3);
+      const transportCtx = engine.registerInboundSupplierContext('peer-authorized-supplier', 3, transportCap);
 
       const decisions = engine.ingestRepairBatch(batch, transportCtx);
 
@@ -127,7 +136,7 @@ describe('Phase 7.3-R5-G: Final Supplier Authorization Closure', () => {
 
       const batch = makeSampleBatch('peer-authorized-supplier', 'peer-A', 1, 1);
       // Transport context reports stale generation 2
-      const transportCtx = engine.registerInboundSupplierContext('peer-authorized-supplier', 2);
+      const transportCtx = engine.registerInboundSupplierContext('peer-authorized-supplier', 2, transportCap);
 
       const decisions = engine.ingestRepairBatch(batch, transportCtx);
 
@@ -146,7 +155,7 @@ describe('Phase 7.3-R5-G: Final Supplier Authorization Closure', () => {
 
       const batch = makeSampleBatch('peer-authorized-supplier', 'peer-A', 1, 1);
       // Transport context claims future unannounced generation 4
-      const transportCtx = engine.registerInboundSupplierContext('peer-authorized-supplier', 4);
+      const transportCtx = engine.registerInboundSupplierContext('peer-authorized-supplier', 4, transportCap);
 
       const decisions = engine.ingestRepairBatch(batch, transportCtx);
 
@@ -170,7 +179,7 @@ describe('Phase 7.3-R5-G: Final Supplier Authorization Closure', () => {
       const initialPlaybackState = { ...engine.getState() };
 
       const batch = makeSampleBatch('peer-unauthorized-rogue', 'peer-A', 1, 1);
-      const transportCtx = engine.registerInboundSupplierContext('peer-unauthorized-rogue', 1);
+      const transportCtx = engine.registerInboundSupplierContext('peer-unauthorized-rogue', 1, transportCap);
 
       const decisions = engine.ingestRepairBatch(batch, transportCtx);
       expect(decisions[0]!.accepted).toBe(false);
@@ -216,7 +225,7 @@ describe('Phase 7.3-R5-G: Final Supplier Authorization Closure', () => {
       const batch = makeSampleBatch('peer-S', 'peer-A', 1, 1);
 
       // Genuine transport context created
-      const genuineContext = engine.registerInboundSupplierContext('peer-S', 1);
+      const genuineContext = engine.registerInboundSupplierContext('peer-S', 1, transportCap);
 
       // Untrusted caller shallow-clones the genuine context
       const clonedContext = { ...genuineContext };
@@ -237,7 +246,7 @@ describe('Phase 7.3-R5-G: Final Supplier Authorization Closure', () => {
       const batch = makeSampleBatch('peer-S', 'peer-A', 1, 1);
 
       // Created via genuine engine / transport adapter registration
-      const genuineContext = createAuthenticatedSupplierContext(engine, 'peer-S', 1);
+      const genuineContext = createAuthenticatedSupplierContext(engine, 'peer-S', 1, transportCap);
 
       const decisions = engine.ingestRepairBatch(batch, genuineContext);
 
@@ -256,7 +265,7 @@ describe('Phase 7.3-R5-G: Final Supplier Authorization Closure', () => {
       const batch = makeSampleBatch('peer-attacker', 'peer-A', 1, 1);
 
       // Authenticated transport metadata confirms physical channel is 'peer-S'
-      const genuineContext = engine.registerInboundSupplierContext('peer-S', 1);
+      const genuineContext = engine.registerInboundSupplierContext('peer-S', 1, transportCap);
 
       const decisions = engine.ingestRepairBatch(batch, genuineContext);
 
@@ -276,7 +285,7 @@ describe('Phase 7.3-R5-G: Final Supplier Authorization Closure', () => {
       engine.authorizePeerGeneration('peer-S', 7);
 
       const batch = makeSampleBatch('peer-S', 'peer-A', 1, 1);
-      const genuineContext = engine.registerInboundSupplierContext('peer-S', 7);
+      const genuineContext = engine.registerInboundSupplierContext('peer-S', 7, transportCap);
 
       const decisions = engine.ingestRepairBatch(batch, genuineContext);
 
@@ -290,3 +299,4 @@ describe('Phase 7.3-R5-G: Final Supplier Authorization Closure', () => {
     });
   });
 });
+

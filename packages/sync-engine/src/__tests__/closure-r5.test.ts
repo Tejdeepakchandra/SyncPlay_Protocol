@@ -11,10 +11,12 @@ import { describe, it, expect, beforeEach } from 'vitest';
 import {
   LeaderlessSyncEngine,
   createEpochTransitionCapability,
+  createTransportRegistrationCapability,
   canonicalizeJson,
   sha256,
   computeOperationFingerprint,
   type EpochTransitionCapability,
+  type TransportRegistrationCapability,
   type AuthenticatedSupplierContext,
 } from '../index.js';
 import { SyncEngineError } from '../errors.js';
@@ -57,6 +59,7 @@ function makeRemoteEvent(
 describe('Phase 7.3-R5: Final Authorization & Canonicalization Closure', () => {
   let engine: LeaderlessSyncEngine;
   let coordinatorCapability: EpochTransitionCapability;
+  let transportCapability: TransportRegistrationCapability;
   let simulatedTime: number;
 
   beforeEach(() => {
@@ -67,6 +70,11 @@ describe('Phase 7.3-R5: Final Authorization & Canonicalization Closure', () => {
       'test-session',
       'coordinator-secret-key-999',
     );
+    transportCapability = createTransportRegistrationCapability(
+      'transport-adapter',
+      'test-session',
+      'transport-secret-key-999',
+    );
 
     // Injects capability at trusted engine creation time
     engine = new LeaderlessSyncEngine({
@@ -74,6 +82,7 @@ describe('Phase 7.3-R5: Final Authorization & Canonicalization Closure', () => {
       localPeerId: 'peer-coordinator',
       clock: { now: () => simulatedTime },
       epochCapability: coordinatorCapability,
+      transportCapability,
     });
   });
 
@@ -351,7 +360,11 @@ describe('Phase 7.3-R5: Final Authorization & Canonicalization Closure', () => {
         ],
       };
 
-      const transportContext = engine.registerInboundSupplierContext('peer-S', 2);
+      const transportContext = engine.registerInboundSupplierContext(
+        'peer-S',
+        2,
+        transportCapability,
+      );
 
       const decisions = engine.ingestRepairBatch(batch, transportContext);
       expect(decisions).toHaveLength(1);
@@ -386,7 +399,11 @@ describe('Phase 7.3-R5: Final Authorization & Canonicalization Closure', () => {
       };
 
       // Authenticated transport layer identified sender as peer-attacker
-      const transportContext = engine.registerInboundSupplierContext('peer-attacker', 1);
+      const transportContext = engine.registerInboundSupplierContext(
+        'peer-attacker',
+        1,
+        transportCapability,
+      );
 
       const decisions = engine.ingestRepairBatch(batch, transportContext);
       expect(decisions).toHaveLength(1);
@@ -418,7 +435,11 @@ describe('Phase 7.3-R5: Final Authorization & Canonicalization Closure', () => {
         ],
       };
 
-      const transportContext = engine.registerInboundSupplierContext('peer-S', 2); // Claims gen 2, but authorized is 1
+      const transportContext = engine.registerInboundSupplierContext(
+        'peer-S',
+        2,
+        transportCapability,
+      ); // Claims gen 2, but authorized is 1
 
       const decisions = engine.ingestRepairBatch(batch, transportContext);
       expect(decisions).toHaveLength(1);
@@ -450,7 +471,11 @@ describe('Phase 7.3-R5: Final Authorization & Canonicalization Closure', () => {
         ],
       };
 
-      const transportContext = engine.registerInboundSupplierContext('peer-S', 2); // Claims stale gen 2, active is 3
+      const transportContext = engine.registerInboundSupplierContext(
+        'peer-S',
+        2,
+        transportCapability,
+      ); // Claims stale gen 2, active is 3
 
       const decisions = engine.ingestRepairBatch(batch, transportContext);
       expect(decisions).toHaveLength(1);
@@ -485,7 +510,11 @@ describe('Phase 7.3-R5: Final Authorization & Canonicalization Closure', () => {
         ],
       };
 
-      const transportContext = engine.registerInboundSupplierContext('peer-S', 2);
+      const transportContext = engine.registerInboundSupplierContext(
+        'peer-S',
+        2,
+        transportCapability,
+      );
 
       // Supplier gen 2 is validated; author Peer A's generation 4 is NOT compared
       const decisions = engine.ingestRepairBatch(batch, transportContext);
@@ -529,7 +558,11 @@ describe('Phase 7.3-R5: Final Authorization & Canonicalization Closure', () => {
         ],
       };
 
-      const transportContext = engine.registerInboundSupplierContext('peer-S', 1);
+      const transportContext = engine.registerInboundSupplierContext(
+        'peer-S',
+        1,
+        transportCapability,
+      );
 
       const decisions = engine.ingestRepairBatch(batch, transportContext);
       expect(decisions).toHaveLength(2);
@@ -545,7 +578,11 @@ describe('Phase 7.3-R5: Final Authorization & Canonicalization Closure', () => {
     it('rejects supplier attempt to alter operation content with REJECTED_IDENTITY_CONFLICT', () => {
       engine.authorizePeerGeneration('peer-S', 1);
 
-      const transportContext = engine.registerInboundSupplierContext('peer-S', 1);
+      const transportContext = engine.registerInboundSupplierContext(
+        'peer-S',
+        1,
+        transportCapability,
+      );
 
       // 1. Initial op applied
       const originalBatch: OperationBatchPayload = {
@@ -753,7 +790,11 @@ describe('Phase 7.3-R5: Final Authorization & Canonicalization Closure', () => {
         ],
       };
 
-      const transportContext = engine.registerInboundSupplierContext('peer-S', 5);
+      const transportContext = engine.registerInboundSupplierContext(
+        'peer-S',
+        5,
+        transportCapability,
+      );
 
       const decisions = engine.ingestRepairBatch(batch, transportContext);
       expect(decisions).toHaveLength(1);

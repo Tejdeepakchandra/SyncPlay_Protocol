@@ -11,10 +11,12 @@ import { describe, it, expect, beforeEach } from 'vitest';
 import {
   LeaderlessSyncEngine,
   createEpochTransitionCapability,
+  createTransportRegistrationCapability,
   canonicalizeJson,
   sha256,
   computeOperationFingerprint,
   type EpochTransitionCapability,
+  type TransportRegistrationCapability,
 } from '../index.js';
 import { SyncEngineError } from '../errors.js';
 import type { AnyControlSyncEvent } from '@syncplay/control-events';
@@ -57,6 +59,7 @@ describe('Phase 7.3-R4: Final Trust-Boundary Verification', () => {
   let engine: LeaderlessSyncEngine;
   let simulatedTime: number;
   let epochCapability: EpochTransitionCapability;
+  let transportCapability: TransportRegistrationCapability;
 
   beforeEach(() => {
     simulatedTime = 1000;
@@ -65,11 +68,17 @@ describe('Phase 7.3-R4: Final Trust-Boundary Verification', () => {
       'test-session',
       'coordinator-secret-token-12345',
     );
+    transportCapability = createTransportRegistrationCapability(
+      'peer-local',
+      'test-session',
+      'transport-secret-token-12345',
+    );
     engine = new LeaderlessSyncEngine({
       sessionId: 'test-session',
       localPeerId: 'peer-local',
       clock: { now: () => simulatedTime },
       epochCapability,
+      transportCapability,
     });
   });
 
@@ -102,7 +111,7 @@ describe('Phase 7.3-R4: Final Trust-Boundary Verification', () => {
 
       const decisions = engine.ingestRepairBatch(
         batch,
-        engine.registerInboundSupplierContext('peer-S', 2),
+        engine.registerInboundSupplierContext('peer-S', 2, transportCapability),
       );
       expect(decisions).toHaveLength(1);
       expect(decisions[0]!.accepted).toBe(true);
@@ -137,7 +146,7 @@ describe('Phase 7.3-R4: Final Trust-Boundary Verification', () => {
       // Supplier claims stale generation 2
       const decisions = engine.ingestRepairBatch(
         batch,
-        engine.registerInboundSupplierContext('peer-S', 2),
+        engine.registerInboundSupplierContext('peer-S', 2, transportCapability),
       );
       expect(decisions).toHaveLength(1);
       expect(decisions[0]!.accepted).toBe(false);
@@ -173,7 +182,7 @@ describe('Phase 7.3-R4: Final Trust-Boundary Verification', () => {
       // Supplier claims unannounced generation 2
       const decisions = engine.ingestRepairBatch(
         batch,
-        engine.registerInboundSupplierContext('peer-S', 2),
+        engine.registerInboundSupplierContext('peer-S', 2, transportCapability),
       );
       expect(decisions).toHaveLength(1);
       expect(decisions[0]!.accepted).toBe(false);
@@ -210,7 +219,7 @@ describe('Phase 7.3-R4: Final Trust-Boundary Verification', () => {
       // Supplier generation 2 is validated; author Peer A's current generation 3 is NOT compared
       const decisions = engine.ingestRepairBatch(
         batch,
-        engine.registerInboundSupplierContext('peer-S', 2),
+        engine.registerInboundSupplierContext('peer-S', 2, transportCapability),
       );
       expect(decisions).toHaveLength(1);
       expect(decisions[0]!.accepted).toBe(true);
@@ -242,7 +251,7 @@ describe('Phase 7.3-R4: Final Trust-Boundary Verification', () => {
 
       engine.ingestRepairBatch(
         batch,
-        engine.registerInboundSupplierContext('peer-S', 1),
+        engine.registerInboundSupplierContext('peer-S', 1, transportCapability),
       );
 
       // Replication vector tracks origin 'peer-A', NOT supplier 'peer-S'
@@ -285,7 +294,7 @@ describe('Phase 7.3-R4: Final Trust-Boundary Verification', () => {
 
       const decisions = engine.ingestRepairBatch(
         batch,
-        engine.registerInboundSupplierContext('peer-S', 1),
+        engine.registerInboundSupplierContext('peer-S', 1, transportCapability),
       );
       expect(decisions).toHaveLength(2);
       expect(decisions[0]!.accepted).toBe(true);
@@ -322,7 +331,7 @@ describe('Phase 7.3-R4: Final Trust-Boundary Verification', () => {
       };
       const d1 = engine.ingestRepairBatch(
         opOriginal,
-        engine.registerInboundSupplierContext('peer-S', 1),
+        engine.registerInboundSupplierContext('peer-S', 1, transportCapability),
       );
       expect(d1[0]!.accepted).toBe(true);
 
@@ -347,7 +356,7 @@ describe('Phase 7.3-R4: Final Trust-Boundary Verification', () => {
       };
       const d2 = engine.ingestRepairBatch(
         opTampered,
-        engine.registerInboundSupplierContext('peer-S', 1),
+        engine.registerInboundSupplierContext('peer-S', 1, transportCapability),
       );
       expect(d2[0]!.accepted).toBe(false);
       expect(d2[0]!.code).toBe('REJECTED_IDENTITY_CONFLICT');

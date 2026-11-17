@@ -14,7 +14,9 @@ import type { AnyControlSyncEvent } from '@syncplay/control-events';
 import {
   LeaderlessSyncEngine,
   createEpochTransitionCapability,
+  createTransportRegistrationCapability,
   type EpochTransitionCapability,
+  type TransportRegistrationCapability,
 } from '../engine/leaderless-sync-engine.js';
 import { OrderedOperationLog } from '../log/ordered-operation-log.js';
 import { PendingDependencyQueue } from '../log/pending-dependency-queue.js';
@@ -121,14 +123,17 @@ function makeStoredOp(
 describe('Phase 7.3-R3 Final Identity & Authorization Audit', () => {
   let engine: LeaderlessSyncEngine;
   let epochCapability: EpochTransitionCapability;
+  let transportCapability: TransportRegistrationCapability;
 
   beforeEach(() => {
     epochCapability = createEpochTransitionCapability('peer-local', 'session-001');
+    transportCapability = createTransportRegistrationCapability('peer-local', 'session-001');
     engine = new LeaderlessSyncEngine({
       sessionId: 'session-001',
       localPeerId: 'peer-local',
       clock: { now: () => 1000 },
       epochCapability,
+      transportCapability,
     });
   });
 
@@ -557,6 +562,7 @@ describe('Phase 7.3-R3 Final Identity & Authorization Audit', () => {
       const transportContext = engine.registerInboundSupplierContext(
         (batchPayload as any).supplierPeerId,
         4,
+        transportCapability,
       );
       const decisions = engine.ingestRepairBatch(batchPayload as any, transportContext);
 

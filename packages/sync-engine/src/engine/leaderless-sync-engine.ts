@@ -79,21 +79,92 @@ export interface AuthenticatedSupplierContext {
   readonly connectionGeneration?: number;
 }
 
+export interface TransportRegistrationCapability {
+  readonly authority: string;
+  readonly sessionId: string;
+  readonly token: string;
+}
+
+/**
+ * Creates an authorized TransportRegistrationCapability for trusted transport adapter initialization.
+ */
+export function createTransportRegistrationCapability(
+  authority: string,
+  sessionId: string,
+  token?: string,
+): TransportRegistrationCapability {
+  return Object.freeze({
+    authority,
+    sessionId,
+    token:
+      token ??
+      `transport-cap-${sessionId}-${Math.random().toString(36).slice(2)}-${Date.now()}`,
+  });
+}
+
+export type SupplierContextRegistrationCapability = TransportRegistrationCapability;
+export const createSupplierContextRegistrationCapability = createTransportRegistrationCapability;
+
 /**
  * Creates an authenticated supplier transport context registered with the target engine.
+ * Requires the authorized TransportRegistrationCapability held by the trusted transport adapter.
  */
 export function createAuthenticatedSupplierContext(
   engine: LeaderlessSyncEngine,
   supplierPeerId: string,
   connectionGeneration: number,
+  capability: TransportRegistrationCapability,
 ): AuthenticatedSupplierContext {
-  return engine.registerInboundSupplierContext(supplierPeerId, connectionGeneration);
+  return engine.registerInboundSupplierContext(supplierPeerId, connectionGeneration, capability);
+}
+
+/**
+ * Trusted transport adapter that wraps the engine and holds the transport registration capability.
+ * Created by the composition root and provided to transport drivers (PeerMesh, ControlEventService).
+ */
+export class TrustedTransportAdapter {
+  constructor(
+    private readonly engine: LeaderlessSyncEngine,
+    private readonly capability: TransportRegistrationCapability,
+  ) {
+    if (!engine) {
+      throw new SyncEngineError('INVALID_ARGUMENT', 'TrustedTransportAdapter requires an engine instance');
+    }
+    if (!capability) {
+      throw new SyncEngineError(
+        'INVALID_ARGUMENT',
+        'TrustedTransportAdapter requires an authorized TransportRegistrationCapability',
+      );
+    }
+  }
+
+  public registerContext(
+    supplierPeerId: string,
+    connectionGeneration: number,
+  ): AuthenticatedSupplierContext {
+    return this.engine.registerInboundSupplierContext(
+      supplierPeerId,
+      connectionGeneration,
+      this.capability,
+    );
+  }
+
+  public ingestRepairBatch(
+    batch: OperationBatchPayload,
+    supplierPeerId: string,
+    connectionGeneration: number,
+  ): EngineDecision[] {
+    const context = this.registerContext(supplierPeerId, connectionGeneration);
+    return this.engine.ingestRepairBatch(batch, context);
+  }
 }
 
 export interface LeaderlessSyncEngineConfig extends SyncEngineConfig {
   readonly initialClock?: number;
   readonly logCapacity?: number;
   readonly epochCapability?: EpochTransitionCapability;
+  readonly transportCapability?: TransportRegistrationCapability;
+  readonly supplierCapability?: TransportRegistrationCapability;
 }
 
 export class LeaderlessSyncEngine implements SyncEngine {
@@ -116,6 +187,7 @@ export class LeaderlessSyncEngine implements SyncEngine {
   private readonly replicationVector: Record<string, number> = {};
   private readonly peerGenerations = new Map<string, number>();
   private readonly authorizedEpochCapability?: EpochTransitionCapability;
+  private readonly authorizedTransportCapability?: TransportRegistrationCapability;
   private readonly validSupplierContexts = new WeakSet<AuthenticatedSupplierContext>();
   private localOriginSequence = 0;
   private currentEpoch = 1;
@@ -158,6 +230,11 @@ export class LeaderlessSyncEngine implements SyncEngine {
 
     this.authorizedEpochCapability = config.epochCapability
       ? Object.freeze(config.epochCapability)
+      : undefined;
+
+    const transportCap = config.transportCapability ?? config.supplierCapability;
+    this.authorizedTransportCapability = transportCap
+      ? Object.freeze(transportCap)
       : undefined;
 
     const logCapacity = config.logCapacity ?? 256;
@@ -274,13 +351,25 @@ export class LeaderlessSyncEngine implements SyncEngine {
 
   /**
    * Registers an authenticated supplier transport context from the trusted transport adapter (ControlEventService / PeerMesh).
+   * Requires the exact authorized TransportRegistrationCapability injected at engine construction.
    * Contexts registered here are branded and retained in a private WeakSet to ensure unforgeable provenance.
-   * Plain objects constructed by arbitrary application callers without registration are rejected.
+   * Plain objects constructed by arbitrary application callers without registration or without the capability are rejected.
    */
   public registerInboundSupplierContext(
     supplierPeerId: string,
     connectionGeneration: number,
+    capability: TransportRegistrationCapability,
   ): AuthenticatedSupplierContext {
+    if (
+      !this.authorizedTransportCapability ||
+      !capability ||
+      capability !== this.authorizedTransportCapability
+    ) {
+      throw new SyncEngineError(
+        'UNAUTHORIZED',
+        'Supplier context registration requires authorized TransportRegistrationCapability',
+      );
+    }
     if (!supplierPeerId || typeof supplierPeerId !== 'string') {
       throw new SyncEngineError('INVALID_ARGUMENT', 'supplierPeerId must be non-empty string');
     }

@@ -10,7 +10,11 @@
  */
 
 import { describe, it, expect, beforeEach } from 'vitest';
-import { LeaderlessSyncEngine } from '../engine/leaderless-sync-engine.js';
+import {
+  LeaderlessSyncEngine,
+  createTransportRegistrationCapability,
+  type TransportRegistrationCapability,
+} from '../index.js';
 import { PROTOCOL_VERSION } from '@syncplay/protocol';
 import type { AnyControlSyncEvent } from '@syncplay/control-events';
 import type { PlaybackState } from '../types.js';
@@ -264,12 +268,15 @@ describe('Phase 7.3 Deterministic Simulation Test Suite', () => {
   // ── Suite B: Causal Dependency Handling & Buffering ───────────
   describe('Suite B: Causal Dependency Handling', () => {
     let peerC: LeaderlessSyncEngine;
+    let peerCTransportCap: TransportRegistrationCapability;
 
     beforeEach(() => {
+      peerCTransportCap = createTransportRegistrationCapability('peer-C', 'test-session');
       peerC = new LeaderlessSyncEngine({
         sessionId: 'test-session',
         localPeerId: 'peer-C',
         clock: { now: () => 1000 },
+        transportCapability: peerCTransportCap,
       });
 
       // Peer C initializes with A: 9 and B: 5 (missing A: 10)
@@ -346,6 +353,7 @@ describe('Phase 7.3 Deterministic Simulation Test Suite', () => {
       const transportContext = peerC.registerInboundSupplierContext(
         repairBatch.supplierPeerId,
         1,
+        peerCTransportCap,
       );
       peerC.ingestRepairBatch(repairBatch, transportContext);
 
