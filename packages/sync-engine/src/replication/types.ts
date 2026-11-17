@@ -185,6 +185,7 @@ export interface InFlightRepairRequest {
   readonly requestId: string;
   readonly sessionId: string;
   readonly supplierPeerId: string;
+  readonly supplierConnectionGeneration: number;
   readonly originPeerId: string;
   readonly fromSequence: number;
   readonly toSequence: number;
@@ -300,20 +301,26 @@ export interface IAntiEntropyManager {
   /** Serves an inbound REPAIR_REQUEST from local log history (M4). */
   serveRepairRequest(request: RepairRequestPayload): OperationBatchPayload | RepairRejectedPayload;
 
-  /** Processes an inbound OPERATION_BATCH fulfilling an active repair request (M3). */
+  /** Processes an inbound OPERATION_BATCH fulfilling an active repair request (M3). Requires genuine AuthenticatedSupplierContext. */
   handleRepairBatch(
     batch: OperationBatchPayload,
-    context?: AuthenticatedSupplierContext,
+    context: AuthenticatedSupplierContext,
   ): EngineDecision[];
 
-  /** Processes an inbound REPAIR_REJECTED response handling failover/backoff (M3). */
-  handleRepairRejected(rejection: RepairRejectedPayload): void;
+  /** Processes an inbound REPAIR_REJECTED response handling failover/backoff (M3). Requires genuine AuthenticatedSupplierContext. */
+  handleRepairRejected(
+    rejection: RepairRejectedPayload,
+    context: AuthenticatedSupplierContext,
+  ): void;
 
   /** Schedules targeted repair requests for all currently detected sequence gaps (M3). */
   reconcileGaps(): void;
 
   /** Cancels active repair requests to a departing peer. */
   onPeerDisconnected(peerId: string): void;
+
+  /** Invalidates and fails over in-flight requests bound to an obsolete supplier connection generation. */
+  onPeerGenerationChanged?(peerId: string, newGeneration: number): void;
 
   /** Resets state upon membership epoch transition. */
   onEpochTransition(newEpoch: number): void;

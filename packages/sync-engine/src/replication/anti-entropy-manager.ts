@@ -92,6 +92,11 @@ export class AntiEntropyManager implements IAntiEntropyManager {
     this.tokens = this.rateLimitBurst;
     this.lastTokenRefillAt = this.clock.now();
 
+    // Auto-listen to peer generation changes on the engine
+    this.engine.onPeerGenerationChange?.((peerId, newGen) => {
+      this.onPeerGenerationChanged(peerId, newGen);
+    });
+
     // Start background periodic digest exchange timer
     this.scheduleNextPeriodicTick();
   }
@@ -222,10 +227,11 @@ export class AntiEntropyManager implements IAntiEntropyManager {
 
   /**
    * Processes inbound OPERATION_BATCH fulfilling an active repair request (M3).
+   * Requires genuine AuthenticatedSupplierContext.
    */
   public handleRepairBatch(
     batch: OperationBatchPayload,
-    context?: AuthenticatedSupplierContext,
+    context: AuthenticatedSupplierContext,
   ): EngineDecision[] {
     if (this.disposed) {
       throw new SyncEngineError('DISPOSED', 'Cannot handle repair batch on disposed manager');
@@ -235,10 +241,22 @@ export class AntiEntropyManager implements IAntiEntropyManager {
 
   /**
    * Processes an inbound REPAIR_REJECTED response handling failover/backoff (M3).
+   * Requires genuine AuthenticatedSupplierContext.
    */
-  public handleRepairRejected(rejection: RepairRejectedPayload): void {
+  public handleRepairRejected(
+    rejection: RepairRejectedPayload,
+    context: AuthenticatedSupplierContext,
+  ): void {
     if (this.disposed) return;
-    this.pipeline.handleRepairRejected(rejection);
+    this.pipeline.handleRepairRejected(rejection, context);
+  }
+
+  /**
+   * Invalidates and fails over in-flight requests bound to an obsolete supplier connection generation.
+   */
+  public onPeerGenerationChanged(peerId: string, newGeneration: number): void {
+    if (this.disposed) return;
+    this.pipeline.onPeerGenerationChanged(peerId, newGeneration);
   }
 
   /**

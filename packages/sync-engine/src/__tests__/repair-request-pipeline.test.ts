@@ -543,7 +543,8 @@ describe('Phase 7.4 Milestone M3 — Repair Request Pipeline', () => {
         retainedHorizonSequence: 10,
       };
 
-      pipeline.handleRepairRejected(rejection);
+      const supplierCtx = engine.registerInboundSupplierContext(firstSupplier, 1, transportCap);
+      pipeline.handleRepairRejected(rejection, supplierCtx);
 
       // Immediate failover to S2
       expect(sentRequests.length).toBe(2);
@@ -580,7 +581,8 @@ describe('Phase 7.4 Milestone M3 — Repair Request Pipeline', () => {
         retainedHorizonSequence: 15,
       };
 
-      pipeline.handleRepairRejected(rejection);
+      const supplierCtx = engine.registerInboundSupplierContext('peer-S1', 1, transportCap);
+      pipeline.handleRepairRejected(rejection, supplierCtx);
 
       expect(pipeline.getStatus().degraded).toBe(true);
       expect(pipeline.getStatus().degradedReason).toBe('HISTORY_HORIZON_EXCEEDED');
@@ -623,6 +625,7 @@ describe('Phase 7.4 Milestone M3 — Repair Request Pipeline', () => {
       const reqId = sentRequests[0]!.request.requestId;
 
       // Reject with RATE_LIMITED
+      const supplierCtx = engine.registerInboundSupplierContext(sentRequests[0]!.targetPeerId, 1, transportCap);
       pipeline.handleRepairRejected({
         requestId: reqId,
         sessionId: 'test-session-1',
@@ -631,7 +634,7 @@ describe('Phase 7.4 Milestone M3 — Repair Request Pipeline', () => {
         fromSequence: 1,
         toSequence: 5,
         reason: 'RATE_LIMITED',
-      });
+      }, supplierCtx);
 
       // Awaits backoff delay (1000ms)
       clock.advanceTime(1000);
@@ -1133,7 +1136,8 @@ describe('Phase 7.4 Milestone M3 — Repair Request Pipeline', () => {
         retainedHorizonSequence: 10,
       };
 
-      pipeline.handleRepairRejected(delayedRejection);
+      const delayedContext = engine.registerInboundSupplierContext('peer-S1', 1, transportCap);
+      pipeline.handleRepairRejected(delayedRejection, delayedContext);
 
       // Must be dropped immediately: no retry dispatched, no failover in new epoch
       expect(sentRequests.length).toBe(1); // Still only the initial request from epoch 1
@@ -1313,17 +1317,14 @@ describe('Phase 7.4 Milestone M3 — Repair Request Pipeline', () => {
       expect(d1[0]!.message).toContain('does not match requested supplier');
 
       // Now test context with mismatched connection generation
-      const staleContextS1 = {
-        supplierPeerId: 'peer-S1',
-        connectionGeneration: 999, // Stale generation
-      };
+      const staleContextS1 = engine.registerInboundSupplierContext('peer-S1', 999, transportCap);
       const batchFromS1 = makeSampleBatch(reqId, 'peer-S1', 'peer-author', 1, 5);
 
-      const d2 = pipeline.handleRepairBatch(batchFromS1, staleContextS1 as any);
+      const d2 = pipeline.handleRepairBatch(batchFromS1, staleContextS1);
       expect(d2.length).toBe(1);
       expect(d2[0]!.accepted).toBe(false);
       expect(d2[0]!.code).toBe('REJECTED_INVALID');
-      expect(d2[0]!.message).toContain('does not match active peer generation');
+      expect(d2[0]!.message).toContain('does not match dispatch generation 1 or active peer generation 1');
 
       pipeline.dispose();
     });
@@ -1490,6 +1491,7 @@ describe('Phase 7.4 Milestone M3 — Repair Request Pipeline', () => {
       pipeline.addGaps([{ originPeerId: 'origin-1', fromSequence: 1, toSequence: 5 }]);
 
       // Attempt 1 to S1 -> S1 rejects RATE_LIMITED
+      const ctxS1 = engine.registerInboundSupplierContext('peer-S1', 1, transportCap);
       pipeline.handleRepairRejected({
         requestId: sentRequests[0]!.request.requestId,
         sessionId: 'test-session-1',
@@ -1498,13 +1500,14 @@ describe('Phase 7.4 Milestone M3 — Repair Request Pipeline', () => {
         fromSequence: 1,
         toSequence: 5,
         reason: 'RATE_LIMITED',
-      });
+      }, ctxS1);
 
       // Backoff 1 (1000ms) -> Attempt 2 to S2
       clock.advanceTime(1000);
       expect(sentRequests.length).toBe(2);
 
       // S2 rejects BUSY
+      const ctxS2 = engine.registerInboundSupplierContext('peer-S2', 1, transportCap);
       pipeline.handleRepairRejected({
         requestId: sentRequests[1]!.request.requestId,
         sessionId: 'test-session-1',
@@ -1513,7 +1516,7 @@ describe('Phase 7.4 Milestone M3 — Repair Request Pipeline', () => {
         fromSequence: 1,
         toSequence: 5,
         reason: 'BUSY',
-      });
+      }, ctxS2);
 
       // Backoff 2 (2000ms) -> Attempt 3 to S3
       clock.advanceTime(2000);
@@ -1558,6 +1561,7 @@ describe('Phase 7.4 Milestone M3 — Repair Request Pipeline', () => {
       // Event 2: Timeout timer for reqId fires late
       clock.advanceTime(2000);
       // Event 3: A rejection for reqId arrives late
+      const ctxS1 = engine.registerInboundSupplierContext('peer-S1', 1, transportCap);
       pipeline.handleRepairRejected({
         requestId: reqId,
         sessionId: 'test-session-1',
@@ -1566,7 +1570,7 @@ describe('Phase 7.4 Milestone M3 — Repair Request Pipeline', () => {
         fromSequence: 1,
         toSequence: 5,
         reason: 'BUSY',
-      });
+      }, ctxS1);
 
       // Prove that no duplicate retries were scheduled for reqId
       expect(sentRequests.length).toBe(2);
@@ -1677,6 +1681,472 @@ describe('Phase 7.4 Milestone M3 — Repair Request Pipeline', () => {
 
       // Local engine remains unmutated
       expect(engine.replicationFrontier['peer-author']).toBeUndefined();
+
+      pipeline.dispose();
+    });
+  });
+
+  // ───────────────────────────────────────────────────────────────────────────
+  // 16. Mandatory Transport Authentication & Generation-Binding Adversarial Tests
+  // ───────────────────────────────────────────────────────────────────────────
+  describe('16. Mandatory Transport Authentication & Generation-Binding Adversarial Tests', () => {
+    it('1. Inbound OPERATION_BATCH without AuthenticatedSupplierContext is rejected before engine ingestion', () => {
+      const pipeline = new RepairRequestPipeline(engine, callbacks, {}, clock);
+      engine.setPeerGeneration('peer-S', 1);
+      pipeline.recordPeerDigestKnowledge({
+        formatVersion: 2,
+        sessionId: 'test-session-1',
+        senderPeerId: 'peer-S',
+        connectionGeneration: 1,
+        membershipEpoch: 1,
+        replicationVector: { 'peer-author': 10 },
+        snapshotFrontier: { 'peer-author': 0 },
+        historyFingerprints: { 'peer-author': 'a'.repeat(64) },
+      });
+
+      pipeline.addGaps([{ originPeerId: 'peer-author', fromSequence: 1, toSequence: 5 }]);
+      const reqId = sentRequests[0]!.request.requestId;
+      const batch = makeSampleBatch(reqId, 'peer-S', 'peer-author', 1, 5);
+
+      const decisions = pipeline.handleRepairBatch(batch, undefined as any);
+
+      expect(decisions.length).toBe(1);
+      expect(decisions[0]!.accepted).toBe(false);
+      expect(decisions[0]!.code).toBe('REJECTED_INVALID');
+      expect(decisions[0]!.message).toContain(
+        'missing or invalid authenticated supplier transport context',
+      );
+
+      // Local engine remains completely unmutated
+      expect(engine.replicationFrontier['peer-author']).toBeUndefined();
+      expect(engine.logSize).toBe(0);
+
+      pipeline.dispose();
+    });
+
+    it('2. Inbound OPERATION_BATCH with fabricated AuthenticatedSupplierContext is rejected before engine ingestion', () => {
+      const pipeline = new RepairRequestPipeline(engine, callbacks, {}, clock);
+      engine.setPeerGeneration('peer-S', 1);
+      pipeline.recordPeerDigestKnowledge({
+        formatVersion: 2,
+        sessionId: 'test-session-1',
+        senderPeerId: 'peer-S',
+        connectionGeneration: 1,
+        membershipEpoch: 1,
+        replicationVector: { 'peer-author': 10 },
+        snapshotFrontier: { 'peer-author': 0 },
+        historyFingerprints: { 'peer-author': 'a'.repeat(64) },
+      });
+
+      pipeline.addGaps([{ originPeerId: 'peer-author', fromSequence: 1, toSequence: 5 }]);
+      const reqId = sentRequests[0]!.request.requestId;
+      const batch = makeSampleBatch(reqId, 'peer-S', 'peer-author', 1, 5);
+
+      const fabricatedContext = {
+        supplierPeerId: 'peer-S',
+        connectionGeneration: 1,
+      };
+
+      const decisions = pipeline.handleRepairBatch(batch, fabricatedContext as any);
+
+      expect(decisions.length).toBe(1);
+      expect(decisions[0]!.accepted).toBe(false);
+      expect(decisions[0]!.code).toBe('REJECTED_INVALID');
+      expect(decisions[0]!.message).toContain(
+        'missing or invalid authenticated supplier transport context',
+      );
+
+      // Local engine remains completely unmutated
+      expect(engine.replicationFrontier['peer-author']).toBeUndefined();
+      expect(engine.logSize).toBe(0);
+
+      pipeline.dispose();
+    });
+
+    it('3. Inbound REPAIR_REJECTED without AuthenticatedSupplierContext is ignored and dropped', () => {
+      const pipeline = new RepairRequestPipeline(engine, callbacks, {}, clock);
+      engine.setPeerGeneration('peer-S1', 1);
+      engine.setPeerGeneration('peer-S2', 1);
+      pipeline.recordPeerDigestKnowledge({
+        formatVersion: 2,
+        sessionId: 'test-session-1',
+        senderPeerId: 'peer-S1',
+        connectionGeneration: 1,
+        membershipEpoch: 1,
+        replicationVector: { 'peer-author': 10 },
+        snapshotFrontier: { 'peer-author': 0 },
+        historyFingerprints: { 'peer-author': 'a'.repeat(64) },
+      });
+      pipeline.recordPeerDigestKnowledge({
+        formatVersion: 2,
+        sessionId: 'test-session-1',
+        senderPeerId: 'peer-S2',
+        connectionGeneration: 1,
+        membershipEpoch: 1,
+        replicationVector: { 'peer-author': 10 },
+        snapshotFrontier: { 'peer-author': 0 },
+        historyFingerprints: { 'peer-author': 'b'.repeat(64) },
+      });
+
+      pipeline.addGaps([{ originPeerId: 'peer-author', fromSequence: 1, toSequence: 5 }]);
+      const reqId = sentRequests[0]!.request.requestId;
+
+      const rejection: RepairRejectedPayload = {
+        requestId: reqId,
+        sessionId: 'test-session-1',
+        supplierPeerId: 'peer-S1',
+        targetOriginPeerId: 'peer-author',
+        fromSequence: 1,
+        toSequence: 5,
+        reason: 'OUTSIDE_HORIZON',
+        retainedHorizonSequence: 10,
+      };
+
+      // Inbound rejection with missing context
+      pipeline.handleRepairRejected(rejection, undefined as any);
+
+      // Rejection dropped: request is still active, no failover dispatched
+      expect(sentRequests.length).toBe(1);
+      expect(pipeline.getStatus().activeRequestsCount).toBe(1);
+      expect(pipeline.getStatus().degraded).toBe(false);
+
+      pipeline.dispose();
+    });
+
+    it('4. Inbound REPAIR_REJECTED with fabricated AuthenticatedSupplierContext is ignored and dropped', () => {
+      const pipeline = new RepairRequestPipeline(engine, callbacks, {}, clock);
+      engine.setPeerGeneration('peer-S1', 1);
+      engine.setPeerGeneration('peer-S2', 1);
+      pipeline.recordPeerDigestKnowledge({
+        formatVersion: 2,
+        sessionId: 'test-session-1',
+        senderPeerId: 'peer-S1',
+        connectionGeneration: 1,
+        membershipEpoch: 1,
+        replicationVector: { 'peer-author': 10 },
+        snapshotFrontier: { 'peer-author': 0 },
+        historyFingerprints: { 'peer-author': 'a'.repeat(64) },
+      });
+      pipeline.recordPeerDigestKnowledge({
+        formatVersion: 2,
+        sessionId: 'test-session-1',
+        senderPeerId: 'peer-S2',
+        connectionGeneration: 1,
+        membershipEpoch: 1,
+        replicationVector: { 'peer-author': 10 },
+        snapshotFrontier: { 'peer-author': 0 },
+        historyFingerprints: { 'peer-author': 'b'.repeat(64) },
+      });
+
+      pipeline.addGaps([{ originPeerId: 'peer-author', fromSequence: 1, toSequence: 5 }]);
+      const reqId = sentRequests[0]!.request.requestId;
+
+      const rejection: RepairRejectedPayload = {
+        requestId: reqId,
+        sessionId: 'test-session-1',
+        supplierPeerId: 'peer-S1',
+        targetOriginPeerId: 'peer-author',
+        fromSequence: 1,
+        toSequence: 5,
+        reason: 'OUTSIDE_HORIZON',
+        retainedHorizonSequence: 10,
+      };
+
+      const fabricatedContext = {
+        supplierPeerId: 'peer-S1',
+        connectionGeneration: 1,
+      };
+
+      pipeline.handleRepairRejected(rejection, fabricatedContext as any);
+
+      // Rejection dropped: request is still active, no failover dispatched
+      expect(sentRequests.length).toBe(1);
+      expect(pipeline.getStatus().activeRequestsCount).toBe(1);
+      expect(pipeline.getStatus().degraded).toBe(false);
+
+      pipeline.dispose();
+    });
+
+    it('5. REPAIR_REJECTED from peer X for request sent to peer Y is rejected and dropped', () => {
+      const pipeline = new RepairRequestPipeline(engine, callbacks, {}, clock);
+      engine.setPeerGeneration('peer-S1', 1);
+      engine.setPeerGeneration('peer-S2', 1);
+      pipeline.recordPeerDigestKnowledge({
+        formatVersion: 2,
+        sessionId: 'test-session-1',
+        senderPeerId: 'peer-S1',
+        connectionGeneration: 1,
+        membershipEpoch: 1,
+        replicationVector: { 'peer-author': 10 },
+        snapshotFrontier: { 'peer-author': 0 },
+        historyFingerprints: { 'peer-author': 'a'.repeat(64) },
+      });
+      pipeline.recordPeerDigestKnowledge({
+        formatVersion: 2,
+        sessionId: 'test-session-1',
+        senderPeerId: 'peer-S2',
+        connectionGeneration: 1,
+        membershipEpoch: 1,
+        replicationVector: { 'peer-author': 10 },
+        snapshotFrontier: { 'peer-author': 0 },
+        historyFingerprints: { 'peer-author': 'b'.repeat(64) },
+      });
+
+      pipeline.addGaps([{ originPeerId: 'peer-author', fromSequence: 1, toSequence: 5 }]);
+      const reqId = sentRequests[0]!.request.requestId;
+      const targetSupplier = sentRequests[0]!.targetPeerId;
+      const otherSupplier = targetSupplier === 'peer-S1' ? 'peer-S2' : 'peer-S1';
+
+      // Genuine context registered for peer X, but request was sent to peer Y
+      const otherCtx = engine.registerInboundSupplierContext(otherSupplier, 1, transportCap);
+      const spoofedRejection: RepairRejectedPayload = {
+        requestId: reqId,
+        sessionId: 'test-session-1',
+        supplierPeerId: otherSupplier,
+        targetOriginPeerId: 'peer-author',
+        fromSequence: 1,
+        toSequence: 5,
+        reason: 'RATE_LIMITED',
+      };
+
+      pipeline.handleRepairRejected(spoofedRejection, otherCtx);
+
+      // Dropped: request to targeted supplier remains in flight
+      expect(sentRequests.length).toBe(1);
+      expect(pipeline.getStatus().activeRequestsCount).toBe(1);
+
+      pipeline.dispose();
+    });
+
+    it('6. Request sent to peer on generation 3; peer reconnects to generation 4; response on gen 4 for gen-3 request is rejected', () => {
+      const pipeline = new RepairRequestPipeline(engine, callbacks, {}, clock);
+      engine.setPeerGeneration('peer-S', 3);
+      pipeline.recordPeerDigestKnowledge({
+        formatVersion: 2,
+        sessionId: 'test-session-1',
+        senderPeerId: 'peer-S',
+        connectionGeneration: 3,
+        membershipEpoch: 1,
+        replicationVector: { 'peer-author': 10 },
+        snapshotFrontier: { 'peer-author': 0 },
+        historyFingerprints: { 'peer-author': 'a'.repeat(64) },
+      });
+
+      pipeline.addGaps([{ originPeerId: 'peer-author', fromSequence: 1, toSequence: 5 }]);
+      const reqIdGen3 = sentRequests[0]!.request.requestId;
+
+      // Peer reconnects to generation 4
+      engine.setPeerGeneration('peer-S', 4);
+
+      // Generating context for generation 4
+      const gen4Ctx = engine.registerInboundSupplierContext('peer-S', 4, transportCap);
+
+      // Inbound response arrives with gen-4 context for the old gen-3 request
+      const staleBatch = makeSampleBatch(reqIdGen3, 'peer-S', 'peer-author', 1, 5);
+      const decisions = pipeline.handleRepairBatch(staleBatch, gen4Ctx);
+
+      expect(decisions.length).toBe(1);
+      expect(decisions[0]!.accepted).toBe(false);
+      expect(decisions[0]!.code).toBe('REJECTED_INVALID');
+      expect(decisions[0]!.message).toContain('not an active in-flight request');
+
+      // Engine remains unmutated
+      expect(engine.replicationFrontier['peer-author']).toBeUndefined();
+      expect(engine.logSize).toBe(0);
+
+      pipeline.dispose();
+    });
+
+    it('7. Response arrives with context generation differing from dispatch generation is rejected', () => {
+      const pipeline = new RepairRequestPipeline(engine, callbacks, {}, clock);
+      engine.setPeerGeneration('peer-S', 1);
+      pipeline.recordPeerDigestKnowledge({
+        formatVersion: 2,
+        sessionId: 'test-session-1',
+        senderPeerId: 'peer-S',
+        connectionGeneration: 1,
+        membershipEpoch: 1,
+        replicationVector: { 'peer-author': 10 },
+        snapshotFrontier: { 'peer-author': 0 },
+        historyFingerprints: { 'peer-author': 'a'.repeat(64) },
+      });
+
+      pipeline.addGaps([{ originPeerId: 'peer-author', fromSequence: 1, toSequence: 5 }]);
+      const reqId = sentRequests[0]!.request.requestId;
+
+      // Register context with generation 2 (dispatch was generation 1)
+      const gen2Ctx = engine.registerInboundSupplierContext('peer-S', 2, transportCap);
+      const batch = makeSampleBatch(reqId, 'peer-S', 'peer-author', 1, 5);
+
+      const decisions = pipeline.handleRepairBatch(batch, gen2Ctx);
+
+      expect(decisions.length).toBe(1);
+      expect(decisions[0]!.accepted).toBe(false);
+      expect(decisions[0]!.code).toBe('REJECTED_INVALID');
+      expect(decisions[0]!.message).toContain(
+        'does not match dispatch generation 1 or active peer generation 1',
+      );
+
+      // Local engine remains unmutated
+      expect(engine.replicationFrontier['peer-author']).toBeUndefined();
+
+      pipeline.dispose();
+    });
+
+    it('8. Response arrives with context generation differing from engine active generation is rejected', () => {
+      const pipeline = new RepairRequestPipeline(engine, callbacks, {}, clock);
+      engine.setPeerGeneration('peer-S', 1);
+      pipeline.recordPeerDigestKnowledge({
+        formatVersion: 2,
+        sessionId: 'test-session-1',
+        senderPeerId: 'peer-S',
+        connectionGeneration: 1,
+        membershipEpoch: 1,
+        replicationVector: { 'peer-author': 10 },
+        snapshotFrontier: { 'peer-author': 0 },
+        historyFingerprints: { 'peer-author': 'a'.repeat(64) },
+      });
+
+      pipeline.addGaps([{ originPeerId: 'peer-author', fromSequence: 1, toSequence: 5 }]);
+      const reqId = sentRequests[0]!.request.requestId;
+
+      // Register context with generation 1 (matches dispatch generation)
+      const gen1Ctx = engine.registerInboundSupplierContext('peer-S', 1, transportCap);
+
+      // Engine active generation transitions to 2 directly on the map (simulating state shift)
+      engine.setPeerGeneration('peer-S', 2);
+
+      const batch = makeSampleBatch(reqId, 'peer-S', 'peer-author', 1, 5);
+      const decisions = pipeline.handleRepairBatch(batch, gen1Ctx);
+
+      expect(decisions.length).toBe(1);
+      expect(decisions[0]!.accepted).toBe(false);
+      expect(decisions[0]!.code).toBe('REJECTED_INVALID');
+
+      // Local engine remains unmutated
+      expect(engine.replicationFrontier['peer-author']).toBeUndefined();
+
+      pipeline.dispose();
+    });
+
+    it('9. REPAIR_REJECTED arriving after peer reconnect with old generation is ignored', () => {
+      const pipeline = new RepairRequestPipeline(engine, callbacks, {}, clock);
+      engine.setPeerGeneration('peer-S1', 1);
+      engine.setPeerGeneration('peer-S2', 1);
+      pipeline.recordPeerDigestKnowledge({
+        formatVersion: 2,
+        sessionId: 'test-session-1',
+        senderPeerId: 'peer-S1',
+        connectionGeneration: 1,
+        membershipEpoch: 1,
+        replicationVector: { 'peer-author': 10 },
+        snapshotFrontier: { 'peer-author': 0 },
+        historyFingerprints: { 'peer-author': 'a'.repeat(64) },
+      });
+      pipeline.recordPeerDigestKnowledge({
+        formatVersion: 2,
+        sessionId: 'test-session-1',
+        senderPeerId: 'peer-S2',
+        connectionGeneration: 1,
+        membershipEpoch: 1,
+        replicationVector: { 'peer-author': 10 },
+        snapshotFrontier: { 'peer-author': 0 },
+        historyFingerprints: { 'peer-author': 'b'.repeat(64) },
+      });
+
+      pipeline.addGaps([{ originPeerId: 'peer-author', fromSequence: 1, toSequence: 5 }]);
+      const reqIdGen1 = sentRequests[0]!.request.requestId;
+      const firstSupplier = sentRequests[0]!.targetPeerId;
+
+      // Peer reconnects to generation 2
+      engine.setPeerGeneration(firstSupplier, 2);
+
+      // Old rejection arrives for gen-1 request with gen-1 context
+      const gen1Ctx = engine.registerInboundSupplierContext(firstSupplier, 1, transportCap);
+      const oldRejection: RepairRejectedPayload = {
+        requestId: reqIdGen1,
+        sessionId: 'test-session-1',
+        supplierPeerId: firstSupplier,
+        targetOriginPeerId: 'peer-author',
+        fromSequence: 1,
+        toSequence: 5,
+        reason: 'RATE_LIMITED',
+      };
+
+      pipeline.handleRepairRejected(oldRejection, gen1Ctx);
+
+      // Stale rejection was dropped without mutating retry count or triggering failover
+      expect(pipeline.getStatus().degraded).toBe(false);
+
+      pipeline.dispose();
+    });
+
+    it('10. Partial response [10, 20] for request [1, 32] preserves [1, 9] in repair queue and converges once [1, 9] arrives', () => {
+      const pipeline = new RepairRequestPipeline(engine, callbacks, {}, clock);
+      engine.setPeerGeneration('peer-S', 1);
+      pipeline.recordPeerDigestKnowledge({
+        formatVersion: 2,
+        sessionId: 'test-session-1',
+        senderPeerId: 'peer-S',
+        connectionGeneration: 1,
+        membershipEpoch: 1,
+        replicationVector: { 'peer-author': 50 },
+        snapshotFrontier: { 'peer-author': 0 },
+        historyFingerprints: { 'peer-author': 'a'.repeat(64) },
+      });
+
+      // Request 1..32
+      pipeline.addGaps([{ originPeerId: 'peer-author', fromSequence: 1, toSequence: 32 }]);
+      expect(sentRequests.length).toBe(1);
+      const reqId1 = sentRequests[0]!.request.requestId;
+      expect(sentRequests[0]!.request.fromSequence).toBe(1);
+      expect(sentRequests[0]!.request.toSequence).toBe(32);
+
+      const supplierCtx = createAuthenticatedSupplierContext(engine, 'peer-S', 1, transportCap);
+
+      // Supplier returns partial response [10..20] (missing prefix 1..9)
+      const partialBatch10_20 = makeSampleBatch(reqId1, 'peer-S', 'peer-author', 10, 20);
+      const d1 = pipeline.handleRepairBatch(partialBatch10_20, supplierCtx);
+
+      // Operations 10..20 are buffered in PendingDependencyQueue awaiting 1..9
+      expect(engine.replicationFrontier['peer-author']).toBeUndefined();
+      expect(engine.pendingQueueSize).toBe(11); // 10..20 buffered
+
+      // Crucial Safety Property: Unfulfilled prefix [1, 9] was NOT lost!
+      // Remainder was recalculated from actual replication frontier (0 + 1 = 1) up to targetEnd (32).
+      // A new request was automatically dispatched for [1..32].
+      expect(sentRequests.length).toBe(2);
+      const reqId2 = sentRequests[1]!.request.requestId;
+      expect(sentRequests[1]!.request.fromSequence).toBe(1);
+      expect(sentRequests[1]!.request.toSequence).toBe(32);
+
+      // Supplier now fulfills prefix [1..9]
+      const batch1_9 = makeSampleBatch(reqId2, 'peer-S', 'peer-author', 1, 9);
+      const d2 = pipeline.handleRepairBatch(batch1_9, supplierCtx);
+      expect(d2.every((d) => d.accepted)).toBe(true);
+
+      // Operations 1..9 admitted, which unblocked and drained buffered operations 10..20!
+      expect(engine.replicationFrontier['peer-author']).toBe(20);
+      expect(engine.pendingQueueSize).toBe(0);
+
+      // Suffix remainder [21..32] was automatically recalculated and dispatched
+      expect(sentRequests.length).toBe(3);
+      const reqId3 = sentRequests[2]!.request.requestId;
+      expect(sentRequests[2]!.request.fromSequence).toBe(21);
+      expect(sentRequests[2]!.request.toSequence).toBe(32);
+
+      // Supplier now fulfills suffix [21..32]
+      const batch21_32 = makeSampleBatch(reqId3, 'peer-S', 'peer-author', 21, 32);
+      const d3 = pipeline.handleRepairBatch(batch21_32, supplierCtx);
+      expect(d3.every((d) => d.accepted)).toBe(true);
+
+      // All 32 operations are fully applied and frontier reached 32
+      expect(engine.replicationFrontier['peer-author']).toBe(32);
+      expect(engine.logSize).toBe(32);
+      expect(pipeline.getStatus().activeRequestsCount).toBe(0);
+      expect(pipeline.getStatus().pendingGapsCount).toBe(0);
+      expect(pipeline.getStatus().totalRepairsCompleted).toBe(1);
+      expect(pipeline.getStatus().degraded).toBe(false);
 
       pipeline.dispose();
     });

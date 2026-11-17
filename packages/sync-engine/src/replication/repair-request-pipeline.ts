@@ -99,6 +99,7 @@ export class RepairRequestPipeline {
   private degraded = false;
   private degradedReason?: string;
   private disposed = false;
+  private readonly unregisterGenListener?: () => void;
 
   constructor(
     engine: LeaderlessSyncEngine,
@@ -122,6 +123,10 @@ export class RepairRequestPipeline {
     this.maxConcurrentTotal =
       options?.maxConcurrentRequestsTotal ?? MAX_CONCURRENT_REQUESTS_TOTAL;
     this.rttProvider = options?.rttProvider;
+
+    this.unregisterGenListener = this.engine.onPeerGenerationChange?.((peerId, newGen) => {
+      this.onPeerGenerationChanged(peerId, newGen);
+    });
   }
 
   public get isDisposed(): boolean {
@@ -256,22 +261,23 @@ export class RepairRequestPipeline {
   /**
    * Processes inbound OPERATION_BATCH fulfilling an active repair request.
    *
-   * STRICT CORRELATION & PRE-INGESTION VALIDATION:
-   * 1. Request ID must correlate to an active in-flight request.
-   * 2. Session ID must match the active room session and the original request.
-   * 3. Membership epoch must match current engine epoch and the original request epoch.
-   * 4. Supplier identity must match the requested supplier.
-   * 5. Context supplier identity must match the requested supplier.
-   * 6. Context connection generation must match the supplier's active authorized generation.
-   * 7. Target origin must match the requested origin.
-   * 8. Sequence range must be within the requested [fromSequence, toSequence] bounds.
+   * STRICT CORRELATION & MANDATORY AUTHENTICATED TRANSPORT CONTEXT:
+   * 1. Requires a genuine, unforgeable AuthenticatedSupplierContext registered by trusted transport.
+   * 2. Request ID must correlate to an active in-flight request.
+   * 3. Session ID must match the active room session and the original request.
+   * 4. Membership epoch must match current engine epoch and the original request epoch.
+   * 5. Supplier identity in payload must match the requested supplier.
+   * 6. Context supplier identity must match the requested supplier.
+   * 7. Context connection generation must match the request's dispatch generation AND engine's active generation.
+   * 8. Target origin must match the requested origin.
+   * 9. Sequence range must be within the requested [fromSequence, toSequence] bounds.
    *
    * Any violation is rejected with REJECTED_INVALID before engine ingestion can occur,
-   * guaranteeing that stale, cancelled, duplicate, or rogue responses cannot mutate engine state.
+   * guaranteeing that stale, cancelled, duplicate, rogue, or unauthenticated responses cannot mutate engine state.
    */
   public handleRepairBatch(
     batch: OperationBatchPayload,
-    context?: AuthenticatedSupplierContext,
+    context: AuthenticatedSupplierContext,
   ): EngineDecision[] {
     if (this.disposed) {
       throw new SyncEngineError('DISPOSED', 'Cannot handle repair batch on disposed pipeline');
@@ -279,7 +285,24 @@ export class RepairRequestPipeline {
 
     const now = this.clock.now();
 
-    // 1. Request correlation check
+    // 1. Mandatory authenticated supplier transport context check
+    if (
+      !context ||
+      typeof context !== 'object' ||
+      !this.engine.isValidSupplierContext(context)
+    ) {
+      const decision: EngineDecision = {
+        accepted: false,
+        code: 'REJECTED_INVALID',
+        stateVersion: this.engine.getState().stateVersion,
+        decidedAt: now,
+        message:
+          'Repair batch rejected: missing or invalid authenticated supplier transport context',
+      };
+      return [decision];
+    }
+
+    // 2. Request correlation check
     if (!batch.requestId || !this.inFlightRequests.has(batch.requestId)) {
       const decision: EngineDecision = {
         accepted: false,
@@ -293,7 +316,7 @@ export class RepairRequestPipeline {
 
     const inFlight = this.inFlightRequests.get(batch.requestId)!;
 
-    // 2. Session ID match
+    // 3. Session ID match
     if (batch.sessionId !== this.engine.sessionId || batch.sessionId !== inFlight.sessionId) {
       const decision: EngineDecision = {
         accepted: false,
@@ -305,7 +328,7 @@ export class RepairRequestPipeline {
       return [decision];
     }
 
-    // 3. Membership epoch match
+    // 4. Membership epoch match
     if (
       batch.membershipEpoch !== this.engine.epoch ||
       batch.membershipEpoch !== inFlight.membershipEpoch
@@ -320,7 +343,7 @@ export class RepairRequestPipeline {
       return [decision];
     }
 
-    // 4. Supplier identity match
+    // 5. Supplier identity match
     if (batch.supplierPeerId !== inFlight.supplierPeerId) {
       const decision: EngineDecision = {
         accepted: false,
@@ -332,8 +355,8 @@ export class RepairRequestPipeline {
       return [decision];
     }
 
-    // 5. Context supplier consistency check
-    if (context && context.supplierPeerId !== inFlight.supplierPeerId) {
+    // 6. Context supplier consistency check
+    if (context.supplierPeerId !== inFlight.supplierPeerId) {
       const decision: EngineDecision = {
         accepted: false,
         code: 'REJECTED_INVALID',
@@ -344,22 +367,24 @@ export class RepairRequestPipeline {
       return [decision];
     }
 
-    // 6. Context connection generation check
-    if (context && context.connectionGeneration !== undefined) {
-      const activeGen = this.engine.getPeerGeneration(inFlight.supplierPeerId);
-      if (activeGen === undefined || context.connectionGeneration !== activeGen) {
-        const decision: EngineDecision = {
-          accepted: false,
-          code: 'REJECTED_INVALID',
-          stateVersion: this.engine.getState().stateVersion,
-          decidedAt: now,
-          message: `Repair batch rejected: transport context generation ${context.connectionGeneration} does not match active peer generation ${activeGen ?? 'undefined'}`,
-        };
-        return [decision];
-      }
+    // 7. Context connection generation check (must match dispatch generation AND engine active generation)
+    const activeGen = this.engine.getPeerGeneration(inFlight.supplierPeerId);
+    if (
+      activeGen === undefined ||
+      context.connectionGeneration !== inFlight.supplierConnectionGeneration ||
+      context.connectionGeneration !== activeGen
+    ) {
+      const decision: EngineDecision = {
+        accepted: false,
+        code: 'REJECTED_INVALID',
+        stateVersion: this.engine.getState().stateVersion,
+        decidedAt: now,
+        message: `Repair batch rejected: transport context generation ${context.connectionGeneration} does not match dispatch generation ${inFlight.supplierConnectionGeneration} or active peer generation ${activeGen ?? 'undefined'}`,
+      };
+      return [decision];
     }
 
-    // 7. Target origin match
+    // 8. Target origin match
     if (batch.originPeerId !== inFlight.originPeerId) {
       const decision: EngineDecision = {
         accepted: false,
@@ -371,7 +396,7 @@ export class RepairRequestPipeline {
       return [decision];
     }
 
-    // 8. Sequence boundaries check
+    // 9. Sequence boundaries check
     if (batch.fromSequence < inFlight.fromSequence || batch.toSequence > inFlight.toSequence) {
       const decision: EngineDecision = {
         accepted: false,
@@ -409,15 +434,15 @@ export class RepairRequestPipeline {
     if (currentSeq >= targetEnd) {
       // Completed this range
       this.totalRepairsCompleted++;
-    } else if (currentSeq < inFlight.toSequence) {
-      // Partial batch fulfillment: re-enqueue the unfulfilled remainder
-      const remainderFrom = Math.max(batch.toSequence + 1, currentSeq + 1);
-      const remainderTo = inFlight.toSequence;
-      if (remainderFrom <= remainderTo) {
+    } else {
+      // Partial batch fulfillment: recalculate unfulfilled range from actual replication frontier
+      const neededStart = Math.max(inFlight.fromSequence, currentSeq + 1);
+      const neededEnd = inFlight.toSequence;
+      if (neededStart <= neededEnd) {
         this.enqueueGapSlice(
           inFlight.originPeerId,
-          remainderFrom,
-          remainderTo,
+          neededStart,
+          neededEnd,
           inFlight.supplierPeerId,
         );
       }
@@ -430,30 +455,55 @@ export class RepairRequestPipeline {
   /**
    * Handles an explicit REPAIR_REJECTED response from a supplier.
    *
-   * STRICT CORRELATION:
-   * Validates correlation against active inFlightRequests, session ID, supplier identity,
-   * target origin, and sequence range. Drops uncoordinated or obsolete rejections without
-   * triggering retries, failovers, or mutating peer knowledge.
+   * STRICT CORRELATION & MANDATORY AUTHENTICATED TRANSPORT CONTEXT:
+   * 1. Requires a genuine, unforgeable AuthenticatedSupplierContext registered by trusted transport.
+   * 2. Rejection request ID must correlate to an active in-flight request.
+   * 3. Session ID must match the active room session and the original request.
+   * 4. Supplier identity in payload must match the requested supplier.
+   * 5. Context supplier identity must match the requested supplier.
+   * 6. Context connection generation must match the request's dispatch generation AND engine's active generation.
+   * 7. Target origin and sequence range must exactly match the requested bounds.
+   *
+   * Drops uncoordinated, unauthenticated, mismatched, or obsolete rejections without
+   * triggering retries, failovers, backoff, or mutating peer knowledge.
    */
-  public handleRepairRejected(rejection: RepairRejectedPayload): void {
+  public handleRepairRejected(
+    rejection: RepairRejectedPayload,
+    context: AuthenticatedSupplierContext,
+  ): void {
     if (this.disposed) return;
 
+    // 1. Mandatory authenticated supplier transport context check
+    if (
+      !context ||
+      typeof context !== 'object' ||
+      !this.engine.isValidSupplierContext(context)
+    ) {
+      return; // Dropped: unauthenticated, missing, or fabricated supplier transport context
+    }
+
+    // 2. Request correlation check
     if (!rejection.requestId || !this.inFlightRequests.has(rejection.requestId)) {
       return; // Unknown, expired, cancelled, duplicate, or obsolete request; drop immediately
     }
 
     const inFlight = this.inFlightRequests.get(rejection.requestId)!;
 
-    // Validate correlation invariants
+    // 3. Validate correlation invariants, peer identity, and active connection generation
+    const activeGen = this.engine.getPeerGeneration(inFlight.supplierPeerId);
     if (
       rejection.sessionId !== this.engine.sessionId ||
       rejection.sessionId !== inFlight.sessionId ||
       rejection.supplierPeerId !== inFlight.supplierPeerId ||
+      context.supplierPeerId !== inFlight.supplierPeerId ||
+      context.connectionGeneration !== inFlight.supplierConnectionGeneration ||
+      context.connectionGeneration !== activeGen ||
+      activeGen === undefined ||
       rejection.targetOriginPeerId !== inFlight.originPeerId ||
       rejection.fromSequence !== inFlight.fromSequence ||
       rejection.toSequence !== inFlight.toSequence
     ) {
-      return; // Dropped: response does not correlate to active request
+      return; // Dropped: response does not correlate, peer mismatch, or stale/obsolete generation
     }
 
     this.clock.clearTimeout(inFlight.timerId);
@@ -539,6 +589,28 @@ export class RepairRequestPipeline {
   }
 
   /**
+   * Invalidates and fails over in-flight requests bound to an obsolete supplier connection generation.
+   */
+  public onPeerGenerationChanged(peerId: string, newGeneration: number): void {
+    if (this.disposed) return;
+
+    // Invalidate and failover any in-flight requests that were dispatched to this peer under an older generation
+    for (const [reqId, inFlight] of Array.from(this.inFlightRequests.entries())) {
+      if (
+        inFlight.supplierPeerId === peerId &&
+        inFlight.supplierConnectionGeneration !== newGeneration
+      ) {
+        this.clock.clearTimeout(inFlight.timerId);
+        this.inFlightRequests.delete(reqId);
+        inFlight.attemptedSuppliers.add(peerId);
+        this.reEnqueueForFailover(inFlight, false);
+      }
+    }
+
+    this.drainQueue();
+  }
+
+  /**
    * Cancels all active in-flight requests and timers upon membership epoch transition.
    */
   public onEpochTransition(_newEpoch: number): void {
@@ -580,6 +652,7 @@ export class RepairRequestPipeline {
   public dispose(): void {
     if (this.disposed) return;
     this.disposed = true;
+    this.unregisterGenListener?.();
 
     for (const inFlight of this.inFlightRequests.values()) {
       this.clock.clearTimeout(inFlight.timerId);
@@ -811,6 +884,11 @@ export class RepairRequestPipeline {
       // Generate UUID v4 request identifier
       const requestId = generateUUIDv4();
 
+      const supplierGen = this.engine.getPeerGeneration(supplierPeerId);
+      if (supplierGen === undefined || supplierGen < 1) {
+        break;
+      }
+
       const requestPayload: RepairRequestPayload = {
         requestId,
         sessionId: this.engine.sessionId,
@@ -833,6 +911,7 @@ export class RepairRequestPipeline {
         requestId,
         sessionId: this.engine.sessionId,
         supplierPeerId,
+        supplierConnectionGeneration: supplierGen,
         originPeerId: task.originPeerId,
         fromSequence: task.fromSequence,
         toSequence: task.toSequence,

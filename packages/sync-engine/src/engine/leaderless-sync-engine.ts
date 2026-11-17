@@ -201,6 +201,9 @@ export class LeaderlessSyncEngine implements SyncEngine {
 
   private readonly stateChangeListeners = new Set<StateChangeListener>();
   private readonly decisionListeners = new Set<DecisionListener>();
+  private readonly peerGenerationListeners = new Set<
+    (peerId: string, newGen: number, oldGen?: number) => void
+  >();
 
   private readonly mutableStats: MutableStats = {
     eventsReceivedCount: 0,
@@ -369,7 +372,24 @@ export class LeaderlessSyncEngine implements SyncEngine {
       const firstKey = this.peerGenerations.keys().next().value;
       if (firstKey) this.peerGenerations.delete(firstKey);
     }
+    const oldGen = this.peerGenerations.get(peerId);
     this.peerGenerations.set(peerId, generation);
+    if (oldGen !== generation) {
+      for (const listener of this.peerGenerationListeners) {
+        try {
+          listener(peerId, generation, oldGen);
+        } catch {
+          this.mutableStats.listenerErrorCount++;
+        }
+      }
+    }
+  }
+
+  public onPeerGenerationChange(
+    listener: (peerId: string, newGen: number, oldGen?: number) => void,
+  ): () => void {
+    this.peerGenerationListeners.add(listener);
+    return () => this.peerGenerationListeners.delete(listener);
   }
 
   public getPeerGeneration(peerId: string): number | undefined {
@@ -416,6 +436,14 @@ export class LeaderlessSyncEngine implements SyncEngine {
     });
     this.validSupplierContexts.add(context);
     return context;
+  }
+
+  /**
+   * Verifies whether the provided context is an unforgeable, genuinely registered supplier context.
+   */
+  public isValidSupplierContext(context?: AuthenticatedSupplierContext): boolean {
+    if (!context || typeof context !== 'object') return false;
+    return this.validSupplierContexts.has(context);
   }
 
   public getState(): Readonly<PlaybackState> {
@@ -1062,7 +1090,7 @@ export class LeaderlessSyncEngine implements SyncEngine {
    */
   public ingestRepairBatch(
     batch: OperationBatchPayload,
-    transportContext?: AuthenticatedSupplierContext,
+    transportContext: AuthenticatedSupplierContext,
   ): EngineDecision[] {
     const now = this.clock.now();
     const decisions: EngineDecision[] = [];
@@ -1229,6 +1257,53 @@ export class LeaderlessSyncEngine implements SyncEngine {
         appliedAtMonotonic: now,
         payload: rawOp.payload,
       };
+
+      // If sequence <= current frontier or already in log, let admitOperation verify duplicate or identity conflict
+      const currentOriginSeq = this.replicationVector[storedOp.originPeerId] ?? 0;
+      const alreadyInLog =
+        this.operationLog.get(storedOp.logicalEventId) !== undefined ||
+        this.operationLog.getOperationAt(storedOp.originPeerId, storedOp.originSequenceNumber) !== undefined;
+
+      if (!alreadyInLog && storedOp.originSequenceNumber > currentOriginSeq) {
+        let missingDep = false;
+        if (storedOp.originSequenceNumber > currentOriginSeq + 1) {
+          missingDep = true;
+        } else {
+          for (const [depOrigin, reqSeq] of Object.entries(storedOp.causalContext)) {
+            const haveSeq = this.replicationVector[depOrigin] ?? 0;
+            if (reqSeq > haveSeq) {
+              missingDep = true;
+              break;
+            }
+          }
+        }
+
+        if (missingDep) {
+          try {
+            this.pendingQueue.enqueue(storedOp);
+            const decision: EngineDecision = {
+              accepted: false,
+              code: 'BUFFERED_PENDING_DEPENDENCY',
+              stateVersion: this.state.stateVersion,
+              decidedAt: now,
+              message: `Buffered repair operation ${storedOp.logicalEventId} awaiting missing causal dependencies`,
+            };
+            this.lastDecision = decision;
+            decisions.push(decision);
+          } catch (err) {
+            const decision: EngineDecision = {
+              accepted: false,
+              code: 'REJECTED_CAPACITY',
+              stateVersion: this.state.stateVersion,
+              decidedAt: now,
+              message: err instanceof Error ? err.message : String(err),
+            };
+            this.lastDecision = decision;
+            decisions.push(decision);
+          }
+          continue;
+        }
+      }
 
       try {
         this.admitOperation(storedOp, undefined, now, 'REPAIR_BATCH');
@@ -1661,6 +1736,7 @@ export class LeaderlessSyncEngine implements SyncEngine {
     this.disposed = true;
     this.stateChangeListeners.clear();
     this.decisionListeners.clear();
+    this.peerGenerationListeners.clear();
     this.operationLog.dispose();
     this.pendingQueue.clear();
   }
