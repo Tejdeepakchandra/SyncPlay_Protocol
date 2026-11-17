@@ -331,6 +331,8 @@ describe('Phase 7.3 Deterministic Simulation Test Suite', () => {
       // Ingest repair batch supplying A10 (L=12, seq=10, causalContext { 'peer-A': 9 })
       // Expected for A10: 1 + L(A9) = 1 + 11 = 12. Exact match!
       const repairBatch = {
+        requestId: '00000000-0000-4000-8000-000000000001',
+        sessionId: 'session-test',
         supplierPeerId: 'peer-repair-node',
         originPeerId: 'peer-A',
         fromSequence: 10,

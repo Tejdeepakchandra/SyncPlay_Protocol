@@ -15,6 +15,7 @@ export {
   MAX_PAYLOAD_BYTES,
   MAX_BATCH_PAYLOAD_BYTES,
   MAX_OPERATIONS_PER_BATCH,
+  MAX_VECTOR_ENTRIES,
 } from './constants.js';
 
 // ── Identity types ───────────────────────────────────────────
@@ -84,6 +85,8 @@ export type {
   StateDigestPayloadV2,
   SerializedControlOperation,
   OperationBatchPayload,
+  PushOperationBatchPayload,
+  CompatibilityOperationBatchPayload,
   RepairRequestPayload,
   RepairRejectedPayload,
   RepairRejectionReason,
@@ -91,13 +94,22 @@ export type {
   StateSnapshotPayloadV2,
 } from './payloads/repair.js';
 export {
+  UUID_V4_REGEX,
+  UUIDv4Schema,
   StateDigestPayloadSchema,
   StateDigestPayloadV2Schema,
   isStateDigestV2,
+  isRequestDrivenOperationBatch,
+  isPushOperationBatch,
   SerializedControlOperationSchema,
   OperationBatchPayloadSchema,
+  PushOperationBatchPayloadSchema,
+  CompatibilityOperationBatchPayloadSchema,
   RepairRequestPayloadSchema,
   RepairRejectedPayloadSchema,
+  ReplicationVectorSchema,
+  SnapshotFrontierSchema,
+  HistoryFingerprintsSchema,
   CompactedCheckpointItemSchema,
   StateSnapshotPayloadV2Schema,
   REPAIR_REJECTION_REASONS,

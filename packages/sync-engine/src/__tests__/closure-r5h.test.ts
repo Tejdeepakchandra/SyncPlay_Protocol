@@ -68,6 +68,8 @@ describe('Phase 7.3-R5-H: Final Transport Context Issuer Authorization', () => {
     messageType: 'PLAY' | 'PAUSE' | 'SEEK' | 'RATE_CHANGE' = 'PLAY',
   ): OperationBatchPayload {
     return {
+      requestId: '00000000-0000-4000-8000-000000000001',
+      sessionId: 'session-test',
       supplierPeerId,
       originPeerId,
       fromSequence: seq,

@@ -61,6 +61,8 @@ describe('Phase 7.3-R5-G: Final Supplier Authorization Closure', () => {
     clock: number = 1,
   ): OperationBatchPayload {
     return {
+      requestId: '00000000-0000-4000-8000-000000000001',
+      sessionId: 'session-test',
       supplierPeerId,
       originPeerId,
       fromSequence: seq,

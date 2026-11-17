@@ -14,6 +14,7 @@ import {
   MAX_PAYLOAD_BYTES,
   MAX_BATCH_PAYLOAD_BYTES,
   MAX_OPERATIONS_PER_BATCH,
+  MAX_VECTOR_ENTRIES,
 
   // Message type registry
   MessageType,
@@ -38,8 +39,13 @@ import {
   StateDigestPayloadV2Schema,
   StateSnapshotPayloadV2Schema,
   OperationBatchPayloadSchema,
+  PushOperationBatchPayloadSchema,
+  CompatibilityOperationBatchPayloadSchema,
   RepairRequestPayloadSchema,
   RepairRejectedPayloadSchema,
+  ReplicationVectorSchema,
+  SnapshotFrontierSchema,
+  HistoryFingerprintsSchema,
   CompactedCheckpointItemSchema,
   STATE_REQUEST_REASONS,
   REPAIR_REJECTION_REASONS,
@@ -47,8 +53,12 @@ import {
   StateDigestWireSchema,
 
   // Helpers
+  UUID_V4_REGEX,
+  UUIDv4Schema,
   isLegacyStateDigest,
   isStateDigestV2,
+  isRequestDrivenOperationBatch,
+  isPushOperationBatch,
 
   // Validation
   validateMessage,
@@ -95,10 +105,12 @@ describe('Public exports', () => {
     expect(typeof MAX_PAYLOAD_BYTES).toBe('number');
     expect(typeof MAX_BATCH_PAYLOAD_BYTES).toBe('number');
     expect(typeof MAX_OPERATIONS_PER_BATCH).toBe('number');
+    expect(typeof MAX_VECTOR_ENTRIES).toBe('number');
     expect(MAX_MESSAGE_BYTES).toBeGreaterThan(0);
     expect(MAX_PAYLOAD_BYTES).toBeGreaterThan(0);
     expect(MAX_MESSAGE_BYTES).toBeGreaterThanOrEqual(MAX_PAYLOAD_BYTES);
     expect(MAX_OPERATIONS_PER_BATCH).toBe(32);
+    expect(MAX_VECTOR_ENTRIES).toBe(64);
   });
 
   it('should export all known message types including Phase 7.4 anti-entropy', () => {
@@ -156,11 +168,18 @@ describe('Public exports', () => {
     expect(typeof StateDigestPayloadV1Schema.safeParse).toBe('function');
     expect(typeof StateDigestPayloadV2Schema.safeParse).toBe('function');
     expect(typeof OperationBatchPayloadSchema.safeParse).toBe('function');
+    expect(typeof PushOperationBatchPayloadSchema.safeParse).toBe('function');
+    expect(typeof CompatibilityOperationBatchPayloadSchema.safeParse).toBe('function');
     expect(typeof RepairRequestPayloadSchema.safeParse).toBe('function');
     expect(typeof RepairRejectedPayloadSchema.safeParse).toBe('function');
+    expect(typeof ReplicationVectorSchema.safeParse).toBe('function');
+    expect(typeof SnapshotFrontierSchema.safeParse).toBe('function');
+    expect(typeof HistoryFingerprintsSchema.safeParse).toBe('function');
     expect(typeof CompactedCheckpointItemSchema.safeParse).toBe('function');
     expect(typeof StateSnapshotPayloadV2Schema.safeParse).toBe('function');
     expect(typeof StateDigestWireSchema.safeParse).toBe('function');
+    expect(typeof UUIDv4Schema.safeParse).toBe('function');
+    expect(UUID_V4_REGEX instanceof RegExp).toBe(true);
   });
 
   it('should export validation and size helper functions', () => {
@@ -173,6 +192,8 @@ describe('Public exports', () => {
     expect(typeof serializeAndCheckSize).toBe('function');
     expect(typeof isLegacyStateDigest).toBe('function');
     expect(typeof isStateDigestV2).toBe('function');
+    expect(typeof isRequestDrivenOperationBatch).toBe('function');
+    expect(typeof isPushOperationBatch).toBe('function');
   });
 
   it('should export PAYLOAD_SCHEMAS map with entry for each message type', () => {

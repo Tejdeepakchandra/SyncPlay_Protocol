@@ -645,6 +645,9 @@ describe('validateMessage payload size enforcement', () => {
 // ── Phase 7.4 Message Envelope & Payload Validation ────────────
 
 describe('Phase 7.4 Message Envelope & Payload Validation', () => {
+  const validUuidV4 = 'f47ac10b-58cc-4372-a567-0e02b2c3d479';
+  const sha256A = 'a'.repeat(64);
+
   const validV2DigestPayload = {
     formatVersion: 2 as const,
     sessionId: 'session-room-1',
@@ -654,12 +657,12 @@ describe('Phase 7.4 Message Envelope & Payload Validation', () => {
     stateVersion: 10,
     replicationVector: { 'peer-sender-1': 5, 'peer-remote-2': 3 },
     snapshotFrontier: { 'peer-sender-1': 0, 'peer-remote-2': 0 },
-    historyFingerprints: { 'peer-sender-1': 'a1b2c3d4e5f60718' },
+    historyFingerprints: { 'peer-sender-1': sha256A },
     sentAt: Date.now(),
   };
 
   const validRepairRequestPayload = {
-    requestId: 'req-uuid-test-1',
+    requestId: validUuidV4,
     sessionId: 'session-room-1',
     requesterPeerId: 'peer-req-1',
     targetOriginPeerId: 'peer-orig-1',
@@ -669,7 +672,7 @@ describe('Phase 7.4 Message Envelope & Payload Validation', () => {
   };
 
   const validBatchPayload = {
-    requestId: 'req-uuid-test-1',
+    requestId: validUuidV4,
     sessionId: 'session-room-1',
     supplierPeerId: 'peer-supplier-1',
     originPeerId: 'peer-orig-1',
@@ -700,7 +703,7 @@ describe('Phase 7.4 Message Envelope & Payload Validation', () => {
   };
 
   const validRepairRejectedPayload = {
-    requestId: 'req-uuid-test-1',
+    requestId: validUuidV4,
     sessionId: 'session-room-1',
     supplierPeerId: 'peer-supplier-1',
     targetOriginPeerId: 'peer-orig-1',
@@ -801,11 +804,20 @@ describe('Phase 7.4 Message Envelope & Payload Validation', () => {
       expect(result.error.code).toBe('INVALID_PAYLOAD');
     }
   });
+
+  it('documents that payload identity claims do not constitute transport authentication', () => {
+    // Contract invariant: Protocol schemas validate message structure only.
+    // The engine layer in M2/M3/M4/M5 MUST cross-check supplierPeerId and connectionGeneration
+    // against the authenticated transport context registered via TransportRegistrationCapability.
+    expect(validBatchPayload.supplierPeerId).toBe('peer-supplier-1');
+  });
 });
 
 // ── Phase 7.4 Batch Payload Size & WebRTC Limits ───────────────
 
 describe('Phase 7.4 Batch Payload Size & WebRTC Limits', () => {
+  const validUuidV4 = 'f47ac10b-58cc-4372-a567-0e02b2c3d479';
+
   it('should permit OPERATION_BATCH payload between 32 KB and 64 KB', () => {
     // Generate an operation batch that is ~45 KB
     const filler = 'X'.repeat(4000);
@@ -821,7 +833,7 @@ describe('Phase 7.4 Batch Payload Size & WebRTC Limits', () => {
     }));
 
     const batchPayload = {
-      requestId: 'req-45k',
+      requestId: validUuidV4,
       sessionId: 'session-room-1',
       supplierPeerId: 'peer-supplier-1',
       originPeerId: 'peer-orig-1',
@@ -867,7 +879,7 @@ describe('Phase 7.4 Batch Payload Size & WebRTC Limits', () => {
     }));
 
     const batchPayload = {
-      requestId: 'req-over64k',
+      requestId: validUuidV4,
       sessionId: 'session-room-1',
       supplierPeerId: 'peer-supplier-1',
       originPeerId: 'peer-orig-1',

@@ -24,7 +24,12 @@ export const MAX_PAYLOAD_BYTES = 32_768;
 
 /**
  * Maximum application payload size for anti-entropy operation batches (64 KB = 65,536 bytes).
- * WebRTC DataChannel interoperability limit.
+ *
+ * NOTE: This is an application-level batch payload cap derived from RFC 8831 / RFC 8841
+ * SCTP interoperability recommendations, NOT a universal browser DataChannel guarantee.
+ * Individual browsers and transport configurations may negotiate a smaller `maxMessageSize`.
+ * In Milestone M5 (Transport Integration), the transport adapter layer must respect
+ * the negotiated DataChannel maxMessageSize and paginate or fragment batches accordingly.
  */
 export const MAX_BATCH_PAYLOAD_BYTES = 65_536;
 
@@ -33,3 +38,17 @@ export const MAX_BATCH_PAYLOAD_BYTES = 65_536;
  * Hard limit enforced by Zod schema and engine pagination.
  */
 export const MAX_OPERATIONS_PER_BATCH = 32;
+
+/**
+ * Maximum number of origin entries permitted in a single StateDigest replicationVector,
+ * snapshotFrontier, or historyFingerprints collection.
+ *
+ * Architectural basis:
+ * - SyncPlay rooms are configured for 4-10 concurrent peers (default: 4, absolute ceiling: 50
+ *   in BootstrapServer).
+ * - Full-mesh WebRTC topologies are practically bounded to 10-16 active peers due to O(N^2) links.
+ * - An upper bound of 64 accommodates all active participants plus historical departed/churned peers
+ *   over the session lifetime prior to snapshot compaction.
+ * - Caps serialized StateDigest size to ~7 KB, preserving ample headroom within MAX_PAYLOAD_BYTES (32 KB).
+ */
+export const MAX_VECTOR_ENTRIES = 64;
