@@ -48,16 +48,17 @@ quadrantChart
 
 ---
 
-### R-7.4-02: Silent Forking / Byzantine Sequence Substitution
+### R-7.4-02: Silent Forking / Byzantine Sequence Substitution & Digest Completeness Limits
 - **Category:** State Consistency / Integrity.
 - **Severity:** Critical
 - **Likelihood:** Low (requires malicious peer or severe software defect).
 - **Trigger Condition:** A peer authors two distinct operations with the same `(originPeerId, originSequenceNumber)`, sending variant $\alpha$ to Peer A and variant $\beta$ to Peer B.
-- **Architectural Mitigations:**
+- **Architectural Mitigations & Detection Boundaries:**
   1. *Tail Fingerprint Comparison in Digest:* `StateDigestPayload.historyFingerprints` carries the SHA-256 fingerprint of the latest operation for each origin. If Peer A and Peer B compare vectors and find $V_A[P] == V_B[P]$ but $H_A[P] \ne H_B[P]$, divergence is flagged immediately.
-  2. *Immutable Content Verification:* When variant $\beta$ is subsequently delivered to Peer A, `OrderedOperationLog.insert()` checks `this.originSeqIndex`. It detects that sequence $k$ already has a different `logicalEventId` and throws `SyncEngineError('SEQUENCE_COLLISION_DETECTED')`.
-  3. *No-Overwrite Rule:* An existing accepted operation is **never** silently overwritten or mutated.
-- **Contingency Plan:** The engine rejects the colliding event with `REJECTED_SEQUENCE_CONFLICT`, freezes replication progress for that specific origin, flags `isDegraded = true`, and preserves the existing uncontaminated playback state.
+  2. *Immutable Content Verification:* When variant $\beta$ is subsequently delivered to Peer A, `OrderedOperationLog.insert()` checks `this.originSeqIndex`. It detects that sequence $k$ already has a different `logicalEventId` and rejects with `REJECTED_SEQUENCE_CONFLICT`. If `logicalEventId` matches but payload differs, it rejects with `REJECTED_IDENTITY_CONFLICT`.
+  3. *Digest Completeness Boundary:* The tail fingerprint only attests to the single latest operation at sequence $V_{\text{rep}}[p]$; it is not a recursive Merkle root of ancient history. Matching replication vectors and tail fingerprints establish latest-retained operation agreement, **not** unconditional Byzantine historical identity across compacted pre-horizon history.
+  4. *Safe Compacted History Behavior:* If history predating the retained horizon ($s \le \text{snapshotFrontier}$) cannot be compared or repaired, the engine never guesses or performs partial merges; it immediately triggers `onHistoryExhausted` and hands off to Phase 7.5 snapshot reset.
+- **Contingency Plan:** The engine rejects colliding events with `REJECTED_SEQUENCE_CONFLICT` or `REJECTED_IDENTITY_CONFLICT`, freezes replication progress for that origin, flags `isDegraded = true`, and preserves uncontaminated state.
 
 ---
 
@@ -100,15 +101,17 @@ quadrantChart
 
 ---
 
-### R-7.4-06: WebRTC SCTP DataChannel Buffer Starvation
+### R-7.4-06: WebRTC DataChannel 64 KB Limit & Buffer Starvation
 - **Category:** Transport Layer Performance.
 - **Severity:** Medium
 - **Likelihood:** Medium (sending large repair batches over saturated uplink).
-- **Trigger Condition:** A peer requests a large range of operations, and the supplier sends a monolithic payload that exceeds the WebRTC DataChannel `bufferedAmountLowThreshold` (typically $16\text{ KB} - 64\text{ KB}$), blocking live control messages.
+- **Trigger Condition:** A peer requests a large range of operations, and the supplier sends a payload that exceeds the WebRTC DataChannel maximum interoperable message size (64 KB) or `bufferedAmountLowThreshold`, causing frame drops or blocking live control messages.
 - **Architectural Mitigations:**
   1. *Batch Size Limit:* `OperationBatchPayload.operations` is strictly capped at $32$ items.
-  2. *Payload Size Cap:* Maximum serialized message size is capped at $64\text{ KB}$.
-  3. *Separate SCTP Channels:* If supported by browser WebRTC implementation, repair traffic is sent on a secondary DataChannel (`syncplay-repair`), leaving `syncplay-control` unobstructed for live user actions (PLAY/PAUSE).
+  2. *Payload Size Cap (64 KB):* Maximum serialized message size is capped at $65,536$ bytes (WebRTC DataChannel maximum interoperable message size defined by RFC 8831 / RFC 8841 / W3C standards across standard browsers; not an SCTP MTU).
+  3. *Pre-Send Size Enforcement:* Supplier serializes the frame to UTF-8 JSON. If length $> \min(65536, \text{negotiated } \text{sctp.maxMessageSize})$, the batch is sliced to fewer operations.
+  4. *Post-Receive Size Enforcement:* Receiver inspects `rawData.byteLength` and drops frames $> 65536$ bytes without calling `JSON.parse()`.
+  5. *Separate SCTP Channels:* If supported by browser WebRTC implementation, repair traffic is sent on a secondary DataChannel (`syncplay-repair`), leaving `syncplay-control` unobstructed for live user actions (PLAY/PAUSE).
 - **Contingency Plan:** If `dataChannel.bufferedAmount > 64 * 1024`, outbound repair responses are paused until `onbufferedamountlow` fires.
 
 ---
@@ -121,7 +124,7 @@ quadrantChart
 - **Architectural Mitigations:**
   1. *Explicit Negative Response:* Suppliers check their log horizon. Since $5 < \text{snapshotFrontier}$, they immediately return `REPAIR_REJECTED` (`reason: 'OUTSIDE_HORIZON'`, `retainedHorizonSequence: 50`).
   2. *No Unsafe Partial Merges:* The requester does not attempt to fabricate or guess the missing operations.
-  3. *Phase 7.5 Handoff:* The requester detects that all connected peers have compacted the requested sequence, triggers `onHistoryExhausted`, sets `isDegraded = true`, and transitions into Phase 7.5 atomic snapshot catch-up.
+  3. *Phase 7.5 Handoff:* The requester detects that all connected peers have compacted the requested sequence, triggers `onHistoryExhausted`, sets `isDegraded = true` with reason `'HISTORY_HORIZON_EXCEEDED'`, and transitions into Phase 7.5 atomic snapshot catch-up.
 - **Contingency Plan:** The UI alerts the user that history has expired and displays a "Resync with Room" prompt.
 
 ---
@@ -140,7 +143,11 @@ To ensure real-time observability of anti-entropy health, `LeaderlessSyncEngine.
 | `antiEntropyTimeoutsCount` | Counter | $> 3\text{ consecutive}$ | Repair requests that expired without response. |
 | `antiEntropyRejectionsCount` | Counter | $> 5$ | Repair batches rejected by validation. |
 | `antiEntropyHorizonExceededCount` | Counter | $> 0$ | Requests rejected because history is outside horizon. |
+| `antiEntropyFrameOversized` | Counter | $> 0$ | Raw frames dropped for exceeding 64 KB limit without parsing. |
+| `antiEntropyLegacyDigestsIgnored` | Counter | $> 0$ | Incompatible Phase 2 digests safely dropped. |
+| `antiEntropyFutureDigestsIgnored` | Counter | $> 0$ | Unsupported future format digests safely dropped. |
 
 ---
 
 **Phase 7.4 is in planning state. Implementation has not started and remains subject to separate authorization.**
+

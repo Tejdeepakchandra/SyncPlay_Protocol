@@ -41,6 +41,13 @@ Periodic or event-triggered message broadcasting a peer's contiguous replication
 import { z } from 'zod';
 
 export const StateDigestPayloadSchema = z.object({
+  /**
+   * Protocol format version discriminator.
+   * Literal 2 strictly differentiates Phase 7.4 multi-vector digests from
+   * Phase 2 legacy digests ({ digestId, stateVersion, digest }).
+   */
+  formatVersion: z.literal(2),
+
   /** Session identifier to ensure messages belong to active room. */
   sessionId: z.string().min(1).max(128),
 
@@ -96,6 +103,12 @@ export type StateDigestPayload = z.infer<typeof StateDigestPayloadSchema>;
 - **Rate Limit:** Maximum 1 per peer per 2 seconds (token bucket refill rate 0.5/sec, burst 2).
 - **Maximum Size:** $\le 8\text{ KB}$ for rooms with up to 64 peers.
 - **Delivery Requirements:** Reliable, unordered SCTP stream (out-of-order digests are superseded by newer `stateVersion` or `sentAt`).
+
+#### Protocol Version Compatibility & Discrimination:
+- **Discriminator Enforcement:** Inbound frames are evaluated against `formatVersion === 2`.
+- **Legacy Phase 2 Digests:** Packets lacking `formatVersion` or containing legacy Phase 2 fields (`digestId`, `digest`) are safely ignored and dropped with a debug-level log (`"Ignoring legacy Phase 2 state digest: incompatible format"`), producing zero mutation on local replication vectors or clocks.
+- **Future Unsupported Versions:** Packets advertising `formatVersion > 2` are safely dropped with a warning-level diagnostic log, preventing engine crashes.
+- **Heterogeneous Networks:** Version-compatible peers exchange digests and execute anti-entropy; mixed-version peers continue baseline live playback without anti-entropy corruption.
 
 ---
 
@@ -169,6 +182,8 @@ export const SerializedControlOperationSchema = z.object({
 export type SerializedControlOperation = z.infer<typeof SerializedControlOperationSchema>;
 
 export const OperationBatchPayloadSchema = z.object({
+  /** Correlation identifier echoing the RepairRequestPayload.requestId when fulfilling a repair. */
+  requestId: z.string().min(1).max(128).optional(),
   sessionId: z.string().min(1).max(128),
   supplierPeerId: z.string().min(1).max(128),
   originPeerId: z.string().min(1).max(128),
@@ -182,8 +197,12 @@ export type OperationBatchPayload = z.infer<typeof OperationBatchPayloadSchema>;
 
 #### Operational Characteristics:
 - **Direction:** P2P Unicast (supplier to requester).
-- **Maximum Operations:** 32 operations.
-- **Maximum Frame Size:** $\le 64\text{ KB}$ serialized.
+- **Maximum Operations:** 32 operations per batch.
+- **Maximum Frame Size (64 KB):** Maximum $65,536$ bytes serialized.
+  > [!NOTE] WebRTC DataChannel Limit vs SCTP MTU
+  > The 64 KB limit ($65,536$ bytes) is the **WebRTC DataChannel maximum interoperable message size** defined by RFC 8831 / RFC 8841 and W3C WebRTC specifications across standard browsers (Chrome, Firefox, Safari). It is **not** an SCTP MTU (which is 1200–1280 bytes on the wire).
+- **Pre-Send Serialized Size Verification (Sender):** The supplier serializes the batch to UTF-8 JSON. If byte length exceeds $\min(65536, \text{negotiated } \text{sctp.maxMessageSize})$, the batch is sliced into fewer operations (e.g. 16 or 8) so that the serialized frame strictly complies with the size cap.
+- **Post-Receive Frame Size Verification (Receiver):** The receiver checks incoming raw buffer length before calling `JSON.parse()`. If `rawPayload.byteLength > 65536` (or negotiated `sctp.maxMessageSize`), the frame is **dropped immediately without parsing** to prevent buffer allocation exhaustion / DoS.
 - **Delivery Requirements:** Reliable, ordered SCTP stream.
 
 ---
@@ -354,18 +373,25 @@ classDiagram
    ```
 2. **Channel Selection:** Anti-entropy repair messages (`REPAIR_REQUEST`, `OPERATION_BATCH`, `REPAIR_REJECTED`) are transmitted over the **ordered, reliable** WebRTC DataChannel (`syncplay-control`).
 3. **Digest Channel:** `STATE_DIGEST` messages may be transmitted over an **unordered, reliable** DataChannel to prevent head-of-line blocking during heavy playback activity.
+4. **Transport Message Size Constraints (RFC 8831 / RFC 8841):**
+   - The maximum payload size for any DataChannel message is $65,536$ bytes (WebRTC DataChannel maximum interoperable message size across standard browsers).
+   - **Sender:** Calculates UTF-8 JSON size. If byte length exceeds $\min(65536, \text{negotiated } \text{sctp.maxMessageSize})$, the batch is automatically sliced to a smaller contiguous operation count.
+   - **Receiver:** Inspects `rawData.byteLength` before calling `JSON.parse()`. If `byteLength > 65536` (or negotiated `sctp.maxMessageSize`), the frame is **dropped immediately without parsing** to prevent buffer allocation exhaustion.
 
 ### 3.2. Verification at Transport Boundary
 
 Upon packet arrival in `AntiEntropyTransportAdapter`:
 1. Validates `fromPeerId` matches the physical WebRTC DataChannel identity.
-2. Checks `connectionGeneration === peerManager.getPeerGeneration(fromPeerId)`.
-3. If the payload is an `OPERATION_BATCH`:
+2. Checks frame size $\le 65536$ bytes; drops immediately without parsing if oversized.
+3. Checks `connectionGeneration === peerManager.getPeerGeneration(fromPeerId)`.
+4. If the payload is an `OPERATION_BATCH`:
+   - Validates that the active membership epoch matches local engine epoch; drops with `REJECTED_INVALID` if obsolete.
    - Calls `transportAdapter.registerContext(fromPeerId, connectionGeneration)` using the injected `TransportRegistrationCapability` (R5-H).
    - Hands the batch and registered context to `engine.ingestRepairBatch()`.
-4. If the payload is a `REPAIR_REQUEST`:
+   - On successful admission, checks if $V_{\text{rep}}[origin] \ge toSeq$ to retire the pending repair task; if partial, automatically requests the remaining range.
+5. If the payload is a `REPAIR_REQUEST`:
    - Delegates to `engineAntiEntropy.serveRepairRequest(payload)`.
-   - Sends the resulting batch or rejection back to `fromPeerId`.
+   - Sends the resulting batch (sliced to $\le 64\text{ KB}$) or rejection back to `fromPeerId`.
 
 ---
 
@@ -375,13 +401,15 @@ The anti-entropy subsystem utilizes the following machine-readable error codes:
 
 | Error Code | Layer | Meaning | Resolution |
 |---|---|---|---|
-| `REJECTED_INVALID` | Engine | Malformed schema, invalid epoch, or unregistered transport context. | Drop packet; isolate peer if repeated. |
-| `REJECTED_IDENTITY_CONFLICT` | Engine | An operation's immutable content differs from a retained op with the same ID. | Abort repair; log critical diagnostic alert. |
-| `REJECTED_SEQUENCE_CONFLICT` | Engine | Two distinct operation IDs share the same origin sequence number. | Abort repair; isolate offending origin. |
+| `REJECTED_INVALID` | Engine | Malformed schema, obsolete epoch, or unregistered transport context. | Drop packet; isolate peer if repeated. |
+| `REJECTED_IDENTITY_CONFLICT` | Engine | An operation's immutable content differs from a retained op with the same ID. | Abort repair; freeze replication for origin; set `isDegraded = true`. |
+| `REJECTED_SEQUENCE_CONFLICT` | Engine | Two distinct operation IDs share the same origin sequence number. | Abort repair; freeze replication for origin; set `isDegraded = true`. |
 | `REJECTED_CAPACITY` | Engine | `PendingDependencyQueue` capacity ($K=256$) exceeded. | Discard incoming event; backoff repair. |
-| `REPAIR_TIMEOUT` | AntiEntropy | Supplier did not respond within $1500\text{ms}$. | Retry with backoff or switch supplier. |
+| `REPAIR_TIMEOUT` | AntiEntropy | Supplier did not respond within $1500\text{ms}$. | Retry with backoff or failover to next eligible supplier. |
 | `OUTSIDE_HORIZON` | AntiEntropy | Requested sequence predates supplier's retained history. | Trigger Phase 7.5 snapshot catch-up. |
+| `NO_ELIGIBLE_REPAIR_SUPPLIER` | AntiEntropy | No connected peer meets generation, frontier, and uncompacted horizon criteria. | Mark `isDegraded = true`; trigger `onHistoryExhausted()`. |
 
 ---
 
 **Phase 7.4 is in planning state. Implementation has not started and remains subject to separate authorization.**
+
