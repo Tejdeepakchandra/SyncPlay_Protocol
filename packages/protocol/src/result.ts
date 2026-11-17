@@ -15,13 +15,16 @@ export type ValidationErrorCode =
   | 'MESSAGE_TOO_LARGE'
   | 'PAYLOAD_TOO_LARGE'
   | 'INVALID_JSON'
-  | 'MISSING_LOGICAL_EVENT_ID';
+  | 'MISSING_LOGICAL_EVENT_ID'
+  | 'SERIALIZATION_FAILED';
 
 /** Structured validation error. */
 export interface ValidationError {
   readonly code: ValidationErrorCode;
   readonly message: string;
   readonly path?: ReadonlyArray<string | number>;
+  readonly byteLength?: number;
+  readonly maxBytes?: number;
 }
 
 /**

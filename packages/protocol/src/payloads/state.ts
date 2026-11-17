@@ -48,7 +48,11 @@ export const StateSnapshotPayloadSchema = z.object({
 
 export type StateSnapshotPayload = z.infer<typeof StateSnapshotPayloadSchema>;
 
-export const StateDigestPayloadSchema = z.object({
+/**
+ * Legacy Phase 2 state digest payload schema.
+ * Maintained for backward compatibility and protocol version discrimination.
+ */
+export const StateDigestPayloadV1Schema = z.object({
   /** Unique identifier for this digest. */
   digestId: z.string().min(1).max(128),
   /** Engine-defined state version counter. */
@@ -60,4 +64,23 @@ export const StateDigestPayloadSchema = z.object({
   digest: z.string().min(1).max(4096),
 });
 
-export type StateDigestPayload = z.infer<typeof StateDigestPayloadSchema>;
+export type StateDigestPayloadV1 = z.infer<typeof StateDigestPayloadV1Schema>;
+export const LegacyStateDigestPayloadSchema = StateDigestPayloadV1Schema;
+export type LegacyStateDigestPayload = StateDigestPayloadV1;
+
+/** Backwards-compatible alias for Phase 2 state digest payload schema within state.ts */
+export const StateDigestPayloadSchema = StateDigestPayloadV1Schema;
+export type StateDigestPayload = StateDigestPayloadV1;
+
+/**
+ * Type guard checking whether a raw payload conforms to the Phase 2 legacy digest structure.
+ */
+export function isLegacyStateDigest(payload: unknown): payload is LegacyStateDigestPayload {
+  return (
+    typeof payload === 'object' &&
+    payload !== null &&
+    !('formatVersion' in payload) &&
+    'digestId' in payload &&
+    'digest' in payload
+  );
+}

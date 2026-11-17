@@ -13,6 +13,8 @@ export {
   PROTOCOL_VERSION,
   MAX_MESSAGE_BYTES,
   MAX_PAYLOAD_BYTES,
+  MAX_BATCH_PAYLOAD_BYTES,
+  MAX_OPERATIONS_PER_BATCH,
 } from './constants.js';
 
 // ── Identity types ───────────────────────────────────────────
@@ -26,7 +28,13 @@ export type {
 } from './identity.js';
 
 // ── Message type registry ────────────────────────────────────
-export { MessageType, KNOWN_MESSAGE_TYPES, REQUIRES_LOGICAL_EVENT_ID } from './message-types.js';
+export {
+  MessageType,
+  SYNC_MESSAGE_TYPES,
+  KNOWN_MESSAGE_TYPES,
+  REQUIRES_LOGICAL_EVENT_ID,
+} from './message-types.js';
+export type { SyncMessageType } from './message-types.js';
 
 // ── Protocol envelope ────────────────────────────────────────
 export type { ProtocolMessage } from './envelope.js';
@@ -58,33 +66,45 @@ export {
 export type {
   StateRequestPayload,
   StateSnapshotPayload,
-  StateDigestPayload,
+  StateDigestPayloadV1,
+  LegacyStateDigestPayload,
   StateRequestReason,
 } from './payloads/state.js';
 export {
   StateRequestPayloadSchema,
   StateSnapshotPayloadSchema,
-  StateDigestPayloadSchema,
+  StateDigestPayloadV1Schema,
+  LegacyStateDigestPayloadSchema,
+  isLegacyStateDigest,
   STATE_REQUEST_REASONS,
 } from './payloads/state.js';
 
 export type {
+  StateDigestPayload,
+  StateDigestPayloadV2,
   SerializedControlOperation,
   OperationBatchPayload,
   RepairRequestPayload,
+  RepairRejectedPayload,
+  RepairRejectionReason,
   CompactedCheckpointItem,
   StateSnapshotPayloadV2,
 } from './payloads/repair.js';
 export {
+  StateDigestPayloadSchema,
+  StateDigestPayloadV2Schema,
+  isStateDigestV2,
   SerializedControlOperationSchema,
   OperationBatchPayloadSchema,
   RepairRequestPayloadSchema,
+  RepairRejectedPayloadSchema,
   CompactedCheckpointItemSchema,
   StateSnapshotPayloadV2Schema,
+  REPAIR_REJECTION_REASONS,
 } from './payloads/repair.js';
 
 // ── Payload schema registry ─────────────────────────────────
-export { PAYLOAD_SCHEMAS } from './payloads/index.js';
+export { PAYLOAD_SCHEMAS, StateDigestWireSchema } from './payloads/index.js';
 
 // ── Result types ─────────────────────────────────────────────
 export type {
@@ -94,10 +114,13 @@ export type {
 } from './result.js';
 
 // ── Validation ───────────────────────────────────────────────
+export type { SerializedPayload } from './validation.js';
 export {
   validateMessage,
   validatePayload,
   checkMessageSize,
   checkPayloadSize,
   parseAndValidateMessage,
+  computeUtf8ByteLength,
+  serializeAndCheckSize,
 } from './validation.js';

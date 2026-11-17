@@ -11,9 +11,16 @@ import {
   checkMessageSize,
   checkPayloadSize,
   parseAndValidateMessage,
+  computeUtf8ByteLength,
+  serializeAndCheckSize,
 } from '../validation.js';
-import { PROTOCOL_VERSION, MAX_MESSAGE_BYTES, MAX_PAYLOAD_BYTES } from '../constants.js';
-import { MessageType } from '../message-types.js';
+import {
+  PROTOCOL_VERSION,
+  MAX_MESSAGE_BYTES,
+  MAX_PAYLOAD_BYTES,
+  MAX_BATCH_PAYLOAD_BYTES,
+} from '../constants.js';
+import { MessageType, SYNC_MESSAGE_TYPES } from '../message-types.js';
 
 /** Helper: create a valid full message object. */
 function fullMessage(
@@ -632,5 +639,320 @@ describe('validateMessage payload size enforcement', () => {
     const msg = fullMessage(MessageType.PLAY, { targetPositionMs: 5000 });
     const result = validateMessage(msg);
     expect(result.ok).toBe(true);
+  });
+});
+
+// ── Phase 7.4 Message Envelope & Payload Validation ────────────
+
+describe('Phase 7.4 Message Envelope & Payload Validation', () => {
+  const validV2DigestPayload = {
+    formatVersion: 2 as const,
+    sessionId: 'session-room-1',
+    senderPeerId: 'peer-sender-1',
+    connectionGeneration: 1,
+    membershipEpoch: 1,
+    stateVersion: 10,
+    replicationVector: { 'peer-sender-1': 5, 'peer-remote-2': 3 },
+    snapshotFrontier: { 'peer-sender-1': 0, 'peer-remote-2': 0 },
+    historyFingerprints: { 'peer-sender-1': 'a1b2c3d4e5f60718' },
+    sentAt: Date.now(),
+  };
+
+  const validRepairRequestPayload = {
+    requestId: 'req-uuid-test-1',
+    sessionId: 'session-room-1',
+    requesterPeerId: 'peer-req-1',
+    targetOriginPeerId: 'peer-orig-1',
+    fromSequence: 1,
+    toSequence: 10,
+    membershipEpoch: 1,
+  };
+
+  const validBatchPayload = {
+    requestId: 'req-uuid-test-1',
+    sessionId: 'session-room-1',
+    supplierPeerId: 'peer-supplier-1',
+    originPeerId: 'peer-orig-1',
+    fromSequence: 1,
+    toSequence: 2,
+    operations: [
+      {
+        logicalEventId: 'op-1',
+        originPeerId: 'peer-orig-1',
+        membershipEpoch: 1,
+        messageType: 'PLAY' as const,
+        logicalTimestamp: 1,
+        originSequenceNumber: 1,
+        causalContext: {},
+        payload: { targetPositionMs: 1000 },
+      },
+      {
+        logicalEventId: 'op-2',
+        originPeerId: 'peer-orig-1',
+        membershipEpoch: 1,
+        messageType: 'PAUSE' as const,
+        logicalTimestamp: 2,
+        originSequenceNumber: 2,
+        causalContext: { 'peer-orig-1': 1 },
+        payload: { observedPositionMs: 1500 },
+      },
+    ],
+  };
+
+  const validRepairRejectedPayload = {
+    requestId: 'req-uuid-test-1',
+    sessionId: 'session-room-1',
+    supplierPeerId: 'peer-supplier-1',
+    targetOriginPeerId: 'peer-orig-1',
+    fromSequence: 1,
+    toSequence: 10,
+    reason: 'OUTSIDE_HORIZON' as const,
+    retainedHorizonSequence: 15,
+  };
+
+  it('should validate MessageType.STATE_DIGEST with v2 payload', () => {
+    const msg = fullMessage(MessageType.STATE_DIGEST, validV2DigestPayload);
+    const result = validateMessage(msg);
+    expect(result.ok).toBe(true);
+    if (result.ok) {
+      expect(result.value.messageType).toBe(MessageType.STATE_DIGEST);
+    }
+  });
+
+  it('should validate SYNC_MESSAGE_TYPES.STATE_DIGEST wire format', () => {
+    const msg = fullMessage(SYNC_MESSAGE_TYPES.STATE_DIGEST, validV2DigestPayload);
+    const result = validateMessage(msg);
+    expect(result.ok).toBe(true);
+  });
+
+  it('should validate MessageType.REPAIR_REQUEST with payload', () => {
+    const msg = fullMessage(MessageType.REPAIR_REQUEST, validRepairRequestPayload);
+    const result = validateMessage(msg);
+    expect(result.ok).toBe(true);
+    if (result.ok) {
+      expect(result.value.messageType).toBe(MessageType.REPAIR_REQUEST);
+    }
+  });
+
+  it('should validate SYNC_MESSAGE_TYPES.REPAIR_REQUEST wire format', () => {
+    const msg = fullMessage(SYNC_MESSAGE_TYPES.REPAIR_REQUEST, validRepairRequestPayload);
+    const result = validateMessage(msg);
+    expect(result.ok).toBe(true);
+  });
+
+  it('should validate MessageType.OPERATION_BATCH with payload', () => {
+    const msg = fullMessage(MessageType.OPERATION_BATCH, validBatchPayload);
+    const result = validateMessage(msg);
+    expect(result.ok).toBe(true);
+    if (result.ok) {
+      expect(result.value.messageType).toBe(MessageType.OPERATION_BATCH);
+    }
+  });
+
+  it('should validate SYNC_MESSAGE_TYPES.OPERATION_BATCH wire format', () => {
+    const msg = fullMessage(SYNC_MESSAGE_TYPES.OPERATION_BATCH, validBatchPayload);
+    const result = validateMessage(msg);
+    expect(result.ok).toBe(true);
+  });
+
+  it('should validate MessageType.REPAIR_REJECTED with payload', () => {
+    const msg = fullMessage(MessageType.REPAIR_REJECTED, validRepairRejectedPayload);
+    const result = validateMessage(msg);
+    expect(result.ok).toBe(true);
+    if (result.ok) {
+      expect(result.value.messageType).toBe(MessageType.REPAIR_REJECTED);
+    }
+  });
+
+  it('should validate SYNC_MESSAGE_TYPES.REPAIR_REJECTED wire format', () => {
+    const msg = fullMessage(SYNC_MESSAGE_TYPES.REPAIR_REJECTED, validRepairRejectedPayload);
+    const result = validateMessage(msg);
+    expect(result.ok).toBe(true);
+  });
+
+  it('should round-trip parseAndValidateMessage for all Phase 7.4 messages', () => {
+    const msgs = [
+      fullMessage(MessageType.STATE_DIGEST, validV2DigestPayload),
+      fullMessage(MessageType.REPAIR_REQUEST, validRepairRequestPayload),
+      fullMessage(MessageType.OPERATION_BATCH, validBatchPayload),
+      fullMessage(MessageType.REPAIR_REJECTED, validRepairRejectedPayload),
+    ];
+
+    for (const msg of msgs) {
+      const serialized = JSON.stringify(msg);
+      const parsed = parseAndValidateMessage(serialized);
+      expect(parsed.ok).toBe(true);
+      if (parsed.ok) {
+        expect(parsed.value.messageType).toBe(msg.messageType);
+      }
+    }
+  });
+
+  it('should reject malformed payload with INVALID_PAYLOAD code', () => {
+    const badRequest = {
+      ...validRepairRequestPayload,
+      fromSequence: 10,
+      toSequence: 2, // invalid: inverted range
+    };
+    const msg = fullMessage(MessageType.REPAIR_REQUEST, badRequest);
+    const result = validateMessage(msg);
+    expect(result.ok).toBe(false);
+    if (!result.ok) {
+      expect(result.error.code).toBe('INVALID_PAYLOAD');
+    }
+  });
+});
+
+// ── Phase 7.4 Batch Payload Size & WebRTC Limits ───────────────
+
+describe('Phase 7.4 Batch Payload Size & WebRTC Limits', () => {
+  it('should permit OPERATION_BATCH payload between 32 KB and 64 KB', () => {
+    // Generate an operation batch that is ~45 KB
+    const filler = 'X'.repeat(4000);
+    const ops = Array.from({ length: 10 }, (_, i) => ({
+      logicalEventId: `op-${i + 1}`,
+      originPeerId: 'peer-orig-1',
+      membershipEpoch: 1,
+      messageType: 'PLAY' as const,
+      logicalTimestamp: i + 1,
+      originSequenceNumber: i + 1,
+      causalContext: {},
+      payload: { targetPositionMs: i * 1000, padding: filler },
+    }));
+
+    const batchPayload = {
+      requestId: 'req-45k',
+      sessionId: 'session-room-1',
+      supplierPeerId: 'peer-supplier-1',
+      originPeerId: 'peer-orig-1',
+      fromSequence: 1,
+      toSequence: 10,
+      operations: ops,
+    };
+
+    const payloadByteLength = computeUtf8ByteLength(batchPayload);
+    // Verify it exceeds 32 KB and is well within 64 KB
+    expect(payloadByteLength).toBeGreaterThan(MAX_PAYLOAD_BYTES);
+    expect(payloadByteLength).toBeLessThan(MAX_BATCH_PAYLOAD_BYTES);
+
+    // Validate OPERATION_BATCH message
+    const msg = fullMessage(MessageType.OPERATION_BATCH, batchPayload);
+    const result = validateMessage(msg);
+    expect(result.ok).toBe(true);
+
+    // Conversely, verify normal control message (STATE_SNAPSHOT) with > 32 KB payload is rejected
+    const snapshotMsg = fullMessage(MessageType.STATE_SNAPSHOT, {
+      snapshotId: 'snap-large',
+      stateVersion: 1,
+      state: 'X'.repeat(MAX_PAYLOAD_BYTES + 500),
+    });
+    const snapshotResult = validateMessage(snapshotMsg);
+    expect(snapshotResult.ok).toBe(false);
+    if (!snapshotResult.ok) {
+      expect(snapshotResult.error.code).toBe('PAYLOAD_TOO_LARGE');
+    }
+  });
+
+  it('should reject OPERATION_BATCH payload exceeding MAX_BATCH_PAYLOAD_BYTES (65,536)', () => {
+    const filler = 'Y'.repeat(7000);
+    const ops = Array.from({ length: 12 }, (_, i) => ({
+      logicalEventId: `op-${i + 1}`,
+      originPeerId: 'peer-orig-1',
+      membershipEpoch: 1,
+      messageType: 'PLAY' as const,
+      logicalTimestamp: i + 1,
+      originSequenceNumber: i + 1,
+      causalContext: {},
+      payload: { targetPositionMs: i * 1000, padding: filler },
+    }));
+
+    const batchPayload = {
+      requestId: 'req-over64k',
+      sessionId: 'session-room-1',
+      supplierPeerId: 'peer-supplier-1',
+      originPeerId: 'peer-orig-1',
+      fromSequence: 1,
+      toSequence: 12,
+      operations: ops,
+    };
+
+    const payloadByteLength = computeUtf8ByteLength(batchPayload);
+    expect(payloadByteLength).toBeGreaterThan(MAX_BATCH_PAYLOAD_BYTES);
+
+    const msg = fullMessage(MessageType.OPERATION_BATCH, batchPayload);
+    const result = validateMessage(msg);
+    expect(result.ok).toBe(false);
+    if (!result.ok) {
+      expect(result.error.code).toBe('PAYLOAD_TOO_LARGE');
+    }
+  });
+});
+
+// ── computeUtf8ByteLength & serializeAndCheckSize ──────────────
+
+describe('computeUtf8ByteLength & serializeAndCheckSize', () => {
+  it('should compute exact byte length for standard ASCII strings', () => {
+    expect(computeUtf8ByteLength('hello world')).toBe(11);
+    expect(computeUtf8ByteLength('')).toBe(0);
+  });
+
+  it('should accurately compute UTF-8 bytes for multibyte characters', () => {
+    // 'café': 4 characters, 5 bytes (é is 2 bytes in UTF-8)
+    expect(computeUtf8ByteLength('café')).toBe(5);
+
+    // '🚀': 2 UTF-16 code units, 4 UTF-8 bytes
+    expect(computeUtf8ByteLength('🚀')).toBe(4);
+
+    // '日本語': 3 characters, 9 UTF-8 bytes (3 bytes each)
+    expect(computeUtf8ByteLength('日本語')).toBe(9);
+  });
+
+  it('should accurately compute UTF-8 bytes for complex objects', () => {
+    const obj = { text: 'Hello 🌍', numbers: [1, 2, 3] };
+    const expected = new TextEncoder().encode(JSON.stringify(obj)).byteLength;
+    expect(computeUtf8ByteLength(obj)).toBe(expected);
+  });
+
+  it('should succeed in serializeAndCheckSize when within limit', () => {
+    const data = { valid: 'content', id: 42 };
+    const result = serializeAndCheckSize(data, 1024);
+    expect(result.ok).toBe(true);
+    if (result.ok) {
+      expect(result.value.byteLength).toBe(new TextEncoder().encode(JSON.stringify(data)).byteLength);
+      expect(result.value.json).toBe(JSON.stringify(data));
+    }
+  });
+
+  it('should reject in serializeAndCheckSize when exceeding limit with accurate byte count', () => {
+    const data = { large: 'Z'.repeat(100) };
+    const expectedBytes = new TextEncoder().encode(JSON.stringify(data)).byteLength;
+    const result = serializeAndCheckSize(data, 50);
+    expect(result.ok).toBe(false);
+    if (!result.ok) {
+      expect(result.error.code).toBe('PAYLOAD_TOO_LARGE');
+      expect(result.error.byteLength).toBe(expectedBytes);
+      expect(result.error.maxBytes).toBe(50);
+      expect(result.error.message).toContain(String(expectedBytes));
+    }
+  });
+
+  it('should return SERIALIZATION_FAILED gracefully for circular references', () => {
+    const circular: Record<string, unknown> = { a: 1 };
+    circular.self = circular;
+    const result = serializeAndCheckSize(circular, 1024);
+    expect(result.ok).toBe(false);
+    if (!result.ok) {
+      expect(result.error.code).toBe('SERIALIZATION_FAILED');
+      expect(result.error.message).toContain('Failed to serialize payload');
+    }
+  });
+
+  it('should return SERIALIZATION_FAILED gracefully for BigInt values', () => {
+    const hasBigInt = { val: BigInt(9007199254740991) };
+    const result = serializeAndCheckSize(hasBigInt, 1024);
+    expect(result.ok).toBe(false);
+    if (!result.ok) {
+      expect(result.error.code).toBe('SERIALIZATION_FAILED');
+    }
   });
 });

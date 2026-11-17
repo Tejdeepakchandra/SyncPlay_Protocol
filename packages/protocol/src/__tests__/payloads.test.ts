@@ -18,8 +18,20 @@ import {
 import {
   StateRequestPayloadSchema,
   StateSnapshotPayloadSchema,
-  StateDigestPayloadSchema,
+  StateDigestPayloadV1Schema,
+  LegacyStateDigestPayloadSchema,
+  isLegacyStateDigest,
 } from '../payloads/state.js';
+import {
+  StateDigestPayloadSchema,
+  StateDigestPayloadV2Schema,
+  isStateDigestV2,
+  RepairRequestPayloadSchema,
+  OperationBatchPayloadSchema,
+  RepairRejectedPayloadSchema,
+  REPAIR_REJECTION_REASONS,
+  SerializedControlOperationSchema,
+} from '../payloads/repair.js';
 
 // ── PING ─────────────────────────────────────────────────────
 
@@ -340,11 +352,11 @@ describe('StateSnapshotPayloadSchema', () => {
   });
 });
 
-// ── STATE_DIGEST ─────────────────────────────────────────────
+// ── STATE_DIGEST (Phase 2 Legacy) ──────────────────────────
 
-describe('StateDigestPayloadSchema', () => {
-  it('should accept valid STATE_DIGEST', () => {
-    const result = StateDigestPayloadSchema.safeParse({
+describe('StateDigestPayloadV1Schema (Phase 2 Legacy Digest)', () => {
+  it('should accept valid Phase 2 legacy STATE_DIGEST', () => {
+    const result = StateDigestPayloadV1Schema.safeParse({
       digestId: 'digest-001',
       stateVersion: 3,
       digest: 'sha256:abc123',
@@ -353,7 +365,7 @@ describe('StateDigestPayloadSchema', () => {
   });
 
   it('should reject empty digest string', () => {
-    const result = StateDigestPayloadSchema.safeParse({
+    const result = StateDigestPayloadV1Schema.safeParse({
       digestId: 'digest-001',
       stateVersion: 3,
       digest: '',
@@ -362,7 +374,7 @@ describe('StateDigestPayloadSchema', () => {
   });
 
   it('should reject digest exceeding max length', () => {
-    const result = StateDigestPayloadSchema.safeParse({
+    const result = StateDigestPayloadV1Schema.safeParse({
       digestId: 'digest-001',
       stateVersion: 3,
       digest: 'X'.repeat(4097),
@@ -371,11 +383,444 @@ describe('StateDigestPayloadSchema', () => {
   });
 
   it('should accept digest at max length', () => {
-    const result = StateDigestPayloadSchema.safeParse({
+    const result = StateDigestPayloadV1Schema.safeParse({
       digestId: 'digest-001',
       stateVersion: 3,
       digest: 'X'.repeat(4096),
     });
     expect(result.success).toBe(true);
+  });
+
+  it('should identify legacy digest via isLegacyStateDigest', () => {
+    const legacy = {
+      digestId: 'digest-001',
+      stateVersion: 3,
+      digest: 'sha256:abc123',
+    };
+    expect(isLegacyStateDigest(legacy)).toBe(true);
+    expect(isStateDigestV2(legacy)).toBe(false);
+    expect(isLegacyStateDigest(null)).toBe(false);
+    expect(isLegacyStateDigest(undefined)).toBe(false);
+    expect(isLegacyStateDigest({ other: 'field' })).toBe(false);
+  });
+});
+
+// ── STATE_DIGEST (Phase 7.4 V2 Multi-Vector) ─────────────────
+
+describe('StateDigestPayloadSchema (Phase 7.4 V2 Multi-Vector Digest)', () => {
+  const validV2Digest = {
+    formatVersion: 2 as const,
+    sessionId: 'session-room-1',
+    senderPeerId: 'peer-sender-1',
+    connectionGeneration: 1,
+    membershipEpoch: 2,
+    stateVersion: 42,
+    replicationVector: {
+      'peer-sender-1': 10,
+      'peer-remote-2': 5,
+    },
+    snapshotFrontier: {
+      'peer-sender-1': 0,
+      'peer-remote-2': 0,
+    },
+    historyFingerprints: {
+      'peer-sender-1': 'a1b2c3d4e5f60718',
+      'peer-remote-2': '0123456789abcdef0123456789abcdef',
+    },
+    sentAt: 1700000000000,
+  };
+
+  it('should accept a valid Phase 7.4 V2 state digest', () => {
+    const result = StateDigestPayloadSchema.safeParse(validV2Digest);
+    expect(result.success).toBe(true);
+    if (result.success) {
+      expect(result.data.formatVersion).toBe(2);
+      expect(result.data.sessionId).toBe('session-room-1');
+      expect(result.data.replicationVector['peer-sender-1']).toBe(10);
+      expect(result.data.historyFingerprints['peer-remote-2']).toBe(
+        '0123456789abcdef0123456789abcdef',
+      );
+    }
+  });
+
+  it('should verify isStateDigestV2 helper returns true for valid v2 digest', () => {
+    expect(isStateDigestV2(validV2Digest)).toBe(true);
+    expect(isLegacyStateDigest(validV2Digest)).toBe(false);
+  });
+
+  it('should reject digest missing formatVersion', () => {
+    const { formatVersion, ...withoutVersion } = validV2Digest;
+    const result = StateDigestPayloadSchema.safeParse(withoutVersion);
+    expect(result.success).toBe(false);
+  });
+
+  it('should reject digest with formatVersion: 1', () => {
+    const result = StateDigestPayloadSchema.safeParse({
+      ...validV2Digest,
+      formatVersion: 1,
+    });
+    expect(result.success).toBe(false);
+  });
+
+  it('should reject digest with unsupported future formatVersion: 3', () => {
+    const result = StateDigestPayloadSchema.safeParse({
+      ...validV2Digest,
+      formatVersion: 3,
+    });
+    expect(result.success).toBe(false);
+  });
+
+  it('should reject non-number formatVersion', () => {
+    const result = StateDigestPayloadSchema.safeParse({
+      ...validV2Digest,
+      formatVersion: '2',
+    });
+    expect(result.success).toBe(false);
+  });
+
+  it('should reject legacy Phase 2 digest passed to V2 schema', () => {
+    const legacy = {
+      digestId: 'digest-001',
+      stateVersion: 3,
+      digest: 'sha256:abc123',
+    };
+    const result = StateDigestPayloadSchema.safeParse(legacy);
+    expect(result.success).toBe(false);
+  });
+
+  it('should reject missing or empty sessionId', () => {
+    expect(
+      StateDigestPayloadSchema.safeParse({ ...validV2Digest, sessionId: '' }).success,
+    ).toBe(false);
+  });
+
+  it('should reject zero or negative connectionGeneration', () => {
+    expect(
+      StateDigestPayloadSchema.safeParse({ ...validV2Digest, connectionGeneration: 0 }).success,
+    ).toBe(false);
+    expect(
+      StateDigestPayloadSchema.safeParse({ ...validV2Digest, connectionGeneration: -1 }).success,
+    ).toBe(false);
+  });
+
+  it('should reject zero or negative membershipEpoch', () => {
+    expect(
+      StateDigestPayloadSchema.safeParse({ ...validV2Digest, membershipEpoch: 0 }).success,
+    ).toBe(false);
+    expect(
+      StateDigestPayloadSchema.safeParse({ ...validV2Digest, membershipEpoch: -2 }).success,
+    ).toBe(false);
+  });
+
+  it('should reject negative stateVersion', () => {
+    expect(
+      StateDigestPayloadSchema.safeParse({ ...validV2Digest, stateVersion: -1 }).success,
+    ).toBe(false);
+  });
+
+  it('should reject negative sequence numbers in replicationVector', () => {
+    expect(
+      StateDigestPayloadSchema.safeParse({
+        ...validV2Digest,
+        replicationVector: { 'peer-1': -1 },
+      }).success,
+    ).toBe(false);
+  });
+
+  it('should reject negative sequence numbers in snapshotFrontier', () => {
+    expect(
+      StateDigestPayloadSchema.safeParse({
+        ...validV2Digest,
+        snapshotFrontier: { 'peer-1': -5 },
+      }).success,
+    ).toBe(false);
+  });
+
+  it('should reject invalid hex characters in historyFingerprints', () => {
+    expect(
+      StateDigestPayloadSchema.safeParse({
+        ...validV2Digest,
+        historyFingerprints: { 'peer-1': 'not-a-hex-string!!' },
+      }).success,
+    ).toBe(false);
+  });
+
+  it('should reject fingerprints shorter than 16 characters or longer than 64', () => {
+    expect(
+      StateDigestPayloadSchema.safeParse({
+        ...validV2Digest,
+        historyFingerprints: { 'peer-1': 'abc' },
+      }).success,
+    ).toBe(false);
+    expect(
+      StateDigestPayloadSchema.safeParse({
+        ...validV2Digest,
+        historyFingerprints: { 'peer-1': 'a'.repeat(65) },
+      }).success,
+    ).toBe(false);
+  });
+
+  it('should reject negative sentAt timestamp', () => {
+    expect(
+      StateDigestPayloadSchema.safeParse({ ...validV2Digest, sentAt: -100 }).success,
+    ).toBe(false);
+  });
+});
+
+// ── REPAIR_REQUEST (Phase 7.4) ────────────────────────────────
+
+describe('RepairRequestPayloadSchema (Phase 7.4)', () => {
+  const validRequest = {
+    requestId: 'req-uuid-12345',
+    sessionId: 'session-room-1',
+    requesterPeerId: 'peer-requester-1',
+    targetOriginPeerId: 'peer-author-1',
+    fromSequence: 1,
+    toSequence: 10,
+    membershipEpoch: 1,
+  };
+
+  it('should accept a valid repair request within 32 operations range', () => {
+    const result = RepairRequestPayloadSchema.safeParse(validRequest);
+    expect(result.success).toBe(true);
+    if (result.success) {
+      expect(result.data.requestId).toBe('req-uuid-12345');
+      expect(result.data.fromSequence).toBe(1);
+      expect(result.data.toSequence).toBe(10);
+      expect(result.data.toSequence - result.data.fromSequence + 1).toBe(10);
+    }
+  });
+
+  it('should accept single-operation repair request (from == to)', () => {
+    const result = RepairRequestPayloadSchema.safeParse({
+      ...validRequest,
+      fromSequence: 5,
+      toSequence: 5,
+    });
+    expect(result.success).toBe(true);
+  });
+
+  it('should accept exactly 32 operations range (1 to 32)', () => {
+    const result = RepairRequestPayloadSchema.safeParse({
+      ...validRequest,
+      fromSequence: 1,
+      toSequence: 32,
+    });
+    expect(result.success).toBe(true);
+  });
+
+  it('should reject range exceeding 32 operations (1 to 33 = 33 ops)', () => {
+    const result = RepairRequestPayloadSchema.safeParse({
+      ...validRequest,
+      fromSequence: 1,
+      toSequence: 33,
+    });
+    expect(result.success).toBe(false);
+    if (!result.success) {
+      expect(result.error.issues[0]?.message).toContain(
+        'Requested range cannot exceed 32 operations per request',
+      );
+    }
+  });
+
+  it('should reject inverted sequence range (toSequence < fromSequence)', () => {
+    const result = RepairRequestPayloadSchema.safeParse({
+      ...validRequest,
+      fromSequence: 10,
+      toSequence: 5,
+    });
+    expect(result.success).toBe(false);
+    if (!result.success) {
+      expect(result.error.issues[0]?.message).toContain(
+        'toSequence must be greater than or equal to fromSequence',
+      );
+    }
+  });
+
+  it('should reject missing or empty requestId', () => {
+    const { requestId, ...withoutId } = validRequest;
+    expect(RepairRequestPayloadSchema.safeParse(withoutId).success).toBe(false);
+    expect(
+      RepairRequestPayloadSchema.safeParse({ ...validRequest, requestId: '' }).success,
+    ).toBe(false);
+  });
+
+  it('should reject zero or negative fromSequence', () => {
+    expect(
+      RepairRequestPayloadSchema.safeParse({ ...validRequest, fromSequence: 0 }).success,
+    ).toBe(false);
+    expect(
+      RepairRequestPayloadSchema.safeParse({ ...validRequest, fromSequence: -1 }).success,
+    ).toBe(false);
+  });
+
+  it('should reject non-integer sequence numbers', () => {
+    expect(
+      RepairRequestPayloadSchema.safeParse({ ...validRequest, fromSequence: 1.5 }).success,
+    ).toBe(false);
+    expect(
+      RepairRequestPayloadSchema.safeParse({ ...validRequest, toSequence: 2.7 }).success,
+    ).toBe(false);
+  });
+
+  it('should reject zero or negative membershipEpoch', () => {
+    expect(
+      RepairRequestPayloadSchema.safeParse({ ...validRequest, membershipEpoch: 0 }).success,
+    ).toBe(false);
+    expect(
+      RepairRequestPayloadSchema.safeParse({ ...validRequest, membershipEpoch: -1 }).success,
+    ).toBe(false);
+  });
+});
+
+// ── OPERATION_BATCH (Phase 7.4) ───────────────────────────────
+
+describe('OperationBatchPayloadSchema (Phase 7.4)', () => {
+  const createTestOp = (seq: number) => ({
+    logicalEventId: `op-evt-${seq}`,
+    originPeerId: 'peer-author-1',
+    membershipEpoch: 1,
+    messageType: 'PLAY' as const,
+    logicalTimestamp: seq,
+    originSequenceNumber: seq,
+    causalContext: { 'peer-author-1': seq - 1 },
+    payload: { targetPositionMs: seq * 1000 },
+  });
+
+  const validBatch = {
+    requestId: 'req-uuid-12345',
+    sessionId: 'session-room-1',
+    supplierPeerId: 'peer-supplier-1',
+    originPeerId: 'peer-author-1',
+    fromSequence: 1,
+    toSequence: 2,
+    operations: [createTestOp(1), createTestOp(2)],
+  };
+
+  it('should accept a valid operation batch with echoed requestId', () => {
+    const result = OperationBatchPayloadSchema.safeParse(validBatch);
+    expect(result.success).toBe(true);
+    if (result.success) {
+      expect(result.data.requestId).toBe('req-uuid-12345');
+      expect(result.data.operations.length).toBe(2);
+    }
+  });
+
+  it('should accept operation batch without optional requestId', () => {
+    const { requestId, ...withoutId } = validBatch;
+    const result = OperationBatchPayloadSchema.safeParse(withoutId);
+    expect(result.success).toBe(true);
+  });
+
+  it('should accept operation batch without optional sessionId (Phase 7.3 backward compatibility)', () => {
+    const { sessionId, ...withoutSession } = validBatch;
+    const result = OperationBatchPayloadSchema.safeParse(withoutSession);
+    expect(result.success).toBe(true);
+  });
+
+  it('should accept batch with exactly 32 operations', () => {
+    const ops = Array.from({ length: 32 }, (_, i) => createTestOp(i + 1));
+    const result = OperationBatchPayloadSchema.safeParse({
+      ...validBatch,
+      fromSequence: 1,
+      toSequence: 32,
+      operations: ops,
+    });
+    expect(result.success).toBe(true);
+  });
+
+  it('should reject batch exceeding 32 operations', () => {
+    const ops = Array.from({ length: 33 }, (_, i) => createTestOp(i + 1));
+    const result = OperationBatchPayloadSchema.safeParse({
+      ...validBatch,
+      fromSequence: 1,
+      toSequence: 33,
+      operations: ops,
+    });
+    expect(result.success).toBe(false);
+  });
+
+  it('should reject inverted sequence range in batch', () => {
+    const result = OperationBatchPayloadSchema.safeParse({
+      ...validBatch,
+      fromSequence: 5,
+      toSequence: 2,
+    });
+    expect(result.success).toBe(false);
+  });
+
+  it('should reject operation with invalid messageType in batch', () => {
+    const badOp = {
+      ...createTestOp(1),
+      messageType: 'UNSUPPORTED_TYPE',
+    };
+    const result = OperationBatchPayloadSchema.safeParse({
+      ...validBatch,
+      operations: [badOp],
+    });
+    expect(result.success).toBe(false);
+  });
+});
+
+// ── REPAIR_REJECTED (Phase 7.4) ───────────────────────────────
+
+describe('RepairRejectedPayloadSchema (Phase 7.4)', () => {
+  const baseRejection = {
+    requestId: 'req-uuid-12345',
+    sessionId: 'session-room-1',
+    supplierPeerId: 'peer-supplier-1',
+    targetOriginPeerId: 'peer-author-1',
+    fromSequence: 5,
+    toSequence: 10,
+  };
+
+  it.each(REPAIR_REJECTION_REASONS)('should accept valid rejection reason: %s', (reason) => {
+    const result = RepairRejectedPayloadSchema.safeParse({
+      ...baseRejection,
+      reason,
+      retainedHorizonSequence: reason === 'OUTSIDE_HORIZON' ? 20 : undefined,
+    });
+    expect(result.success).toBe(true);
+    if (result.success) {
+      expect(result.data.reason).toBe(reason);
+    }
+  });
+
+  it('should accept OUTSIDE_HORIZON with retainedHorizonSequence', () => {
+    const result = RepairRejectedPayloadSchema.safeParse({
+      ...baseRejection,
+      reason: 'OUTSIDE_HORIZON',
+      retainedHorizonSequence: 50,
+    });
+    expect(result.success).toBe(true);
+    if (result.success) {
+      expect(result.data.retainedHorizonSequence).toBe(50);
+    }
+  });
+
+  it('should reject unknown rejection reason', () => {
+    const result = RepairRejectedPayloadSchema.safeParse({
+      ...baseRejection,
+      reason: 'INVALID_REASON',
+    });
+    expect(result.success).toBe(false);
+  });
+
+  it('should reject missing requestId', () => {
+    const { requestId, ...withoutId } = baseRejection;
+    const result = RepairRejectedPayloadSchema.safeParse({
+      ...withoutId,
+      reason: 'RATE_LIMITED',
+    });
+    expect(result.success).toBe(false);
+  });
+
+  it('should reject empty requestId', () => {
+    const result = RepairRejectedPayloadSchema.safeParse({
+      ...baseRejection,
+      requestId: '',
+      reason: 'BUSY',
+    });
+    expect(result.success).toBe(false);
   });
 });

@@ -12,9 +12,12 @@ import {
   PROTOCOL_VERSION,
   MAX_MESSAGE_BYTES,
   MAX_PAYLOAD_BYTES,
+  MAX_BATCH_PAYLOAD_BYTES,
+  MAX_OPERATIONS_PER_BATCH,
 
   // Message type registry
   MessageType,
+  SYNC_MESSAGE_TYPES,
   KNOWN_MESSAGE_TYPES,
   REQUIRES_LOGICAL_EVENT_ID,
 
@@ -31,8 +34,21 @@ import {
   StateRequestPayloadSchema,
   StateSnapshotPayloadSchema,
   StateDigestPayloadSchema,
+  StateDigestPayloadV1Schema,
+  StateDigestPayloadV2Schema,
+  StateSnapshotPayloadV2Schema,
+  OperationBatchPayloadSchema,
+  RepairRequestPayloadSchema,
+  RepairRejectedPayloadSchema,
+  CompactedCheckpointItemSchema,
   STATE_REQUEST_REASONS,
+  REPAIR_REJECTION_REASONS,
   PAYLOAD_SCHEMAS,
+  StateDigestWireSchema,
+
+  // Helpers
+  isLegacyStateDigest,
+  isStateDigestV2,
 
   // Validation
   validateMessage,
@@ -40,6 +56,8 @@ import {
   checkMessageSize,
   checkPayloadSize,
   parseAndValidateMessage,
+  computeUtf8ByteLength,
+  serializeAndCheckSize,
 } from '../index.js';
 
 // Type-only imports verified at compile time
@@ -75,13 +93,16 @@ describe('Public exports', () => {
   it('should export size limit constants', () => {
     expect(typeof MAX_MESSAGE_BYTES).toBe('number');
     expect(typeof MAX_PAYLOAD_BYTES).toBe('number');
+    expect(typeof MAX_BATCH_PAYLOAD_BYTES).toBe('number');
+    expect(typeof MAX_OPERATIONS_PER_BATCH).toBe('number');
     expect(MAX_MESSAGE_BYTES).toBeGreaterThan(0);
     expect(MAX_PAYLOAD_BYTES).toBeGreaterThan(0);
-    expect(MAX_MESSAGE_BYTES).toBeGreaterThan(MAX_PAYLOAD_BYTES);
+    expect(MAX_MESSAGE_BYTES).toBeGreaterThanOrEqual(MAX_PAYLOAD_BYTES);
+    expect(MAX_OPERATIONS_PER_BATCH).toBe(32);
   });
 
-  it('should export all 9 message types', () => {
-    expect(KNOWN_MESSAGE_TYPES.size).toBe(9);
+  it('should export all known message types including Phase 7.4 anti-entropy', () => {
+    expect(KNOWN_MESSAGE_TYPES.size).toBe(17);
     expect(KNOWN_MESSAGE_TYPES.has(MessageType.PING)).toBe(true);
     expect(KNOWN_MESSAGE_TYPES.has(MessageType.PONG)).toBe(true);
     expect(KNOWN_MESSAGE_TYPES.has(MessageType.PLAY)).toBe(true);
@@ -91,6 +112,16 @@ describe('Public exports', () => {
     expect(KNOWN_MESSAGE_TYPES.has(MessageType.STATE_REQUEST)).toBe(true);
     expect(KNOWN_MESSAGE_TYPES.has(MessageType.STATE_SNAPSHOT)).toBe(true);
     expect(KNOWN_MESSAGE_TYPES.has(MessageType.STATE_DIGEST)).toBe(true);
+    expect(KNOWN_MESSAGE_TYPES.has(MessageType.OPERATION_BATCH)).toBe(true);
+    expect(KNOWN_MESSAGE_TYPES.has(MessageType.REPAIR_REQUEST)).toBe(true);
+    expect(KNOWN_MESSAGE_TYPES.has(MessageType.REPAIR_REJECTED)).toBe(true);
+
+    // Wire subprotocol constants
+    expect(KNOWN_MESSAGE_TYPES.has(SYNC_MESSAGE_TYPES.CONTROL_EVENT)).toBe(true);
+    expect(KNOWN_MESSAGE_TYPES.has(SYNC_MESSAGE_TYPES.OPERATION_BATCH)).toBe(true);
+    expect(KNOWN_MESSAGE_TYPES.has(SYNC_MESSAGE_TYPES.STATE_DIGEST)).toBe(true);
+    expect(KNOWN_MESSAGE_TYPES.has(SYNC_MESSAGE_TYPES.REPAIR_REQUEST)).toBe(true);
+    expect(KNOWN_MESSAGE_TYPES.has(SYNC_MESSAGE_TYPES.REPAIR_REJECTED)).toBe(true);
   });
 
   it('should export REQUIRES_LOGICAL_EVENT_ID with 4 control types', () => {
@@ -99,10 +130,13 @@ describe('Public exports', () => {
     expect(REQUIRES_LOGICAL_EVENT_ID.has(MessageType.PAUSE)).toBe(true);
     expect(REQUIRES_LOGICAL_EVENT_ID.has(MessageType.SEEK)).toBe(true);
     expect(REQUIRES_LOGICAL_EVENT_ID.has(MessageType.RATE_CHANGE)).toBe(true);
-    // Transport and state messages do NOT require it
+    // Transport, state, and anti-entropy repair messages do NOT require it
     expect(REQUIRES_LOGICAL_EVENT_ID.has(MessageType.PING)).toBe(false);
     expect(REQUIRES_LOGICAL_EVENT_ID.has(MessageType.PONG)).toBe(false);
     expect(REQUIRES_LOGICAL_EVENT_ID.has(MessageType.STATE_REQUEST)).toBe(false);
+    expect(REQUIRES_LOGICAL_EVENT_ID.has(MessageType.OPERATION_BATCH)).toBe(false);
+    expect(REQUIRES_LOGICAL_EVENT_ID.has(MessageType.REPAIR_REQUEST)).toBe(false);
+    expect(REQUIRES_LOGICAL_EVENT_ID.has(MessageType.REPAIR_REJECTED)).toBe(false);
   });
 
   it('should export ProtocolMessageSchema as a Zod schema', () => {
@@ -119,6 +153,26 @@ describe('Public exports', () => {
     expect(typeof StateRequestPayloadSchema.safeParse).toBe('function');
     expect(typeof StateSnapshotPayloadSchema.safeParse).toBe('function');
     expect(typeof StateDigestPayloadSchema.safeParse).toBe('function');
+    expect(typeof StateDigestPayloadV1Schema.safeParse).toBe('function');
+    expect(typeof StateDigestPayloadV2Schema.safeParse).toBe('function');
+    expect(typeof OperationBatchPayloadSchema.safeParse).toBe('function');
+    expect(typeof RepairRequestPayloadSchema.safeParse).toBe('function');
+    expect(typeof RepairRejectedPayloadSchema.safeParse).toBe('function');
+    expect(typeof CompactedCheckpointItemSchema.safeParse).toBe('function');
+    expect(typeof StateSnapshotPayloadV2Schema.safeParse).toBe('function');
+    expect(typeof StateDigestWireSchema.safeParse).toBe('function');
+  });
+
+  it('should export validation and size helper functions', () => {
+    expect(typeof validateMessage).toBe('function');
+    expect(typeof validatePayload).toBe('function');
+    expect(typeof checkMessageSize).toBe('function');
+    expect(typeof checkPayloadSize).toBe('function');
+    expect(typeof parseAndValidateMessage).toBe('function');
+    expect(typeof computeUtf8ByteLength).toBe('function');
+    expect(typeof serializeAndCheckSize).toBe('function');
+    expect(typeof isLegacyStateDigest).toBe('function');
+    expect(typeof isStateDigestV2).toBe('function');
   });
 
   it('should export PAYLOAD_SCHEMAS map with entry for each message type', () => {

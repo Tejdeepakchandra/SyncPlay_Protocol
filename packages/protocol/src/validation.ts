@@ -20,8 +20,18 @@
 import type { z } from 'zod';
 import { ProtocolMessageSchema } from './envelope.js';
 import type { ProtocolMessage } from './envelope.js';
-import { PROTOCOL_VERSION, MAX_MESSAGE_BYTES, MAX_PAYLOAD_BYTES } from './constants.js';
-import { KNOWN_MESSAGE_TYPES, REQUIRES_LOGICAL_EVENT_ID } from './message-types.js';
+import {
+  PROTOCOL_VERSION,
+  MAX_MESSAGE_BYTES,
+  MAX_PAYLOAD_BYTES,
+  MAX_BATCH_PAYLOAD_BYTES,
+} from './constants.js';
+import {
+  MessageType,
+  SYNC_MESSAGE_TYPES,
+  KNOWN_MESSAGE_TYPES,
+  REQUIRES_LOGICAL_EVENT_ID,
+} from './message-types.js';
 import { PAYLOAD_SCHEMAS } from './payloads/index.js';
 import type { Result, ValidationError, ValidationErrorCode } from './result.js';
 
@@ -211,7 +221,14 @@ export function validateMessage(raw: unknown): Result<ProtocolMessage> {
   }
 
   // 6. Check payload size independently
-  const payloadSizeResult = checkPayloadSize(payloadResult.value);
+  // Anti-entropy operation batches can utilize the full WebRTC DataChannel application payload cap (64 KB).
+  const maxPayloadBytes =
+    message.messageType === MessageType.OPERATION_BATCH ||
+    message.messageType === SYNC_MESSAGE_TYPES.OPERATION_BATCH
+      ? MAX_BATCH_PAYLOAD_BYTES
+      : MAX_PAYLOAD_BYTES;
+
+  const payloadSizeResult = checkPayloadSize(payloadResult.value, maxPayloadBytes);
   if (!payloadSizeResult.ok) {
     return payloadSizeResult as Result<never>;
   }
@@ -223,6 +240,63 @@ export function validateMessage(raw: unknown): Result<ProtocolMessage> {
   };
 
   return { ok: true, value: validated };
+}
+
+// ── Serialization & UTF-8 Size Helpers ────────────────────────
+
+/**
+ * Computes exact UTF-8 byte length for any string or serializable data.
+ * Always measures UTF-8 encoded bytes, not JavaScript character count.
+ */
+export function computeUtf8ByteLength(data: string | unknown): number {
+  const str = typeof data === 'string' ? data : JSON.stringify(data);
+  return new TextEncoder().encode(str).byteLength;
+}
+
+export interface SerializedPayload {
+  readonly json: string;
+  readonly byteLength: number;
+}
+
+/**
+ * Serializes an object to JSON and verifies that its UTF-8 byte length
+ * does not exceed the specified maximum byte limit.
+ *
+ * @param payload - The payload object to serialize.
+ * @param maxBytes - Maximum permitted UTF-8 byte length (default MAX_MESSAGE_BYTES = 65,536).
+ */
+export function serializeAndCheckSize(
+  payload: unknown,
+  maxBytes: number = MAX_MESSAGE_BYTES,
+): Result<SerializedPayload> {
+  let json: string;
+  try {
+    json = JSON.stringify(payload);
+    if (json === undefined) {
+      return fail('SERIALIZATION_FAILED', 'Failed to serialize payload to JSON: undefined output');
+    }
+  } catch (err) {
+    return fail(
+      'SERIALIZATION_FAILED',
+      `Failed to serialize payload to JSON: ${err instanceof Error ? err.message : String(err)}`,
+    );
+  }
+
+  const byteLength = new TextEncoder().encode(json).byteLength;
+  if (byteLength > maxBytes) {
+    return {
+      ok: false,
+      error: {
+        code: 'PAYLOAD_TOO_LARGE',
+        message: `Serialized payload is ${byteLength} bytes, exceeding ${maxBytes} byte limit`,
+        path: ['payload'],
+        byteLength,
+        maxBytes,
+      },
+    };
+  }
+
+  return { ok: true, value: { json, byteLength } };
 }
 
 // ── Combined parse + validate ────────────────────────────────
