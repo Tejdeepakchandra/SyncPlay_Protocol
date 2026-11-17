@@ -21,6 +21,11 @@ export interface StoredOperation {
   readonly payload: unknown;
 }
 
+export interface CompactedCheckpointRecord {
+  readonly logicalTimestamp: number;
+  readonly logicalEventId: string;
+}
+
 export type InsertOperationCode =
   | 'INSERTED_HEAD'
   | 'INSERTED_REORDER'
@@ -66,6 +71,20 @@ export interface IOrderedOperationLog {
 
   /** Retrieves exact Lamport timestamp for a compacted sequence. */
   getCompactedCheckpoint(originPeerId: string, sequenceNumber: number): number | undefined;
+
+  /** Retrieves compacted checkpoint record including identity metadata. */
+  getCompactedCheckpointRecord?(
+    originPeerId: string,
+    sequenceNumber: number,
+  ): CompactedCheckpointRecord | undefined;
+
+  /** Sets compacted checkpoint with timestamp and optional logical event id. */
+  setCompactedCheckpoint?(
+    originPeerId: string,
+    sequenceNumber: number,
+    logicalTimestamp: number,
+    logicalEventId?: string,
+  ): void;
 
   /** Gets base snapshot frontier representation. */
   getBaseSnapshotFrontier?(): Readonly<Record<string, number>>;

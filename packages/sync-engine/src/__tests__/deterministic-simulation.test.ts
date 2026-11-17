@@ -728,28 +728,40 @@ describe('Phase 7.3 Deterministic Simulation Test Suite', () => {
       expect(noisyState.lastAppliedEvent?.logicalEventId).toBe(cleanState.lastAppliedEvent?.logicalEventId);
     });
 
-    it('out-of-order with post-compaction arrival: pre-horizon events are ignored as compacted', () => {
+    it('out-of-order with post-compaction arrival: pre-horizon events with checkpoint are ignored, expired are rejected', () => {
       const engine = new LeaderlessSyncEngine({
         sessionId: 'test-session',
         localPeerId: 'peer-obs',
         clock: { now: () => 1000 },
       });
 
-      engine.importSnapshotV2(
-        makeSnapshotV2(
-          'snap-compact',
-          { 'peer-base': 1, 'peer-A': 10 },
-          15,
-          { 'peer-base': 1, 'peer-A': 10 },
-          'paused',
-          5000,
-        ),
+      const snap = makeSnapshotV2(
+        'snap-compact',
+        { 'peer-base': 1, 'peer-A': 10 },
+        15,
+        { 'peer-base': 1, 'peer-A': 10 },
+        'paused',
+        5000,
       );
+      // Explicitly include checkpoint for peer-A: 5
+      snap.compactedCheckpoints.push({
+        originPeerId: 'peer-A',
+        sequenceNumber: 5,
+        logicalTimestamp: 8,
+        logicalEventId: 'late-1',
+      } as any);
 
-      // Late event from peer-A with seq 5 (<= 10) -> IGNORED_ALREADY_COMPACTED
+      engine.importSnapshotV2(snap);
+
+      // Arrival 1: Legitimate duplicate with retained checkpoint -> IGNORED_ALREADY_COMPACTED
       const lateCompacted = makeRemoteEvent('late-1', 'peer-A', 'SEEK', { targetPositionMs: 2000 }, 8, 5, { 'peer-base': 1 });
       engine.receive(lateCompacted);
       expect(engine.getLastDecision()?.code).toBe('IGNORED_ALREADY_COMPACTED');
+
+      // Arrival 2: Expired pre-horizon event without checkpoint (e.g. seq 3) -> REJECTED_OUTSIDE_HORIZON
+      const expiredEvent = makeRemoteEvent('expired-1', 'peer-A', 'SEEK', { targetPositionMs: 1000 }, 6, 3, { 'peer-base': 1 });
+      engine.receive(expiredEvent);
+      expect(engine.getLastDecision()?.code).toBe('REJECTED_OUTSIDE_HORIZON');
 
       expect(engine.getState().anchorPositionMs).toBe(5000);
     });

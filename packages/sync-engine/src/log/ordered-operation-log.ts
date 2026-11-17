@@ -15,6 +15,7 @@ import type {
   StoredOperation,
   InsertOperationResult,
   IOrderedOperationLog,
+  CompactedCheckpointRecord,
 } from './types.js';
 
 export class OrderedOperationLog implements IOrderedOperationLog {
@@ -24,7 +25,7 @@ export class OrderedOperationLog implements IOrderedOperationLog {
   private readonly operations: StoredOperation[] = [];
   private readonly idIndex = new Map<string, StoredOperation>();
   private readonly originSeqIndex = new Map<string, StoredOperation>();
-  private readonly compactedCheckpoints = new Map<string, number>();
+  private readonly compactedCheckpoints = new Map<string, CompactedCheckpointRecord>();
   private readonly originFrontierTimestamps = new Map<string, number>();
   private baseSnapshot?: PlaybackState;
   private baseSnapshotFrontier: Record<string, number> = {};
@@ -91,6 +92,13 @@ export class OrderedOperationLog implements IOrderedOperationLog {
     originPeerId: string,
     sequenceNumber: number,
   ): number | undefined {
+    return this.compactedCheckpoints.get(`${originPeerId}:${sequenceNumber}`)?.logicalTimestamp;
+  }
+
+  public getCompactedCheckpointRecord(
+    originPeerId: string,
+    sequenceNumber: number,
+  ): CompactedCheckpointRecord | undefined {
     return this.compactedCheckpoints.get(`${originPeerId}:${sequenceNumber}`);
   }
 
@@ -98,8 +106,12 @@ export class OrderedOperationLog implements IOrderedOperationLog {
     originPeerId: string,
     sequenceNumber: number,
     logicalTimestamp: number,
+    logicalEventId: string = '',
   ): void {
-    this.compactedCheckpoints.set(`${originPeerId}:${sequenceNumber}`, logicalTimestamp);
+    this.compactedCheckpoints.set(`${originPeerId}:${sequenceNumber}`, {
+      logicalTimestamp,
+      logicalEventId,
+    });
     // Strict global bound K = 256 entries across all origins
     if (this.compactedCheckpoints.size > this._capacity) {
       // FIFO eviction: prune oldest checkpoint entry globally
@@ -159,19 +171,46 @@ export class OrderedOperationLog implements IOrderedOperationLog {
       };
     }
 
-    // 3. Compacted check: if already subsumed by base snapshot frontier
+    // 3. Compacted check: if already subsumed by base snapshot frontier or in checkpoints
     const baseSeq = this.baseSnapshotFrontier[operation.originPeerId] ?? 0;
     if (operation.originSequenceNumber <= baseSeq) {
-      return {
-        inserted: false,
-        isHead: false,
-        index: -1,
-        code: 'IGNORED_ALREADY_COMPACTED',
-      };
+      const checkpoint = this.compactedCheckpoints.get(seqKey);
+      if (checkpoint) {
+        // Identity metadata is retained in compactedCheckpoints horizon!
+        if (checkpoint.logicalEventId && checkpoint.logicalEventId !== operation.logicalEventId) {
+          // Known sequence collision with compacted operation! Must NOT treat as duplicate!
+          throw new SyncEngineError(
+            'SEQUENCE_COLLISION_DETECTED',
+            `Sequence collision detected for compacted origin ${operation.originPeerId} seq ${operation.originSequenceNumber}: compacted ${checkpoint.logicalEventId} vs incoming ${operation.logicalEventId}`,
+          );
+        }
+        return {
+          inserted: false,
+          isHead: false,
+          index: -1,
+          code: 'IGNORED_ALREADY_COMPACTED',
+        };
+      } else {
+        // Identity metadata has expired beyond the retention horizon!
+        // Cannot distinguish legitimate duplicate from conflicting event -> return safe outside-horizon
+        return {
+          inserted: false,
+          isHead: false,
+          index: -1,
+          code: 'REJECTED_OUTSIDE_HORIZON',
+        };
+      }
     }
 
-    // Also check if explicitly marked in compactedCheckpoints
+    // Also check if explicitly marked in compactedCheckpoints (even if baseSeq wasn't updated)
     if (this.compactedCheckpoints.has(seqKey)) {
+      const checkpoint = this.compactedCheckpoints.get(seqKey)!;
+      if (checkpoint.logicalEventId && checkpoint.logicalEventId !== operation.logicalEventId) {
+        throw new SyncEngineError(
+          'SEQUENCE_COLLISION_DETECTED',
+          `Sequence collision detected for compacted origin ${operation.originPeerId} seq ${operation.originSequenceNumber}: compacted ${checkpoint.logicalEventId} vs incoming ${operation.logicalEventId}`,
+        );
+      }
       return {
         inserted: false,
         isHead: false,
@@ -214,6 +253,7 @@ export class OrderedOperationLog implements IOrderedOperationLog {
         evicted.originPeerId,
         evicted.originSequenceNumber,
         evicted.logicalTimestamp,
+        evicted.logicalEventId,
       );
       // Fold evicted operation into base snapshot
       if (this.baseSnapshot && this.reducer) {
@@ -224,6 +264,10 @@ export class OrderedOperationLog implements IOrderedOperationLog {
         evicted.originSequenceNumber,
       );
       this.originFrontierTimestamps.set(evicted.originPeerId, evicted.logicalTimestamp);
+      if (this.originFrontierTimestamps.size > 64) {
+        const firstKey = this.originFrontierTimestamps.keys().next().value;
+        if (firstKey) this.originFrontierTimestamps.delete(firstKey);
+      }
       this.hasPrunedOperations = true;
     }
 
@@ -251,6 +295,7 @@ export class OrderedOperationLog implements IOrderedOperationLog {
           op.originPeerId,
           op.originSequenceNumber,
           op.logicalTimestamp,
+          op.logicalEventId,
         );
         toPrune.push(op);
       }
@@ -268,6 +313,10 @@ export class OrderedOperationLog implements IOrderedOperationLog {
           op.originSequenceNumber,
         );
         this.originFrontierTimestamps.set(op.originPeerId, op.logicalTimestamp);
+        if (this.originFrontierTimestamps.size > 64) {
+          const firstKey = this.originFrontierTimestamps.keys().next().value;
+          if (firstKey) this.originFrontierTimestamps.delete(firstKey);
+        }
       }
       this.hasPrunedOperations = true;
     }

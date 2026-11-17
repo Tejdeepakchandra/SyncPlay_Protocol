@@ -70,6 +70,7 @@ export class LeaderlessSyncEngine implements SyncEngine {
   // Causal vectors
   private readonly localCausalContext: Record<string, number> = {};
   private readonly replicationVector: Record<string, number> = {};
+  private readonly peerGenerations = new Map<string, number>();
   private localOriginSequence = 0;
   private currentEpoch = 1;
 
@@ -142,6 +143,36 @@ export class LeaderlessSyncEngine implements SyncEngine {
 
   public get logSize(): number {
     return this.operationLog.size;
+  }
+
+  public get epoch(): number {
+    return this.currentEpoch;
+  }
+
+  public transitionEpoch(newEpoch: number): void {
+    if (
+      typeof newEpoch !== 'number' ||
+      !Number.isInteger(newEpoch) ||
+      newEpoch <= this.currentEpoch
+    ) {
+      throw new SyncEngineError(
+        'INVALID_ARGUMENT',
+        `Invalid epoch transition: newEpoch ${newEpoch} must be integer > currentEpoch ${this.currentEpoch}`,
+      );
+    }
+    this.currentEpoch = newEpoch;
+  }
+
+  public setPeerGeneration(peerId: string, generation: number): void {
+    if (this.peerGenerations.size >= 64 && !this.peerGenerations.has(peerId)) {
+      const firstKey = this.peerGenerations.keys().next().value;
+      if (firstKey) this.peerGenerations.delete(firstKey);
+    }
+    this.peerGenerations.set(peerId, generation);
+  }
+
+  public getPeerGeneration(peerId: string): number | undefined {
+    return this.peerGenerations.get(peerId);
   }
 
   public getState(): Readonly<PlaybackState> {
@@ -373,18 +404,45 @@ export class LeaderlessSyncEngine implements SyncEngine {
     }
 
     // Strict epoch fencing
-    if (
-      event.message.membershipEpoch !== undefined &&
-      event.message.membershipEpoch < this.currentEpoch
-    ) {
-      this.recordDecision(event, {
-        accepted: false,
-        code: 'REJECTED_OBSOLETE_EPOCH',
-        stateVersion: this.state.stateVersion,
-        decidedAt: now,
-        message: `Event from obsolete epoch ${event.message.membershipEpoch} < ${this.currentEpoch}`,
-      });
-      return;
+    if (event.message.membershipEpoch !== undefined) {
+      if (event.message.membershipEpoch < this.currentEpoch) {
+        this.recordDecision(event, {
+          accepted: false,
+          code: 'REJECTED_OBSOLETE_EPOCH',
+          stateVersion: this.state.stateVersion,
+          decidedAt: now,
+          message: `Event from obsolete epoch ${event.message.membershipEpoch} < ${this.currentEpoch}`,
+        });
+        return;
+      }
+      if (event.message.membershipEpoch > this.currentEpoch) {
+        this.recordDecision(event, {
+          accepted: false,
+          code: 'REJECTED_OBSOLETE_EPOCH',
+          stateVersion: this.state.stateVersion,
+          decidedAt: now,
+          message: `Event from unestablished future epoch ${event.message.membershipEpoch} > ${this.currentEpoch}`,
+        });
+        return;
+      }
+    }
+
+    // Strict connection generation check: reject stale connection generations
+    if (event.message.connectionGeneration !== undefined) {
+      const activeGen = this.peerGenerations.get(senderPeerId);
+      if (activeGen !== undefined && event.message.connectionGeneration < activeGen) {
+        this.recordDecision(event, {
+          accepted: false,
+          code: 'REJECTED_INVALID',
+          stateVersion: this.state.stateVersion,
+          decidedAt: now,
+          message: `Event from stale connection generation ${event.message.connectionGeneration} < active ${activeGen}`,
+        });
+        return;
+      }
+      if (activeGen === undefined || event.message.connectionGeneration > activeGen) {
+        this.setPeerGeneration(senderPeerId, event.message.connectionGeneration);
+      }
     }
 
     const originSeq = event.message.originSequenceNumber ?? 1;
@@ -420,13 +478,32 @@ export class LeaderlessSyncEngine implements SyncEngine {
 
     // 3. Check if already compacted below base snapshot frontier
     if (originSeq <= (this.baseSnapshotFrontier[originPeerId] ?? 0)) {
-      this.recordDecision(event, {
-        accepted: true,
-        code: 'IGNORED_ALREADY_COMPACTED',
-        stateVersion: this.state.stateVersion,
-        decidedAt: now,
-      });
-      return;
+      const cpRecord = this.operationLog.getCompactedCheckpointRecord?.(originPeerId, originSeq);
+      if (cpRecord) {
+        if (cpRecord.logicalEventId && cpRecord.logicalEventId !== logicalEventId) {
+          throw new SyncEngineError(
+            'SEQUENCE_COLLISION_DETECTED',
+            `Sequence collision detected for compacted origin ${originPeerId} seq ${originSeq}: compacted ${cpRecord.logicalEventId} vs incoming ${logicalEventId}`,
+          );
+        }
+        this.recordDecision(event, {
+          accepted: true,
+          code: 'IGNORED_ALREADY_COMPACTED',
+          stateVersion: this.state.stateVersion,
+          decidedAt: now,
+        });
+        return;
+      } else {
+        // Identity metadata expired beyond retention horizon -> cannot distinguish duplicate from conflict
+        this.recordDecision(event, {
+          accepted: false,
+          code: 'REJECTED_OUTSIDE_HORIZON',
+          stateVersion: this.state.stateVersion,
+          decidedAt: now,
+          message: `Operation ${logicalEventId} (${originPeerId}:${originSeq}) predates retention horizon and cannot be verified`,
+        });
+        return;
+      }
     }
 
     const causalContext = event.message.causalContext ?? {};
@@ -855,13 +932,14 @@ export class LeaderlessSyncEngine implements SyncEngine {
         cp.originPeerId,
         cp.sequenceNumber,
         cp.logicalTimestamp,
+        (cp as any).logicalEventId ?? '',
       );
     }
-    // Also ingest frontier timestamps
+    // Also ingest frontier timestamps if not already present in compactedCheckpoints
     for (const [peer, seq] of Object.entries(snapshot.snapshotFrontier)) {
       const ts = snapshot.originFrontierTimestamps[peer];
-      if (ts !== undefined) {
-        this.operationLog.setCompactedCheckpoint(peer, seq, ts);
+      if (ts !== undefined && this.operationLog.getCompactedCheckpoint(peer, seq) === undefined) {
+        this.operationLog.setCompactedCheckpoint(peer, seq, ts, '');
       }
     }
 

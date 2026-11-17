@@ -341,6 +341,15 @@ export class ControlEventServiceImpl implements ControlEventService, IntentExecu
       return;
     }
 
+    // 3b. Stale connection generation check: drop messages from obsolete generation
+    const peerStatus = this.mesh.getPeerStatus(inbound.fromPeerId);
+    if (peerStatus && msg.connectionGeneration !== undefined) {
+      if (msg.connectionGeneration < peerStatus.generation) {
+        this.stats.inboundDroppedCount++;
+        return;
+      }
+    }
+
     // 4. Self-reflection guard: ignore our own messages if reflected
     if (msg.senderPeerId === this.config.localPeerId) {
       this.stats.inboundDroppedCount++;

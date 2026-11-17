@@ -49,6 +49,11 @@ export interface ProtocolMessage<TPayload = unknown> {
    */
   readonly membershipEpoch?: number;
   /**
+   * WebRTC connection generation counter.
+   * Used to filter stale messages across peer reconnections.
+   */
+  readonly connectionGeneration?: number;
+  /**
    * Monotonic Lamport logical timestamp.
    * Required for all distributed control operations.
    */
@@ -85,6 +90,7 @@ export const ProtocolMessageSchema = z.object({
   logicalEventId: z.string().min(1).max(128).optional(),
   originPeerId: z.string().min(1).max(128).optional(),
   membershipEpoch: z.number().int().nonnegative().optional(),
+  connectionGeneration: z.number().int().positive().max(Number.MAX_SAFE_INTEGER).optional(),
   logicalTimestamp: z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER).optional(),
   originSequenceNumber: z.number().int().positive().max(Number.MAX_SAFE_INTEGER).optional(),
   causalContext: z
