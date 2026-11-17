@@ -111,7 +111,11 @@ export class LeaderlessSyncEngine implements SyncEngine {
 
     const logCapacity = config.logCapacity ?? 256;
     this.clockManager = new LogicalClockManager(config.initialClock ?? 0);
-    this.operationLog = new OrderedOperationLog(logCapacity, initialState);
+    const reducerFn = (state: PlaybackState, op: StoredOperation): PlaybackState => {
+      const reducerContext = this.getReducerContext();
+      return this.conflictResolver.reduce(state, op, this.clock.now(), reducerContext).nextState;
+    };
+    this.operationLog = new OrderedOperationLog(logCapacity, initialState, reducerFn);
     this.pendingQueue = new PendingDependencyQueue(logCapacity);
     this.conflictResolver = new ConflictResolver();
   }
@@ -225,7 +229,9 @@ export class LeaderlessSyncEngine implements SyncEngine {
                     err.code === 'INVALID_LOGICAL_TIMESTAMP' ||
                     err.code === 'CLOCK_REGRESSION')
                 ? 'REJECTED_CAUSAL_VIOLATION'
-                : 'REJECTED_INVALID';
+                : err instanceof SyncEngineError && err.code === 'REJECTED_OUTSIDE_HORIZON'
+                  ? 'REJECTED_OUTSIDE_HORIZON'
+                  : 'REJECTED_INVALID';
 
         this.recordDecision(event, {
           accepted: false,
@@ -253,9 +259,48 @@ export class LeaderlessSyncEngine implements SyncEngine {
 
     // Snapshot immutable causal context representing author's complete contiguous frontier
     const causalContext = { ...this.localCausalContext };
+    if (originSeq > 1) {
+      causalContext[this.config.localPeerId] = originSeq - 1;
+    }
 
-    // Advance local Lamport clock: L = 1 + L_local
-    const stampedTimestamp = this.clockManager.tickLocal();
+    // Resolve exact timestamps of complete causal frontier
+    const dependencyClocks: number[] = [];
+    for (const [depOrigin, depSeq] of Object.entries(causalContext)) {
+      if (depSeq === 0) continue;
+      const depOp = this.operationLog.getOperationAt(depOrigin, depSeq);
+      if (depOp) {
+        dependencyClocks.push(depOp.logicalTimestamp);
+      } else {
+        const cpTs = this.operationLog.getCompactedCheckpoint(depOrigin, depSeq);
+        if (cpTs !== undefined) {
+          dependencyClocks.push(cpTs);
+        } else {
+          throw new SyncEngineError(
+            'REJECTED_OUTSIDE_HORIZON',
+            `Local event causal dependency ${depOrigin}:${depSeq} is outside retained history`,
+          );
+        }
+      }
+    }
+
+    let maxFrontierTimestamp = 0;
+    for (const clk of dependencyClocks) {
+      if (clk > maxFrontierTimestamp) {
+        maxFrontierTimestamp = clk;
+      }
+    }
+
+    // If local clock exceeds represented frontier, throw to prevent authoring an inflated event
+    if (this.clockManager.clock > maxFrontierTimestamp && dependencyClocks.length > 0) {
+      throw new SyncEngineError(
+        'INVALID_LOGICAL_TIMESTAMP',
+        `Local clock ${this.clockManager.clock} exceeds maximum represented frontier timestamp ${maxFrontierTimestamp}`,
+      );
+    }
+
+    // Exact Lamport creation invariant: L(e) = 1 + max(dependencies in causalContext)
+    const stampedTimestamp = dependencyClocks.length === 0 ? 1 : 1 + maxFrontierTimestamp;
+    this.clockManager.reseed(stampedTimestamp);
 
     // Component-wise merge origin sequence into author's local causal frontier and replication vector
     this.localCausalContext[this.config.localPeerId] = originSeq;
@@ -279,19 +324,20 @@ export class LeaderlessSyncEngine implements SyncEngine {
 
     if (insertResult.isHead) {
       const allOps = this.operationLog.getAllOperations();
-      const priorOp = allOps.length > 1 ? allOps[allOps.length - 2] : undefined;
+      const priors = allOps.slice(0, allOps.length - 1);
       const { nextState, decision } = this.conflictResolver.reduce(
         this.state,
         storedOp,
         now,
         reducerContext,
-        priorOp,
+        priors,
       );
       this.commitState(nextState, decision, event);
     } else {
       // Replay forward from base snapshot
+      const baseSnap = this.operationLog.getBaseSnapshot() ?? this.baseSnapshot;
       const { finalState, decisions } = this.conflictResolver.replay(
-        this.baseSnapshot,
+        baseSnap,
         this.operationLog.getAllOperations(),
         now,
         reducerContext,
@@ -343,7 +389,7 @@ export class LeaderlessSyncEngine implements SyncEngine {
 
     const originSeq = event.message.originSequenceNumber ?? 1;
 
-    // Check duplicate
+    // 1. Check duplicate by logicalEventId
     if (this.operationLog.has(logicalEventId)) {
       this.recordDecision(event, {
         accepted: true,
@@ -354,7 +400,7 @@ export class LeaderlessSyncEngine implements SyncEngine {
       return;
     }
 
-    // Check collision on same sequence
+    // 2. Check collision on same sequence
     const existingBySeq = this.operationLog.getOperationAt(originPeerId, originSeq);
     if (existingBySeq) {
       if (existingBySeq.logicalEventId !== logicalEventId) {
@@ -372,7 +418,7 @@ export class LeaderlessSyncEngine implements SyncEngine {
       return;
     }
 
-    // Check if already compacted below base snapshot
+    // 3. Check if already compacted below base snapshot frontier
     if (originSeq <= (this.baseSnapshotFrontier[originPeerId] ?? 0)) {
       this.recordDecision(event, {
         accepted: true,
@@ -383,12 +429,20 @@ export class LeaderlessSyncEngine implements SyncEngine {
       return;
     }
 
+    const causalContext = event.message.causalContext ?? {};
+
+    // 4. For any sequence > 1, author's immediate predecessor MUST be declared in causalContext
+    if (originSeq > 1 && causalContext[originPeerId] !== originSeq - 1) {
+      throw new SyncEngineError(
+        'INVALID_CAUSAL_TIMESTAMP',
+        `Event from ${originPeerId} seq ${originSeq} missing immediate predecessor seq ${originSeq - 1} in causalContext`,
+      );
+    }
+
     const logicalTimestamp = event.message.logicalTimestamp;
     if (typeof logicalTimestamp !== 'number') {
       throw new SyncEngineError('INVALID_CLOCK', 'Remote event missing logicalTimestamp');
     }
-
-    const causalContext = event.message.causalContext ?? {};
 
     const storedOp: StoredOperation = {
       logicalEventId,
@@ -481,23 +535,43 @@ export class LeaderlessSyncEngine implements SyncEngine {
 
     // 4. Total-order log insertion
     const insertResult = this.operationLog.insert(op);
+    if (!insertResult.inserted) {
+      if (insertResult.code === 'IGNORED_ALREADY_COMPACTED') {
+        this.recordDecision(originalEvent ?? ({ message: op } as any), {
+          accepted: true,
+          code: 'IGNORED_ALREADY_COMPACTED',
+          stateVersion: this.state.stateVersion,
+          decidedAt: now,
+        });
+        return;
+      }
+      if (insertResult.code === 'REJECTED_OUTSIDE_HORIZON') {
+        throw new SyncEngineError(
+          'REJECTED_OUTSIDE_HORIZON',
+          `Operation ${op.logicalEventId} falls before compacted horizon and cannot be verified`,
+        );
+      }
+      return;
+    }
+
     const reducerContext = this.getReducerContext();
 
     if (insertResult.isHead) {
       const allOps = this.operationLog.getAllOperations();
-      const priorOp = allOps.length > 1 ? allOps[allOps.length - 2] : undefined;
+      const priors = allOps.slice(0, allOps.length - 1);
       const { nextState, decision } = this.conflictResolver.reduce(
         this.state,
         op,
         now,
         reducerContext,
-        priorOp,
+        priors,
       );
       this.commitState(nextState, decision, originalEvent);
     } else {
-      // Speculative rollback/replay
+      // Speculative rollback/replay from base snapshot
+      const baseSnap = this.operationLog.getBaseSnapshot() ?? this.baseSnapshot;
       const { finalState, decisions } = this.conflictResolver.replay(
-        this.baseSnapshot,
+        baseSnap,
         this.operationLog.getAllOperations(),
         now,
         reducerContext,
@@ -772,7 +846,7 @@ export class LeaderlessSyncEngine implements SyncEngine {
 
     this.state = importedState;
     this.baseSnapshot = importedState;
-    this.operationLog.reset(importedState);
+    this.operationLog.reset(importedState, snapshot.snapshotFrontier);
     this.pendingQueue.clear();
 
     // 4. Ingest compacted checkpoints after log reset

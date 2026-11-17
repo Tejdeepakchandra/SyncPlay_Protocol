@@ -209,4 +209,39 @@ describe('LogicalClockManager', () => {
       expect(() => clockManager.reseed(NaN)).toThrow(SyncEngineError);
     });
   });
+
+  describe('Phase 7.3-R1 Exact Dependency & Rate State Invariants', () => {
+    it('genesis event with empty dependencyClocks requires expectedTimestamp exactly 1', () => {
+      const clock = clockManager.validateAndAdvanceRemote('peer-A', 1, 1, [], 1000);
+      expect(clock).toBe(1);
+      expect(clockManager.clock).toBe(1);
+
+      expect(() =>
+        clockManager.validateAndAdvanceRemote('peer-B', 1, 2, [], 1000),
+      ).toThrow(SyncEngineError);
+
+      expect(() =>
+        clockManager.validateAndAdvanceRemote('peer-C', 1, 0, [], 1000),
+      ).toThrow(SyncEngineError);
+    });
+
+    it('derives expected timestamp strictly from dependencyClocks without origin previous clock', () => {
+      clockManager.validateAndAdvanceRemote('peer-A', 1, 10, [9], 1000);
+      expect(clockManager.getOriginClock('peer-A')).toBe(10);
+
+      const clk = clockManager.validateAndAdvanceRemote('peer-A', 1, 16, [10, 15], 1010);
+      expect(clk).toBe(16);
+      expect(clockManager.clock).toBe(16);
+    });
+
+    it('bounds originRateStates strictly to 64 entries with FIFO eviction', () => {
+      for (let i = 1; i <= 70; i++) {
+        clockManager.validateAndAdvanceRemote(`origin-${i}`, 1, 1, [], 1000 + i);
+      }
+
+      expect(() =>
+        clockManager.validateAndAdvanceRemote('origin-1', 1, 2, [1], 2000),
+      ).not.toThrow();
+    });
+  });
 });

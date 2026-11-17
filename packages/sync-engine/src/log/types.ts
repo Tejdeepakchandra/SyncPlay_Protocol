@@ -67,11 +67,17 @@ export interface IOrderedOperationLog {
   /** Retrieves exact Lamport timestamp for a compacted sequence. */
   getCompactedCheckpoint(originPeerId: string, sequenceNumber: number): number | undefined;
 
+  /** Gets base snapshot frontier representation. */
+  getBaseSnapshotFrontier?(): Readonly<Record<string, number>>;
+
+  /** Sets reducer callback for folding compacted operations forward into base snapshot. */
+  setReducer?(reducer: (state: PlaybackState, op: StoredOperation) => PlaybackState): void;
+
   /** Prunes operations older than stable frontier and preserves checkpoints. */
   compactAtFrontier(stableFrontier: Record<string, number>): number;
 
   /** Resets log and initializes new base snapshot. */
-  reset(baseSnapshot: PlaybackState): void;
+  reset(baseSnapshot: PlaybackState, frontier?: Record<string, number>): void;
 
   /** Clears memory on disposal. */
   dispose(): void;

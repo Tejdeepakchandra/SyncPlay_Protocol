@@ -143,6 +143,77 @@ describe('OrderedOperationLog', () => {
     expect(log.has('op-1')).toBe(false);
     expect(log.getCompactedCheckpoint('peer-A', 1)).toBe(1);
   });
+
+  it('compactedCheckpoints is strictly bounded to capacity and evicts oldest FIFO', () => {
+    // Capacity is 4
+    for (let i = 1; i <= 6; i++) {
+      log.setCompactedCheckpoint(`peer-${i}`, 1, i * 10);
+    }
+
+    // Only 4 checkpoints should remain: peer-3, peer-4, peer-5, peer-6
+    // peer-1 and peer-2 evicted FIFO
+    expect(log.getCompactedCheckpoint('peer-1', 1)).toBeUndefined();
+    expect(log.getCompactedCheckpoint('peer-2', 1)).toBeUndefined();
+    expect(log.getCompactedCheckpoint('peer-3', 1)).toBe(30);
+    expect(log.getCompactedCheckpoint('peer-6', 1)).toBe(60);
+  });
+
+  it('compactAtFrontier folds pruned operations into baseSnapshot and advances frontier', () => {
+    const initialState = Object.freeze({
+      status: 'paused' as const,
+      anchorPositionMs: 0,
+      anchorLocalTimestamp: 1000,
+      playbackRate: 1.0,
+      stateVersion: 0,
+    });
+
+    const reducer = (state: any, op: StoredOperation) => ({
+      ...state,
+      anchorPositionMs: (op.payload as any)?.targetPos ?? state.anchorPositionMs,
+      stateVersion: state.stateVersion + 1,
+    });
+
+    const customLog = new OrderedOperationLog(4, initialState, reducer);
+    const op1 = makeOp('op-1', 'peer-A', 1, 1, {}, 'SEEK');
+    (op1 as any).payload = { targetPos: 5000 };
+    customLog.insert(op1);
+
+    const pruned = customLog.compactAtFrontier({ 'peer-A': 1 });
+    expect(pruned).toBe(1);
+    expect(customLog.size).toBe(0);
+
+    const baseSnap = customLog.getBaseSnapshot();
+    expect(baseSnap?.anchorPositionMs).toBe(5000);
+    expect(baseSnap?.stateVersion).toBe(1);
+    expect(customLog.getBaseSnapshotFrontier()['peer-A']).toBe(1);
+  });
+
+  it('rejects late operations older than earliest retained operation in compacted log (Arrival Case C)', () => {
+    const initialState = Object.freeze({
+      status: 'paused' as const,
+      anchorPositionMs: 0,
+      anchorLocalTimestamp: 1000,
+      playbackRate: 1.0,
+      stateVersion: 0,
+    });
+
+    const customLog = new OrderedOperationLog(4, initialState);
+    customLog.insert(makeOp('op-1', 'peer-A', 1, 1));
+    customLog.insert(makeOp('op-2', 'peer-A', 2, 2));
+    customLog.insert(makeOp('op-3', 'peer-A', 3, 3));
+    customLog.insert(makeOp('op-4', 'peer-A', 4, 4));
+    // 5th op causes op-1 to be evicted (pruned from log)
+    customLog.insert(makeOp('op-5', 'peer-A', 5, 5));
+
+    // op-1 was evicted. Now customLog has pruned operations.
+    // Earliest retained operation is op-2 (L=2).
+    // Now a late operation op-late from peer-B arrives with L=1 (older than op-2), but seq 1 > baseSnapshotFrontier (peer-B not in frontier):
+    const opLate = makeOp('op-late', 'peer-B', 1, 1);
+    const res = customLog.insert(opLate);
+
+    expect(res.inserted).toBe(false);
+    expect(res.code).toBe('REJECTED_OUTSIDE_HORIZON');
+  });
 });
 
 describe('PendingDependencyQueue', () => {

@@ -574,6 +574,185 @@ describe('Phase 7.3 Deterministic Simulation Test Suite', () => {
         expect(st.playbackRate).toBe(1.5);
       }
     });
+
+    it('three-operation Pause/Play resumption: A pauses, B plays concurrently, C plays observing both -> all 6 permutations converge to playing', () => {
+      const makeEngine = () => {
+        const eng = new LeaderlessSyncEngine({
+          sessionId: 'test-session',
+          localPeerId: 'peer-obs',
+          clock: { now: () => 1000 },
+        });
+        eng.importSnapshotV2(
+          makeSnapshotV2('snap-base', { 'peer-base': 1 }, 1, { 'peer-base': 1 }, 'paused', 0),
+        );
+        return eng;
+      };
+
+      // Peer A: PAUSE (L=2, seq 1, causal { 'peer-base': 1 })
+      const opA = makeRemoteEvent('op-A', 'peer-A', 'PAUSE', {}, 2, 1, { 'peer-base': 1 });
+      // Peer B: PLAY (L=2, seq 1, causal { 'peer-base': 1 }) - concurrent with A
+      const opB = makeRemoteEvent('op-B', 'peer-B', 'PLAY', {}, 2, 1, { 'peer-base': 1 });
+      // Peer C: PLAY (L=3, seq 1, causal { 'peer-base': 1, 'peer-A': 1, 'peer-B': 1 }) - observes both
+      const opC = makeRemoteEvent('op-C', 'peer-C', 'PLAY', {}, 3, 1, {
+        'peer-base': 1,
+        'peer-A': 1,
+        'peer-B': 1,
+      });
+
+      const getPerms = <T>(items: T[]): T[][] => {
+        if (items.length <= 1) return [items];
+        const res: T[][] = [];
+        for (let i = 0; i < items.length; i++) {
+          const cur = items[i]!;
+          const rem = [...items.slice(0, i), ...items.slice(i + 1)];
+          for (const p of getPerms(rem)) {
+            res.push([cur, ...p]);
+          }
+        }
+        return res;
+      };
+
+      const permutations = getPerms([opA, opB, opC]);
+      expect(permutations).toHaveLength(6);
+
+      const states: PlaybackState[] = [];
+      const fixedEvalTime = 2000;
+
+      for (const perm of permutations) {
+        const eng = makeEngine();
+        for (const ev of perm) {
+          eng.receive(ev);
+        }
+        states.push(eng.getState());
+        expect(eng.getState().status).toBe('playing');
+        expect(eng.getCurrentPositionMs(fixedEvalTime)).toBe(1000);
+      }
+
+      // Verify complete resulting PlaybackState matches across all 6 permutations
+      const first = states[0]!;
+      for (const st of states) {
+        expect(st.status).toBe('playing');
+        expect(st.anchorPositionMs).toBe(first.anchorPositionMs);
+        expect(st.playbackRate).toBe(first.playbackRate);
+        expect(st.lastAppliedEvent?.logicalEventId).toBe(first.lastAppliedEvent?.logicalEventId);
+      }
+    });
+
+    it('4 concurrent operations: all 24 delivery permutations converge to identical PlaybackState', () => {
+      const makeEngine = () => {
+        const eng = new LeaderlessSyncEngine({
+          sessionId: 'test-session',
+          localPeerId: 'peer-obs',
+          clock: { now: () => 1000 },
+        });
+        eng.importSnapshotV2(
+          makeSnapshotV2('snap-base', { 'peer-base': 1 }, 1, { 'peer-base': 1 }, 'paused', 0),
+        );
+        return eng;
+      };
+
+      // 4 concurrent operations with L=2, causal { 'peer-base': 1 }
+      const op1 = makeRemoteEvent('op-1', 'peer-A', 'SEEK', { targetPositionMs: 5000 }, 2, 1, { 'peer-base': 1 });
+      const op2 = makeRemoteEvent('op-2', 'peer-B', 'SEEK', { targetPositionMs: 15000 }, 2, 1, { 'peer-base': 1 });
+      const op3 = makeRemoteEvent('op-3', 'peer-C', 'RATE_CHANGE', { playbackRate: 1.25 }, 2, 1, { 'peer-base': 1 });
+      const op4 = makeRemoteEvent('op-4', 'peer-D', 'RATE_CHANGE', { playbackRate: 1.75 }, 2, 1, { 'peer-base': 1 });
+
+      const getPerms = <T>(items: T[]): T[][] => {
+        if (items.length <= 1) return [items];
+        const res: T[][] = [];
+        for (let i = 0; i < items.length; i++) {
+          const cur = items[i]!;
+          const rem = [...items.slice(0, i), ...items.slice(i + 1)];
+          for (const p of getPerms(rem)) {
+            res.push([cur, ...p]);
+          }
+        }
+        return res;
+      };
+
+      const permutations = getPerms([op1, op2, op3, op4]);
+      expect(permutations).toHaveLength(24);
+
+      const states: PlaybackState[] = [];
+      for (const perm of permutations) {
+        const eng = makeEngine();
+        for (const ev of perm) {
+          eng.receive(ev);
+        }
+        states.push(eng.getState());
+      }
+
+      const first = states[0]!;
+      for (const st of states) {
+        expect(st.status).toBe(first.status);
+        expect(st.anchorPositionMs).toBe(first.anchorPositionMs);
+        expect(st.playbackRate).toBe(first.playbackRate);
+        expect(st.lastAppliedEvent?.logicalEventId).toBe(first.lastAppliedEvent?.logicalEventId);
+      }
+    });
+
+    it('out-of-order with duplicate deliveries [A, B, A, C, B] converges to identical PlaybackState as [A, B, C]', () => {
+      const makeEngine = () => {
+        const eng = new LeaderlessSyncEngine({
+          sessionId: 'test-session',
+          localPeerId: 'peer-obs',
+          clock: { now: () => 1000 },
+        });
+        eng.importSnapshotV2(
+          makeSnapshotV2('snap-base', { 'peer-base': 1 }, 1, { 'peer-base': 1 }, 'paused', 0),
+        );
+        return eng;
+      };
+
+      const opA = makeRemoteEvent('op-A', 'peer-A', 'PLAY', {}, 2, 1, { 'peer-base': 1 });
+      const opB = makeRemoteEvent('op-B', 'peer-B', 'SEEK', { targetPositionMs: 25000 }, 2, 1, { 'peer-base': 1 });
+      const opC = makeRemoteEvent('op-C', 'peer-C', 'RATE_CHANGE', { playbackRate: 1.5 }, 2, 1, { 'peer-base': 1 });
+
+      const cleanEngine = makeEngine();
+      cleanEngine.receive(opA);
+      cleanEngine.receive(opB);
+      cleanEngine.receive(opC);
+
+      const noisyEngine = makeEngine();
+      const noisySequence = [opA, opB, opA, opC, opB];
+      for (const ev of noisySequence) {
+        noisyEngine.receive(ev);
+      }
+
+      const cleanState = cleanEngine.getState();
+      const noisyState = noisyEngine.getState();
+
+      expect(noisyState.status).toBe(cleanState.status);
+      expect(noisyState.anchorPositionMs).toBe(cleanState.anchorPositionMs);
+      expect(noisyState.playbackRate).toBe(cleanState.playbackRate);
+      expect(noisyState.lastAppliedEvent?.logicalEventId).toBe(cleanState.lastAppliedEvent?.logicalEventId);
+    });
+
+    it('out-of-order with post-compaction arrival: pre-horizon events are ignored as compacted', () => {
+      const engine = new LeaderlessSyncEngine({
+        sessionId: 'test-session',
+        localPeerId: 'peer-obs',
+        clock: { now: () => 1000 },
+      });
+
+      engine.importSnapshotV2(
+        makeSnapshotV2(
+          'snap-compact',
+          { 'peer-base': 1, 'peer-A': 10 },
+          15,
+          { 'peer-base': 1, 'peer-A': 10 },
+          'paused',
+          5000,
+        ),
+      );
+
+      // Late event from peer-A with seq 5 (<= 10) -> IGNORED_ALREADY_COMPACTED
+      const lateCompacted = makeRemoteEvent('late-1', 'peer-A', 'SEEK', { targetPositionMs: 2000 }, 8, 5, { 'peer-base': 1 });
+      engine.receive(lateCompacted);
+      expect(engine.getLastDecision()?.code).toBe('IGNORED_ALREADY_COMPACTED');
+
+      expect(engine.getState().anchorPositionMs).toBe(5000);
+    });
   });
 
   // ── Suite E: Bounded Resource Behavior ───────────────────────

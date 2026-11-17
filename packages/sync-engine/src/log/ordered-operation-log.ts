@@ -25,14 +25,20 @@ export class OrderedOperationLog implements IOrderedOperationLog {
   private readonly idIndex = new Map<string, StoredOperation>();
   private readonly originSeqIndex = new Map<string, StoredOperation>();
   private readonly compactedCheckpoints = new Map<string, number>();
+  private readonly originFrontierTimestamps = new Map<string, number>();
   private baseSnapshot?: PlaybackState;
+  private baseSnapshotFrontier: Record<string, number> = {};
+  private hasPrunedOperations = false;
+  private reducer?: (state: PlaybackState, op: StoredOperation) => PlaybackState;
 
   constructor(
     capacity: number = OrderedOperationLog.DEFAULT_CAPACITY,
     initialBaseSnapshot?: PlaybackState,
+    reducer?: (state: PlaybackState, op: StoredOperation) => PlaybackState,
   ) {
     this._capacity = capacity;
     this.baseSnapshot = initialBaseSnapshot;
+    this.reducer = reducer;
   }
 
   public get size(): number {
@@ -47,8 +53,19 @@ export class OrderedOperationLog implements IOrderedOperationLog {
     return this.baseSnapshot;
   }
 
-  public setBaseSnapshot(snapshot: PlaybackState): void {
+  public getBaseSnapshotFrontier(): Readonly<Record<string, number>> {
+    return { ...this.baseSnapshotFrontier };
+  }
+
+  public setReducer(reducer: (state: PlaybackState, op: StoredOperation) => PlaybackState): void {
+    this.reducer = reducer;
+  }
+
+  public setBaseSnapshot(snapshot: PlaybackState, frontier?: Record<string, number>): void {
     this.baseSnapshot = snapshot;
+    if (frontier) {
+      this.baseSnapshotFrontier = { ...frontier };
+    }
   }
 
   public has(logicalEventId: string): boolean {
@@ -83,8 +100,9 @@ export class OrderedOperationLog implements IOrderedOperationLog {
     logicalTimestamp: number,
   ): void {
     this.compactedCheckpoints.set(`${originPeerId}:${sequenceNumber}`, logicalTimestamp);
-    if (this.compactedCheckpoints.size > this._capacity * 2) {
-      // Prune oldest checkpoint entries if excessive
+    // Strict global bound K = 256 entries across all origins
+    if (this.compactedCheckpoints.size > this._capacity) {
+      // FIFO eviction: prune oldest checkpoint entry globally
       const firstKey = this.compactedCheckpoints.keys().next().value;
       if (firstKey) {
         this.compactedCheckpoints.delete(firstKey);
@@ -141,7 +159,18 @@ export class OrderedOperationLog implements IOrderedOperationLog {
       };
     }
 
-    // 3. Compacted check: if already compacted
+    // 3. Compacted check: if already subsumed by base snapshot frontier
+    const baseSeq = this.baseSnapshotFrontier[operation.originPeerId] ?? 0;
+    if (operation.originSequenceNumber <= baseSeq) {
+      return {
+        inserted: false,
+        isHead: false,
+        index: -1,
+        code: 'IGNORED_ALREADY_COMPACTED',
+      };
+    }
+
+    // Also check if explicitly marked in compactedCheckpoints
     if (this.compactedCheckpoints.has(seqKey)) {
       return {
         inserted: false,
@@ -153,6 +182,21 @@ export class OrderedOperationLog implements IOrderedOperationLog {
 
     // 4. Binary search insertion location
     const insertIndex = this.findInsertionIndex(operation);
+
+    // Check if operation falls before earliest retained operation when compacted
+    if (this.hasPrunedOperations && this.operations.length > 0 && insertIndex === 0) {
+      if (compareOperations(operation, this.operations[0]!) < 0) {
+        // Late event older than earliest retained operation, but sequence > baseSeq!
+        // Cannot be inserted before compacted base state -> reject outside horizon!
+        return {
+          inserted: false,
+          isHead: false,
+          index: -1,
+          code: 'REJECTED_OUTSIDE_HORIZON',
+        };
+      }
+    }
+
     const isHead = insertIndex === this.operations.length;
 
     this.operations.splice(insertIndex, 0, operation);
@@ -171,6 +215,16 @@ export class OrderedOperationLog implements IOrderedOperationLog {
         evicted.originSequenceNumber,
         evicted.logicalTimestamp,
       );
+      // Fold evicted operation into base snapshot
+      if (this.baseSnapshot && this.reducer) {
+        this.baseSnapshot = this.reducer(this.baseSnapshot, evicted);
+      }
+      this.baseSnapshotFrontier[evicted.originPeerId] = Math.max(
+        this.baseSnapshotFrontier[evicted.originPeerId] ?? 0,
+        evicted.originSequenceNumber,
+      );
+      this.originFrontierTimestamps.set(evicted.originPeerId, evicted.logicalTimestamp);
+      this.hasPrunedOperations = true;
     }
 
     return {
@@ -182,10 +236,10 @@ export class OrderedOperationLog implements IOrderedOperationLog {
   }
 
   /**
-   * Prunes operations older than stable frontier and preserves checkpoints.
+   * Prunes operations older than stable frontier, updates base snapshot, and preserves checkpoints.
    */
   public compactAtFrontier(stableFrontier: Record<string, number>): number {
-    let prunedCount = 0;
+    const toPrune: StoredOperation[] = [];
     for (let i = this.operations.length - 1; i >= 0; i--) {
       const op = this.operations[i]!;
       const stableSeq = stableFrontier[op.originPeerId] ?? 0;
@@ -198,18 +252,38 @@ export class OrderedOperationLog implements IOrderedOperationLog {
           op.originSequenceNumber,
           op.logicalTimestamp,
         );
-        prunedCount++;
+        toPrune.push(op);
       }
     }
-    return prunedCount;
+
+    if (toPrune.length > 0) {
+      // Sort ascending to fold into base snapshot in deterministic total order
+      toPrune.sort((a, b) => compareOperations(a, b));
+      for (const op of toPrune) {
+        if (this.baseSnapshot && this.reducer) {
+          this.baseSnapshot = this.reducer(this.baseSnapshot, op);
+        }
+        this.baseSnapshotFrontier[op.originPeerId] = Math.max(
+          this.baseSnapshotFrontier[op.originPeerId] ?? 0,
+          op.originSequenceNumber,
+        );
+        this.originFrontierTimestamps.set(op.originPeerId, op.logicalTimestamp);
+      }
+      this.hasPrunedOperations = true;
+    }
+
+    return toPrune.length;
   }
 
-  public reset(baseSnapshot: PlaybackState): void {
+  public reset(baseSnapshot: PlaybackState, frontier?: Record<string, number>): void {
     this.operations.length = 0;
     this.idIndex.clear();
     this.originSeqIndex.clear();
     this.compactedCheckpoints.clear();
+    this.originFrontierTimestamps.clear();
     this.baseSnapshot = baseSnapshot;
+    this.baseSnapshotFrontier = frontier ? { ...frontier } : {};
+    this.hasPrunedOperations = false;
   }
 
   public dispose(): void {
@@ -217,7 +291,11 @@ export class OrderedOperationLog implements IOrderedOperationLog {
     this.idIndex.clear();
     this.originSeqIndex.clear();
     this.compactedCheckpoints.clear();
+    this.originFrontierTimestamps.clear();
     this.baseSnapshot = undefined;
+    this.baseSnapshotFrontier = {};
+    this.hasPrunedOperations = false;
+    this.reducer = undefined;
   }
 
   /**

@@ -145,6 +145,39 @@ describe('ConflictResolver', () => {
       expect(replayRes.finalState.status).toBe('playing');
       expect(replayRes.decisions[1]!.code).toBe('APPLIED');
     });
+
+    it('pause priority is preserved across interleaved SEEK and RATE_CHANGE operations', () => {
+      const pauseOp = makeOp('pause-1', 'peer-A', 1, 1, 'PAUSE', {}, {});
+      const seekOp = makeOp('seek-1', 'peer-C', 1, 1, 'SEEK', { targetPositionMs: 20000 }, {});
+      const rateOp = makeOp('rate-1', 'peer-D', 1, 1, 'RATE_CHANGE', { playbackRate: 1.5 }, {});
+      // Concurrent PLAY
+      const playOp = makeOp('play-1', 'peer-B', 1, 1, 'PLAY', {}, {});
+
+      const state = createInitialState('playing', 10000);
+
+      // Replay order: [PAUSE, SEEK, RATE_CHANGE, PLAY]
+      const replayRes = resolver.replay(state, [pauseOp, seekOp, rateOp, playOp], 1000, testContext);
+      expect(replayRes.finalState.status).toBe('paused');
+      expect(replayRes.finalState.anchorPositionMs).toBe(20000); // SEEK applied
+      expect(replayRes.finalState.playbackRate).toBe(1.5); // RATE applied
+      expect(replayRes.decisions[3]!.code).toBe('SUPERSEDED'); // Concurrent PLAY superseded
+    });
+
+    it('three-operation Pause/Play resumption in pure reducer: A pauses, B plays concurrently, C plays observing both', () => {
+      const opA = makeOp('op-A', 'peer-A', 1, 1, 'PAUSE', {}, {});
+      const opB = makeOp('op-B', 'peer-B', 1, 1, 'PLAY', {}, {});
+      const opC = makeOp('op-C', 'peer-C', 2, 1, 'PLAY', {}, { 'peer-A': 1, 'peer-B': 1 });
+
+      const state = createInitialState('playing', 10000);
+
+      // Order [opA, opB, opC]
+      const res1 = resolver.replay(state, [opA, opB, opC], 1000, testContext);
+      expect(res1.finalState.status).toBe('playing');
+
+      // Order [opB, opA, opC]
+      const res2 = resolver.replay(state, [opB, opA, opC], 1000, testContext);
+      expect(res2.finalState.status).toBe('playing');
+    });
   });
 
   describe('RATE_CHANGE conflict (Scalar LWW)', () => {

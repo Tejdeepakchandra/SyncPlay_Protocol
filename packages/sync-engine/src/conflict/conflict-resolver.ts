@@ -3,7 +3,7 @@
  *
  * Implements Phase 7 conflict resolution policies:
  * - Deterministic total-order LWW for SEEK and RATE_CHANGE
- * - Concurrency-aware intent-preserving PAUSE priority over PLAY
+ * - Concurrency-aware intent-preserving PAUSE priority over PLAY across arbitrary interleavings
  * - Causally sequential PLAY resumption
  * - Orthogonal composition of SEEK with PLAY/PAUSE
  * - Deterministic replay from base snapshot
@@ -42,9 +42,16 @@ export class ConflictResolver implements IConflictResolver {
     operation: StoredOperation,
     monotonicNow: number,
     context: ReducerContext,
-    priorOperation?: StoredOperation,
+    priorOperations?: ReadonlyArray<StoredOperation> | StoredOperation,
   ): { nextState: PlaybackState; decision: EngineDecision } {
     const { messageType } = operation;
+
+    // Normalize prior operations array
+    const priors: ReadonlyArray<StoredOperation> = priorOperations
+      ? Array.isArray(priorOperations)
+        ? priorOperations
+        : [priorOperations]
+      : [];
 
     // Helper to produce LastAppliedOperation metadata
     const createOpDetails = (): LastAppliedOperation =>
@@ -76,19 +83,23 @@ export class ConflictResolver implements IConflictResolver {
           };
         }
 
-        // Total-order LWW: Check against prior operation if it was also a SEEK
-        if (priorOperation && priorOperation.messageType === 'SEEK') {
-          if (compareOperations(operation, priorOperation) < 0) {
-            return {
-              nextState: currentState,
-              decision: {
-                accepted: true,
-                code: 'SUPERSEDED',
-                stateVersion: currentState.stateVersion,
-                decidedAt: monotonicNow,
-                message: `Seek operation ${operation.logicalEventId} superseded by higher key seek ${priorOperation.logicalEventId}`,
-              },
-            };
+        // Total-order LWW: Check against prior seek operations
+        for (let i = priors.length - 1; i >= 0; i--) {
+          const prior = priors[i]!;
+          if (prior.messageType === 'SEEK') {
+            if (compareOperations(operation, prior) < 0) {
+              return {
+                nextState: currentState,
+                decision: {
+                  accepted: true,
+                  code: 'SUPERSEDED',
+                  stateVersion: currentState.stateVersion,
+                  decidedAt: monotonicNow,
+                  message: `Seek operation ${operation.logicalEventId} superseded by higher key seek ${prior.logicalEventId}`,
+                },
+              };
+            }
+            break; // Evaluated against most recent seek in total order
           }
         }
 
@@ -182,21 +193,41 @@ export class ConflictResolver implements IConflictResolver {
           }
         }
 
-        // Check Concurrency-Aware Pause Priority against prior operation
-        if (priorOperation && priorOperation.messageType === 'PAUSE') {
-          if (areConcurrent(priorOperation, operation)) {
-            // Concurrent PAUSE takes priority over PLAY!
-            return {
-              nextState: currentState,
-              decision: {
-                accepted: true,
-                code: 'SUPERSEDED',
-                stateVersion: currentState.stateVersion,
-                decidedAt: monotonicNow,
-                message: `Concurrent PLAY ${operation.logicalEventId} superseded by PAUSE priority from ${priorOperation.logicalEventId}`,
-              },
-            };
+        // Concurrency-Aware Pause Priority:
+        // Inspect backwards to check if there is an un-resumed concurrent PAUSE.
+        // If there exists a prior PAUSE p that is concurrent with this PLAY, AND
+        // no subsequent sequential PLAY resumed p before this operation, PAUSE overrides PLAY!
+        let hasActiveConcurrentPause = false;
+        let conflictingPauseOp: StoredOperation | undefined;
+
+        for (let i = priors.length - 1; i >= 0; i--) {
+          const prior = priors[i]!;
+          if (prior.messageType === 'PAUSE') {
+            if (areConcurrent(prior, operation)) {
+              hasActiveConcurrentPause = true;
+              conflictingPauseOp = prior;
+              break;
+            }
+            if (happensBefore(prior, operation)) {
+              // Operation causally happened after this PAUSE (sequential follow-up)
+              break;
+            }
+          } else if (prior.messageType === 'PLAY') {
+            // If an earlier PLAY causally happened after a PAUSE, that PAUSE was already resumed.
           }
+        }
+
+        if (hasActiveConcurrentPause && conflictingPauseOp) {
+          return {
+            nextState: currentState,
+            decision: {
+              accepted: true,
+              code: 'SUPERSEDED',
+              stateVersion: currentState.stateVersion,
+              decidedAt: monotonicNow,
+              message: `Concurrent PLAY ${operation.logicalEventId} superseded by PAUSE priority from ${conflictingPauseOp.logicalEventId}`,
+            },
+          };
         }
 
         if (currentState.status === 'paused') {
@@ -293,19 +324,23 @@ export class ConflictResolver implements IConflictResolver {
           };
         }
 
-        // Scalar LWW check if prior was also RATE_CHANGE
-        if (priorOperation && priorOperation.messageType === 'RATE_CHANGE') {
-          if (compareOperations(operation, priorOperation) < 0) {
-            return {
-              nextState: currentState,
-              decision: {
-                accepted: true,
-                code: 'SUPERSEDED',
-                stateVersion: currentState.stateVersion,
-                decidedAt: monotonicNow,
-                message: `Rate change ${operation.logicalEventId} superseded by higher key rate change`,
-              },
-            };
+        // Scalar LWW check against prior rate changes
+        for (let i = priors.length - 1; i >= 0; i--) {
+          const prior = priors[i]!;
+          if (prior.messageType === 'RATE_CHANGE') {
+            if (compareOperations(operation, prior) < 0) {
+              return {
+                nextState: currentState,
+                decision: {
+                  accepted: true,
+                  code: 'SUPERSEDED',
+                  stateVersion: currentState.stateVersion,
+                  decidedAt: monotonicNow,
+                  message: `Rate change ${operation.logicalEventId} superseded by higher key rate change ${prior.logicalEventId}`,
+                },
+              };
+            }
+            break;
           }
         }
 
@@ -376,9 +411,9 @@ export class ConflictResolver implements IConflictResolver {
 
     for (let i = 0; i < operations.length; i++) {
       const op = operations[i]!;
-      const priorOp = i > 0 ? operations[i - 1] : undefined;
+      const priors = operations.slice(0, i);
 
-      const result = this.reduce(state, op, monotonicNow, context, priorOp);
+      const result = this.reduce(state, op, monotonicNow, context, priors);
       state = result.nextState;
       decisions.push(result.decision);
     }

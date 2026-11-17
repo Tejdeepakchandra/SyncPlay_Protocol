@@ -93,7 +93,8 @@ export class LogicalClockManager implements ILogicalClockManager {
       );
     }
 
-    // 2. Exact Expected Lamport Timestamp Calculation & Validation
+    // 2. Exact Expected Lamport Timestamp Calculation & Validation (R9 invariant)
+    // Dependencies declared in causalContext strictly and exclusively determine expected timestamp.
     let maxDepClock = 0;
     for (const clock of dependencyClocks) {
       if (typeof clock === 'number' && clock > maxDepClock) {
@@ -101,7 +102,7 @@ export class LogicalClockManager implements ILogicalClockManager {
       }
     }
 
-    const expectedTimestamp = 1 + Math.max(lastOriginClock, maxDepClock);
+    const expectedTimestamp = dependencyClocks.length === 0 ? 1 : 1 + maxDepClock;
     if (remoteClock < expectedTimestamp) {
       throw new SyncEngineError(
         'INVALID_CAUSAL_TIMESTAMP',
@@ -120,6 +121,10 @@ export class LogicalClockManager implements ILogicalClockManager {
       const rateKey = `${originPeerId}:${membershipEpoch}`;
       let rate = this.originRateStates.get(rateKey);
       if (!rate) {
+        if (this.originRateStates.size >= 64) {
+          const firstKey = this.originRateStates.keys().next().value;
+          if (firstKey) this.originRateStates.delete(firstKey);
+        }
         rate = { lastMonotonicMs: monotonicNow, tokens: 50, lastClock: remoteClock };
         this.originRateStates.set(rateKey, rate);
       } else {
