@@ -207,7 +207,7 @@ All 25 tests in `packages/sync-engine/src/__tests__/identity-authorization-r3.te
 ## 8. Git Verification & Strict Stop Condition
 
 - **Pre-commit verification:** Monorepo test suite (541 tests, 32 files) and production builds pass with zero failures.
-- **Commit hash:** `1eaf038` (`1eaf038133c4469c9d51176e2a6c5389bcb62d0a`)
+- **Commit hash:** `88e14c3` (`88e14c38f0feae6fca71c466c6b9f6d3ab7d26a3`)
 - **Git status:**
   ```text
   On branch main
