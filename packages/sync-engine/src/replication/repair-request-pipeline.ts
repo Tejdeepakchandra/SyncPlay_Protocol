@@ -253,6 +253,22 @@ export class RepairRequestPipeline {
    * - Passes batch and genuine AuthenticatedSupplierContext to engine.ingestRepairBatch().
    * - Advances progress and triggers partial-batch slicing if necessary.
    */
+  /**
+   * Processes inbound OPERATION_BATCH fulfilling an active repair request.
+   *
+   * STRICT CORRELATION & PRE-INGESTION VALIDATION:
+   * 1. Request ID must correlate to an active in-flight request.
+   * 2. Session ID must match the active room session and the original request.
+   * 3. Membership epoch must match current engine epoch and the original request epoch.
+   * 4. Supplier identity must match the requested supplier.
+   * 5. Context supplier identity must match the requested supplier.
+   * 6. Context connection generation must match the supplier's active authorized generation.
+   * 7. Target origin must match the requested origin.
+   * 8. Sequence range must be within the requested [fromSequence, toSequence] bounds.
+   *
+   * Any violation is rejected with REJECTED_INVALID before engine ingestion can occur,
+   * guaranteeing that stale, cancelled, duplicate, or rogue responses cannot mutate engine state.
+   */
   public handleRepairBatch(
     batch: OperationBatchPayload,
     context?: AuthenticatedSupplierContext,
@@ -261,11 +277,115 @@ export class RepairRequestPipeline {
       throw new SyncEngineError('DISPOSED', 'Cannot handle repair batch on disposed pipeline');
     }
 
-    const inFlight = batch.requestId ? this.inFlightRequests.get(batch.requestId) : undefined;
-    if (inFlight) {
-      this.clock.clearTimeout(inFlight.timerId);
-      this.inFlightRequests.delete(batch.requestId);
+    const now = this.clock.now();
+
+    // 1. Request correlation check
+    if (!batch.requestId || !this.inFlightRequests.has(batch.requestId)) {
+      const decision: EngineDecision = {
+        accepted: false,
+        code: 'REJECTED_INVALID',
+        stateVersion: this.engine.getState().stateVersion,
+        decidedAt: now,
+        message: `Repair batch rejected: request correlation ID '${batch.requestId ?? 'undefined'}' is not an active in-flight request (unknown, expired, cancelled, duplicate, or obsolete)`,
+      };
+      return [decision];
     }
+
+    const inFlight = this.inFlightRequests.get(batch.requestId)!;
+
+    // 2. Session ID match
+    if (batch.sessionId !== this.engine.sessionId || batch.sessionId !== inFlight.sessionId) {
+      const decision: EngineDecision = {
+        accepted: false,
+        code: 'REJECTED_INVALID',
+        stateVersion: this.engine.getState().stateVersion,
+        decidedAt: now,
+        message: `Repair batch rejected: session ID '${batch.sessionId}' does not match expected active session '${this.engine.sessionId}'`,
+      };
+      return [decision];
+    }
+
+    // 3. Membership epoch match
+    if (
+      batch.membershipEpoch !== this.engine.epoch ||
+      batch.membershipEpoch !== inFlight.membershipEpoch
+    ) {
+      const decision: EngineDecision = {
+        accepted: false,
+        code: 'REJECTED_INVALID',
+        stateVersion: this.engine.getState().stateVersion,
+        decidedAt: now,
+        message: `Repair batch rejected: membership epoch ${batch.membershipEpoch} does not match active engine epoch ${this.engine.epoch}`,
+      };
+      return [decision];
+    }
+
+    // 4. Supplier identity match
+    if (batch.supplierPeerId !== inFlight.supplierPeerId) {
+      const decision: EngineDecision = {
+        accepted: false,
+        code: 'REJECTED_INVALID',
+        stateVersion: this.engine.getState().stateVersion,
+        decidedAt: now,
+        message: `Repair batch rejected: supplierPeerId '${batch.supplierPeerId}' does not match requested supplier '${inFlight.supplierPeerId}'`,
+      };
+      return [decision];
+    }
+
+    // 5. Context supplier consistency check
+    if (context && context.supplierPeerId !== inFlight.supplierPeerId) {
+      const decision: EngineDecision = {
+        accepted: false,
+        code: 'REJECTED_INVALID',
+        stateVersion: this.engine.getState().stateVersion,
+        decidedAt: now,
+        message: `Repair batch rejected: transport context supplier '${context.supplierPeerId}' does not match requested supplier '${inFlight.supplierPeerId}'`,
+      };
+      return [decision];
+    }
+
+    // 6. Context connection generation check
+    if (context && context.connectionGeneration !== undefined) {
+      const activeGen = this.engine.getPeerGeneration(inFlight.supplierPeerId);
+      if (activeGen === undefined || context.connectionGeneration !== activeGen) {
+        const decision: EngineDecision = {
+          accepted: false,
+          code: 'REJECTED_INVALID',
+          stateVersion: this.engine.getState().stateVersion,
+          decidedAt: now,
+          message: `Repair batch rejected: transport context generation ${context.connectionGeneration} does not match active peer generation ${activeGen ?? 'undefined'}`,
+        };
+        return [decision];
+      }
+    }
+
+    // 7. Target origin match
+    if (batch.originPeerId !== inFlight.originPeerId) {
+      const decision: EngineDecision = {
+        accepted: false,
+        code: 'REJECTED_INVALID',
+        stateVersion: this.engine.getState().stateVersion,
+        decidedAt: now,
+        message: `Repair batch rejected: originPeerId '${batch.originPeerId}' does not match requested origin '${inFlight.originPeerId}'`,
+      };
+      return [decision];
+    }
+
+    // 8. Sequence boundaries check
+    if (batch.fromSequence < inFlight.fromSequence || batch.toSequence > inFlight.toSequence) {
+      const decision: EngineDecision = {
+        accepted: false,
+        code: 'REJECTED_INVALID',
+        stateVersion: this.engine.getState().stateVersion,
+        decidedAt: now,
+        message: `Repair batch rejected: sequence range [${batch.fromSequence}, ${batch.toSequence}] extends outside requested range [${inFlight.fromSequence}, ${inFlight.toSequence}]`,
+      };
+      return [decision];
+    }
+
+    // Clear timer and remove from inFlight tracking
+    this.clock.clearTimeout(inFlight.timerId);
+    this.inFlightRequests.delete(batch.requestId);
 
     // Pass repaired operations directly into the Phase 7.3 capability-gated admission pipeline
     const decisions = this.engine.ingestRepairBatch(batch, context);
@@ -284,12 +404,12 @@ export class RepairRequestPipeline {
 
     // Evaluate progress against local replication frontier
     const currentSeq = this.engine.replicationFrontier[batch.originPeerId] ?? 0;
-    const targetEnd = inFlight ? inFlight.toSequence : batch.toSequence;
+    const targetEnd = inFlight.toSequence;
 
     if (currentSeq >= targetEnd) {
       // Completed this range
       this.totalRepairsCompleted++;
-    } else if (inFlight && currentSeq < inFlight.toSequence) {
+    } else if (currentSeq < inFlight.toSequence) {
       // Partial batch fulfillment: re-enqueue the unfulfilled remainder
       const remainderFrom = Math.max(batch.toSequence + 1, currentSeq + 1);
       const remainderTo = inFlight.toSequence;
@@ -309,15 +429,32 @@ export class RepairRequestPipeline {
 
   /**
    * Handles an explicit REPAIR_REJECTED response from a supplier.
-   * - Clears timeout timer.
-   * - Blacklists the rejecting supplier for this range.
-   * - Handles specific reason codes and fails over to other eligible suppliers.
+   *
+   * STRICT CORRELATION:
+   * Validates correlation against active inFlightRequests, session ID, supplier identity,
+   * target origin, and sequence range. Drops uncoordinated or obsolete rejections without
+   * triggering retries, failovers, or mutating peer knowledge.
    */
   public handleRepairRejected(rejection: RepairRejectedPayload): void {
     if (this.disposed) return;
 
-    const inFlight = this.inFlightRequests.get(rejection.requestId);
-    if (!inFlight) return;
+    if (!rejection.requestId || !this.inFlightRequests.has(rejection.requestId)) {
+      return; // Unknown, expired, cancelled, duplicate, or obsolete request; drop immediately
+    }
+
+    const inFlight = this.inFlightRequests.get(rejection.requestId)!;
+
+    // Validate correlation invariants
+    if (
+      rejection.sessionId !== this.engine.sessionId ||
+      rejection.sessionId !== inFlight.sessionId ||
+      rejection.supplierPeerId !== inFlight.supplierPeerId ||
+      rejection.targetOriginPeerId !== inFlight.originPeerId ||
+      rejection.fromSequence !== inFlight.fromSequence ||
+      rejection.toSequence !== inFlight.toSequence
+    ) {
+      return; // Dropped: response does not correlate to active request
+    }
 
     this.clock.clearTimeout(inFlight.timerId);
     this.inFlightRequests.delete(rejection.requestId);
@@ -413,18 +550,14 @@ export class RepairRequestPipeline {
     }
     this.inFlightRequests.clear();
 
-    // 2. Clear all backoff timers in pending queue
+    // 2. Clear all backoff timers and cancel queued pending gaps from old epoch
     for (const pending of this.pendingGaps) {
       if (pending.backoffTimerId !== undefined) {
         this.clock.clearTimeout(pending.backoffTimerId);
         pending.backoffTimerId = undefined;
       }
-      pending.retryCount = 0;
-      pending.attemptedSuppliers.clear();
     }
-
-    // 3. Re-evaluate remaining gaps under new epoch
-    this.drainQueue();
+    this.pendingGaps.length = 0;
   }
 
   /**
@@ -698,6 +831,7 @@ export class RepairRequestPipeline {
 
       const inFlight: InFlightRepairRequest = {
         requestId,
+        sessionId: this.engine.sessionId,
         supplierPeerId,
         originPeerId: task.originPeerId,
         fromSequence: task.fromSequence,

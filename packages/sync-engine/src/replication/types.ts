@@ -183,6 +183,7 @@ export interface SchedulerClock extends Clock {
  */
 export interface InFlightRepairRequest {
   readonly requestId: string;
+  readonly sessionId: string;
   readonly supplierPeerId: string;
   readonly originPeerId: string;
   readonly fromSequence: number;

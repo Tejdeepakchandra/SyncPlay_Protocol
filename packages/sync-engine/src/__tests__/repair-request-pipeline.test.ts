@@ -822,8 +822,24 @@ describe('Phase 7.4 Milestone M3 — Repair Request Pipeline', () => {
 
       const manager = new AntiEntropyManager(engine, callbacks, {}, clock);
 
-      // Ingest ops 1..5 into local engine
-      const batch = makeSampleBatch(generateUUIDv4(), 'peer-author', 'peer-author', 1, 5);
+      // Record peer knowledge and schedule repair for missing range 1..5
+      manager.repairPipeline.recordPeerDigestKnowledge({
+        formatVersion: 2,
+        sessionId: 'test-session-1',
+        senderPeerId: 'peer-author',
+        connectionGeneration: 1,
+        membershipEpoch: 1,
+        replicationVector: { 'peer-author': 5 },
+        snapshotFrontier: { 'peer-author': 0 },
+        historyFingerprints: { 'peer-author': 'a'.repeat(64) },
+      });
+
+      manager.repairPipeline.addGaps([{ originPeerId: 'peer-author', fromSequence: 1, toSequence: 5 }]);
+      expect(sentRequests.length).toBe(1);
+      const reqId = sentRequests[0]!.request.requestId;
+
+      // Ingest ops 1..5 into local engine fulfilling active request
+      const batch = makeSampleBatch(reqId, 'peer-author', 'peer-author', 1, 5);
       const decisions = manager.handleRepairBatch(batch, supplierContext);
       expect(decisions.every((d) => d.accepted)).toBe(true);
 
@@ -1021,6 +1037,646 @@ describe('Phase 7.4 Milestone M3 — Repair Request Pipeline', () => {
       // Should failover to the other supplier
       expect(sentRequests.length).toBe(2);
       expect(sentRequests[1]!.targetPeerId).not.toBe(departingPeer);
+
+      pipeline.dispose();
+    });
+  });
+
+  // ───────────────────────────────────────────────────────────────────────────
+  // 12. Adversarial Stale-Response and Correlation Safety Tests (Section 2)
+  // ───────────────────────────────────────────────────────────────────────────
+  describe('12. Adversarial Stale-Response and Pre-Ingestion Correlation Safety', () => {
+    it('1. epoch transition followed by delayed old-epoch OPERATION_BATCH is rejected before engine ingestion', () => {
+      const pipeline = new RepairRequestPipeline(engine, callbacks, {}, clock);
+      engine.setPeerGeneration('peer-S', 1);
+      pipeline.recordPeerDigestKnowledge({
+        formatVersion: 2,
+        sessionId: 'test-session-1',
+        senderPeerId: 'peer-S',
+        connectionGeneration: 1,
+        membershipEpoch: 1,
+        replicationVector: { 'peer-author': 10 },
+        snapshotFrontier: { 'peer-author': 0 },
+        historyFingerprints: { 'peer-author': 'a'.repeat(64) },
+      });
+
+      pipeline.addGaps([{ originPeerId: 'peer-author', fromSequence: 1, toSequence: 5 }]);
+      expect(sentRequests.length).toBe(1);
+      const oldReqId = sentRequests[0]!.request.requestId;
+
+      // Authoritative epoch transition to epoch 2
+      engine.transitionEpoch(2, epochCap);
+      pipeline.onEpochTransition(2);
+
+      // Now a delayed OPERATION_BATCH from epoch 1 arrives
+      const genuineContext = createAuthenticatedSupplierContext(engine, 'peer-S', 1, transportCap);
+      const staleBatch = makeSampleBatch(oldReqId, 'peer-S', 'peer-author', 1, 5, 1);
+
+      const decisions = pipeline.handleRepairBatch(staleBatch, genuineContext);
+
+      // Must be rejected with REJECTED_INVALID BEFORE mutating engine state
+      expect(decisions.length).toBe(1);
+      expect(decisions[0]!.accepted).toBe(false);
+      expect(decisions[0]!.code).toBe('REJECTED_INVALID');
+      expect(decisions[0]!.message).toContain('not an active in-flight request');
+
+      // Local replication frontier in epoch 2 remains unmodified (0)
+      expect(engine.replicationFrontier['peer-author']).toBeUndefined();
+      expect(engine.logSize).toBe(0);
+
+      pipeline.dispose();
+    });
+
+    it('2. epoch transition followed by delayed old-epoch REPAIR_REJECTED cannot trigger retries or mutate state', () => {
+      const pipeline = new RepairRequestPipeline(engine, callbacks, {}, clock);
+      engine.setPeerGeneration('peer-S1', 1);
+      engine.setPeerGeneration('peer-S2', 1);
+
+      pipeline.recordPeerDigestKnowledge({
+        formatVersion: 2,
+        sessionId: 'test-session-1',
+        senderPeerId: 'peer-S1',
+        connectionGeneration: 1,
+        membershipEpoch: 1,
+        replicationVector: { 'peer-author': 10 },
+        snapshotFrontier: { 'peer-author': 0 },
+        historyFingerprints: { 'peer-author': 'a'.repeat(64) },
+      });
+      pipeline.recordPeerDigestKnowledge({
+        formatVersion: 2,
+        sessionId: 'test-session-1',
+        senderPeerId: 'peer-S2',
+        connectionGeneration: 1,
+        membershipEpoch: 1,
+        replicationVector: { 'peer-author': 10 },
+        snapshotFrontier: { 'peer-author': 0 },
+        historyFingerprints: { 'peer-author': 'a'.repeat(64) },
+      });
+
+      pipeline.addGaps([{ originPeerId: 'peer-author', fromSequence: 1, toSequence: 5 }]);
+      expect(sentRequests.length).toBe(1);
+      const oldReqId = sentRequests[0]!.request.requestId;
+
+      // Authoritative transition to epoch 2
+      engine.transitionEpoch(2, epochCap);
+      pipeline.onEpochTransition(2);
+
+      // Delayed REPAIR_REJECTED arrives for the cancelled request
+      const delayedRejection: RepairRejectedPayload = {
+        requestId: oldReqId,
+        sessionId: 'test-session-1',
+        supplierPeerId: 'peer-S1',
+        targetOriginPeerId: 'peer-author',
+        fromSequence: 1,
+        toSequence: 5,
+        reason: 'OUTSIDE_HORIZON',
+        retainedHorizonSequence: 10,
+      };
+
+      pipeline.handleRepairRejected(delayedRejection);
+
+      // Must be dropped immediately: no retry dispatched, no failover in new epoch
+      expect(sentRequests.length).toBe(1); // Still only the initial request from epoch 1
+      expect(pipeline.getStatus().totalRepairsFailed).toBe(0);
+      expect(pipeline.getStatus().degraded).toBe(false);
+      expect(callbacks.onHistoryExhausted).not.toHaveBeenCalled();
+
+      pipeline.dispose();
+    });
+
+    it('3. response for an expired request (after timeout) is rejected before engine ingestion', () => {
+      const pipeline = new RepairRequestPipeline(engine, callbacks, {}, clock);
+      engine.setPeerGeneration('peer-S', 1);
+      pipeline.recordPeerDigestKnowledge({
+        formatVersion: 2,
+        sessionId: 'test-session-1',
+        senderPeerId: 'peer-S',
+        connectionGeneration: 1,
+        membershipEpoch: 1,
+        replicationVector: { 'peer-author': 10 },
+        snapshotFrontier: { 'peer-author': 0 },
+        historyFingerprints: { 'peer-author': 'a'.repeat(64) },
+      });
+
+      pipeline.addGaps([{ originPeerId: 'peer-author', fromSequence: 1, toSequence: 5 }]);
+      const reqId = sentRequests[0]!.request.requestId;
+
+      // Request times out at 1500ms and is removed from inFlightRequests
+      clock.advanceTime(1500);
+
+      // Now the late response arrives with the expired requestId
+      const genuineContext = createAuthenticatedSupplierContext(engine, 'peer-S', 1, transportCap);
+      const lateBatch = makeSampleBatch(reqId, 'peer-S', 'peer-author', 1, 5);
+
+      const decisions = pipeline.handleRepairBatch(lateBatch, genuineContext);
+      expect(decisions.length).toBe(1);
+      expect(decisions[0]!.accepted).toBe(false);
+      expect(decisions[0]!.code).toBe('REJECTED_INVALID');
+      expect(decisions[0]!.message).toContain('not an active in-flight request');
+
+      expect(engine.replicationFrontier['peer-author']).toBeUndefined();
+
+      pipeline.dispose();
+    });
+
+    it('4. duplicate response after successful completion is rejected before engine ingestion', () => {
+      const pipeline = new RepairRequestPipeline(engine, callbacks, {}, clock);
+      engine.setPeerGeneration('peer-S', 1);
+      pipeline.recordPeerDigestKnowledge({
+        formatVersion: 2,
+        sessionId: 'test-session-1',
+        senderPeerId: 'peer-S',
+        connectionGeneration: 1,
+        membershipEpoch: 1,
+        replicationVector: { 'peer-author': 10 },
+        snapshotFrontier: { 'peer-author': 0 },
+        historyFingerprints: { 'peer-author': 'a'.repeat(64) },
+      });
+
+      pipeline.addGaps([{ originPeerId: 'peer-author', fromSequence: 1, toSequence: 5 }]);
+      const reqId = sentRequests[0]!.request.requestId;
+
+      const genuineContext = createAuthenticatedSupplierContext(engine, 'peer-S', 1, transportCap);
+      const batch = makeSampleBatch(reqId, 'peer-S', 'peer-author', 1, 5);
+
+      // First delivery: successfully fulfilled and retired from inFlightRequests
+      const d1 = pipeline.handleRepairBatch(batch, genuineContext);
+      expect(d1.every((d) => d.accepted)).toBe(true);
+      expect(engine.replicationFrontier['peer-author']).toBe(5);
+
+      // Duplicate delivery with the same requestId
+      const d2 = pipeline.handleRepairBatch(batch, genuineContext);
+      expect(d2.length).toBe(1);
+      expect(d2[0]!.accepted).toBe(false);
+      expect(d2[0]!.code).toBe('REJECTED_INVALID');
+      expect(d2[0]!.message).toContain('not an active in-flight request');
+
+      pipeline.dispose();
+    });
+
+    it('5. response with mismatched session ID is rejected before engine ingestion', () => {
+      const pipeline = new RepairRequestPipeline(engine, callbacks, {}, clock);
+      engine.setPeerGeneration('peer-S', 1);
+      pipeline.recordPeerDigestKnowledge({
+        formatVersion: 2,
+        sessionId: 'test-session-1',
+        senderPeerId: 'peer-S',
+        connectionGeneration: 1,
+        membershipEpoch: 1,
+        replicationVector: { 'peer-author': 10 },
+        snapshotFrontier: { 'peer-author': 0 },
+        historyFingerprints: { 'peer-author': 'a'.repeat(64) },
+      });
+
+      pipeline.addGaps([{ originPeerId: 'peer-author', fromSequence: 1, toSequence: 5 }]);
+      const reqId = sentRequests[0]!.request.requestId;
+
+      const genuineContext = createAuthenticatedSupplierContext(engine, 'peer-S', 1, transportCap);
+      const rogueSessionBatch = {
+        ...makeSampleBatch(reqId, 'peer-S', 'peer-author', 1, 5),
+        sessionId: 'rogue-session-different',
+      };
+
+      const decisions = pipeline.handleRepairBatch(rogueSessionBatch, genuineContext);
+      expect(decisions.length).toBe(1);
+      expect(decisions[0]!.accepted).toBe(false);
+      expect(decisions[0]!.code).toBe('REJECTED_INVALID');
+      expect(decisions[0]!.message).toContain('does not match expected active session');
+
+      expect(engine.replicationFrontier['peer-author']).toBeUndefined();
+
+      pipeline.dispose();
+    });
+
+    it('6. response with mismatched membership epoch is rejected before engine ingestion', () => {
+      const pipeline = new RepairRequestPipeline(engine, callbacks, {}, clock);
+      engine.setPeerGeneration('peer-S', 1);
+      pipeline.recordPeerDigestKnowledge({
+        formatVersion: 2,
+        sessionId: 'test-session-1',
+        senderPeerId: 'peer-S',
+        connectionGeneration: 1,
+        membershipEpoch: 1,
+        replicationVector: { 'peer-author': 10 },
+        snapshotFrontier: { 'peer-author': 0 },
+        historyFingerprints: { 'peer-author': 'a'.repeat(64) },
+      });
+
+      pipeline.addGaps([{ originPeerId: 'peer-author', fromSequence: 1, toSequence: 5 }]);
+      const reqId = sentRequests[0]!.request.requestId;
+
+      const genuineContext = createAuthenticatedSupplierContext(engine, 'peer-S', 1, transportCap);
+      const wrongEpochBatch = {
+        ...makeSampleBatch(reqId, 'peer-S', 'peer-author', 1, 5),
+        membershipEpoch: 99,
+      };
+
+      const decisions = pipeline.handleRepairBatch(wrongEpochBatch, genuineContext);
+      expect(decisions.length).toBe(1);
+      expect(decisions[0]!.accepted).toBe(false);
+      expect(decisions[0]!.code).toBe('REJECTED_INVALID');
+      expect(decisions[0]!.message).toContain('does not match active engine epoch');
+
+      expect(engine.replicationFrontier['peer-author']).toBeUndefined();
+
+      pipeline.dispose();
+    });
+
+    it('7. response with mismatched supplier identity or connection generation is rejected', () => {
+      const pipeline = new RepairRequestPipeline(engine, callbacks, {}, clock);
+      engine.setPeerGeneration('peer-S1', 1);
+      engine.setPeerGeneration('peer-S2', 1);
+
+      pipeline.recordPeerDigestKnowledge({
+        formatVersion: 2,
+        sessionId: 'test-session-1',
+        senderPeerId: 'peer-S1',
+        connectionGeneration: 1,
+        membershipEpoch: 1,
+        replicationVector: { 'peer-author': 10 },
+        snapshotFrontier: { 'peer-author': 0 },
+        historyFingerprints: { 'peer-author': 'a'.repeat(64) },
+      });
+
+      pipeline.addGaps([{ originPeerId: 'peer-author', fromSequence: 1, toSequence: 5 }]);
+      expect(sentRequests[0]!.targetPeerId).toBe('peer-S1');
+      const reqId = sentRequests[0]!.request.requestId;
+
+      // S2 attempts to fulfill a request dispatched to S1
+      const genuineContextS2 = createAuthenticatedSupplierContext(engine, 'peer-S2', 1, transportCap);
+      const batchFromS2 = makeSampleBatch(reqId, 'peer-S2', 'peer-author', 1, 5);
+
+      const d1 = pipeline.handleRepairBatch(batchFromS2, genuineContextS2);
+      expect(d1.length).toBe(1);
+      expect(d1[0]!.accepted).toBe(false);
+      expect(d1[0]!.code).toBe('REJECTED_INVALID');
+      expect(d1[0]!.message).toContain('does not match requested supplier');
+
+      // Now test context with mismatched connection generation
+      const staleContextS1 = {
+        supplierPeerId: 'peer-S1',
+        connectionGeneration: 999, // Stale generation
+      };
+      const batchFromS1 = makeSampleBatch(reqId, 'peer-S1', 'peer-author', 1, 5);
+
+      const d2 = pipeline.handleRepairBatch(batchFromS1, staleContextS1 as any);
+      expect(d2.length).toBe(1);
+      expect(d2[0]!.accepted).toBe(false);
+      expect(d2[0]!.code).toBe('REJECTED_INVALID');
+      expect(d2[0]!.message).toContain('does not match active peer generation');
+
+      pipeline.dispose();
+    });
+
+    it('8. response with unrelated origin or sequence range outside requested bounds is rejected', () => {
+      const pipeline = new RepairRequestPipeline(engine, callbacks, {}, clock);
+      engine.setPeerGeneration('peer-S', 1);
+      pipeline.recordPeerDigestKnowledge({
+        formatVersion: 2,
+        sessionId: 'test-session-1',
+        senderPeerId: 'peer-S',
+        connectionGeneration: 1,
+        membershipEpoch: 1,
+        replicationVector: { 'origin-A': 10, 'origin-B': 10 },
+        snapshotFrontier: { 'origin-A': 0, 'origin-B': 0 },
+        historyFingerprints: { 'origin-A': 'a'.repeat(64), 'origin-B': 'b'.repeat(64) },
+      });
+
+      pipeline.addGaps([{ originPeerId: 'origin-A', fromSequence: 5, toSequence: 10 }]);
+      const reqId = sentRequests[0]!.request.requestId;
+      const genuineContext = createAuthenticatedSupplierContext(engine, 'peer-S', 1, transportCap);
+
+      // Response returns origin-B instead of origin-A
+      const wrongOriginBatch = makeSampleBatch(reqId, 'peer-S', 'origin-B', 5, 10);
+      const d1 = pipeline.handleRepairBatch(wrongOriginBatch, genuineContext);
+      expect(d1.length).toBe(1);
+      expect(d1[0]!.accepted).toBe(false);
+      expect(d1[0]!.code).toBe('REJECTED_INVALID');
+      expect(d1[0]!.message).toContain('does not match requested origin');
+
+      // Response returns sequences extending outside requested range [5..10]
+      const outOfBoundsBatch = makeSampleBatch(reqId, 'peer-S', 'origin-A', 4, 10); // starts at 4 instead of 5
+      const d2 = pipeline.handleRepairBatch(outOfBoundsBatch, genuineContext);
+      expect(d2.length).toBe(1);
+      expect(d2[0]!.accepted).toBe(false);
+      expect(d2[0]!.code).toBe('REJECTED_INVALID');
+      expect(d2[0]!.message).toContain('extends outside requested range');
+
+      pipeline.dispose();
+    });
+  });
+
+  // ───────────────────────────────────────────────────────────────────────────
+  // 13. Advisory Supplier Knowledge Trust Boundary (Section 3)
+  // ───────────────────────────────────────────────────────────────────────────
+  describe('13. Advisory Supplier Knowledge Trust Boundary', () => {
+    it('optimistic advertised replication vector cannot bypass inbound response validation or supplier authorization', () => {
+      const pipeline = new RepairRequestPipeline(engine, callbacks, {}, clock);
+
+      // Peer advertises an inflated, optimistic replication vector
+      pipeline.recordPeerDigestKnowledge({
+        formatVersion: 2,
+        sessionId: 'test-session-1',
+        senderPeerId: 'peer-unauthorized-optimist',
+        connectionGeneration: 1,
+        membershipEpoch: 1,
+        replicationVector: { 'peer-author': 1000 },
+        snapshotFrontier: { 'peer-author': 0 },
+        historyFingerprints: { 'peer-author': 'f'.repeat(64) },
+      });
+
+      // 1. Peer cannot be selected as supplier because it lacks active connection generation in peerGenerations
+      pipeline.addGaps([{ originPeerId: 'peer-author', fromSequence: 1, toSequence: 5 }]);
+      expect(sentRequests.length).toBe(0); // Not eligible!
+
+      // 2. If the peer sends an unsolicited OPERATION_BATCH directly:
+      const unsolicitedBatch = makeSampleBatch(generateUUIDv4(), 'peer-unauthorized-optimist', 'peer-author', 1, 5);
+      const decisions = pipeline.handleRepairBatch(unsolicitedBatch);
+
+      // Rejected immediately: uncoordinated request ID
+      expect(decisions.length).toBe(1);
+      expect(decisions[0]!.accepted).toBe(false);
+      expect(decisions[0]!.code).toBe('REJECTED_INVALID');
+
+      // 3. Engine state remains unmutated
+      expect(engine.replicationFrontier['peer-author']).toBeUndefined();
+      expect(engine.logSize).toBe(0);
+
+      pipeline.dispose();
+    });
+  });
+
+  // ───────────────────────────────────────────────────────────────────────────
+  // 14. Global Retry Budget & Concurrency Invariants (Section 4)
+  // ───────────────────────────────────────────────────────────────────────────
+  describe('14. Global Retry Budget and Concurrency Invariants', () => {
+    it('switching suppliers during failover consumes the single globally bounded retry budget', () => {
+      const pipeline = new RepairRequestPipeline(engine, callbacks, {}, clock);
+      engine.setPeerGeneration('peer-S1', 1);
+      engine.setPeerGeneration('peer-S2', 1);
+      engine.setPeerGeneration('peer-S3', 1);
+      engine.setPeerGeneration('peer-S4', 1);
+
+      for (const peer of ['peer-S1', 'peer-S2', 'peer-S3', 'peer-S4']) {
+        pipeline.recordPeerDigestKnowledge({
+          formatVersion: 2,
+          sessionId: 'test-session-1',
+          senderPeerId: peer,
+          connectionGeneration: 1,
+          membershipEpoch: 1,
+          replicationVector: { 'origin-1': 10 },
+          snapshotFrontier: { 'origin-1': 0 },
+          historyFingerprints: { 'origin-1': '1'.repeat(64) },
+        });
+      }
+
+      pipeline.addGaps([{ originPeerId: 'origin-1', fromSequence: 1, toSequence: 5 }]);
+
+      // Attempt 1: S1 (retryCount 0)
+      expect(sentRequests.length).toBe(1);
+      expect(sentRequests[0]!.targetPeerId).toBe('peer-S1');
+
+      // S1 times out (1500ms) -> backoff (1000ms) -> Attempt 2: S2 (retryCount 1)
+      clock.advanceTime(1500 + 1000);
+      expect(sentRequests.length).toBe(2);
+      expect(sentRequests[1]!.targetPeerId).toBe('peer-S2');
+
+      // S2 times out (1500ms) -> backoff (2000ms) -> Attempt 3: S3 (retryCount 2)
+      clock.advanceTime(1500 + 2000);
+      expect(sentRequests.length).toBe(3);
+      expect(sentRequests[2]!.targetPeerId).toBe('peer-S3');
+
+      // S3 times out (1500ms) -> backoff (4000ms) -> Attempt 4: S4 (retryCount 3)
+      clock.advanceTime(1500 + 4000);
+      expect(sentRequests.length).toBe(4);
+      expect(sentRequests[3]!.targetPeerId).toBe('peer-S4');
+
+      // S4 times out (1500ms) -> exceeds maxRetries (3) -> Exhausted!
+      clock.advanceTime(1500);
+
+      expect(sentRequests.length).toBe(4);
+      expect(pipeline.getStatus().totalRepairsFailed).toBe(1);
+      expect(pipeline.getStatus().degraded).toBe(true);
+      expect(pipeline.getStatus().degradedReason).toBe('MAX_RETRIES_EXCEEDED');
+      expect(callbacks.onHistoryExhausted).toHaveBeenCalledWith({
+        originPeerId: 'origin-1',
+        missingSequence: 1,
+        highestRetainedSequence: 0,
+      });
+
+      pipeline.dispose();
+    });
+
+    it('RATE_LIMITED and BUSY responses consume the logical retry budget', () => {
+      const pipeline = new RepairRequestPipeline(engine, callbacks, {}, clock);
+      engine.setPeerGeneration('peer-S1', 1);
+      engine.setPeerGeneration('peer-S2', 1);
+      engine.setPeerGeneration('peer-S3', 1);
+      engine.setPeerGeneration('peer-S4', 1);
+
+      for (const peer of ['peer-S1', 'peer-S2', 'peer-S3', 'peer-S4']) {
+        pipeline.recordPeerDigestKnowledge({
+          formatVersion: 2,
+          sessionId: 'test-session-1',
+          senderPeerId: peer,
+          connectionGeneration: 1,
+          membershipEpoch: 1,
+          replicationVector: { 'origin-1': 10 },
+          snapshotFrontier: { 'origin-1': 0 },
+          historyFingerprints: { 'origin-1': '1'.repeat(64) },
+        });
+      }
+
+      pipeline.addGaps([{ originPeerId: 'origin-1', fromSequence: 1, toSequence: 5 }]);
+
+      // Attempt 1 to S1 -> S1 rejects RATE_LIMITED
+      pipeline.handleRepairRejected({
+        requestId: sentRequests[0]!.request.requestId,
+        sessionId: 'test-session-1',
+        supplierPeerId: 'peer-S1',
+        targetOriginPeerId: 'origin-1',
+        fromSequence: 1,
+        toSequence: 5,
+        reason: 'RATE_LIMITED',
+      });
+
+      // Backoff 1 (1000ms) -> Attempt 2 to S2
+      clock.advanceTime(1000);
+      expect(sentRequests.length).toBe(2);
+
+      // S2 rejects BUSY
+      pipeline.handleRepairRejected({
+        requestId: sentRequests[1]!.request.requestId,
+        sessionId: 'test-session-1',
+        supplierPeerId: 'peer-S2',
+        targetOriginPeerId: 'origin-1',
+        fromSequence: 1,
+        toSequence: 5,
+        reason: 'BUSY',
+      });
+
+      // Backoff 2 (2000ms) -> Attempt 3 to S3
+      clock.advanceTime(2000);
+      expect(sentRequests.length).toBe(3);
+
+      pipeline.dispose();
+    });
+
+    it('simultaneous timeout, disconnect, and rejection cannot schedule duplicate retries', () => {
+      const pipeline = new RepairRequestPipeline(engine, callbacks, {}, clock);
+      engine.setPeerGeneration('peer-S1', 1);
+      engine.setPeerGeneration('peer-S2', 1);
+
+      pipeline.recordPeerDigestKnowledge({
+        formatVersion: 2,
+        sessionId: 'test-session-1',
+        senderPeerId: 'peer-S1',
+        connectionGeneration: 1,
+        membershipEpoch: 1,
+        replicationVector: { 'origin-1': 10 },
+        snapshotFrontier: { 'origin-1': 0 },
+        historyFingerprints: { 'origin-1': '1'.repeat(64) },
+      });
+      pipeline.recordPeerDigestKnowledge({
+        formatVersion: 2,
+        sessionId: 'test-session-1',
+        senderPeerId: 'peer-S2',
+        connectionGeneration: 1,
+        membershipEpoch: 1,
+        replicationVector: { 'origin-1': 10 },
+        snapshotFrontier: { 'origin-1': 0 },
+        historyFingerprints: { 'origin-1': '1'.repeat(64) },
+      });
+
+      pipeline.addGaps([{ originPeerId: 'origin-1', fromSequence: 1, toSequence: 5 }]);
+      const reqId = sentRequests[0]!.request.requestId;
+
+      // Event 1: Peer S1 disconnects -> failover initiated
+      pipeline.onPeerDisconnected('peer-S1');
+      expect(sentRequests.length).toBe(2); // S2 dispatched
+
+      // Event 2: Timeout timer for reqId fires late
+      clock.advanceTime(2000);
+      // Event 3: A rejection for reqId arrives late
+      pipeline.handleRepairRejected({
+        requestId: reqId,
+        sessionId: 'test-session-1',
+        supplierPeerId: 'peer-S1',
+        targetOriginPeerId: 'origin-1',
+        fromSequence: 1,
+        toSequence: 5,
+        reason: 'BUSY',
+      });
+
+      // Prove that no duplicate retries were scheduled for reqId
+      expect(sentRequests.length).toBe(2);
+
+      pipeline.dispose();
+    });
+  });
+
+  // ───────────────────────────────────────────────────────────────────────────
+  // 15. Partial Batch and Overlapping Correlation Safety (Section 5)
+  // ───────────────────────────────────────────────────────────────────────────
+  describe('15. Partial Batch and Overlapping Correlation Safety', () => {
+    it('partial response followed by duplicate response, delayed response, and concurrent gap update', () => {
+      const pipeline = new RepairRequestPipeline(engine, callbacks, {}, clock);
+      engine.setPeerGeneration('peer-S', 1);
+      pipeline.recordPeerDigestKnowledge({
+        formatVersion: 2,
+        sessionId: 'test-session-1',
+        senderPeerId: 'peer-S',
+        connectionGeneration: 1,
+        membershipEpoch: 1,
+        replicationVector: { 'peer-author': 20 },
+        snapshotFrontier: { 'peer-author': 0 },
+        historyFingerprints: { 'peer-author': 'a'.repeat(64) },
+      });
+
+      // Request 1..20
+      pipeline.addGaps([{ originPeerId: 'peer-author', fromSequence: 1, toSequence: 20 }]);
+      expect(sentRequests.length).toBe(1);
+      const reqId1 = sentRequests[0]!.request.requestId;
+
+      // 1. Partial fulfillment: returns [1..10]
+      const genuineContext = createAuthenticatedSupplierContext(engine, 'peer-S', 1, transportCap);
+      const partialBatch = makeSampleBatch(reqId1, 'peer-S', 'peer-author', 1, 10);
+
+      const d1 = pipeline.handleRepairBatch(partialBatch, genuineContext);
+      expect(d1.every((d) => d.accepted)).toBe(true);
+      expect(engine.replicationFrontier['peer-author']).toBe(10);
+
+      // Remaining range [11..20] is automatically dispatched with fresh reqId2
+      expect(sentRequests.length).toBe(2);
+      const reqId2 = sentRequests[1]!.request.requestId;
+      expect(reqId2).not.toBe(reqId1);
+      expect(sentRequests[1]!.request.fromSequence).toBe(11);
+      expect(sentRequests[1]!.request.toSequence).toBe(20);
+
+      // 2. Duplicate response arrives for reqId1 (the fulfilled partial batch)
+      const dDup = pipeline.handleRepairBatch(partialBatch, genuineContext);
+      expect(dDup.length).toBe(1);
+      expect(dDup[0]!.accepted).toBe(false);
+      expect(dDup[0]!.code).toBe('REJECTED_INVALID');
+      expect(dDup[0]!.message).toContain('not an active in-flight request');
+
+      // 3. Delayed response arrives for reqId1 with different operations
+      const delayedBatch = makeSampleBatch(reqId1, 'peer-S', 'peer-author', 1, 10);
+      const dDelayed = pipeline.handleRepairBatch(delayedBatch, genuineContext);
+      expect(dDelayed.length).toBe(1);
+      expect(dDelayed[0]!.accepted).toBe(false);
+      expect(dDelayed[0]!.code).toBe('REJECTED_INVALID');
+
+      // 4. Concurrent gap update arrives for [1..20]
+      pipeline.addGaps([{ originPeerId: 'peer-author', fromSequence: 1, toSequence: 20 }]);
+      // [1..10] is dropped because replicationFrontier is already 10;
+      // [11..20] is suppressed because reqId2 is already actively in-flight!
+      expect(sentRequests.length).toBe(2); // No duplicate request dispatched!
+
+      // 5. Complete fulfillment of reqId2 [11..20]
+      const batch2 = makeSampleBatch(reqId2, 'peer-S', 'peer-author', 11, 20);
+      const d2 = pipeline.handleRepairBatch(batch2, genuineContext);
+      expect(d2.every((d) => d.accepted)).toBe(true);
+      expect(engine.replicationFrontier['peer-author']).toBe(20);
+
+      // Status verifies both parts completed
+      expect(pipeline.getStatus().activeRequestsCount).toBe(0);
+      expect(pipeline.getStatus().pendingGapsCount).toBe(0);
+      expect(pipeline.getStatus().totalRepairsCompleted).toBe(1);
+
+      pipeline.dispose();
+    });
+
+    it('response cannot advance sequence progress beyond the requested range', () => {
+      const pipeline = new RepairRequestPipeline(engine, callbacks, {}, clock);
+      engine.setPeerGeneration('peer-S', 1);
+      pipeline.recordPeerDigestKnowledge({
+        formatVersion: 2,
+        sessionId: 'test-session-1',
+        senderPeerId: 'peer-S',
+        connectionGeneration: 1,
+        membershipEpoch: 1,
+        replicationVector: { 'peer-author': 30 },
+        snapshotFrontier: { 'peer-author': 0 },
+        historyFingerprints: { 'peer-author': 'a'.repeat(64) },
+      });
+
+      // Request 1..5
+      pipeline.addGaps([{ originPeerId: 'peer-author', fromSequence: 1, toSequence: 5 }]);
+      const reqId = sentRequests[0]!.request.requestId;
+      const genuineContext = createAuthenticatedSupplierContext(engine, 'peer-S', 1, transportCap);
+
+      // Supplier tries to serve [1..10] when only [1..5] was requested
+      const overreachingBatch = makeSampleBatch(reqId, 'peer-S', 'peer-author', 1, 10);
+      const decisions = pipeline.handleRepairBatch(overreachingBatch, genuineContext);
+
+      expect(decisions.length).toBe(1);
+      expect(decisions[0]!.accepted).toBe(false);
+      expect(decisions[0]!.code).toBe('REJECTED_INVALID');
+      expect(decisions[0]!.message).toContain('extends outside requested range');
+
+      // Local engine remains unmutated
+      expect(engine.replicationFrontier['peer-author']).toBeUndefined();
 
       pipeline.dispose();
     });
