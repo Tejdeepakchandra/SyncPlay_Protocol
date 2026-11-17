@@ -51,6 +51,7 @@ export { BaselineSyncEngine } from './baseline-sync-engine.js';
 export {
   LeaderlessSyncEngine,
   createEpochTransitionCapability,
+  createAuthenticatedSupplierContext,
 } from './engine/leaderless-sync-engine.js';
 export type {
   LeaderlessSyncEngineConfig,

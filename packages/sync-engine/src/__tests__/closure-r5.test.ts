@@ -351,10 +351,7 @@ describe('Phase 7.3-R5: Final Authorization & Canonicalization Closure', () => {
         ],
       };
 
-      const transportContext: AuthenticatedSupplierContext = {
-        supplierPeerId: 'peer-S',
-        connectionGeneration: 2,
-      };
+      const transportContext = engine.registerInboundSupplierContext('peer-S', 2);
 
       const decisions = engine.ingestRepairBatch(batch, transportContext);
       expect(decisions).toHaveLength(1);
@@ -389,10 +386,7 @@ describe('Phase 7.3-R5: Final Authorization & Canonicalization Closure', () => {
       };
 
       // Authenticated transport layer identified sender as peer-attacker
-      const transportContext: AuthenticatedSupplierContext = {
-        supplierPeerId: 'peer-attacker',
-        connectionGeneration: 1,
-      };
+      const transportContext = engine.registerInboundSupplierContext('peer-attacker', 1);
 
       const decisions = engine.ingestRepairBatch(batch, transportContext);
       expect(decisions).toHaveLength(1);
@@ -424,10 +418,7 @@ describe('Phase 7.3-R5: Final Authorization & Canonicalization Closure', () => {
         ],
       };
 
-      const transportContext: AuthenticatedSupplierContext = {
-        supplierPeerId: 'peer-S',
-        connectionGeneration: 2, // Claims gen 2, but authorized is 1
-      };
+      const transportContext = engine.registerInboundSupplierContext('peer-S', 2); // Claims gen 2, but authorized is 1
 
       const decisions = engine.ingestRepairBatch(batch, transportContext);
       expect(decisions).toHaveLength(1);
@@ -459,10 +450,7 @@ describe('Phase 7.3-R5: Final Authorization & Canonicalization Closure', () => {
         ],
       };
 
-      const transportContext: AuthenticatedSupplierContext = {
-        supplierPeerId: 'peer-S',
-        connectionGeneration: 2, // Claims stale gen 2, active is 3
-      };
+      const transportContext = engine.registerInboundSupplierContext('peer-S', 2); // Claims stale gen 2, active is 3
 
       const decisions = engine.ingestRepairBatch(batch, transportContext);
       expect(decisions).toHaveLength(1);
@@ -497,10 +485,7 @@ describe('Phase 7.3-R5: Final Authorization & Canonicalization Closure', () => {
         ],
       };
 
-      const transportContext: AuthenticatedSupplierContext = {
-        supplierPeerId: 'peer-S',
-        connectionGeneration: 2,
-      };
+      const transportContext = engine.registerInboundSupplierContext('peer-S', 2);
 
       // Supplier gen 2 is validated; author Peer A's generation 4 is NOT compared
       const decisions = engine.ingestRepairBatch(batch, transportContext);
@@ -544,10 +529,7 @@ describe('Phase 7.3-R5: Final Authorization & Canonicalization Closure', () => {
         ],
       };
 
-      const transportContext: AuthenticatedSupplierContext = {
-        supplierPeerId: 'peer-S',
-        connectionGeneration: 1,
-      };
+      const transportContext = engine.registerInboundSupplierContext('peer-S', 1);
 
       const decisions = engine.ingestRepairBatch(batch, transportContext);
       expect(decisions).toHaveLength(2);
@@ -563,10 +545,7 @@ describe('Phase 7.3-R5: Final Authorization & Canonicalization Closure', () => {
     it('rejects supplier attempt to alter operation content with REJECTED_IDENTITY_CONFLICT', () => {
       engine.authorizePeerGeneration('peer-S', 1);
 
-      const transportContext: AuthenticatedSupplierContext = {
-        supplierPeerId: 'peer-S',
-        connectionGeneration: 1,
-      };
+      const transportContext = engine.registerInboundSupplierContext('peer-S', 1);
 
       // 1. Initial op applied
       const originalBatch: OperationBatchPayload = {
@@ -774,10 +753,7 @@ describe('Phase 7.3-R5: Final Authorization & Canonicalization Closure', () => {
         ],
       };
 
-      const transportContext: AuthenticatedSupplierContext = {
-        supplierPeerId: 'peer-S',
-        connectionGeneration: 5,
-      };
+      const transportContext = engine.registerInboundSupplierContext('peer-S', 5);
 
       const decisions = engine.ingestRepairBatch(batch, transportContext);
       expect(decisions).toHaveLength(1);

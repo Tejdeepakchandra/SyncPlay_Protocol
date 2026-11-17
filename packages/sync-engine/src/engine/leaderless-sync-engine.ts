@@ -79,6 +79,17 @@ export interface AuthenticatedSupplierContext {
   readonly connectionGeneration?: number;
 }
 
+/**
+ * Creates an authenticated supplier transport context registered with the target engine.
+ */
+export function createAuthenticatedSupplierContext(
+  engine: LeaderlessSyncEngine,
+  supplierPeerId: string,
+  connectionGeneration: number,
+): AuthenticatedSupplierContext {
+  return engine.registerInboundSupplierContext(supplierPeerId, connectionGeneration);
+}
+
 export interface LeaderlessSyncEngineConfig extends SyncEngineConfig {
   readonly initialClock?: number;
   readonly logCapacity?: number;
@@ -105,6 +116,7 @@ export class LeaderlessSyncEngine implements SyncEngine {
   private readonly replicationVector: Record<string, number> = {};
   private readonly peerGenerations = new Map<string, number>();
   private readonly authorizedEpochCapability?: EpochTransitionCapability;
+  private readonly validSupplierContexts = new WeakSet<AuthenticatedSupplierContext>();
   private localOriginSequence = 0;
   private currentEpoch = 1;
 
@@ -258,6 +270,36 @@ export class LeaderlessSyncEngine implements SyncEngine {
 
   public getPeerGeneration(peerId: string): number | undefined {
     return this.peerGenerations.get(peerId);
+  }
+
+  /**
+   * Registers an authenticated supplier transport context from the trusted transport adapter (ControlEventService / PeerMesh).
+   * Contexts registered here are branded and retained in a private WeakSet to ensure unforgeable provenance.
+   * Plain objects constructed by arbitrary application callers without registration are rejected.
+   */
+  public registerInboundSupplierContext(
+    supplierPeerId: string,
+    connectionGeneration: number,
+  ): AuthenticatedSupplierContext {
+    if (!supplierPeerId || typeof supplierPeerId !== 'string') {
+      throw new SyncEngineError('INVALID_ARGUMENT', 'supplierPeerId must be non-empty string');
+    }
+    if (
+      typeof connectionGeneration !== 'number' ||
+      !Number.isInteger(connectionGeneration) ||
+      connectionGeneration < 1
+    ) {
+      throw new SyncEngineError(
+        'INVALID_ARGUMENT',
+        `Invalid connection generation ${connectionGeneration}: must be positive integer`,
+      );
+    }
+    const context: AuthenticatedSupplierContext = Object.freeze({
+      supplierPeerId,
+      connectionGeneration,
+    });
+    this.validSupplierContexts.add(context);
+    return context;
   }
 
   public getState(): Readonly<PlaybackState> {
@@ -960,10 +1002,26 @@ export class LeaderlessSyncEngine implements SyncEngine {
       return [decision];
     }
 
+    // 3. Validate unforgeable transport registration
+    if (!this.validSupplierContexts.has(transportContext)) {
+      const decision: EngineDecision = {
+        accepted: false,
+        code: 'REJECTED_INVALID',
+        stateVersion: this.state.stateVersion,
+        decidedAt: now,
+        message:
+          'Fabricated or unauthenticated supplier transport context: context must be locally registered by transport adapter',
+      };
+      this.lastDecision = decision;
+      this.mutableStats.eventsReceivedCount += Math.max(1, batch.operations.length);
+      this.mutableStats.eventsRejectedCount += Math.max(1, batch.operations.length);
+      return [decision];
+    }
+
     const transportSupplierPeerId = transportContext.supplierPeerId;
     const transportSupplierGen = transportContext.connectionGeneration;
 
-    // 3. Reject forged supplier identity if payload claims a different peer than authenticated transport
+    // 4. Reject forged supplier identity if payload claims a different peer than authenticated transport
     if (batch.supplierPeerId && batch.supplierPeerId !== transportSupplierPeerId) {
       const decision: EngineDecision = {
         accepted: false,
@@ -978,8 +1036,22 @@ export class LeaderlessSyncEngine implements SyncEngine {
       return [decision];
     }
 
-    // 4. Validate supplier connection generation against authorized peerGenerations
-    const activeSupplierGen = this.peerGenerations.get(transportSupplierPeerId) ?? 1;
+    // 5. Authoritative supplier authorization & generation match (No ?? 1 fallback)
+    const activeSupplierGen = this.peerGenerations.get(transportSupplierPeerId);
+    if (activeSupplierGen === undefined) {
+      const decision: EngineDecision = {
+        accepted: false,
+        code: 'REJECTED_INVALID',
+        stateVersion: this.state.stateVersion,
+        decidedAt: now,
+        message: `Unknown or unauthorized repair supplier: ${transportSupplierPeerId}`,
+      };
+      this.lastDecision = decision;
+      this.mutableStats.eventsReceivedCount += Math.max(1, batch.operations.length);
+      this.mutableStats.eventsRejectedCount += Math.max(1, batch.operations.length);
+      return [decision];
+    }
+
     if (transportSupplierGen < activeSupplierGen) {
       const decision: EngineDecision = {
         accepted: false,
