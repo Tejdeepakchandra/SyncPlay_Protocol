@@ -171,7 +171,7 @@ The JSON canonicalizer implemented in `packages/sync-engine/src/log/operation-fi
 
 ### 4.1 Git Repository Verification
 
-- **Final Implementation Commit:** `45233b691e093fa90a8f269a43d0cb37f7a97e2f` (`45233b6`)
+- **Final Implementation Commit:** `d6087a30d453bbb1e31aab524020f061349e2543` (`d6087a3`)
 - **Parent Baseline Commit:** `a199e08` (`fix(sync-engine): complete Phase 7.3-R5 final authorization & canonicalization closure`)
 - **Approved Architectural Baseline:** Phase 7.2-R9 (`1825de1`)
 - **Branch:** `main`
