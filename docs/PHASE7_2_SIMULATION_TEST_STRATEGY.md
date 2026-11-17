@@ -121,3 +121,35 @@ interface NetworkImpairmentConfig {
   1. Periodic anti-entropy detects all gaps.
   2. All `REPAIR_REQUEST` calls are fulfilled within $< 2000$ virtual ms.
   3. Final state is identical across all 4 peers.
+
+### Suite 4: Causal Context & True Concurrency Verification
+- **Execution:**
+  1. Generate concurrent operations $A_1$ (`PAUSE`) and $B_1$ (`PLAY`) such that $A_1 \parallel B_1$ ($A_1.\text{originSequence} > B_1.\text{causalContext}[A]$ and vice versa).
+  2. Verify that all peers resolve state to `'paused'` (intent-preserving pause priority).
+  3. Peer B observes $A_1$ and subsequently generates $B_2$ (`PLAY`) with $A_1.\text{originSequence} \le B_2.\text{causalContext}[A]$.
+  4. Verify that all peers resolve state to `'playing'` (intentional sequential resumption).
+  5. **Multi-Branch Dependency Merge:** Peer C observes concurrent operations $A_2$ and $B_3$ and generates $C_1$. Peer D is injected with $A_2$ and $C_1$ while $B_3$ is delayed.
+  6. Assert that Peer D holds $C_1$ in `PendingDependencyQueue`, dispatches `REPAIR_REQUEST` for $B_3$, and only applies $C_1$ once $B_3$ arrives.
+
+### Suite 5: Snapshot Frontier & Reconnect Recovery Verification
+- **Execution:**
+  1. Peer D rejoins after missing $> 256$ operations (Class 3 horizon gap).
+  2. Peer D requests `STATE_SNAPSHOT` from Peer A.
+  3. **Stale Snapshot Test:** Peer C (slow peer) attempts to offer an outdated snapshot ($V_{\text{snap}} < V_{\text{local}}$). Assert Peer D rejects with `SNAPSHOT_STALE`.
+  4. **Corrupt Digest Test:** Inject a snapshot where `stateDigestSha256` does not match the computed hash of the payload. Assert rejection with `DIGEST_MISMATCH`.
+  5. **Atomic Installation & Local Replay:** Peer D holds 2 locally generated pending operations created during reconnect. Peer D receives valid snapshot from Peer A, atomically installs base state, and successfully replays the 2 local operations.
+  6. Assert Peer D transitions from `'recovering'` to `'active'` and converges with Peer A.
+
+### Suite 6: Empirical Replay Latency & Performance Benchmark Harness
+- **Objective:** Empirically evaluate the unverified performance target hypothesis: *"In-memory replay of 256 operations through pure functional reducer executes in $< 2.0\text{ ms}$."*
+- **Harness Specification:**
+  - Dedicated benchmark file: `packages/sync-engine/test/benchmark/replay-performance.bench.ts`.
+  - Runs in clean Node.js / V8 environment using `performance.now()` with high-resolution timers.
+  - Generates 1,000 iterations of 256 mixed operations (`PLAY`, `PAUSE`, `SEEK`, `RATE_CHANGE`).
+  - Simulates late-arrival speculative rollback where an operation arrives at index 0, forcing a full 256-operation replay loop from base snapshot.
+  - Measures execution time per replay loop.
+- **Reporting Metrics:**
+  - $p50$ (median latency), $p95$, and $p99$ tail latency.
+  - Garbage collection overhead and heap allocation per replay.
+- **Pass / Fail Threshold:** $p99 < 2.0\text{ ms}$ on baseline testing machines. Results will be published in the Milestone P7.7 Performance Evaluation Report.
+

@@ -34,6 +34,7 @@ The master planning suite for Phase 7 is located at the root of the `docs/` dire
 - `docs/PHASE7_1_FINAL_RECOMMENDATION.md`: Answers to 10 core architectural decisions, alternative rejections, and P7.2 scope.
 
 ### Milestone P7.2 Architecture & Interface Specifications
+- `docs/PHASE7_2_ARCHITECTURAL_CORRECTIONS.md`: Authoritative architectural correction register (P7.2-R1) resolving causal metadata, epoch compaction, snapshot recovery, clock validation, and guarded convergence.
 - `docs/PHASE7_2_HLD.md`: High-Level Design for `LeaderlessSyncEngine`, trust boundaries, data flows, and module responsibilities.
 - `docs/PHASE7_2_LLD.md`: Low-Level Design covering ordering keys, conflict policies, bounded ring buffer ($K=256$), and anti-entropy version vectors.
 - `docs/PHASE7_2_PROTOCOL_EVOLUTION_RFC.md`: Wire protocol schemas for `logicalTimestamp`, `STATE_DIGEST`, `REPAIR_REQUEST`, and `OPERATION_BATCH`.

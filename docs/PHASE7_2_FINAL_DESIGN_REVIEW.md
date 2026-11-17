@@ -14,15 +14,15 @@ During Milestone P7.2, the following ten fundamental architectural decisions wer
 
 | Decision ID | Area | Selected Architectural Policy | Core Justification |
 | :---: | :--- | :--- | :--- |
-| **AD-701** | Total Ordering | **Lamport Clock + Lexicographic Tie-Breaker** | Strict total order $\langle L, \text{peerId}, \text{eventId} \rangle$ with only 8 bytes wire overhead; roster-independent. |
-| **AD-702** | Concurrency Detection | **Causal Predecessor Pointer (`predecessorEventId`)** | Resolves the Lamport limitation: distinguishes $a \to b$ from $a \parallel b$ without full $O(N)$ vector clock on every event. |
-| **AD-703** | Play/Pause Conflict | **Intent-Preserving Pause Priority** | When causally concurrent ($e_{\text{pause}} \parallel e_{\text{play}}$), `PAUSE` overrides `PLAY` to eliminate uncommanded audio blast hazards. Causally sequential play ($e_{\text{pause}} \to e_{\text{play}}$) cleanly resumes. |
+| **AD-701** | Total Ordering | **Lamport Clock + Lexicographic Tie-Breaker** | Strict total order $\langle L, \text{originPeerId}, \text{logicalEventId} \rangle$ with only 8 bytes wire overhead; roster-independent. |
+| **AD-702** | Concurrency Detection | **Causal Context Vector (`causalContext`)** | Replaces single predecessor pointer to enable mathematically sound multi-branch concurrency detection ($e_1 \parallel e_2 \iff e_1 \not\to e_2 \land e_2 \not\to e_1$). |
+| **AD-703** | Play/Pause Conflict | **Concurrency-Aware Pause Priority** | When causally concurrent ($e_{\text{pause}} \parallel e_{\text{play}}$), `PAUSE` overrides `PLAY` to eliminate uncommanded audio blast hazards. Causally sequential play ($e_{\text{pause}} \to e_{\text{play}}$) cleanly resumes. Media muting strictly isolated in Phase 8 MediaAdapter. |
 | **AD-704** | Seek/Rate Conflict | **Total-Order Last-Write-Wins (LWW)** | Non-commutative seeks and scalar rate updates deterministically resolve to the operation with the highest total key. |
-| **AD-705** | Anti-Entropy Model | **Per-Origin Version Vectors (`STATE_DIGEST`)** | Avoids the multi-origin scalar flaw. Compact map of $\text{PeerId} \to \text{SeqNum}$ ($\approx 276\text{ B}$ for 4 peers) emitted at 0.2 Hz. |
+| **AD-705** | Anti-Entropy Model | **Per-Origin Version Vectors (`STATE_DIGEST`)** | Avoids the multi-origin scalar flaw. Compact map of $\text{PeerId} \to \text{SeqNum}$ ($\approx 392\text{ B}$ for 4 peers) emitted at 0.2 Hz. |
 | **AD-706** | Missing Event Repair | **Targeted Range Requests (`REPAIR_REQUEST`)** | Bounded batches (`OPERATION_BATCH`, max 32 ops) prevent WebRTC DataChannel buffer flooding. |
-| **AD-707** | Bounded History | **Circular Ring Buffer ($K = 256$ Operations)** | Strict memory bounding ($O(K)$). Fast binary-search insertion ($O(\log K)$) and deterministic replay ($< 1\text{ ms}$). |
+| **AD-707** | Bounded History | **Circular Ring Buffer ($K = 256$ Operations)** | Strict memory bounding ($O(K)$) with 5-way horizon classification. Pure reducer replay targeted to execute in $< 2.0\text{ ms}$ (empirical benchmark in P7.7). |
 | **AD-708** | Safe Compaction | **Stable Frontier Pruning with Epoch Eviction** | Operations older than $W_{\text{stable}} = \min(V_p)$ are compacted into base snapshots. Departed peers are evicted via Bootstrap `session:peer-left`. |
-| **AD-709** | Reconnect Recovery | **Two-Tier Catch-Up with Monotonic Generations** | Rejoining peers enter `RECOVERING` status: repair via log if within horizon ($< 256$ ops); fallback to `StateSnapshotPayload` if gap $> 256$. |
+| **AD-709** | Reconnect Recovery | **Cryptographically Verified Snapshot Recovery** | Rejoining peers enter `RECOVERING`: repair via log if within horizon ($< 256$ ops); fallback to `StateSnapshotPayloadV2` with frontier verification ($V_{\text{snap}} \ge V_{\text{local}}$) and SHA-256 digest validation. |
 | **AD-710** | Testing Strategy | **Headless Deterministic Simulation Harness** | Discrete virtual clock, seedable PRNG (Mulberry32), and network impairment injection (loss, delay, jitter, partition). |
 
 ---
@@ -57,20 +57,20 @@ Upon architectural review and formal authorization, Phase 7 implementation shoul
 ```text
 PHASE 7 IMPLEMENTATION SEQUENCE:
 1. Milestone P7.3 (Event Ordering & Conflict Engine):
-   - Step 1: Additive schema types in packages/protocol (logicalTimestamp, predecessorEventId).
-   - Step 2: Implement LogicalClockManager with clock overflow and skew validation.
-   - Step 3: Implement OrderedOperationLog with binary search insertion and total-order sorting.
-   - Step 4: Implement ConflictResolver pure reducer with pause-priority and seek LWW.
+   - Step 1: Additive schema types in packages/protocol (logicalTimestamp, originPeerId, originSequenceNumber, causalContext).
+   - Step 2: Implement LogicalClockManager with per-origin sequence and Lamport monotonicity validation and integer safety.
+   - Step 3: Implement OrderedOperationLog with binary search insertion, 5-way horizon classification, and rollback replay.
+   - Step 4: Implement ConflictResolver pure reducer with concurrency-aware pause-priority and seek LWW.
    - Step 5: Implement SimulatedNetworkMesh harness and execute 100-permutation convergence tests.
 
 2. Milestone P7.4 (State Replication & Convergence):
    - Step 6: Implement ReplicationController (version vector tracking, STATE_DIGEST generation).
-   - Step 7: Implement REPAIR_REQUEST and OPERATION_BATCH handshakes.
+   - Step 7: Implement REPAIR_REQUEST, PendingDependencyQueue, and OPERATION_BATCH handshakes.
    - Step 8: Multi-peer headless convergence tests under simulated 20% packet drop.
 
 3. Milestone P7.5 (Fault Tolerance & State Recovery):
-   - Step 9: Implement RecoveryManager (RECOVERING state gating, generation gating).
-   - Step 10: Implement Snapshot-assisted recovery handshake for gaps > 256 operations.
+   - Step 9: Implement RecoveryManager (RECOVERING state gating, generation gating, ephemeral reload identity).
+   - Step 10: Implement cryptographically verified snapshot recovery (StateSnapshotPayloadV2, frontier verification, SHA-256 digest).
    - Step 11: Network partition healing tests.
 
 4. Milestone P7.6 (Adversarial Multi-Peer Browser Testing):
@@ -91,3 +91,4 @@ PHASE 7 IMPLEMENTATION SEQUENCE:
 - [x] **Principle 4 (Replaceable Algorithms):** `BaselineSyncEngine` remains completely unmodified as a reference.
 - [x] **Principle 5 (Stable Interfaces First):** All specifications completed and verified prior to coding.
 - [x] **Principle 6 (Honest Guarantees):** Explicit conditional guarantees documented; CAP-theorem trade-offs formalized.
+

@@ -12,10 +12,10 @@
 
 ### 1.1. Ordering Key Definition
 Every control operation $e$ is uniquely and deterministically ordered across the distributed mesh by the composite key:
-$$\text{Key}(e) = \langle \text{logicalTimestamp}(e), \text{senderPeerId}(e), \text{logicalEventId}(e) \rangle$$
+$$\text{Key}(e) = \langle \text{logicalTimestamp}(e), \text{originPeerId}(e), \text{logicalEventId}(e) \rangle$$
 
 - `logicalTimestamp(e)`: Non-negative integer ($0 \le L \le \text{Number.MAX\_SAFE\_INTEGER}$).
-- `senderPeerId(e)`: Non-empty ASCII string derived from verified transport connection context.
+- `originPeerId(e)`: Non-empty ASCII string representing the authoring peer identity within the session/epoch.
 - `logicalEventId(e)`: Non-empty ASCII string uniquely identifying the logical user operation.
 
 ### 1.2. Total-Order Comparator Specification
@@ -26,9 +26,9 @@ function compareOperations(e1: ControlOperation, e2: ControlOperation): number {
   if (e1.logicalTimestamp !== e2.logicalTimestamp) {
     return e1.logicalTimestamp - e2.logicalTimestamp;
   }
-  // 2. Secondary order: Deterministic lexicographic peer tie-breaker
-  if (e1.senderPeerId !== e2.senderPeerId) {
-    return e1.senderPeerId < e2.senderPeerId ? -1 : 1;
+  // 2. Secondary order: Deterministic lexicographic origin peer tie-breaker
+  if (e1.originPeerId !== e2.originPeerId) {
+    return e1.originPeerId < e2.originPeerId ? -1 : 1;
   }
   // 3. Tertiary order: Stable logical event ID (breaks rare same-tick same-peer collisions)
   if (e1.logicalEventId !== e2.logicalEventId) {
@@ -39,23 +39,43 @@ function compareOperations(e1: ControlOperation, e2: ControlOperation): number {
 ```
 
 ### 1.3. Concurrency Detection vs. Lamport Limitation
-**The Theoretical Limit:** A scalar Lamport clock guarantees $a \to b \implies L(a) < L(b)$. However, $L(a) < L(b)$ does **not** imply $a \to b$. Two events with different scalar timestamps may still be causally concurrent ($a \parallel b$).
 
-**The SyncPlay Solution:**
-1. **Identical Timestamp Concurrency Theorem:**
-   $$L(e_1) == L(e_2) \implies e_1 \parallel e_2 \quad (\text{Mathematically Guaranteed})$$
-   Whenever two operations carry the exact same logical timestamp, they are guaranteed to have been generated concurrently without causal knowledge of each other.
-2. **Predecessor Reference (`predecessorEventId`):**
-   To detect concurrency when $L(e_1) \neq L(e_2)$, every outgoing control event records:
-   $$\text{predecessorEventId} = \text{lastAppliedOperation.logicalEventId} \quad (\text{or null if initial})$$
-   - If $e_2.\text{predecessorEventId} == e_1.\text{logicalEventId}$ (or exists in $e_2$'s ancestral log), then $e_1 \to e_2$ (Causally Dependent).
-   - If neither operation references the other as predecessor or ancestor, they are **Causally Concurrent** ($e_1 \parallel e_2$).
+#### The Theoretical Limit of Scalar Clocks
+A scalar Lamport clock guarantees $a \to b \implies L(a) < L(b)$. However, $L(a) < L(b)$ does **not** imply $a \to b$. Two events with different scalar timestamps may still be causally concurrent ($a \parallel b$).
 
-### 1.4. Clock Update & Validation Rules
+#### Defect of the Single Predecessor Pointer
+An earlier revision attempted to capture causality using a single predecessor pointer (`predecessorEventId = lastAppliedOperation.logicalEventId`). However, in a distributed mesh where concurrent branches merge, a single predecessor cannot represent multiple concurrent dependencies. If Peer C observes concurrent operations $A_1$ and $B_1$ before generating $C_1$, a single predecessor pointer to $B_1$ loses the causal dependency $A_1 \to C_1$. Any peer receiving $A_1$ and $C_1$ without $B_1$ would erroneously classify $C_1$ as concurrent with $A_1$.
+
+#### The SyncPlay Solution: Explicit Causal Context Vector
+Every control operation $e$ carries an explicit **Causal Context Vector** snapshot observed by the authoring peer at creation:
+$$\text{causalContext}(e) = \text{Record}\langle \text{originPeerId}, \text{originSequenceNumber} \rangle$$
+
+- **Formal Causality Test ($e_1 \to e_2$):**
+  Operation $e_1$ causally precedes operation $e_2$ if and only if $e_2$'s causal context reflects $e_1$'s origin sequence:
+  $$e_1 \to e_2 \iff e_1.\text{originSequence} \le (e_2.\text{causalContext}[e_1.\text{originPeerId}] \ ?? \ 0)$$
+
+- **Formal Concurrency Test ($e_1 \parallel e_2$):**
+  Operations $e_1$ and $e_2$ are causally concurrent if and only if neither causally precedes the other:
+  $$e_1 \parallel e_2 \iff (e_1 \not\to e_2) \land (e_2 \not\to e_1)$$
+
+- **Pending Dependency Queue:**
+  If an operation $e_2$ arrives with causal context entries exceeding the local version vector ($e_2.\text{causalContext}[p] > V_{\text{local}}[p]$ for some origin $p \neq e_2.\text{originPeerId}$), $e_2$ has causal dependencies that the local engine has not yet received. Rather than evaluating $e_2$ with missing context, $e_2$ is held in a `PendingDependencyQueue` and a `REPAIR_REQUEST` is dispatched to fetch the missing dependency. Once the missing operation arrives and is applied, $e_2$ is released for reduction.
+
+### 1.4. Clock Update & Multi-Factor Monotonicity Validation Rules
+
+#### Eliminating Flawed Scalar Clock Skew Limits
+Prior designs imposed a scalar limit `remoteClock <= localClock + MAX_CLOCK_SKEW (10,000)`. In a distributed media room, this rule was fundamentally flawed: if Peer A and Peer B exchange 10,001 operations during an active session while Peer C is silent or playing continuously without generating events, Peer C's Lamport clock legitimately lags by $> 10,000$. Imposing a scalar distance check falsely rejected valid operations.
+
+#### Correct Multi-Factor Validation
+Lamport clocks are validated against three mathematically rigorous invariants:
+1. **Per-Origin Sequence Monotonicity:** Operations from a given `originPeerId` must advance strictly sequentially: $\text{originSequence}_{k+1} = \text{originSequence}_k + 1$. Any regression or non-consecutive jump triggers sequence conflict or buffering.
+2. **Per-Origin Lamport Monotonicity:** Successive operations from a single origin must have strictly increasing Lamport timestamps: $L(e_{k+1}) > L(e_k)$.
+3. **Safe Integer Bounds:** All timestamps must remain non-negative safe integers: $0 \le L \le \text{Number.MAX\_SAFE\_INTEGER} - 1$.
+
 ```ts
 class LogicalClockManager {
   private currentClock: number = 0;
-  private readonly MAX_CLOCK_SKEW: number = 10000;
+  private readonly maxObservedByOrigin: Map<string, number> = new Map();
 
   public tickLocal(): number {
     if (this.currentClock >= Number.MAX_SAFE_INTEGER - 1) {
@@ -65,21 +85,29 @@ class LogicalClockManager {
     return this.currentClock;
   }
 
-  public updateRemote(remoteClock: number): number {
+  public validateAndAdvanceRemote(originPeerId: string, remoteClock: number): number {
     if (!Number.isSafeInteger(remoteClock) || remoteClock < 0) {
       throw new SyncEngineError('INVALID_CLOCK', `Malformed remote timestamp: ${remoteClock}`);
     }
-    if (remoteClock > this.currentClock + this.MAX_CLOCK_SKEW) {
+
+    // Verify per-origin Lamport monotonicity
+    const lastOriginClock = this.maxObservedByOrigin.get(originPeerId) ?? 0;
+    if (remoteClock <= lastOriginClock) {
       throw new SyncEngineError(
-        'CLOCK_SKEW_EXCEEDED',
-        `Remote timestamp ${remoteClock} exceeds local ${this.currentClock} by more than ${this.MAX_CLOCK_SKEW}`
+        'CLOCK_REGRESSION',
+        `Remote timestamp ${remoteClock} from origin ${originPeerId} does not exceed previous ${lastOriginClock}`
       );
     }
+
+    this.maxObservedByOrigin.set(originPeerId, remoteClock);
     this.currentClock = Math.max(this.currentClock, remoteClock) + 1;
     return this.currentClock;
   }
 
   public reseed(maxObservedClock: number): void {
+    if (!Number.isSafeInteger(maxObservedClock) || maxObservedClock < 0) {
+      throw new SyncEngineError('INVALID_CLOCK', `Malformed reseed timestamp: ${maxObservedClock}`);
+    }
     this.currentClock = Math.max(this.currentClock, Math.floor(maxObservedClock)) + 1;
   }
 }
@@ -109,11 +137,14 @@ flowchart TD
 - **Policy:** Highest Total-Order Key Wins ($\max_{\text{Key}}$).
 - **Semantics:** If Peer A seeks to $30\text{ s}$ and Peer B seeks to $60\text{ s}$ concurrently, the operation with the higher key establishes the new `anchorPositionMs`. The lower-key seek is resolved with code `'SUPERSEDED'`.
 
-#### Rule 2: `PLAY` vs. `PAUSE` (Intent-Preserving Pause Priority)
+#### Rule 2: `PLAY` vs. `PAUSE` (Concurrency-Aware Intent-Preserving Pause Priority)
 - **Policy:**
-  1. **Causally Sequential ($e_{\text{pause}} \to e_{\text{play}}$):** Peer B observed Peer A's pause, and intentionally pressed play. **PLAY succeeds**; state transitions to `'playing'`.
-  2. **Causally Concurrent ($e_{\text{pause}} \parallel e_{\text{play}}$):** Peer A and Peer B acted concurrently without knowledge of each other. **PAUSE takes priority**. Playback halts at the pause anchor position; audio is silenced.
-  - *Rationale:* An uncommanded audio blast when a user intended silence is a severe defect. Pause priority guarantees a safe, predictable resting state from which any participant can resume.
+  1. **Causally Concurrent ($e_{\text{pause}} \parallel e_{\text{play}}$ via Causal Context):** Peer A and Peer B acted concurrently without knowledge of each other. **PAUSE takes priority**. Playback transitions to `'paused'` and halts at the pause anchor position.
+     - *Rationale:* An uncommanded audio blast when a user intended silence is a severe defect. Pause priority guarantees a safe, predictable resting state from which any participant can resume.
+  2. **Causally Sequential ($e_{\text{pause}} \to e_{\text{play}}$):** Peer B observed Peer A's pause, and intentionally pressed play. **PLAY succeeds**; state transitions to `'playing'`.
+  3. **Causally Sequential ($e_{\text{play}} \to e_{\text{pause}}$):** Peer B observed Peer A's play, and intentionally pressed pause. **PAUSE succeeds**; state transitions to `'paused'`.
+- **Media Hardware Isolation Boundary:**
+  The `SyncEngine` is a pure state machine producing deterministic `PlaybackState` decisions. Actual media audio muting, buffer adjustments, and HTML5 `<video>` / `<audio>` element controls remain strictly isolated in Phase 8 (`MediaAdapter`). The core engine never manipulates hardware or DOM elements.
 
 #### Rule 3: `PLAY` vs. `SEEK` and `PAUSE` vs. `SEEK`
 - **Policy:** Orthogonal Composition.
@@ -152,28 +183,64 @@ flowchart LR
 
 ### 3.2. Binary Search Insertion & Total-Order Maintenance
 When a new operation $e$ arrives:
-1. **Deduplication Check:** If `idIndex.has(e.logicalEventId)`, reject immediately as `IGNORED_DUPLICATE`.
-2. **Fast Append (Head Path):** If `ringBuffer.length == 0` or `compareOperations(e, ringBuffer[last]) > 0`:
+1. **Deduplication Check:** If `idIndex.has(e.logicalEventId)`, resolve immediately as `IGNORED_DUPLICATE`.
+2. **Causal Dependency Check:** If $e$ depends on operations not yet applied ($e.\text{causalContext}[p] > V_{\text{local}}[p]$ for some $p \neq e.\text{originPeerId}$), buffer in `PendingDependencyQueue` and emit `REPAIR_REQUEST`.
+3. **Fast Append (Head Path):** If `ringBuffer.length == 0` or `compareOperations(e, ringBuffer[last]) > 0`:
    - Append to end of `ringBuffer`.
    - Apply operation to current state via `ConflictResolver`.
-   - Update `idIndex`.
-3. **Speculative Rollback & Replay (Late-Arrival Path):** If `compareOperations(e, ringBuffer[last]) < 0`:
-   - Locate insertion index $i$ via binary search: $O(\log K)$.
-   - Check horizon: If $e$ has timestamp older than `baseSnapshot.logicalTimestamp`, trigger **Outside Horizon Recovery** (Section 3.4).
-   - Insert $e$ at index $i$: array splice ($K \le 256$ takes $< 0.05\text{ ms}$ in V8).
+   - Update `idIndex` and version vector: $V_{\text{local}}[e.\text{originPeerId}] = e.\text{originSequenceNumber}$.
+4. **Speculative Rollback & Replay (Late-Arrival Path):** If `compareOperations(e, ringBuffer[last]) < 0`:
+   - Classify arrival relative to the retained horizon (Section 3.4).
+   - If within horizon, locate insertion index $i$ via binary search: $O(\log K)$.
+   - Insert $e$ at index $i$: array splice.
    - **Replay forward:** Re-evaluate state starting from `baseSnapshot` across all operations in `ringBuffer[0 \dots \text{new\_head}]`.
    - Atomically commit the newly converged `PlaybackState`.
+   - Release any buffered operations in `PendingDependencyQueue` whose dependencies are now satisfied.
 
-### 3.3. Deterministic Replay Performance Bounds
-- In JavaScript V8, executing a pure functional reducer 256 times against an in-memory object takes **$0.3\text{ ms} - 0.7\text{ ms}$** (well within the $16.6\text{ ms}$ single-frame rendering budget).
+### 3.3. Deterministic Replay Performance Bounds & Unverified Target
+
+> [!NOTE]
+> **Performance Target (Hypothesis):**
+> In-memory replay of 256 operations through pure functional reducer targeted to execute in **$< 2.0\text{ ms}$** on modern browser engines (V8, JavaScriptCore, SpiderMonkey).
+> This figure represents an architectural performance goal rather than an empirically verified metric. The formal benchmarking harness and methodology are specified in `PHASE7_2_SIMULATION_TEST_STRATEGY.md` and will be empirically evaluated during Milestone P7.7.
+
 - The operation log commits state atomically; if an exception occurs during replay, the previous valid state is restored without corruption.
+- In-memory pure reduction creates zero DOM mutations or network traffic during replay loops.
 
-### 3.4. Handling Operations Outside the Retained Horizon
-If a delayed operation arrives with a timestamp older than the oldest retained operation in the log ($e < \text{ringBuffer}[0]$):
-1. The engine cannot re-evaluate state from the base snapshot.
-2. The event is rejected with code `REJECTED_OUTSIDE_HORIZON`.
-3. The engine logs a warning and marks `isDegraded = true` in `EngineStatus`.
-4. The engine initiates a snapshot reconciliation request (`STATE_REQUEST`) to an active peer to obtain an updated base snapshot.
+### 3.4. 5-Way Exhaustive Event Horizon Classification
+
+When an operation $e$ arrives from a remote peer, the engine classifies it against the bounded history horizon:
+
+```mermaid
+flowchart TD
+    Op["Inbound Control Operation (e)"] --> SeqCheck{Origin & Sequence Valid?}
+    SeqCheck -->|No: Malformed or Regressive| C4["Class 4: REJECTED_INVALID_ORIGIN / SEQUENCE_CONFLICT"]
+    SeqCheck -->|Yes| BaseCheck{e.seq <= BaseSnapshot.frontier?}
+    
+    BaseCheck -->|Yes| C1["Class 1: IGNORED_ALREADY_COMPACTED<br/>(Idempotent NO-OP)"]
+    BaseCheck -->|No| DepCheck{Dependencies in CausalContext Met?}
+    
+    DepCheck -->|No: Gap <= K| C2["Class 2: BUFFERED_PENDING_DEPENDENCY<br/>(Buffer + Dispatch REPAIR_REQUEST)"]
+    DepCheck -->|No: Gap > K| C3["Class 3: RECOVERING<br/>(Exceeds Horizon; Fetch STATE_SNAPSHOT)"]
+    DepCheck -->|Contradicts Snapshot| C5["Class 5: DEGRADED<br/>(Conflicts with Snapshot; Resync)"]
+    DepCheck -->|Yes| Apply["Insert & Apply to Engine State"]
+```
+
+1. **Class 1 (Subsumed by Base Snapshot):**
+   - Condition: $e.\text{originSequenceNumber} \le V_{\text{baseSnap}}[e.\text{originPeerId}]$.
+   - Resolution: `IGNORED_ALREADY_COMPACTED`. Idempotent NO-OP; zero state mutation, zero error log.
+2. **Class 2 (Missing Dependency within Retained Horizon):**
+   - Condition: $e$ references missing predecessor sequences that fall within the recent log window ($e.\text{originSequenceNumber} - V_{\text{local}}[e.\text{originPeerId}] \le K$).
+   - Resolution: Operation buffered in `PendingDependencyQueue`; triggers targeted `REPAIR_REQUEST` to the origin peer.
+3. **Class 3 (Compacted by Peers & Recoverable via Snapshot):**
+   - Condition: The missing sequence gap exceeds the retained history horizon of connected peers ($> K$).
+   - Resolution: Engine enters `RECOVERING` status, dispatches `STATE_REQUEST`, and resets state via `StateSnapshotPayloadV2`.
+4. **Class 4 (Invalid / Malformed / Conflicting Origin):**
+   - Condition: Operation violates schema, carries non-safe integers, or exhibits an invalid sequence transition.
+   - Resolution: Rejected with `REJECTED_INVALID_ORIGIN` or `REJECTED_SEQUENCE_CONFLICT`. Isolated at boundary without state contamination.
+5. **Class 5 (Conflicts with Installed Snapshot Frontier):**
+   - Condition: Operation predates installed snapshot but contradicts its state.
+   - Resolution: Engine logs diagnostic alert, marks `isDegraded = true`, and requests authoritative snapshot resynchronization.
 
 ---
 
@@ -183,7 +250,7 @@ If a delayed operation arrives with a timestamp older than the oldest retained o
 Every peer maintains a local Version Vector:
 $$V = \text{Map}\langle \text{PeerId}, \text{OriginSequenceNumber} \rangle$$
 - Each peer assigns an integer sequence number $S_p \in \{1, 2, 3, \dots\}$ to the operations it originates.
-- $V[p] = k$ means the local peer has received and applied all operations originated by peer $p$ up to sequence $k$.
+- $V[p] = k$ means the local peer has received, validated, and applied all operations originated by peer $p$ up to sequence $k$.
 
 ### 4.2. Message Protocol Specifications
 
@@ -196,6 +263,7 @@ interface StateDigestPayload {
   readonly connectionGeneration: number;
   readonly membershipEpoch: number;
   readonly versionVector: Record<string, number>;
+  readonly snapshotFrontier: Record<string, number>;
   readonly baseSnapshotId: string;
   readonly baseStateVersion: number;
 }
@@ -216,6 +284,17 @@ interface RepairRequestPayload {
 #### Message 3: `OPERATION_BATCH`
 Response fulfilling a `REPAIR_REQUEST`.
 ```ts
+interface SerializedControlOperation {
+  readonly logicalEventId: string;
+  readonly originPeerId: string;
+  readonly senderPeerId: string;
+  readonly messageType: 'PLAY' | 'PAUSE' | 'SEEK' | 'RATE_CHANGE';
+  readonly logicalTimestamp: number;
+  readonly originSequenceNumber: number;
+  readonly causalContext: Record<string, number>;
+  readonly payload: unknown;
+}
+
 interface OperationBatchPayload {
   readonly sessionId: string;
   readonly originPeerId: string;
@@ -242,6 +321,8 @@ flowchart TD
 ### 5.1. The Stable Frontier Algorithm
 To safely delete operations without risk of deleting data a peer still needs:
 $$W_{\text{stable}}[p] = \min_{i \in \text{ActivePeers}} (V_i[p])$$
+
+- **Meaning of Acknowledgment:** An acknowledgment in `STATE_DIGEST` means the peer has **received, validated, and applied** the operation into its in-memory engine and operation log.
 - An operation $(p, s)$ is part of the stable frontier if $s \le W_{\text{stable}}[p]$.
 - **Safety Invariant:** Because every active connected peer has confirmed receipt of sequence $s \le W_{\text{stable}}[p]$, no connected peer will ever request $(p, s)$ via `REPAIR_REQUEST`, and no valid operation with timestamp smaller than $W_{\text{stable}}$ can be generated by active peers.
 - Operations older than $W_{\text{stable}}$ are folded into `baseSnapshot` and deleted from `ringBuffer`.
@@ -253,9 +334,11 @@ $$W_{\text{stable}}[p] = \min_{i \in \text{ActivePeers}} (V_i[p])$$
   - Surviving peers advance the `membershipEpoch` and **remove Peer D from the stable frontier calculation**.
   - Compaction resumes immediately over the surviving peers.
 - **When Peer D Returns:**
-  - Peer D rejoins with a new `ConnectionGeneration`.
-  - Peer D's missing history exceeds $K=256$.
-  - Peer D is served an authoritative `StateSnapshotPayload` (`importSnapshot`), fast-forwarding it cleanly to the current room baseline.
+  - Peer D rejoins with a new `ConnectionGeneration` and fresh `peerId` (Section 5.3).
+  - If a peer re-uses an identity and its missing history exceeds $K=256$, it is served an authoritative `StateSnapshotPayloadV2` (`importSnapshot`), fast-forwarding it cleanly to the current room baseline.
+
+### 5.3. Browser Reload & Ephemeral Identity Lifecycle
+In a browser runtime without durable IndexedDB storage, page reload (F5) purges in-memory sequence numbers. A reloading peer **MUST obtain a fresh `peerId` from the Bootstrap Server upon rejoining**. It initializes sequence numbers at $1$ under the new identity. Its previous `peerId` is marked departed via `session:peer-left`. This guarantees zero sequence collisions without disk storage.
 
 ---
 
@@ -269,19 +352,23 @@ sequenceDiagram
 
     Note over PeerD: Peer D reconnects via Bootstrap<br/>Enters RECOVERING state
     PeerD->>PeerA: STATE_REQUEST { sessionId, lastKnownVersion: 5 }
-    PeerA->>PeerD: STATE_SNAPSHOT { snapshotId, stateVersion: 45, frontier: V_A, state: SnapshotData }
-    Note over PeerD: 1. Validate snapshot schema & bounds<br/>2. Atomically install base state<br/>3. Re-seed local Lamport clock<br/>4. Clear RECOVERING flag<br/>Peer D is now fully synchronized!
+    PeerA->>PeerD: STATE_SNAPSHOT { snapshotId, stateVersion: 45, frontier: V_A, digestSha256, state: SnapshotData }
+    Note over PeerD: 1. Validate snapshot schema & bounds<br/>2. Verify frontier dominates local history<br/>3. Verify SHA-256 digest<br/>4. Atomically install base state<br/>5. Replay local operations newer than snapshot<br/>6. Re-seed local Lamport clock<br/>7. Clear RECOVERING flag<br/>Peer D is now fully synchronized!
 ```
 
 ### 6.1. Atomic Snapshot Installation Contract
 When `RecoveryManager.installSnapshot(payload)` is called:
-1. Validates that `payload.state.sessionId == this.config.sessionId`.
+1. Validates that `payload.sessionId == this.config.sessionId`.
 2. Validates that `payload.state.anchorPositionMs` is non-negative and finite.
 3. Validates that `payload.state.playbackRate` is within configured $[minRate, maxRate]$.
-4. Re-seeds local `LogicalClockManager` to $\max(L_{\text{local}}, \text{payload.state.logicalTimestamp}) + 1$.
-5. Installs state atomically:
+4. **Frontier Verification:** Verifies that `payload.snapshotFrontier` dominates or matches known history ($V_{\text{snap}} \ge V_{\text{local}}$). Rejects stale snapshots ($V_{\text{snap}} < V_{\text{local}}$).
+5. **Integrity Verification:** Validates payload integrity against `payload.stateDigestSha256`.
+6. Re-seeds local `LogicalClockManager` to $\max(L_{\text{local}}, \text{payload.maxLogicalTimestamp}) + 1$.
+7. Installs base state atomically:
    $$v_{\text{local}} = v_{\text{current}} + 1$$
    *(Never copies remote version as local version; maintains local engine monotonicity).*
-6. Clears operation log and initializes `baseSnapshot` to the imported state.
-7. Sets `isImportedProvenance = true` on `lastAppliedEvent`.
-8. Transitions engine status from `'recovering'` to `'active'`.
+8. **Preserves Newer Operations:** Replays any locally held operations that are strictly newer than the snapshot frontier ($V > V_{\text{snap}}$).
+9. Clears older operations from log and initializes `baseSnapshot` to the imported state.
+10. Sets `isImportedProvenance = true` on `lastAppliedEvent`.
+11. Transitions engine status from `'recovering'` to `'active'`.
+

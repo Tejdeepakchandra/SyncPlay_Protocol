@@ -88,11 +88,21 @@ flowchart TD
 | **`PeerManager`** | `@syncplay/peer-mesh` | Manages WebRTC connection lifecycle, DTLS transport, SCTP DataChannels, ICE candidate queues, generation tracking. | Oblivious to playback state, clocks, digests, and control payloads. |
 | **`BootstrapServer`** | `services/bootstrap-server`| Issues membership tokens, tracks room rosters, assigns monotonic `ConnectionGeneration`, relays SDP/ICE signals. | Strictly non-authoritative for playback state; never inspects control messages. |
 
-### 4.2. Trust Boundaries & Identity Invariants
+### 4.2. Trust Boundaries, Identity & Causality Invariants
 
-1. **Transport-Derived Sender Identity:** The `senderPeerId` used in ordering keys and deduplication is derived strictly from the verified WebRTC connection context (`InboundMessage.fromPeerId`), which is authenticated via Bootstrap membership tokens and DTLS certificate exchange. A peer cannot forge authorship by modifying payload strings.
-2. **Untrusted Snapshot Provenance:** A snapshot received over the wire (`StateSnapshotPayload`) is marked with `isImportedProvenance = true`. The receiving engine validates all fields against strict bounds before installation and never treats the offering peer as a permanent authority.
-3. **Connection Generation Isolation:** Stale packets arriving from previous connection generations ($G < G_{\text{active}}$) are discarded at the transport boundary before reaching the synchronization engine.
+1. **Strictly Delineated 7-Part Identity Model:**
+   - `originPeerId`: Logical author identity within the session/epoch (assigned by Bootstrap during room creation/join).
+   - `originSequence`: Monotonically increasing positive integer per origin ($1, 2, 3\dots$).
+   - `logicalEventId`: Unique identifier (UUID/NanoID) identifying the logical user operation, preserved across transmission retries.
+   - `logicalTimestamp`: Lamport clock counter (scalar integer) used for the deterministic total-order key $\langle L, \text{originPeerId}, \text{logicalEventId} \rangle$.
+   - `fromPeerId`: Transport-verified peer identity of the immediate WebRTC hop (derived from PeerMesh DataChannel context).
+   - `connectionGeneration`: Monotonic integer from Bootstrap tracking the WebRTC connection lifecycle between `fromPeerId` and receiver.
+   - `membershipEpoch`: Monotonic integer tracking the room membership roster configuration from the Bootstrap Server.
+2. **Browser Reload & Ephemeral Identity Policy:**
+   In a browser runtime without durable IndexedDB sequence persistence, a page reload (F5) wipes in-memory sequence numbers. A reloading peer **MUST obtain a fresh `peerId` from the Bootstrap Server upon rejoining**. It starts sequence numbers at $1$ under the new identity. Its old `peerId` is marked departed via Bootstrap `session:peer-left`. This prevents sequence collisions without requiring complex disk persistence.
+3. **Explicit Causal Context (`causalContext`):** Every control operation carries a Version Vector snapshot $\text{causalContext}: \text{Record}\langle \text{originPeerId}, \text{originSequence} \rangle$ representing the latest operations observed from all origins at creation time. This enables mathematically sound concurrency detection ($e_1 \parallel e_2$).
+4. **Untrusted Snapshot Provenance:** A snapshot received over the wire (`StateSnapshotPayloadV2`) is marked with `isImportedProvenance = true`. The receiving engine verifies its `snapshotFrontier` against known history and validates its cryptographic hash before installation. The offering peer is never treated as a permanent authority.
+5. **Connection Generation Isolation:** Stale packets arriving from previous connection generations ($G < G_{\text{active}}$) are discarded at the transport boundary before reaching the synchronization engine.
 
 ---
 
@@ -106,14 +116,16 @@ User Action (e.g. Seek)
 UI / Controls ➔ ControlEventService.executeIntent({ type: 'SEEK', targetPositionMs: 45000 })
    │
    ├─► 1. RateLimiter checks token bucket (passes)
-   ├─► 2. LogicalClockManager.tickLocal() ➔ L_local = L_local + 1
-   ├─► 3. EventFactory creates SyncEvent & ProtocolMessage with L_local
-   ├─► 4. SyncEngine.receive(SyncEvent) [Local Dispatch]:
+   ├─► 2. ReplicationController.nextLocalSequence() ➔ originSequence = S_local + 1
+   ├─► 3. LogicalClockManager.tickLocal() ➔ L_local = L_local + 1
+   ├─► 4. ReplicationController.getCausalContext() ➔ causalContext = current Version Vector
+   ├─► 5. EventFactory creates SyncEvent & ProtocolMessage with L_local, originSequence, causalContext
+   ├─► 6. SyncEngine.receive(SyncEvent) [Local Dispatch]:
    │        • ConflictResolver applies operation optimistically to PlaybackState
    │        • OrderedOperationLog inserts operation at head
    │        • Engine notifications emitted to UI (0 ms latency)
    │
-   └─► 5. ControlEventService broadcasts ProtocolMessage to all open DataChannels in PeerMesh
+   └─► 7. ControlEventService broadcasts ProtocolMessage to all open DataChannels in PeerMesh
 ```
 
 ### 5.2. Inbound Remote Control Flow (Deterministic Total Order & Re-evaluation)
@@ -127,14 +139,22 @@ PeerManager.onMessage ➔ InboundMessage { fromPeerId, senderGeneration, message
 ControlEventService
    ├─► 1. Validate envelope schema and session ID
    ├─► 2. Validate senderGeneration matches active connection generation
-   ├─► 3. DedupCache checks senderPeerId + logicalEventId (drops duplicates)
+   ├─► 3. DedupCache checks originPeerId + originSequence (drops duplicates)
    │
    ▼
 SyncEngine.receive(SyncEvent) [Remote Dispatch]:
-   ├─► 4. LogicalClockManager.updateRemote(message.logicalTimestamp)
-   ├─► 5. Compare Key(e_remote) against current engine state:
+   ├─► 4. Check causal dependencies in message.causalContext:
+   │        • If any dependency is missing:
+   │            Buffer event in PendingDependencyQueue
+   │            Emit targeted REPAIR_REQUEST for missing sequences
+   │            (Do not apply until dependencies are resolved)
+   │        • If all dependencies satisfied:
+   │            Proceed to ordering and reduction
+   │
+   ├─► 5. LogicalClockManager.updateRemote(message.logicalTimestamp)
+   ├─► 6. Compare Key(e_remote) against current engine state:
    │        • If Key(e_remote) > Key(current_head):
-   │            Apply cleanly to current state via ConflictResolver (fast path)
+   │            Apply cleanly via ConflictResolver (fast path)
    │            OrderedOperationLog appends e_remote
    │        • If Key(e_remote) < Key(current_head):
    │            LATE ARRIVAL DETECTED (Out-of-order delivery across mesh)
@@ -142,7 +162,7 @@ SyncEngine.receive(SyncEvent) [Remote Dispatch]:
    │            ConflictResolver rewinds to base snapshot and replays log forward
    │            State atomically updated to re-evaluated total-order state
    │
-   └─► 6. ReplicationController updates local VersionVector for fromPeerId
+   └─► 7. ReplicationController updates local VersionVector for originPeerId
 ```
 
 ### 5.3. Anti-Entropy Digest & Repair Flow
@@ -152,10 +172,11 @@ sequenceDiagram
     participant PeerA as Peer A (Log: A1, A2, B1)
     participant PeerB as Peer B (Log: A1, B1 - missed A2)
 
-    Note over PeerA,PeerB: Periodic or Reactive Digest (0.2 Hz)
+    Note over PeerA,PeerB: Periodic (0.2 Hz) or Reactive Digest
     PeerB->>PeerA: STATE_DIGEST { versionVector: { A: 1, B: 1 } }
     Note over PeerA: Peer A compares vectors:<br/>Local V_A = { A: 2, B: 1 }<br/>Peer B is missing A: fromSeq 2 to 2
-    PeerA->>PeerB: OPERATION_BATCH { originPeerId: "A", operations: [ A2 ] }
+    PeerB->>PeerA: REPAIR_REQUEST { targetOriginPeerId: "A", fromSeq: 2, toSeq: 2 }
+    PeerA->>PeerB: OPERATION_BATCH { originPeerId: "A", operations: [ A2 ] (max 32 ops) }
     Note over PeerB: Peer B receives missing A2:<br/>Inserts into OrderedOperationLog<br/>Replays reducer in total order<br/>Peer B converges to identical state!
 ```
 
@@ -184,3 +205,20 @@ stateDiagram-v2
 2. **Degraded (Partitioned / Churn):** Communication lost to a subset of peers. The engine continues operating optimistically (preserving Availability), flagging degraded state in `EngineStatus`.
 3. **Recovering (Reconnection Handshake):** Reconnecting peer enters `RECOVERING` state under new `ConnectionGeneration`. It is gated from publishing new operations until anti-entropy or snapshot recovery fast-forwards its state to the active room timeline.
 4. **Disposed:** Terminal teardown. Background timers cleared, event subscriptions removed, ring buffers dropped.
+
+---
+
+## 7. Formal Conditional Convergence Guarantee
+
+SyncPlay implements **Strong Eventual Consistency (SEC) under Quiescence** (Shapiro et al., 2011).
+
+**Theorem (Conditional Eventual State Convergence):**  
+Let $\mathcal{P}$ be the set of non-faulty, connected browser peers in session $\mathcal{S}$ within a stable membership epoch $E$. All peers in $\mathcal{P}$ are guaranteed to converge to byte-for-byte identical `PlaybackState` if and only if all of the following conditions are satisfied:
+1. **Partial Synchrony:** Physical time $t > GST$, and message transmission delay on all active DataChannels is bounded by $\Delta$.
+2. **Connected Mesh:** Open DataChannels exist between all non-faulty peers in $\mathcal{P}$ (or a connected communication graph exists for transitive anti-entropy relay).
+3. **Event Dissemination & Anti-Entropy Completion:** All operations originated by any peer in $\mathcal{P}$ have been disseminated, and all pending `REPAIR_REQUEST` handshakes have completed.
+4. **Input Quiescence:** No peer in $\mathcal{P}$ generates a new control intent for duration $\tau \ge \tau_{\text{quiesce}} = 2\Delta + \text{digestInterval} + \text{repairRTT}$.
+5. **Deterministic Pure Reducer:** Every peer executes the identical pure functional reducer over the completed operation set sorted by the total-order key $\langle L, \text{originPeerId}, \text{logicalEventId} \rangle$.
+
+*Limitation:* If network partitions persist permanently, or if users continuously scrub controls without quiescence, convergence is conditionally deferred until communication and quiescence are restored.
+

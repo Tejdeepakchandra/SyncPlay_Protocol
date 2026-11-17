@@ -40,7 +40,7 @@ export const ProtocolMessageSchema = z.object({
 Because Zod's default object behavior is **strip unknown fields**, an existing Phase 1–6 client receiving a Phase 7 message containing `logicalTimestamp` will cleanly strip the field and process the envelope without throwing validation errors.
 
 ### 2.2. Protocol Versioning Strategy
-- **Additive Phase 7 (PROTOCOL_VERSION = 1):** The new fields (`logicalTimestamp`, `originSequenceNumber`, `predecessorEventId`) are optional in the v1 envelope. Phase 7 peers negotiate over v1 DataChannels.
+- **Additive Phase 7 (PROTOCOL_VERSION = 1):** The new fields (`originPeerId`, `logicalTimestamp`, `originSequenceNumber`, `causalContext`) are optional in the v1 envelope. Phase 7 peers negotiate over v1 DataChannels.
 - **Strict Protocol Bump (PROTOCOL_VERSION = 2):** If a deployment requires enforcing that all participating peers possess the leaderless engine, `PROTOCOL_VERSION = 2` is used. During room join, peers advertising `protocolVersion < 2` are rejected.
 
 ---
@@ -60,23 +60,44 @@ export const EngineSnapshotDataSchema = z.object({
 ```
 
 ### 3.1. Phase 7 Snapshot Extension (`formatVersion: 2`)
-Phase 7 extends the snapshot data with version vector metadata while maintaining backward-compatible parsing:
+Phase 7 extends the snapshot data with version vector metadata and cryptographic digest verification while maintaining backward-compatible parsing:
 ```ts
 export const EngineSnapshotDataV2Schema = z.object({
-  formatVersion: z.union([z.literal(1), z.literal(2)]),
+  formatVersion: z.literal(2),
   sessionId: z.string().min(1).max(128),
   status: z.enum(['paused', 'playing']),
   anchorPositionMs: z.number().finite().nonnegative(),
   playbackRate: z.number().finite().positive(),
-  lastAppliedOperation: z.object({...}).optional(),
-  
-  // Phase 7 Additions:
-  frontier: z.record(z.string(), z.number().int().nonnegative()).optional(),
-  logicalTimestamp: z.number().int().nonnegative().optional(),
+  lastAppliedOperation: z.object({
+    logicalEventId: z.string().min(1).max(128),
+    originPeerId: z.string().min(1).max(128),
+    messageType: z.string().min(1).max(64),
+    logicalTimestamp: z.number().int().nonnegative(),
+    appliedAtMonotonic: z.number().finite().nonnegative(),
+    isImportedProvenance: z.boolean().optional(),
+  }).optional(),
+});
+
+export const StateSnapshotPayloadV2Schema = z.object({
+  snapshotId: z.string().min(1).max(128),
+  sessionId: z.string().min(1).max(128),
+  membershipEpoch: z.number().int().nonnegative(),
+  snapshotAuthorPeerId: z.string().min(1).max(128),
+  snapshotFrontier: z.record(z.string().min(1).max(128), z.number().int().nonnegative()),
+  maxLogicalTimestamp: z.number().int().nonnegative(),
+  stateDigestSha256: z.string().min(64).max(64),
+  state: EngineSnapshotDataV2Schema,
 });
 ```
-- If a Phase 7 engine receives a Phase 6 snapshot (`formatVersion: 1`), it defaults `frontier` to empty and seeds its Lamport clock from 0.
-- If a Phase 6 engine receives a Phase 7 snapshot, unknown fields (`frontier`, `logicalTimestamp`) are stripped cleanly.
+- If a Phase 7 engine receives a Phase 6 snapshot (`formatVersion: 1`), it defaults `snapshotFrontier` to empty and seeds its Lamport clock from 0.
+- If a Phase 6 engine receives a Phase 7 snapshot, unknown fields (`snapshotFrontier`, `stateDigestSha256`, `membershipEpoch`) are stripped cleanly.
+
+### 3.2. Browser Reload & Ephemeral Identity Policy
+In a browser client without durable IndexedDB storage, page reload (F5) purges local memory, including sequence counters and operation logs.
+- **Policy Invariant:** A reloading peer **MUST request a fresh `peerId` from the Bootstrap Server upon rejoining**.
+- **Sequence Reset:** The reloading peer begins originating operations at sequence $1$ under its fresh `peerId`.
+- **Roster Cleanup:** The Bootstrap Server observes the disconnection of the previous connection, broadcasts `session:peer-left`, and all surviving peers increment `membershipEpoch` and evict the departed `peerId` from their active frontiers.
+- **Benefit:** Eliminates sequence collisions, stale clock overwrites, and complex client-side disk persistence.
 
 ---
 
@@ -109,3 +130,4 @@ If an unexpected algorithmic or edge-case defect is discovered during Phase 7 im
 1. **Zero Monorepo Contamination:** Because all changes in `@syncplay/sync-engine` are isolated in new modular files (`LeaderlessSyncEngine`, `OrderedOperationLog`, etc.), the unmodified `BaselineSyncEngine` remains active.
 2. **Instant Demo Rollback:** Reverting `apps/demo` to `BaselineSyncEngine` takes under 10 seconds.
 3. **No Database or Server Migration:** The Bootstrap Server stores zero playback state, meaning rollback requires zero database migrations or server rollbacks.
+
