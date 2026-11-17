@@ -51,7 +51,17 @@ export interface OriginComparisonDetail {
   readonly status: OriginComparisonStatus;
   readonly localSequence: number;
   readonly remoteSequence: number;
+  /**
+   * Local snapshot frontier: highest contiguous sequence for this origin already incorporated
+   * into the local compacted base snapshot. Sequences <= localSnapshotFrontier have been compacted
+   * out of the active operation log.
+   */
   readonly localSnapshotFrontier: number;
+  /**
+   * Remote snapshot frontier: highest contiguous sequence for this origin already incorporated
+   * into the remote compacted base snapshot. Sequences <= remoteSnapshotFrontier have been compacted
+   * out of the remote active operation log.
+   */
   readonly remoteSnapshotFrontier: number;
   readonly localFingerprint?: string;
   readonly remoteFingerprint?: string;
@@ -62,6 +72,13 @@ export interface OriginComparisonDetail {
 /**
  * Result of comparing a local StateDigestPayload against a remote StateDigestPayload.
  * Conforms strictly to PHASE7_4_INTERFACE_SPECIFICATION.md §2.1.
+ *
+ * SECURITY & TRUST BOUNDARY:
+ * A remote StateDigestPayload's fields (senderPeerId, connectionGeneration, vectors) are untrusted
+ * remote claims. Digest comparison does NOT authorize the remote peer as a repair supplier, does NOT
+ * authenticate its connection generation, and does NOT permit operation ingestion. Authoritative
+ * supplier authorization and repair batch ingestion strictly require Phase 7.3-R5-H capability-gated
+ * registration via AuthenticatedSupplierContext.
  */
 export interface DigestComparisonResult {
   /** The remote peer transmitting this digest. */
@@ -93,6 +110,14 @@ export interface DigestComparisonResult {
 
   /** Origins where historical equality cannot be proven because checkpoints/ops were compacted. */
   readonly unprovableOrigins: ReadonlyArray<string>;
+
+  /**
+   * Completeness indicator: true if one or more origins had unverified historical equality
+   * (e.g. equal sequence numbers but missing tail fingerprints, or compacted history without checkpoints).
+   * When true, global dominance classifications (LOCAL_DOMINATES / REMOTE_DOMINATES) do NOT imply
+   * complete historical equality across unverified origins.
+   */
+  readonly hasUnverifiedHistory: boolean;
 
   /** Granular per-origin comparison details sorted lexicographically by originPeerId. */
   readonly originDetails: ReadonlyArray<OriginComparisonDetail>;

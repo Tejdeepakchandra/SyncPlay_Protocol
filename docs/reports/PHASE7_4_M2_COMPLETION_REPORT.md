@@ -1,11 +1,13 @@
 # Phase 7.4 Milestone M2 Completion Report: Digest Generation and Comparison
 
 **Milestone:** Phase 7.4 — Milestone M2 (Digest Generation & Comparison)  
-**Status:** COMPLETED & VERIFIED  
+**Status:** COMPLETED & ARCHITECTURALLY VERIFIED  
 **Architecture Specification Baseline:** `0289ad5a62e03264b30a10b429d29eb0ca1691a1`  
 **Approved Causal Architecture Baseline:** Phase 7.2-R9 (`1825de1`)  
-**Previous Implementation Baseline:** Phase 7.3-R5-H (`e49b81a`)  
+**Frozen Phase 7.3-R5-H Trust Boundary Baseline:** `e49b81a`  
 **Parent / M1 Implementation Baseline:** `309b808` (amending `5cadc03`)  
+**M2 Initial Commit:** `7049ca6`  
+**M2 Final Correction Commit:** Current (to be committed)  
 **Date:** 2026-11-17  
 
 ---
@@ -14,7 +16,12 @@
 
 Milestone M2 implements the decentralized state digest generation, pure deterministic replication comparison, and anti-entropy scheduling subsystem for the SyncPlay Protocol.
 
-Building on the M1 wire schema contracts and Phase 7.3 causal ordering and capability-gated boundaries, M2 enables peers to atomically capture their contiguous replication frontier, compare it against remote peer digests, identify exact missing sequence ranges, detect sequence collisions/forks, distinguish uncompacted log history from compacted base snapshots, and coordinate bounded periodic and coalesced reactive digest exchanges without centralized coordination.
+Following the targeted architectural review pass, M2 strictly standardizes:
+1. **Exact Snapshot Frontier Semantics:** `snapshotFrontier[origin]` is the highest contiguous sequence for that origin already incorporated into the compacted base snapshot (sequences $\le \text{snapshotFrontier}$ are compacted out of the active log).
+2. **Bounded Fingerprint Guarantees (Option 1):** Tail fingerprints represent the operation at sequence $k = V_{\text{rep}}[\text{origin}]$. They detect conflicting operations at the frontier, but do NOT prove equality across arbitrary unchained predecessor operations in earlier history.
+3. **Structured Completeness Indicator:** Added `hasUnverifiedHistory: boolean` (`unprovableOrigins.length > 0`) to `DigestComparisonResult` so callers never mistake vector dominance for complete historical verification when origins lack fingerprint evidence.
+4. **Reconciled Rate-Limiting Policy:** Token-bucket capacity 2, refill rate 1 token per 1000ms ($1\text{ digest/sec}$), strictly shared across periodic and reactive triggers.
+5. **Preserved Trust Boundaries:** Digest payloads are untrusted remote claims. Digest comparison does not authorize repair suppliers or authenticate connection generations.
 
 Milestones M3 (Repair Request Pipeline), M4 (Supplier Servicing), M5 (Transport Integration), and Phase 7.5 (Snapshot Recovery) remain strictly unimplemented.
 
@@ -26,130 +33,64 @@ Milestones M3 (Repair Request Pipeline), M4 (Supplier Servicing), M5 (Transport 
 - **Approved Phase 7.2-R9 Causal Baseline:** `1825de1`
 - **Frozen Phase 7.3-R5-H Trust Boundary Baseline:** `e49b81a`
 - **Milestone M1 Baseline:** Commit `309b808` (amending `5cadc03`)
-- **Milestone M2 Implementation:** Commit `7049ca6`
+- **Milestone M2 Initial Implementation:** Commit `7049ca6`
+- **Milestone M2 Targeted Corrections:** Current commit
 
 ---
 
-## 3. New Modules and Interface Contracts
+## 3. Targeted Review Corrections Summary
 
-### 3.1 New Modules Added
+### 3.1 Correction A: Standardized `snapshotFrontier` Semantics
 
-1. **`packages/sync-engine/src/replication/types.ts`:**
-   - `DigestComparisonClassification`: `'IDENTICAL' | 'LOCAL_DOMINATES' | 'REMOTE_DOMINATES' | 'CONCURRENT_INCOMPARABLE' | 'DIVERGENT_FORK' | 'REQUIRES_SNAPSHOT_RECOVERY' | 'INCONCLUSIVE'`.
-   - `OriginComparisonStatus`: `'IDENTICAL' | 'LOCAL_AHEAD' | 'REMOTE_AHEAD' | 'LOCAL_ONLY' | 'REMOTE_ONLY' | 'CONFLICT_FORK' | 'OUTSIDE_LOCAL_HORIZON' | 'OUTSIDE_REMOTE_HORIZON' | 'HISTORICAL_EQUALITY_UNPROVABLE'`.
-   - `OriginComparisonDetail`: Granular per-origin structure containing sequence numbers, frontiers, fingerprints, missing ranges, and diagnostic reasons.
-   - `DigestComparisonResult`: Structured comparison contract conforming strictly to `PHASE7_4_INTERFACE_SPECIFICATION.md §2.1` plus enriched diagnostic fields.
-   - `IAntiEntropyManager`: Anti-entropy subsystem lifecycle interface.
-   - `AntiEntropyStatus`: Operational telemetry metrics.
-   - `AntiEntropySchedulerOptions` & `SchedulerClock`: Injectable monotonic clock and timer interface for 100% deterministic testing.
-2. **`packages/sync-engine/src/replication/replication-comparator.ts`:**
-   - Pure deterministic comparison function: `compareDigests(localDigest: StateDigestPayload, remoteDigest: StateDigestPayload): DigestComparisonResult`.
-   - Independent of local clock, caller peer ID, or arrival order.
-   - Origins sorted strictly lexicographically (`allOrigins.sort()`) guaranteeing identical output regardless of object key order.
-3. **`packages/sync-engine/src/replication/anti-entropy-manager.ts`:**
-   - `AntiEntropyManager` implementing `IAntiEntropyManager`.
-   - Manages bounded periodic digest broadcasting with uniform random jitter ($5000\text{ms} \pm 1000\text{ms}$, interval $4000\text{ms}..6000\text{ms}$).
-   - Coalesces reactive triggers within the same event loop tick.
-   - Enforces token-bucket rate limiting ($1\text{ digest/sec}$, burst 2) to protect SCTP DataChannels.
-   - Clean lifecycle management: cancels all timers and suppresses callbacks upon `dispose()`; cleans state on `onPeerDisconnected()` and `onEpochTransition()`.
-4. **`packages/sync-engine/src/replication/index.ts`:**
-   - Facade re-exporting all replication types, comparator, and manager.
+- **Exact Definition:**
+  $$\text{snapshotFrontier}[p] = \text{highest contiguous sequence for origin } p \text{ already incorporated into the compacted base snapshot}$$
+- **Operational Horizon:**
+  - Sequences $1 \le s \le \text{snapshotFrontier}[p]$ have been compacted into the base snapshot and removed from the active log.
+  - The oldest retained operation in the active operation log is $\text{snapshotFrontier}[p] + 1$.
+  - Missing ranges $[fromSeq, toSeq]$ where $fromSeq \le \text{snapshotFrontier}[p]$ cannot be served from the log and trigger `OUTSIDE_REMOTE_HORIZON` (`requiresSnapshotRecovery = true`).
+  - Missing ranges where $fromSeq > \text{snapshotFrontier}[p]$ are retained in the log and served via `REMOTE_AHEAD`.
+  - An invariant check detects and reports any structural inconsistency where $\text{snapshotFrontier}[p] > \text{replicationVector}[p]$.
 
-### 3.2 Modified Existing Files
+### 3.2 Correction B: Fingerprint Completeness Audit (Option 1 Selected)
 
-1. **`packages/sync-engine/src/log/ordered-operation-log.ts` & `types.ts`:**
-   - Added `getTailFingerprint(originPeerId: string, atSequence?: number): string | undefined`: queries active log first, then compacted checkpoints, returning the canonical 64-char lowercase hexadecimal SHA-256 fingerprint.
-   - Added `getReplicationFrontier(): Record<string, number>`: returns highest sequence numbers observed per origin across retained operations and compacted snapshots.
-2. **`packages/sync-engine/src/engine/leaderless-sync-engine.ts`:**
-   - Added `createLocalDigest(sentAtOverride?: number): StateDigestPayload`: atomic point-in-time snapshot read of contiguous replication vector, snapshot frontier, and tail fingerprints, validated against `StateDigestPayloadSchema`.
-   - Added `compareRemoteDigest(remoteDigest: unknown): DigestComparisonResult`: discriminates legacy Phase 2 digests and unsupported future format versions, validates schema, and invokes pure comparator.
-3. **`packages/sync-engine/src/index.ts`:**
-   - Re-exported replication subsystem.
+- **Audit Findings:** A single tail fingerprint $H[p]$ at $k = V_{\text{rep}}[p]$ hashes only the operation at sequence $k$. If two peers share op C at sequence 12 but hold conflicting operations at sequence 11 (e.g. op B vs op X), their tail fingerprints at sequence 12 match if op C's causal context does not chain the hash of sequence 11.
+- **Option 1 Conformance:** The existing M1 schema contract (one tail fingerprint per origin) is strictly preserved without inventing wire extensions.
+- **Documented Guarantees:**
+  - The state digest tail fingerprint detects a conflicting operation at the compared frontier ($V_{\text{rep}}[p]$).
+  - It does **not** prove universal equality across intermediate operations in preceding history.
+  - Intermediate divergence is detected by Phase 7.3 operation admission (`originSeqIndex` collision detection and exact Lamport checks) during event ingestion or replay, not by the state digest.
+  - Compacted sequences lacking retained fingerprints are explicitly classified as `HISTORICAL_EQUALITY_UNPROVABLE`.
 
----
+### 3.3 Correction C: Completeness Indicator & Multi-Origin Combination
 
-## 4. Digest Data Model and Consistency
+- **Completeness Indicator:** Added `hasUnverifiedHistory: boolean` to `DigestComparisonResult` (`unprovableOrigins.length > 0`).
+- **Global Classification Semantics:**
+  - A global dominance classification (`LOCAL_DOMINATES` / `REMOTE_DOMINATES`) indicates that across verified origins, one peer holds a superset of operations.
+  - If `hasUnverifiedHistory === true`, the caller is explicitly warned that historical equality could not be proven for unverified origins.
+  - If an active fork is detected on any origin ($H_L \ne H_R$), `DIVERGENT_FORK` is prioritized regardless of other origins.
+  - If any origin requires snapshot recovery ($fromSeq \le S_R$), `REQUIRES_SNAPSHOT_RECOVERY` is prioritized for the overall classification.
 
-- **`formatVersion` (Literal `2`):** Distinguishes Phase 7.4 multi-vector digests from legacy Phase 2 scalar digests (`digestId`, `stateVersion`, `digest`).
-- **`replicationVector` ($V_{\text{rep}}$):** Contiguous highest applied sequences per origin. $V_{\text{rep}}[p] = k$ guarantees that sequences $1..k$ have passed schema validation, transport capability authorization, Lamport timestamp check, total-order insertion, and deterministic reduction.
-- **`snapshotFrontier` ($V_{\text{baseSnap}}$):** Oldest retained sequence per origin. Operations below this threshold have been compacted into the base snapshot.
-- **`historyFingerprints` ($H_{\text{origin}}$):** Canonical SHA-256 tail fingerprint for each origin with sequence $k = V_{\text{rep}}[p] > 0$, computed using the approved RFC 8785 canonical JSON serializer.
-- **Consistent Snapshot Read:** In the JavaScript runtime, `LeaderlessSyncEngine` updates are synchronous. `createLocalDigest()` performs an atomic point-in-time defensive clone of the replication vector and snapshot frontier, queries tail fingerprints, and returns an immutable structure.
+### 3.4 Correction D: Reconciled Anti-Entropy Scheduling Limits
 
----
+- **Unified Policy:**
+  - Token-bucket capacity: 2 tokens.
+  - Token refill rate: 1 token per 1000ms ($1\text{ digest/sec}$).
+  - Shared bucket: Both periodic timer ticks and reactive triggers pass through `broadcastDigestIfPermitted()`, preventing accidental rate-limit bypasses.
+  - Reactive trigger coalescing: Multiple reactive triggers within the same event loop tick are coalesced into a single 0ms task.
 
-## 5. Comparison Semantics & Decision Matrix
+### 3.5 Correction E: Trusted Transport Identity & Capability Boundaries
 
-Given `localDigest` and `remoteDigest`:
-
-1. **Pre-Checks:**
-   - Mismatched `sessionId` $\to$ `INCONCLUSIVE` (`"Session mismatch"`).
-   - Mismatched `membershipEpoch` $\to$ `INCONCLUSIVE` (`"Epoch mismatch"`).
-2. **Deterministic Origin Evaluation (Lexicographically Sorted):**
-   - **$L == R$ ($L > 0$):**
-     - $H_L === H_R \implies$ `IDENTICAL`.
-     - $H_L !== H_R \implies$ `CONFLICT_FORK` (`forkDetected = true`, `conflictingOrigins.push(p)`).
-     - Missing fingerprints on either side $\implies$ `HISTORICAL_EQUALITY_UNPROVABLE` (`unprovableOrigins.push(p)`).
-   - **$L < R$ (Remote Ahead):**
-     - Missing range: $[L + 1, R]$.
-     - If $L + 1 \le S_R \implies$ `OUTSIDE_REMOTE_HORIZON` (`outsideRemoteHorizon = true`, `requiresSnapshotRecovery = true`).
-     - If $L + 1 > S_R \implies$ `REMOTE_AHEAD`, `missingFromLocal.push([L + 1, R])`.
-   - **$L > R$ (Local Ahead):**
-     - Missing range: $[R + 1, L]$.
-     - If $R + 1 \le S_L \implies$ `OUTSIDE_LOCAL_HORIZON` (`outsideLocalHorizon = true`).
-     - If $R + 1 > S_L \implies$ `LOCAL_AHEAD`, `missingFromRemote.push([R + 1, L])`.
-   - **Present on Only One Side:**
-     - Remote only ($L = 0, R > 0$): if $1 \le S_R \implies$ `OUTSIDE_REMOTE_HORIZON`; else `missingFromLocal.push([1, R])`.
-     - Local only ($L > 0, R = 0$): if $1 \le S_L \implies$ `OUTSIDE_LOCAL_HORIZON`; else `missingFromRemote.push([1, L])`.
-3. **Overall Classification:**
-   - `DIVERGENT_FORK` if `forkDetected`.
-   - `REQUIRES_SNAPSHOT_RECOVERY` if `requiresSnapshotRecovery`.
-   - `INCONCLUSIVE` if unprovable historical differences exist without clear missing ranges.
-   - `IDENTICAL`, `LOCAL_DOMINATES`, `REMOTE_DOMINATES`, or `CONCURRENT_INCOMPARABLE` based on missing sequence range presence.
+- **Trust Boundary Invariant:** In `LeaderlessSyncEngine.compareRemoteDigest()`, `remoteDigest.senderPeerId` and `remoteDigest.connectionGeneration` are untrusted remote payload claims.
+- **Non-Authorization:** Digest comparison does **not** authorize a peer as a repair supplier and does **not** authenticate connection generations.
+- **Phase 7.3 Preservation:** Authoritative supplier authorization strictly requires Phase 7.3-R5-H capability-gated registration via `AuthenticatedSupplierContext` injected by the trusted transport adapter.
 
 ---
 
-## 6. Horizon Limitations & Completeness Guarantees
+## 4. Verification and Test Results
 
-As established in the Phase 7.4 architectural review:
-- **Detectable Differences:** The hybrid digest reliably detects missing retained sequence ranges $[V_A[p] + 1, V_B[p]]$, conflicting tail operations at the frontier ($H_A[p] \ne H_B[p]$), and divergence within retained checkpoint windows ($K=256$).
-- **Undetectable Compacted History:** Matching replication vectors and tail fingerprints establish latest-retained operation agreement, **not** unconditional Byzantine historical equality across ancient history compacted before the retention horizon ($s \le \text{snapshotFrontier}$). When historical fingerprints are missing for compacted sequences, the comparator explicitly marks the origin as `HISTORICAL_EQUALITY_UNPROVABLE` rather than falsely claiming convergence.
-- **Snapshot Recovery Handoff:** When a peer requires operations that have been compacted out of the remote peer's log ($L + 1 \le S_R$), log-based repair is bypassed and flagged as `REQUIRES_SNAPSHOT_RECOVERY` for Phase 7.5 catch-up.
+### 4.1 Focused Test Suites
 
----
-
-## 7. Scheduling and Flow Control
-
-1. **Periodic Scheduling:**
-   - Default interval: $5000\text{ms} \pm 1000\text{ms}$ uniform random variance ($4000\text{ms}..6000\text{ms}$).
-   - Exactly one periodic timer active at any given time.
-2. **Reactive Scheduling:**
-   - Coalesced on microtask/0ms timer to collapse multiple triggers occurring in the same tick into a single broadcast.
-3. **Token-Bucket Rate Limiter:**
-   - Bucket capacity (burst): 2 tokens.
-   - Refill rate: 1 token per 1000ms.
-   - Excess broadcast requests are safely dropped.
-4. **Lifecycle & Disposal:**
-   - `dispose()` cancels all active timers, marks `isDisposed = true`, and prevents callbacks.
-   - `onEpochTransition(newEpoch)` cancels in-flight reactive timers, reschedules periodic ticks, and broadcasts under the new epoch.
-   - `onPeerDisconnected(peerId)` clears peer rate limits and records.
-
----
-
-## 8. Resource Bounds and Error Handling
-
-- **Origin Bounds:** Bounded to `MAX_VECTOR_ENTRIES = 64` origins per digest (strictly validated by Zod schema).
-- **Memory Safety:** Comparator returns deeply frozen objects and arrays without mutating or retaining references to input payloads.
-- **Legacy & Version Discrimination:** Legacy Phase 2 digests and unsupported future format versions are safely dropped with diagnostic reasons without mutating engine state.
-- **Error Codes:** Throws `SyncEngineError('DISPOSED')` on disposed operations.
-
----
-
-## 9. Verification & Monorepo Test Results
-
-### 9.1 Verification Suite
-
-1. **`packages/sync-engine/src/__tests__/replication-comparator.test.ts` (15 tests):**
+1. **`packages/sync-engine/src/__tests__/replication-comparator.test.ts` (23 tests passed):**
    - Session and epoch mismatch detection.
    - Identical empty and non-empty vector comparison.
    - `LOCAL_DOMINATES` and `REMOTE_DOMINATES` with exact missing sequence ranges.
@@ -157,12 +98,24 @@ As established in the Phase 7.4 architectural review:
    - `CONCURRENT_INCOMPARABLE` multi-origin gaps.
    - `CONFLICT_FORK` detection on tail fingerprint divergence.
    - `HISTORICAL_EQUALITY_UNPROVABLE` detection on missing tail fingerprints.
-   - `OUTSIDE_REMOTE_HORIZON` and `OUTSIDE_LOCAL_HORIZON` compacted snapshot detection.
+   - **Boundary Tests (Correction A):**
+     - Requested missing range entirely below compacted frontier ($toSeq \le S_R$).
+     - Missing range starting exactly at compacted frontier ($fromSeq = S_R$).
+     - Missing range starting immediately after compacted frontier ($fromSeq = S_R + 1$).
+     - Origin with no compacted operations ($S_R = 0$).
+     - Structural inconsistency detection ($S_R > V_R$).
+   - **Mandatory Completeness Case (Correction B):**
+     - Verified that matching tail fingerprints at sequence 12 with divergence at sequence 11 evaluates to `IDENTICAL` at the frontier, proving that a single tail fingerprint does not detect intermediate divergence.
+   - **Multi-Origin Combinations (Correction C):**
+     - Clear missing range on origin 1 + unprovable origin on origin 2 (`hasUnverifiedHistory === true`).
+     - Confirmed fork on origin 1 + normal missing range on origin 2 (`DIVERGENT_FORK`).
+     - Outside-horizon on origin 1 + normal missing range on origin 2 (`REQUIRES_SNAPSHOT_RECOVERY`).
    - Lexicographical determinism under reversed key construction order.
    - Deep object immutability and frozen return structures.
-2. **`packages/sync-engine/src/__tests__/anti-entropy-manager.test.ts` (17 tests):**
+
+2. **`packages/sync-engine/src/__tests__/anti-entropy-manager.test.ts` (18 tests passed):**
    - Schema-compliant digest generation in empty sessions.
-   - Exact replication vector, snapshot frontier, and tail SHA-256 fingerprint generation.
+   - Accurate replication vector, snapshot frontier, and tail SHA-256 fingerprint generation.
    - Multi-origin concurrent digest generation.
    - Distinction between compacted base snapshot frontier and active log.
    - Schema enforcement of 64-origin bound (64 origins pass, 65 origins fail).
@@ -170,27 +123,29 @@ As established in the Phase 7.4 architectural review:
    - Safe dropping of legacy Phase 2 digests and future format versions.
    - Fake-clock periodic scheduling within $[4000\text{ms}, 6000\text{ms}]$ jitter bounds.
    - Reactive trigger coalescing within single tick.
-   - Token-bucket rate limiting (burst 2, refill 1/s).
+   - **Token-bucket rate limiting (Correction D):**
+     - Verified capacity 2, refill 1 token/sec.
+     - Verified periodic and reactive triggers share the exact same token bucket.
    - Clean disposal and cancellation of all timers.
    - Epoch transition reset and reactive trigger.
    - Strict separation: throwing on unimplemented M3 (`reconcileGaps`) and M4 (`serveRepairRequest`) methods.
 
-### 9.2 Monorepo Test Totals
+### 4.2 Full Monorepo Test Totals
 
 ```
 > npm test
 
 Packages:
-- @syncplay/control-events:  6 test files,  49 passed (49 total)
-- @syncplay/peer-mesh:       6 test files, 101 passed (101 total)
-- @syncplay/protocol:        4 test files, 273 passed (273 total)
-- @syncplay/sync-engine:    19 test files, 273 passed (273 total)  [+32 tests from M1]
-- @syncplay/bootstrap-server:3 test files,  91 passed (91 total)
+- @syncplay/control-events:   6 test files,  49 passed (49 total)
+- @syncplay/peer-mesh:        6 test files, 101 passed (101 total)
+- @syncplay/protocol:         4 test files, 273 passed (273 total)
+- @syncplay/sync-engine:     19 test files, 282 passed (282 total)  [+41 tests from M1]
+- @syncplay/bootstrap-server: 3 test files,  91 passed (91 total)
 
-Total Monorepo Tests: 787 tests passed across 38 test files (0 failures).
+Total Monorepo Tests: 796 tests passed across 38 test files (0 failures).
 ```
 
-### 9.3 Monorepo Build Results
+### 4.3 Monorepo Build Results
 
 - `@syncplay/control-events`: `tsc` clean (0 errors)
 - `@syncplay/peer-mesh`: `tsc` clean (0 errors)
@@ -201,10 +156,9 @@ Total Monorepo Tests: 787 tests passed across 38 test files (0 failures).
 
 ---
 
-## 10. Explicit Confirmation of Unimplemented Subsystems
+## 5. Explicit Confirmation of Unimplemented Subsystems
 
-The following subsystems are explicitly confirmed to remain **UNIMPLEMENTED** in Milestone M2:
-
+The following subsystems remain **STRICTLY UNIMPLEMENTED**:
 1. **M3 — Repair Request Pipeline:** No `REPAIR_REQUEST` dispatching, no repair timeout tracking, no retry backoff, and no repair response ingestion pipeline.
 2. **M4 — Supplier Servicing:** No supplier log range query servicing, no `OPERATION_BATCH` slicing or transmission, and no supplier failover.
 3. **M5 — Transport Integration:** No WebRTC DataChannel transport adapter or message size negotiation.
@@ -212,4 +166,4 @@ The following subsystems are explicitly confirmed to remain **UNIMPLEMENTED** in
 
 ---
 
-**PHASE 7.4 M2 — DIGEST GENERATION AND COMPARISON COMPLETE. AWAITING ARCHITECTURAL REVIEW AND EXPLICIT AUTHORIZATION FOR M3.**
+**PHASE 7.4 M2 — TARGETED CORRECTIONS COMPLETE. AWAITING ARCHITECTURAL REVIEW AND EXPLICIT AUTHORIZATION FOR M3.**

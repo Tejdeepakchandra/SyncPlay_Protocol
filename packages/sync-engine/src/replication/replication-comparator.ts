@@ -8,6 +8,16 @@
  *
  * Pure, deterministic comparison function independent of peer identity,
  * clock readings, or input object insertion order.
+ *
+ * SEMANTIC DEFINITIONS:
+ * - replicationVector[p] = k: highest contiguous sequence for origin p that has passed
+ *   validation, causal ordering, and deterministic reduction. Sequences 1..k are applied.
+ * - snapshotFrontier[p] = k: highest contiguous sequence for origin p already incorporated
+ *   into the compacted base snapshot. Sequences 1..k have been compacted out of the active log.
+ *   The oldest retained sequence in the active operation log is snapshotFrontier[p] + 1.
+ * - historyFingerprints[p]: canonical SHA-256 fingerprint of the operation at sequence k = replicationVector[p].
+ *   Detects conflicting operations at the compared replication frontier (V_rep[p]), but does NOT
+ *   prove equality of arbitrary unchained predecessor operations in earlier history.
  */
 
 import type { StateDigestPayload } from '@syncplay/protocol';
@@ -53,6 +63,7 @@ export function compareDigests(
       outsideRemoteHorizon: false,
       requiresSnapshotRecovery: false,
       unprovableOrigins: Object.freeze([]),
+      hasUnverifiedHistory: false,
       originDetails: Object.freeze([]),
       diagnosticReasons: Object.freeze([
         `Session mismatch: local session '${localDigest.sessionId}' vs remote '${remoteDigest.sessionId}'`,
@@ -73,6 +84,7 @@ export function compareDigests(
       outsideRemoteHorizon: false,
       requiresSnapshotRecovery: false,
       unprovableOrigins: Object.freeze([]),
+      hasUnverifiedHistory: false,
       originDetails: Object.freeze([]),
       diagnosticReasons: Object.freeze([
         `Epoch mismatch: local epoch ${localDigest.membershipEpoch} vs remote ${remoteDigest.membershipEpoch}`,
@@ -94,6 +106,7 @@ export function compareDigests(
   const conflictingOrigins: string[] = [];
   const unprovableOrigins: string[] = [];
   const originDetails: OriginComparisonDetail[] = [];
+  const diagnosticReasons: string[] = [];
 
   let forkDetected = false;
   let outsideLocalHorizon = false;
@@ -107,6 +120,18 @@ export function compareDigests(
     const remoteSnap = remoteDigest.snapshotFrontier[origin] ?? 0;
     const localFp = localDigest.historyFingerprints[origin];
     const remoteFp = remoteDigest.historyFingerprints[origin];
+
+    // Invariant check: snapshotFrontier must not exceed replicationVector
+    if (localSnap > localSeq) {
+      diagnosticReasons.push(
+        `Local snapshotFrontier (${localSnap}) exceeds replicationVector (${localSeq}) for origin '${origin}'`,
+      );
+    }
+    if (remoteSnap > remoteSeq) {
+      diagnosticReasons.push(
+        `Remote snapshotFrontier (${remoteSnap}) exceeds replicationVector (${remoteSeq}) for origin '${origin}'`,
+      );
+    }
 
     let status: OriginComparisonStatus;
     let missingRange: MissingSequenceRange | undefined;
@@ -144,10 +169,11 @@ export function compareDigests(
 
       if (fromSeq <= remoteSnap) {
         // Remote has compacted part or all of the needed range into its base snapshot
+        // (sequences 1..remoteSnap are compacted into base snapshot, not retained in log)
         status = 'OUTSIDE_REMOTE_HORIZON';
         outsideRemoteHorizon = true;
         requiresSnapshotRecovery = true;
-        reason = `Remote compacted needed sequence range [${fromSeq}..${toSeq}] at snapshot frontier ${remoteSnap}`;
+        reason = `Remote compacted needed sequence range [${fromSeq}..${toSeq}] at snapshot frontier ${remoteSnap} (sequences <= ${remoteSnap} are compacted)`;
       } else {
         status = localSeq === 0 ? 'REMOTE_ONLY' : 'REMOTE_AHEAD';
         missingFromLocal.push(missingRange);
@@ -160,9 +186,10 @@ export function compareDigests(
 
       if (fromSeq <= localSnap) {
         // Local has compacted part or all of the requested range into its base snapshot
+        // (sequences 1..localSnap are compacted into base snapshot, not retained in log)
         status = 'OUTSIDE_LOCAL_HORIZON';
         outsideLocalHorizon = true;
-        reason = `Local compacted needed sequence range [${fromSeq}..${toSeq}] at snapshot frontier ${localSnap}`;
+        reason = `Local compacted needed sequence range [${fromSeq}..${toSeq}] at snapshot frontier ${localSnap} (sequences <= ${localSnap} are compacted)`;
       } else {
         status = remoteSeq === 0 ? 'LOCAL_ONLY' : 'LOCAL_AHEAD';
         missingFromRemote.push(missingRange);
@@ -207,6 +234,8 @@ export function compareDigests(
     classification = 'CONCURRENT_INCOMPARABLE';
   }
 
+  const hasUnverifiedHistory = unprovableOrigins.length > 0;
+
   return Object.freeze({
     remotePeerId,
     missingFromLocal: Object.freeze(missingFromLocal),
@@ -218,6 +247,8 @@ export function compareDigests(
     outsideRemoteHorizon,
     requiresSnapshotRecovery,
     unprovableOrigins: Object.freeze(unprovableOrigins),
+    hasUnverifiedHistory,
     originDetails: Object.freeze(originDetails),
+    ...(diagnosticReasons.length > 0 ? { diagnosticReasons: Object.freeze(diagnosticReasons) } : {}),
   });
 }

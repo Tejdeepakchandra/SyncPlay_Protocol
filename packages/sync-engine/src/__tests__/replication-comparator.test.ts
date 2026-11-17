@@ -251,33 +251,156 @@ describe('ReplicationComparator', () => {
       expect(result.classification).toBe('INCONCLUSIVE');
       expect(result.forkDetected).toBe(false);
       expect(result.unprovableOrigins).toContain('peer-A');
+      expect(result.hasUnverifiedHistory).toBe(true);
 
       const detail = result.originDetails.find((d) => d.originPeerId === 'peer-A');
       expect(detail?.status).toBe('HISTORICAL_EQUALITY_UNPROVABLE');
     });
+
+    it('documents mandatory fingerprint completeness limitation: tail fingerprint does NOT detect intermediate divergence', () => {
+      // Mandatory test case:
+      // Seq 10: op A (both)
+      // Seq 11: op B on Peer A vs op X on Peer B (divergent!)
+      // Seq 12: op C (both have identical op C at sequence 12)
+      // Both advertise replicationVector = { 'peer-A': 12 }
+      // Both advertise tail fingerprint = fp(op C)
+      const opC_Fp = computeOperationFingerprint({
+        originPeerId: 'peer-A',
+        originSequenceNumber: 12,
+        logicalEventId: 'evt-c-12',
+        logicalTimestamp: 15,
+        causalContext: { 'peer-A': 10 }, // Note: does not chain op 11's hash
+        messageType: 'PLAY',
+        payload: { positionMs: 12000 },
+        membershipEpoch: 1,
+      });
+
+      const localDigest = makeDigest({
+        replicationVector: { 'peer-A': 12 },
+        historyFingerprints: { 'peer-A': opC_Fp },
+      });
+
+      const remoteDigest = makeDigest({
+        senderPeerId: 'peer-remote',
+        replicationVector: { 'peer-A': 12 },
+        historyFingerprints: { 'peer-A': opC_Fp }, // exact same tail fingerprint
+      });
+
+      const result = compareDigests(localDigest, remoteDigest);
+
+      // Demonstrates Option 1 property:
+      // The state digest compares the tail operation at the replication frontier (sequence 12).
+      // Since both peers have identical op C at sequence 12, the comparison classifies as IDENTICAL at the frontier.
+      // It does NOT detect that Peer A had op B at seq 11 while Peer B had op X at seq 11!
+      expect(result.classification).toBe('IDENTICAL');
+      expect(result.forkDetected).toBe(false);
+
+      // Intermediate divergence at sequence 11 is detected during event admission / repair replay
+      // via Phase 7.3 originSeqIndex check, not by the single tail digest fingerprint.
+    });
   });
 
-  describe('Compacted History and Snapshot Horizon Detection', () => {
-    it('flags REQUIRES_SNAPSHOT_RECOVERY when remote has compacted needed sequence into snapshot', () => {
+  describe('Compacted History and Snapshot Horizon Boundary Tests', () => {
+    it('flags OUTSIDE_REMOTE_HORIZON when missing range is entirely below compacted frontier', () => {
+      // Missing range is 3..5. Remote snapshot frontier is 5 (sequences 1..5 compacted)
       const local = makeDigest({
-        replicationVector: { 'peer-A': 2 }, // needs 3..10
+        replicationVector: { 'peer-A': 2 },
       });
       const remote = makeDigest({
         senderPeerId: 'peer-remote',
-        replicationVector: { 'peer-A': 10 },
-        snapshotFrontier: { 'peer-A': 5 }, // sequences 1..5 compacted
+        replicationVector: { 'peer-A': 5 },
+        snapshotFrontier: { 'peer-A': 5 },
       });
 
       const result = compareDigests(local, remote);
       expect(result.classification).toBe('REQUIRES_SNAPSHOT_RECOVERY');
       expect(result.outsideRemoteHorizon).toBe(true);
       expect(result.requiresSnapshotRecovery).toBe(true);
-      // Because remote compacted seq 3, remote log cannot serve [3..10]
       expect(result.missingFromLocal).toHaveLength(0);
 
       const detail = result.originDetails.find((d) => d.originPeerId === 'peer-A');
       expect(detail?.status).toBe('OUTSIDE_REMOTE_HORIZON');
-      expect(detail?.reason).toContain('Remote compacted needed sequence range');
+      expect(detail?.reason).toContain('Remote compacted needed sequence range [3..5]');
+    });
+
+    it('flags OUTSIDE_REMOTE_HORIZON when missing range starts exactly at the compacted frontier', () => {
+      // Local has 4. Remote has 8. Remote snapshot frontier is 5 (sequences 1..5 compacted).
+      // Needed range is 5..8. First missing sequence (5) is compacted in snapshot!
+      const local = makeDigest({
+        replicationVector: { 'peer-A': 4 },
+      });
+      const remote = makeDigest({
+        senderPeerId: 'peer-remote',
+        replicationVector: { 'peer-A': 8 },
+        snapshotFrontier: { 'peer-A': 5 },
+      });
+
+      const result = compareDigests(local, remote);
+      expect(result.classification).toBe('REQUIRES_SNAPSHOT_RECOVERY');
+      expect(result.outsideRemoteHorizon).toBe(true);
+      expect(result.requiresSnapshotRecovery).toBe(true);
+      expect(result.missingFromLocal).toHaveLength(0);
+
+      const detail = result.originDetails.find((d) => d.originPeerId === 'peer-A');
+      expect(detail?.status).toBe('OUTSIDE_REMOTE_HORIZON');
+      expect(detail?.reason).toContain('Remote compacted needed sequence range [5..8]');
+    });
+
+    it('accepts log repair when missing range starts immediately after compacted frontier', () => {
+      // Local has 5. Remote has 8. Remote snapshot frontier is 5 (sequences 1..5 compacted).
+      // Needed range is 6..8. First missing sequence (6) is > remoteSnap (5), so 6..8 are retained in log!
+      const local = makeDigest({
+        replicationVector: { 'peer-A': 5 },
+      });
+      const remote = makeDigest({
+        senderPeerId: 'peer-remote',
+        replicationVector: { 'peer-A': 8 },
+        snapshotFrontier: { 'peer-A': 5 },
+        historyFingerprints: { 'peer-A': sampleFp1 },
+      });
+
+      const result = compareDigests(local, remote);
+      expect(result.classification).toBe('REMOTE_DOMINATES');
+      expect(result.outsideRemoteHorizon).toBe(false);
+      expect(result.requiresSnapshotRecovery).toBe(false);
+      expect(result.missingFromLocal).toEqual([
+        { originPeerId: 'peer-A', fromSequence: 6, toSequence: 8 },
+      ]);
+
+      const detail = result.originDetails.find((d) => d.originPeerId === 'peer-A');
+      expect(detail?.status).toBe('REMOTE_AHEAD');
+    });
+
+    it('accepts log repair when origin has no compacted operations (snapshotFrontier = 0)', () => {
+      const local = makeDigest();
+      const remote = makeDigest({
+        senderPeerId: 'peer-remote',
+        replicationVector: { 'peer-A': 4 },
+        snapshotFrontier: { 'peer-A': 0 },
+        historyFingerprints: { 'peer-A': sampleFp1 },
+      });
+
+      const result = compareDigests(local, remote);
+      expect(result.classification).toBe('REMOTE_DOMINATES');
+      expect(result.outsideRemoteHorizon).toBe(false);
+      expect(result.requiresSnapshotRecovery).toBe(false);
+      expect(result.missingFromLocal).toEqual([
+        { originPeerId: 'peer-A', fromSequence: 1, toSequence: 4 },
+      ]);
+    });
+
+    it('detects structural inconsistency when snapshotFrontier exceeds replicationVector', () => {
+      const local = makeDigest({
+        replicationVector: { 'peer-A': 5 },
+        snapshotFrontier: { 'peer-A': 8 }, // Invariant violation: snap (8) > rep (5)
+      });
+      const remote = makeDigest({
+        senderPeerId: 'peer-remote',
+        replicationVector: { 'peer-A': 5 },
+      });
+
+      const result = compareDigests(local, remote);
+      expect(result.diagnosticReasons?.some((r) => r.includes('exceeds replicationVector'))).toBe(true);
     });
 
     it('flags outsideLocalHorizon when remote needs sequence that local has already compacted', () => {
@@ -297,6 +420,86 @@ describe('ReplicationComparator', () => {
       const detail = result.originDetails.find((d) => d.originPeerId === 'peer-A');
       expect(detail?.status).toBe('OUTSIDE_LOCAL_HORIZON');
       expect(detail?.reason).toContain('Local compacted needed sequence range');
+    });
+  });
+
+  describe('Multi-Origin Combinations & Global Dominance Completeness (Correction C)', () => {
+    it('sets hasUnverifiedHistory = true when clear missing range exists alongside unverified origin', () => {
+      // Origin A: local is ahead (5 vs 2) -> missingFromRemote: [3..5]
+      // Origin B: local and remote both have 10, but NO fingerprint provided -> unverified!
+      const local = makeDigest({
+        replicationVector: { 'peer-A': 5, 'peer-B': 10 },
+        historyFingerprints: { 'peer-A': sampleFp1 },
+        // peer-B omitted from fingerprints
+      });
+      const remote = makeDigest({
+        senderPeerId: 'peer-remote',
+        replicationVector: { 'peer-A': 2, 'peer-B': 10 },
+        // peer-B omitted from fingerprints
+      });
+
+      const result = compareDigests(local, remote);
+
+      // Dominance classification is LOCAL_DOMINATES based on replication vectors...
+      expect(result.classification).toBe('LOCAL_DOMINATES');
+      expect(result.missingFromRemote).toEqual([
+        { originPeerId: 'peer-A', fromSequence: 3, toSequence: 5 },
+      ]);
+
+      // ...BUT completeness indicator explicitly warns caller that historical equality is unverified on peer-B!
+      expect(result.hasUnverifiedHistory).toBe(true);
+      expect(result.unprovableOrigins).toEqual(['peer-B']);
+    });
+
+    it('prioritizes DIVERGENT_FORK when fork on one origin is combined with normal missing range on another', () => {
+      // Origin A: both at 5, but conflicting fingerprints!
+      // Origin B: local has 2, remote has 6 -> normal missing range [3..6]
+      const local = makeDigest({
+        replicationVector: { 'peer-A': 5, 'peer-B': 2 },
+        historyFingerprints: { 'peer-A': sampleFp1 },
+      });
+      const remote = makeDigest({
+        senderPeerId: 'peer-remote',
+        replicationVector: { 'peer-A': 5, 'peer-B': 6 },
+        historyFingerprints: { 'peer-A': sampleFp2, 'peer-B': sampleFpB },
+      });
+
+      const result = compareDigests(local, remote);
+
+      // Critical fork takes priority for overall classification
+      expect(result.classification).toBe('DIVERGENT_FORK');
+      expect(result.forkDetected).toBe(true);
+      expect(result.conflictingOrigins).toEqual(['peer-A']);
+
+      // Missing range on peer-B is still preserved for diagnostics/repair awareness
+      expect(result.missingFromLocal).toEqual([
+        { originPeerId: 'peer-B', fromSequence: 3, toSequence: 6 },
+      ]);
+    });
+
+    it('prioritizes REQUIRES_SNAPSHOT_RECOVERY when outside-horizon origin is combined with normal missing range', () => {
+      // Origin A: remote has 10, snapshotFrontier 8; local has 2 -> needed 3..10, but 3 <= snap(8) -> outside horizon!
+      // Origin B: remote has 5, snapshotFrontier 0; local has 2 -> needed 3..5, in log
+      const local = makeDigest({
+        replicationVector: { 'peer-A': 2, 'peer-B': 2 },
+      });
+      const remote = makeDigest({
+        senderPeerId: 'peer-remote',
+        replicationVector: { 'peer-A': 10, 'peer-B': 5 },
+        snapshotFrontier: { 'peer-A': 8, 'peer-B': 0 },
+        historyFingerprints: { 'peer-B': sampleFpB },
+      });
+
+      const result = compareDigests(local, remote);
+
+      expect(result.classification).toBe('REQUIRES_SNAPSHOT_RECOVERY');
+      expect(result.outsideRemoteHorizon).toBe(true);
+      expect(result.requiresSnapshotRecovery).toBe(true);
+
+      // Normal missing range on peer-B is still retained
+      expect(result.missingFromLocal).toEqual([
+        { originPeerId: 'peer-B', fromSequence: 3, toSequence: 5 },
+      ]);
     });
   });
 

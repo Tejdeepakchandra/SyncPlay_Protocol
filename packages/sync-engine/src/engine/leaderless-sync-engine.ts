@@ -1485,6 +1485,12 @@ export class LeaderlessSyncEngine implements SyncEngine {
   /**
    * Generates a consistent point-in-time StateDigestPayload snapshot for broadcasting.
    * Conforms to Phase 7.4 multi-vector formatVersion 2.
+   *
+   * SEMANTICS:
+   * - replicationVector[origin]: highest contiguous applied sequence (1..k).
+   * - snapshotFrontier[origin]: highest contiguous sequence already incorporated into the
+   *   compacted base snapshot. Sequences <= snapshotFrontier are compacted out of the log.
+   * - historyFingerprints[origin]: canonical SHA-256 fingerprint at sequence k = replicationVector[origin].
    */
   public createLocalDigest(sentAtOverride?: number): StateDigestPayload {
     if (this.disposed) {
@@ -1530,6 +1536,13 @@ export class LeaderlessSyncEngine implements SyncEngine {
   /**
    * Evaluates an incoming remote digest against local replication knowledge.
    * Handles format version discrimination, schema validation, and pure comparison.
+   *
+   * SECURITY & TRUST BOUNDARY INVARIANT:
+   * A remote digest's payload fields (senderPeerId, connectionGeneration, vectors) are
+   * untrusted remote claims. Evaluating a digest does NOT authorize the sender as a repair
+   * supplier, does NOT authenticate its connection generation, and does NOT permit operation
+   * ingestion. Authoritative supplier authorization and repair batch ingestion strictly require
+   * Phase 7.3-R5-H capability-gated registration via AuthenticatedSupplierContext.
    */
   public compareRemoteDigest(remoteDigest: unknown): DigestComparisonResult {
     if (this.disposed) {
@@ -1561,6 +1574,7 @@ export class LeaderlessSyncEngine implements SyncEngine {
         outsideRemoteHorizon: false,
         requiresSnapshotRecovery: false,
         unprovableOrigins: Object.freeze([]),
+        hasUnverifiedHistory: false,
         originDetails: Object.freeze([]),
         diagnosticReasons: Object.freeze([
           'Ignoring legacy Phase 2 state digest: incompatible format',
@@ -1584,6 +1598,7 @@ export class LeaderlessSyncEngine implements SyncEngine {
         outsideRemoteHorizon: false,
         requiresSnapshotRecovery: false,
         unprovableOrigins: Object.freeze([]),
+        hasUnverifiedHistory: false,
         originDetails: Object.freeze([]),
         diagnosticReasons: Object.freeze([
           `Unsupported future protocol format version: ${(remoteDigest as any).formatVersion}`,
@@ -1605,6 +1620,7 @@ export class LeaderlessSyncEngine implements SyncEngine {
         outsideRemoteHorizon: false,
         requiresSnapshotRecovery: false,
         unprovableOrigins: Object.freeze([]),
+        hasUnverifiedHistory: false,
         originDetails: Object.freeze([]),
         diagnosticReasons: Object.freeze(
           parsed.error.issues.map((e) => `${e.path.join('.')}: ${e.message}`),

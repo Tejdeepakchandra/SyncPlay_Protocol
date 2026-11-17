@@ -465,6 +465,53 @@ describe('AntiEntropyManager & Digest Engine Integration', () => {
       manager.dispose();
     });
 
+    it('ensures periodic and reactive scheduling share the same token bucket and cannot bypass rate limits', () => {
+      const broadcastSpy = vi.fn();
+      const callbacks: AntiEntropyCallbacks = { onBroadcastDigest: broadcastSpy };
+
+      // Periodic timer fires every 5000ms. Rate limit: burst 2, 1/sec
+      const manager = new AntiEntropyManager(
+        engine,
+        callbacks,
+        {
+          periodicIntervalMs: 5000,
+          jitterMs: 0,
+          rateLimitBurst: 2,
+          rateLimitMinIntervalMs: 1000,
+          rng: () => 0.5,
+        },
+        fakeClock,
+      );
+
+      // Exhaust both tokens via reactive triggers
+      manager.triggerReactiveDigest();
+      fakeClock.advanceTime(0); // 1st token consumed
+      expect(broadcastSpy).toHaveBeenCalledTimes(1);
+
+      manager.triggerReactiveDigest();
+      fakeClock.advanceTime(0); // 2nd token consumed
+      expect(broadcastSpy).toHaveBeenCalledTimes(2);
+
+      // Immediately trigger 3rd reactive digest in same tick -> throttled!
+      manager.triggerReactiveDigest();
+      fakeClock.advanceTime(0);
+      expect(broadcastSpy).toHaveBeenCalledTimes(2);
+
+      // Advance by 500ms (only 0.5 token refilled, still < 1)
+      fakeClock.advanceTime(500);
+      manager.triggerReactiveDigest();
+      fakeClock.advanceTime(0);
+      expect(broadcastSpy).toHaveBeenCalledTimes(2);
+
+      // Advance another 500ms (total 1000ms elapsed, 1 token refilled)
+      fakeClock.advanceTime(500);
+      manager.triggerReactiveDigest();
+      fakeClock.advanceTime(0);
+      expect(broadcastSpy).toHaveBeenCalledTimes(3);
+
+      manager.dispose();
+    });
+
     it('disposal cancels all pending timers and prevents subsequent callbacks', () => {
       const broadcastSpy = vi.fn();
       const callbacks: AntiEntropyCallbacks = { onBroadcastDigest: broadcastSpy };

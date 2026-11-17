@@ -344,7 +344,8 @@ export const ReplicationVectorSchema = z
 
 /**
  * Snapshot frontier schema:
- * Maps origin peer IDs to base snapshot compacted horizon sequences.
+ * Maps origin peer IDs to highest contiguous sequence numbers already incorporated
+ * into the compacted base snapshot. Sequences <= snapshotFrontier are compacted out of the log.
  * Bounded to MAX_VECTOR_ENTRIES (64) origins.
  */
 export const SnapshotFrontierSchema = z
@@ -408,15 +409,18 @@ export const StateDigestPayloadSchema = z.object({
   replicationVector: ReplicationVectorSchema,
 
   /**
-   * Base snapshot frontier: oldest retained sequence per origin.
-   * Sequences below this have been compacted out of the log.
+   * Base snapshot frontier: highest contiguous sequence per origin already incorporated
+   * into the compacted base snapshot. Sequences <= snapshotFrontier have been compacted out of the active log.
+   * The oldest retained sequence in the active log is snapshotFrontier + 1.
    * Bounded to MAX_VECTOR_ENTRIES (64) origins.
    */
   snapshotFrontier: SnapshotFrontierSchema,
 
   /**
    * Tail operation fingerprints for each origin (full canonical SHA-256 hash).
-   * Used to detect sequence collisions or silent historical divergence.
+   * Fingerprint of the operation at sequence k = replicationVector[origin].
+   * Detects sequence collisions or conflicting operations at the replication frontier,
+   * but does not prove equality across arbitrary intermediate unchained history.
    * Values must be exact 64-char lowercase hexadecimal SHA-256 strings.
    * Bounded to MAX_VECTOR_ENTRIES (64) origins.
    */
