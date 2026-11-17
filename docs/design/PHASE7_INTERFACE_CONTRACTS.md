@@ -96,14 +96,18 @@ export interface ILogicalClockManager {
   /**
    * Validates and advances local clock upon receiving a remote operation.
    * Advances: L = max(L_local, remoteClock) + 1.
-   * Validates non-negative integer, per-origin monotonicity, causal timestamp integrity, and rate inflation.
-   * Throws SyncEngineError('INVALID_CLOCK'), 'CLOCK_REGRESSION', 'INVALID_CAUSAL_TIMESTAMP', or 'CLOCK_INFLATION'.
+   * Validates non-negative integer, per-origin monotonicity, causal timestamp integrity, and per-origin/epoch token bucket rate inflation.
+   * If isRepairOrReplay is true, rate inflation checks are bypassed (repair batches and replayed operations are exempt).
+   * Note: If validation fails, the local clock is NEVER advanced.
+   * Throws SyncEngineError('INVALID_CLOCK'), 'CLOCK_REGRESSION', 'INVALID_CAUSAL_TIMESTAMP', or 'REJECTED_CLOCK_INFLATION'.
    */
   validateAndAdvanceRemote(
     originPeerId: string,
     remoteClock: number,
     dependencyClocks: ReadonlyArray<number>,
-    monotonicNow: number
+    monotonicNow: number,
+    membershipEpoch: number,
+    isRepairOrReplay?: boolean
   ): number;
 
   /**
@@ -125,6 +129,7 @@ export interface ILogicalClockManager {
 export interface StoredOperation {
   readonly logicalEventId: string;
   readonly originPeerId: string;
+  /** In live broadcasts, senderPeerId MUST equal originPeerId (Strict No-Forwarding Policy). In repair batches, senderPeerId reflects the supplierPeerId. */
   readonly senderPeerId: string;
   readonly membershipEpoch: number;
   readonly messageType: 'PLAY' | 'PAUSE' | 'SEEK' | 'RATE_CHANGE';
@@ -288,8 +293,12 @@ export interface IRecoveryManager {
   /**
    * Atomically validates and installs an imported snapshot.
    * Verifies frontier dominates local history (V_snap >= V_local).
+   * If V_snap < V_local, rejects with 'SNAPSHOT_STALE'.
+   * If frontiers are incomparable:
+   *   1. If history log retains missing causal gaps, requests log repair.
+   *   2. If history is compacted beyond horizon (K = 256), NO tie-breaker is used.
+   *      Transitions engine to 'DEGRADED_OUT_OF_SYNC' lifecycle state.
    * Verifies RFC 8785 canonical SHA-256 digest, sets isImportedProvenance = true, and replays newer local operations.
-   * Resolves incomparable frontiers via epoch-monotonic tie-breaking.
    */
   installSnapshot(
     snapshot: StateSnapshotPayloadV2,
@@ -317,7 +326,8 @@ The existing `SyncEngineError` is extended with standardized Phase 7 error codes
 | `'CLOCK_OVERFLOW'` | Lamport clock reached `Number.MAX_SAFE_INTEGER`. | Local clock manager |
 | `'CLOCK_REGRESSION'` | Remote timestamp does not strictly exceed previous timestamp from same origin. | Clock validation |
 | `'INVALID_CAUSAL_TIMESTAMP'` | Remote timestamp does not strictly exceed declared dependency timestamps. | Causal verification |
-| `'CLOCK_INFLATION'` | Remote clock advances faster than physical monotonic rate limit. | Rate inflation check |
+| `'REJECTED_CLOCK_INFLATION'` | Remote clock advances faster than per-origin/per-epoch token bucket rate limit. | Rate inflation check |
+| `'REJECTED_UNAUTHORIZED_ORIGIN'` | Live broadcast received where originPeerId !== senderPeerId (Strict No-Forwarding violation). | Origin validation |
 | `'SEQUENCE_REGRESSION'` | Operation sequence number is lower than known sequence for origin. | Sequence validation |
 | `'SEQUENCE_COLLISION_DETECTED'`| Different logicalEventId received for an already processed origin sequence. | Duplicate detection |
 | `'INVALID_ORIGIN_SEQUENCE'` | Sequence number is non-positive or non-safe integer. | Boundary check |

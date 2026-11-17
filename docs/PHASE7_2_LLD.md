@@ -93,16 +93,27 @@ Incoming remote operations are verified against five strict mathematical invaria
 3. **Duplicate Sequence Handling:** If $e.\text{originSequence} \le \text{replicationVector}[e.\text{originPeerId}]$:
    - If $e.\text{logicalEventId} == \text{storedOperation}.\text{logicalEventId}$: resolve as `IGNORED_DUPLICATE` (idempotent NO-OP).
    - If $e.\text{logicalEventId} \neq \text{storedOperation}.\text{logicalEventId}$: reject with `SEQUENCE_COLLISION_DETECTED` (critical origin defect; isolates peer).
-4. **Rate-Based Clock Inflation Detection:** Rather than a brittle fixed scalar cap ($10,000$), the receiver checks that remote clocks do not advance faster than local physical monotonic time multiplied by the maximum interactive event frequency:
-   $$\Delta L \le (\Delta t_{\text{monotonic}} \times \text{MAX\_INTENT\_HZ}) + \text{BURST\_TOLERANCE}$$
-   Legitimate large gaps from idle peers are accepted provided sequence numbers are consecutive and safe integer bounds are respected.
-5. **Safe Integer Limits:** $0 \le L \le \text{Number.MAX\_SAFE\_INTEGER} - 1$ ($2^{53} - 1$). If exceeded, throws `CLOCK_OVERFLOW` and triggers snapshot re-anchoring.
+4. **Token-Bucket Clock Inflation Detection (Heuristic Filter):**
+   - Applies **only to live real-time broadcasts**. Historical operations arriving via `OPERATION_BATCH` (anti-entropy repair) or local log replays are **EXEMPT** from monotonic rate checks, as historical batches naturally arrive in rapid bursts.
+   - Evaluated per `(originPeerId, membershipEpoch)` using a local token bucket:
+     - Token refill rate: $10\text{ tokens/sec}$ ($0.01\text{ tokens/ms}$).
+     - Burst capacity: $50\text{ tokens}$.
+     - When receiving a live event with clock jump $\Delta L = L(e) - L_{\text{prev}}(p)$, if $\Delta L > \text{tokens}$, the event is classified as `CLOCK_INFLATION` and rejected with `REJECTED_CLOCK_INFLATION`.
+   - **Critical Clock Safety Invariant:** Rejected or quarantined events **MUST NEVER advance the local Lamport clock**.
+   - *Heuristic Limitation:* This rate check is an implementation safeguard against runaway client loops and buggy timers, not a cryptographic Byzantine security guarantee.
+5. **Safe Integer Limits:** $0 \le L \le \text{Number.MAX\_SAFE\_INTEGER} - 1$ ($2^{53} - 1$). If local clock reaches this threshold, the engine throws `CLOCK_OVERFLOW`, enters degraded mode, and halts local event generation until a room snapshot resets the baseline.
 
 ```ts
+interface OriginRateState {
+  lastMonotonicMs: number;
+  tokens: number;
+  lastClock: number;
+}
+
 class LogicalClockManager {
   private currentClock: number = 0;
   private readonly maxObservedByOrigin: Map<string, number> = new Map();
-  private readonly lastMonotonicCheck: Map<string, { time: number; clock: number }> = new Map();
+  private readonly originRateStates: Map<string, OriginRateState> = new Map();
 
   public tickLocal(dependencies?: ReadonlyArray<{ logicalTimestamp: number }>): number {
     let maxDepClock = 0;
@@ -123,9 +134,11 @@ class LogicalClockManager {
 
   public validateAndAdvanceRemote(
     originPeerId: string,
+    membershipEpoch: number,
     remoteClock: number,
     dependencyClocks: ReadonlyArray<number>,
-    monotonicNow: number
+    monotonicNow: number,
+    isRepairOrReplay: boolean = false
   ): number {
     if (!Number.isSafeInteger(remoteClock) || remoteClock < 0) {
       throw new SyncEngineError('INVALID_CLOCK', `Malformed remote timestamp: ${remoteClock}`);
@@ -150,18 +163,32 @@ class LogicalClockManager {
       }
     }
 
-    // 3. Rate-based inflation detection (max 100 intents/sec + burst of 500)
-    const prev = this.lastMonotonicCheck.get(originPeerId);
-    if (prev) {
-      const deltaMs = Math.max(0, monotonicNow - prev.time);
-      const deltaClock = remoteClock - prev.clock;
-      const maxAllowed = (deltaMs * 0.1) + 500;
-      if (deltaClock > maxAllowed) {
-        throw new SyncEngineError('CLOCK_INFLATION', `Clock advance ${deltaClock} exceeds allowable rate`);
+    // 3. Token-bucket rate check (live broadcasts only; repair batches exempt)
+    if (!isRepairOrReplay) {
+      const rateKey = `${originPeerId}:${membershipEpoch}`;
+      let rate = this.originRateStates.get(rateKey);
+      if (!rate) {
+        rate = { lastMonotonicMs: monotonicNow, tokens: 50, lastClock: remoteClock };
+        this.originRateStates.set(rateKey, rate);
+      } else {
+        const deltaMs = Math.max(0, monotonicNow - rate.lastMonotonicMs);
+        rate.tokens = Math.min(50, rate.tokens + (deltaMs * 0.01));
+        rate.lastMonotonicMs = monotonicNow;
+
+        const deltaClock = remoteClock - rate.lastClock;
+        if (deltaClock > rate.tokens) {
+          // REJECTED: Do NOT advance local clock or record maxObservedByOrigin!
+          throw new SyncEngineError(
+            'REJECTED_CLOCK_INFLATION',
+            `Clock advance ${deltaClock} from origin ${originPeerId} exceeds token allowance (${rate.tokens.toFixed(1)})`
+          );
+        }
+        rate.tokens -= deltaClock;
+        rate.lastClock = remoteClock;
       }
     }
-    this.lastMonotonicCheck.set(originPeerId, { time: monotonicNow, clock: remoteClock });
 
+    // All validation passed: safely advance local clock
     this.maxObservedByOrigin.set(originPeerId, remoteClock);
     this.currentClock = Math.max(this.currentClock, remoteClock) + 1;
     return this.currentClock;
@@ -172,6 +199,7 @@ class LogicalClockManager {
       throw new SyncEngineError('INVALID_CLOCK', `Malformed reseed timestamp: ${maxObservedClock}`);
     }
     this.currentClock = Math.max(this.currentClock, Math.floor(maxObservedClock)) + 1;
+    this.originRateStates.clear();
   }
 }
 ```
@@ -362,13 +390,15 @@ interface SerializedControlOperation {
 
 interface OperationBatchPayload {
   readonly sessionId: string;
-  readonly originPeerId: string;
+  readonly supplierPeerId: string; // Immediate transport peer supplying the batch
+  readonly originPeerId: string;   // Original author of the operations
   readonly fromSequence: number;
   readonly toSequence: number;
   readonly operations: ReadonlyArray<SerializedControlOperation>;
 }
 ```
 - **Batch Size Limit:** An `OPERATION_BATCH` contains a maximum of $32$ operations. If more operations are required, multiple batches are paged to prevent WebRTC DataChannel buffer overflows.
+- **Strict No-Forwarding Invariant:** For live broadcasts, $\text{originPeerId} \equiv \text{senderPeerId} \equiv \text{fromPeerId}$. Rebroadcasting live events is rejected. In repair batches, `supplierPeerId` is decoupled from `originPeerId`.
 
 ---
 
@@ -436,11 +466,11 @@ When `RecoveryManager.installSnapshot(payload)` is called:
 4. **Byte-Level Integrity Verification (RFC 8785):** Verifies `payload.stateDigestSha256` against the canonical JSON serialization of the payload. (Guarantees payload bytes are uncorrupted; does not prove semantic truth).
 5. **Frontier Monotonicity Verification:** Verifies that `payload.snapshotFrontier` dominates or matches known history ($V_{\text{snap}} \ge V_{\text{rep, local}}$). Rejects stale snapshots ($V_{\text{snap}} < V_{\text{rep, local}}$).
 6. **Handling Incomparable Version Vectors ($V_A \not\ge V_B \land V_B \not\ge V_A$):**
-   - Comparing vector sums ($\sum V[p]$) is strictly forbidden.
-   - The engine requests missing operation logs from both peers to bridge the concurrency gap.
-   - If log recovery is impossible, deterministic epoch-monotonic tie-breaking is applied:
-     $$\text{Winner} = \max(\text{membershipEpoch}) \to \max(\text{maxLogicalTimestamp}) \to \max_{\text{lex}}(\text{snapshotAuthorPeerId})$$
-   - If convergence cannot be proven, the engine transitions to `DEGRADED_OUT_OF_SYNC` and flags `isDegraded = true`.
+   - Comparing vector sums ($\sum V[p]$) or scalar tie-breakers ($\max(\text{epoch})$, $\max(L)$, $\max_{\text{lex}}(\text{peerId})$) is **strictly forbidden**. A higher Lamport clock or peer ID does not prove event-set completeness.
+   - If missing history is available in peer logs ($\le K=256$), the engine requests the missing operations via `REPAIR_REQUEST` and merges/replays them in total order.
+   - If required history has been compacted beyond the log horizon and no verifiable common recovery point exists, the engine **must not silently choose a winner**. It transitions immediately to `DEGRADED_OUT_OF_SYNC`, sets `EngineStatus.isDegraded = true` and `degradedReason = 'INCOMPARABLE_SNAPSHOT_DIVERGENCE'`, and prompts the user/host to perform an explicit recovery action:
+     - *Host Re-Seek:* Host issues an explicit seek to establish a new agreed baseline.
+     - *Room Reload:* Client reloads session and obtains a fresh identity and snapshot from Bootstrap.
 7. Re-seeds local `LogicalClockManager` to $\max(L_{\text{local}}, \text{payload.maxLogicalTimestamp}) + 1$.
 8. Installs base state atomically:
    $$v_{\text{local}} = v_{\text{current}} + 1$$

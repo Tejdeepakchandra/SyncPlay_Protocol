@@ -178,21 +178,24 @@ interface NetworkImpairmentConfig {
   4. Peer B emits `REPAIR_REQUEST` for sequence range $[2, 2]$.
   5. Network delivers $A_2$; Peer B applies $A_2$, cascades to unblock $A_3$, and advances `replicationVector[A]` to $3$.
 
-### Suite 9: Incomparable Snapshot Frontiers & Deterministic Tie-Breaking
+### Suite 9: Incomparable Snapshot Frontiers & Degraded State Handling
 - **Execution:**
   1. Simulate temporary split-brain partition creating incomparable snapshots between sub-meshes.
   2. Sub-mesh 1 produces Snapshot 1 with frontier $\{A: 10, B: 5\}$ at epoch 6.
   3. Sub-mesh 2 produces Snapshot 2 with frontier $\{A: 5, B: 10\}$ at epoch 6.
 - **Assertions:**
   1. Verifies receiver never chooses a snapshot by comparing entry sums ($\sum V$).
-  2. Receiver attempts log repair to bridge the gap.
-  3. If log history is compacted, receiver applies deterministic epoch-monotonic tie-breaker: $\max(\text{epoch}) \to \max(L) \to \max_{\text{lex}}(\text{authorPeerId})$.
-  4. All nodes converge to the identical tie-breaker winner.
+  2. Receiver attempts log repair to bridge the causal gap if missing operations are retained in log history.
+  3. If log history is compacted beyond horizon ($K = 256$), receiver **strictly avoids arbitrary tie-breaking** (no $\max(\text{epoch}) \to \max(L) \to \max_{\text{lex}}$ selection).
+  4. Receiver transitions engine to `'DEGRADED_OUT_OF_SYNC'` lifecycle state.
+  5. Assert explicit host re-seek or room reload recovers synchrony and returns engine to active state.
 
-### Suite 10: Rate-Based Clock Inflation & Causal Timestamp Integrity
+### Suite 10: Token-Bucket Clock Inflation, Causal Integrity & Strict No-Forwarding
 - **Execution:**
   1. **Integrity Violation:** Peer B emits operation with $L(e) = 5$, but declares dependency with $L(d) = 10$.
   2. Assert receiver rejects with `INVALID_CAUSAL_TIMESTAMP`.
-  3. **Inflation Violation:** Malicious/buggy peer attempts to advance Lamport clock by $10^9$ ticks in $1\text{ ms}$.
-  4. Assert receiver rejects with `CLOCK_INFLATION` without state corruption.
+  3. **Inflation Violation:** Peer attempts to advance Lamport clock faster than token-bucket capacity (refill 10 tokens/sec, burst 50 tokens).
+  4. Assert receiver rejects with `REJECTED_CLOCK_INFLATION` without state corruption, and **verifies that rejected events NEVER advance the local Lamport clock**.
+  5. **Repair Exemption:** Replay 100 historical operations via repair batch (`isRepairOrReplay = true`); assert all 100 operations are accepted and clocks advance without triggering `REJECTED_CLOCK_INFLATION`.
+  6. **Strict No-Forwarding Violation:** Peer C sends a live control event with `originPeerId = "peerA"` and `senderPeerId = "peerB"`. Assert receiver rejects with `REJECTED_UNAUTHORIZED_ORIGIN`.
 

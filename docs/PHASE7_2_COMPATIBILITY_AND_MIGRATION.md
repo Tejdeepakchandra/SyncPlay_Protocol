@@ -107,6 +107,22 @@ In Revision P7.2-R2, the engine adopts **Strict Epoch Fencing** for handling par
   2. Prevention of severe UX regressions (e.g. video jumping backward to an obsolete timestamp from 10 minutes ago).
 - **Bootstrap Downtime Tolerance:** Active peers continue synchronized playback over established WebRTC DataChannels even if the Bootstrap Server is temporarily unreachable. Bootstrap is strictly non-authoritative for playback.
 
+### 3.4. Strict No-Forwarding Policy & Direct Mesh Invariant
+Revision P7.2-R3 formalizes the **Strict No-Forwarding Policy** for live control broadcasts:
+- **Direct Author Broadcast:** Every live control event MUST be broadcast directly by its author to all mesh peers. The transport peer identity (`senderPeerId` / `fromPeerId`) verified at the WebRTC layer MUST equal `originPeerId`.
+- **Relay Prohibition:** Live relayed events are rejected with `REJECTED_UNAUTHORIZED_ORIGIN`. Unauthenticated peer relaying without public-key digital signatures cannot safely distinguish benign forwarding from sender impersonation or replay attacks.
+- **Repair Batch Exemption:** Anti-entropy repair batches (`OPERATION_BATCH`) explicitly decouple `supplierPeerId` (immediate sender fulfilling repair) from `originPeerId` (historical author), and state snapshots decouple `supplierPeerId` from `snapshotAuthorPeerId`.
+- **Topology Limitation:** Direct full mesh is required for live event exchange ($N \le 8$). Multi-hop overlay routing is out of scope for Phase 7.
+
+### 3.5. Incomparable Snapshot Resolution & Explicit Degraded Recovery
+In Revision P7.2-R3, arbitrary scalar tie-breaking ($\max(\text{epoch}) \to \max(L) \to \max_{\text{lex}}(\text{peerId})$) for incomparable snapshots is completely eliminated:
+- **Component-Wise Domination Only:** A snapshot is installed if and only if its frontier dominates local known history ($V_{\text{snap}} \ge V_{\text{local}}$).
+- **Log Repair First:** If frontiers are incomparable ($V_{\text{snap}} \parallel V_{\text{local}}$), the engine attempts anti-entropy log repair to fill the missing operations.
+- **Degraded State Transition:** If missing history has already been compacted beyond the capacity horizon ($K = 256$), the engine refuses to guess or pick an arbitrary branch. It transitions to `'DEGRADED_OUT_OF_SYNC'` and suspends playback mutation.
+- **Recovery Procedures:**
+  1. **Host Re-Seek:** A host or active peer issues a fresh authoritative control operation (`SEEK` or `PLAY`), establishing a new monotonic sequence that dominates both divergent histories.
+  2. **Room Reload:** The degraded peer reloads the page (triggering Section 3.2 Ephemeral Identity Reset), obtains a fresh `peerId`, and pulls the current canonical snapshot cleanly.
+
 ---
 
 ## 4. Demo Application Integration Plan

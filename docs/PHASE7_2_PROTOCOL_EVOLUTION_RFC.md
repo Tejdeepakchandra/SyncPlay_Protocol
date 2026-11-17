@@ -84,6 +84,11 @@ export interface ProtocolMessageV2<TPayload = unknown> {
 ```
 
 > [!NOTE]
+> **Identity & No-Forwarding Rule for Live Broadcasts:**
+> In direct full-mesh WebRTC topology ($N \le 8$), every live control operation must be sent directly by its author:
+> $$\text{originPeerId} \equiv \text{senderPeerId}$$
+> Relaying or rebroadcasting live control operations authored by another peer is strictly forbidden. Any incoming live message where `originPeerId !== senderPeerId` is rejected at the transport boundary with `REJECTED_UNAUTHORIZED_ORIGIN`. Multi-hop live relaying is deferred beyond Phase 7.
+> 
 > **Superseding Single Predecessor Pointers:**
 > A single predecessor pointer (`predecessorEventId`) failed because it could not represent multiple concurrent branches merging into a single causal history. The `causalContext` vector provides complete, mathematically rigorous concurrency detection. For an 8-peer room, `causalContext` adds only $\approx 120\text{ bytes}$ per control event, which is negligible at human interaction rates ($\le 5\text{ ops/sec}$).
 
@@ -242,7 +247,8 @@ export interface SerializedControlOperation {
 
 export interface OperationBatchPayload {
   readonly sessionId: string;
-  readonly originPeerId: string;
+  readonly supplierPeerId: string; // Transport peer supplying the batch
+  readonly originPeerId: string;   // Original author of the operations
   readonly fromSequence: number;
   readonly toSequence: number;
   readonly operations: ReadonlyArray<SerializedControlOperation>;
@@ -265,6 +271,7 @@ export const SerializedControlOperationSchema = z.object({
 
 export const OperationBatchPayloadSchema = z.object({
   sessionId: z.string().min(1).max(128),
+  supplierPeerId: z.string().min(1).max(128),
   originPeerId: z.string().min(1).max(128),
   fromSequence: z.number().int().positive(),
   toSequence: z.number().int().positive(),
@@ -281,6 +288,7 @@ export const OperationBatchPayloadSchema = z.object({
 - **Purpose:** Full authoritative baseline snapshot transfer for rejoining peers or peers whose gap exceeds the retained history horizon ($> K$).
 - **Direction:** Targeted unicast over WebRTC DataChannel in response to `STATE_REQUEST`.
 - **Integrity vs. Semantic Truth:** `stateDigestSha256` computed via RFC 8785 canonical JSON proves **byte-level payload integrity** across the network. It does not prove the state was faithfully reduced from history; semantic consistency is validated by state bounding, frontier monotonicity ($V_{\text{snap}} \ge V_{\text{rep, local}}$), and multi-peer digest agreement.
+- **Supplier vs. Author Decoupling:** The transport peer supplying the snapshot (`supplierPeerId`) is explicitly distinguished from the author who computed the snapshot (`snapshotAuthorPeerId`).
 
 #### Proposed TypeScript Schema (Documentation Only):
 ```ts
@@ -288,7 +296,8 @@ export interface StateSnapshotPayloadV2 {
   readonly snapshotId: string;
   readonly sessionId: string;
   readonly membershipEpoch: number;
-  readonly snapshotAuthorPeerId: string;
+  readonly supplierPeerId: string; // Transport peer providing the snapshot
+  readonly snapshotAuthorPeerId: string; // Peer that authored and digested the snapshot
   readonly snapshotFrontier: Record<string, number>;
   readonly maxLogicalTimestamp: number;
   readonly stateDigestSha256: string;
@@ -316,6 +325,7 @@ export const StateSnapshotPayloadV2Schema = z.object({
   snapshotId: z.string().min(1).max(128),
   sessionId: z.string().min(1).max(128),
   membershipEpoch: z.number().int().nonnegative(),
+  supplierPeerId: z.string().min(1).max(128),
   snapshotAuthorPeerId: z.string().min(1).max(128),
   snapshotFrontier: z.record(z.string().min(1).max(128), z.number().int().nonnegative()),
   maxLogicalTimestamp: z.number().int().nonnegative(),
@@ -345,6 +355,6 @@ export const StateSnapshotPayloadV2Schema = z.object({
 1. **Global Size Cap:** All payloads must serialize to $\le 65,536\text{ bytes}$ (`MAX_PAYLOAD_BYTES`).
 2. **Bounded Batches:** An `OPERATION_BATCH` is strictly capped at $32$ operations. An operation typically serializes to $\approx 250\text{ bytes}$, yielding a batch size of $\approx 8\text{ KB}$, well within SCTP MTU and buffer limits.
 3. **Safe Integer Enforcement:** All counters (`logicalTimestamp`, `originSequenceNumber`, `fromSequence`, `toSequence`, `membershipEpoch`) are validated with `z.number().int().nonnegative()` and `Number.isSafeInteger()`.
-4. **Origin Validation:** In `OPERATION_BATCH`, the receiving peer validates that all operations in the batch have `originPeerId == targetOriginPeerId`, preventing peers from injecting forged operations on behalf of third parties.
-5. **Canonical Integrity Verification (RFC 8785):** In `STATE_SNAPSHOT`, the receiver computes the SHA-256 digest of the canonical JSON representation of the payload. Stale snapshots ($V_{\text{snap}} < V_{\text{rep, local}}$) are rejected immediately. Incomparable snapshots are resolved via epoch-monotonic tie-breaking rather than summing vector entries.
+4. **Origin Validation:** In live broadcasts, `originPeerId === senderPeerId` is strictly enforced. In `OPERATION_BATCH`, the receiving peer validates that all operations in the batch have `originPeerId == targetOriginPeerId`.
+5. **Canonical Integrity Verification (RFC 8785) & Degraded Transition:** In `STATE_SNAPSHOT`, the receiver computes the SHA-256 digest of the canonical JSON representation of the payload. Stale snapshots ($V_{\text{snap}} < V_{\text{rep, local}}$) are rejected immediately. Incomparable snapshots that cannot be reconciled via log replay trigger transition to `DEGRADED_OUT_OF_SYNC`; arbitrary tie-breaking is strictly prohibited.
 

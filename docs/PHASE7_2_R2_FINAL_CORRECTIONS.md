@@ -120,11 +120,10 @@ To ensure identical SHA-256 digests across diverse browser JavaScript engines, s
 
 #### 3. Handling Incomparable Version Vectors ($V_A \not\ge V_B \land V_B \not\ge V_A$)
 - **Strict Prohibition:** Nodes **MUST NEVER** compare snapshots by summing version vector entries ($\sum V[p]$). Summing sequence numbers across independent origins has zero causal meaning.
-- **Resolution Procedure:**
+- **Resolution Procedure (Updated in P7.2-R3):**
   1. If two active peers offer incomparable snapshot frontiers, the receiver requests missing operation logs from both peers to bridge the concurrency gap.
-  2. If the gap cannot be bridged via log replay, the engine applies the deterministic **Epoch-Monotonic Tie-Breaker**:
-     $$\text{Winner} = \max(\text{membershipEpoch}) \to \max(\text{maxLogicalTimestamp}) \to \max_{\text{lex}}(\text{snapshotAuthorPeerId})$$
-  3. If unresolvable semantic divergence persists, the engine transitions to `DEGRADED_OUT_OF_SYNC`, sets `EngineStatus.isDegraded = true`, and prompts the user/host to perform an authoritative manual re-seek.
+  2. If the gap cannot be bridged via log replay (history compacted beyond $K=256$), the engine **MUST NOT silently pick a winner**. *(Note: The previous R2 tie-breaker $\max(\text{epoch}) \to \max(L) \to \max_{\text{lex}}(\text{peerId})$ is REMOVED in P7.2-R3 as mathematically unsafe).*
+  3. The engine transitions to `DEGRADED_OUT_OF_SYNC`, sets `EngineStatus.isDegraded = true` and `degradedReason = 'INCOMPARABLE_SNAPSHOT_DIVERGENCE'`, and prompts the user/host to perform an explicit authoritative manual re-seek or room reload.
 
 ---
 
@@ -149,8 +148,12 @@ $$L(e) = 1 + \max\left(L_{\text{local}}, \max_{d \in \text{dependencies}} L(d)\r
    - If $e.\text{logicalEventId} == \text{storedOperation}.\text{logicalEventId}$, resolve as `IGNORED_DUPLICATE` (idempotent NO-OP).
    - If $e.\text{logicalEventId} \neq \text{storedOperation}.\text{logicalEventId}$, reject with `SEQUENCE_COLLISION_DETECTED` (critical protocol defect; isolates remote peer).
 4. **Elimination of Fixed Clock-Skew Thresholds:** The arbitrary `MAX_CLOCK_SKEW = 10,000` rule is completely eliminated. Silent peers may legitimately lag by arbitrary Lamport ticks.
-5. **Rate-Based Clock Inflation Detection:** To detect misbehaving or buggy clocks without fixed scalar limits, a peer validates that remote Lamport timestamps do not advance faster than local physical monotonic time multiplied by the maximum allowable interactive intent frequency:
-   $$\Delta L \le (\Delta t_{\text{monotonic}} \times \text{MAX\_INTENT\_HZ}) + \text{BURST\_TOLERANCE}$$
+5. **Rate-Based Clock Inflation Detection (Refined in P7.2-R3):**
+   - Applies **only to live broadcasts**; repair batches (`OPERATION_BATCH`) and log replays are exempt.
+   - Evaluated via a per-origin token bucket: refill rate $10\text{ tokens/sec}$, burst capacity $50\text{ tokens}$.
+   - Suspicious events are rejected with `REJECTED_CLOCK_INFLATION`.
+   - **Crucial Invariant:** Rejected events **never advance the local Lamport clock**.
+   - Explicitly recognized as a heuristic sanity filter against runaway loops, not a cryptographic security guarantee.
 6. **Safe Integer Overflow Prevention:** If $L \ge \text{Number.MAX\_SAFE\_INTEGER} - 1$ ($2^{53} - 1$), the engine throws `CLOCK_OVERFLOW`, enters degraded mode, and initiates room-wide snapshot re-anchoring.
 
 ---
@@ -168,29 +171,32 @@ Using the finalized `causalContext: Record<originPeerId, number>`:
 - **Causally Sequential ($e_{\text{play}} \to e_{\text{pause}}$):** User observed play and pressed pause. **PAUSE succeeds**; state transitions to `'paused'`.
 - **Media Hardware Isolation:** The Phase 7 `SyncEngine` outputs purely mathematical `PlaybackState` decisions. Media muting, Web Audio volume ramping, and HTML5 element interaction remain strictly isolated in Phase 8 (`MediaAdapter`).
 
-### 3.2. Formally Guarded Conditional Convergence Theorem
-A set of distributed SyncPlay replicas $\mathcal{R}$ is guaranteed to reach identical `PlaybackState` **if and only if** all eight of the following conditions are satisfied:
-1. **Partial Synchrony:** Physical time $t > GST$, with network transmission latency bounded by $\Delta$.
-2. **Connected Mesh or Anti-Entropy Path:** Open WebRTC DataChannels exist between all non-faulty peers, or a path of anti-entropy relay peers exists.
-3. **Reliable Dissemination or Repair:** All emitted control operations are delivered to all peers, or missing operations are repaired via `REPAIR_REQUEST` within the retained horizon $K = 256$.
-4. **Strict Epoch Fencing:** Offline operations generated under obsolete membership epochs are fenced and discarded upon reconnect.
-5. **Complete Accepted Event Sets:** Every non-faulty replica has admitted the identical set of valid control operations.
-6. **Causal Dependency Invariant:** No operation is admitted to the reducer until all operations in its `causalContext` have been applied.
-7. **Deterministic Reducer & Total-Order Key:** All replicas reduce accepted operations in strict order of $\langle L, \text{originPeerId}, \text{logicalEventId} \rangle$.
-8. **Eventual Quiescence:** No peer originates new control intents for duration $\tau \ge 2\Delta + \text{digestInterval} + \text{repairRTT}$.
+### 3.2. Formally Guarded Conditional Convergence Statement (Corrected in P7.2-R3)
+A set of distributed SyncPlay replicas $\mathcal{R}$ participating in session $\mathcal{S}$ within active membership epoch $E$ will eventually converge to identical `PlaybackState` under the following conditions:
+1. **Connected Communication Graph:** Open WebRTC DataChannels or active anti-entropy repair paths exist between all replicas in $\mathcal{R}$.
+2. **Consistent Membership Epoch & Fencing:** Replicas agree on the active `membershipEpoch` issued by Bootstrap; operations generated under obsolete epochs are strictly fenced and discarded.
+3. **Identical Accepted Event Sets:** Every replica in $\mathcal{R}$ eventually receives and admits into its log the complete set of valid, non-fenced operations originated in epoch $E$.
+4. **Causal Dependency Admissibility:** No replica applies an operation until all operations declared in its `causalContext` have been received and applied.
+5. **Deterministic Total Ordering & Reduction:** Replicas order accepted operations using the deterministic key $\langle L(e), \text{originPeerId}(e), \text{logicalEventId}(e) \rangle$ and reduce them via the pure functional reducer.
+6. **Successful History Recovery:** Any replica with missing history either repairs gaps within the retained horizon $K = 256$ or successfully imports an authoritative snapshot dominating its local history.
+7. **Eventual Quiescence:** Replicas enter a period of quiescence where no new control operations are generated, allowing anti-entropy digests and pending repair requests to settle.
+
+*(Note: The phrase "if and only if" and the expression $\tau \ge 2\Delta + \text{digestInterval} + \text{repairRTT}$ were removed in P7.2-R3; the timing duration is an engineering/test assumption, not a standalone proof).*
 
 ---
 
-## 4. Document Update & Traceability Matrix (P7.2-R2)
+## 4. Document Update & Traceability Matrix (P7.2-R2 / R3)
 
-| Document | Primary Revisions Applied in P7.2-R2 |
+| Document | Primary Revisions Applied in P7.2-R2 / R3 |
 | :--- | :--- |
-| `docs/PHASE7_2_HLD.md` | Delineated `causalContext` vs `replicationVector`; added Strict Epoch Fencing architecture and Bootstrap non-authoritative invariants. |
-| `docs/PHASE7_2_LLD.md` | Formalized contiguous advancement rule, `SparseGapTracker`, exact Lamport clock equations, rate inflation checks, and RFC 8785 canonical digest. |
-| `docs/PHASE7_2_PROTOCOL_EVOLUTION_RFC.md` | Updated envelope and payload definitions for `membershipEpoch` fencing, `replicationVector` in digests, and canonical snapshot serialization. |
-| `docs/design/PHASE7_INTERFACE_CONTRACTS.md` | Updated `ILogicalClockManager`, `IOrderedOperationLog`, `IReplicationController`, and `IRecoveryManager` contracts with R2 semantics. |
-| `docs/PHASE7_2_SIMULATION_TEST_STRATEGY.md` | Added test suites for strict epoch fencing, out-of-order gap repair, incomparable snapshot tie-breaking, and rate-based clock inflation. |
-| `docs/PHASE7_2_COMPATIBILITY_AND_MIGRATION.md` | Documented the explicit offline event discard trade-off under strict epoch fencing and Bootstrap downtime tolerance. |
-| `docs/PHASE7_2_FINAL_DESIGN_REVIEW.md` | Updated decisions AD-701 to AD-710 to reflect R2 refinements and verified acceptance criteria. |
-| `docs/PHASE7_2_ARCHITECTURAL_CORRECTIONS.md` | Cross-referenced P7.2-R2 additions and updated correction register. |
+| `docs/PHASE7_2_R3_FINAL_CORRECTIONS.md` | Final R3 specification resolving tie-breakers, no-forwarding identity, token-bucket inflation, and conditional convergence. |
+| `docs/PHASE7_2_HLD.md` | Delineated `causalContext` vs `replicationVector`; added Strict No-Forwarding policy, Strict Epoch Fencing, and Bootstrap non-authoritative invariants. |
+| `docs/PHASE7_2_LLD.md` | Removed snapshot tie-breaker; formalized contiguous advancement, `SparseGapTracker`, token-bucket Lamport checks, and RFC 8785 canonical digest. |
+| `docs/PHASE7_2_PROTOCOL_EVOLUTION_RFC.md` | Updated envelope and payload definitions for `originPeerId === senderPeerId` no-forwarding, `replicationVector` in digests, and canonical snapshot serialization. |
+| `docs/design/PHASE7_INTERFACE_CONTRACTS.md` | Updated `ILogicalClockManager`, `IOrderedOperationLog`, `IReplicationController`, and `IRecoveryManager` contracts with R3 semantics. |
+| `docs/PHASE7_2_SIMULATION_TEST_STRATEGY.md` | Updated suites to test `DEGRADED_OUT_OF_SYNC` on incomparable snapshots and token-bucket clock inflation. |
+| `docs/PHASE7_2_COMPATIBILITY_AND_MIGRATION.md` | Documented strict no-forwarding limitation, offline event discard trade-off, and degraded recovery paths. |
+| `docs/PHASE7_2_FINAL_DESIGN_REVIEW.md` | Updated decisions AD-701 to AD-710 to reflect R3 refinements and verified acceptance criteria. |
+| `docs/PHASE7_2_ARCHITECTURAL_CORRECTIONS.md` | Cross-referenced P7.2-R3 additions and updated correction register. |
 | `docs/design/README.md` | Added `PHASE7_2_R2_FINAL_CORRECTIONS.md` to design index. |
+
