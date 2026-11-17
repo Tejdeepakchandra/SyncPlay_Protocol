@@ -46,6 +46,15 @@ export interface LastAppliedOperation {
 
   /** True if this record was restored from an imported snapshot (untrusted provenance). */
   readonly isImportedProvenance?: boolean;
+
+  /** Logical author identity of the operation. */
+  readonly originPeerId?: string;
+
+  /** Lamport logical timestamp of the operation. */
+  readonly logicalTimestamp?: number;
+
+  /** Origin-specific sequence number. */
+  readonly originSequenceNumber?: number;
 }
 
 /**
@@ -95,11 +104,19 @@ export interface PlaybackState {
 // ── Decision Outcomes ────────────────────────────────────────
 
 export type EngineDecisionCode =
-  | 'APPLIED'           // Valid event resulted in local state mutation
-  | 'NO_OP'             // Valid event resulted in identical state (e.g. pause when paused)
-  | 'REJECTED_DISPOSED' // Operation rejected because engine is disposed
-  | 'REJECTED_INVALID'  // Payload failed semantic validation preconditions
-  | 'IGNORED_DUPLICATE';// Redundant event already processed
+  | 'APPLIED'                     // Valid event resulted in local state mutation
+  | 'NO_OP'                       // Valid event resulted in identical state (e.g. pause when paused)
+  | 'SUPERSEDED'                  // Valid event was superseded by a higher concurrent or later operation (e.g. lower-key seek)
+  | 'REJECTED_DISPOSED'           // Operation rejected because engine is disposed
+  | 'REJECTED_INVALID'            // Payload failed semantic validation preconditions
+  | 'IGNORED_DUPLICATE'           // Redundant event already processed
+  | 'IGNORED_ALREADY_COMPACTED'   // Pre-horizon operation already compacted into base state
+  | 'BUFFERED_PENDING_DEPENDENCY' // Operation buffered awaiting missing dependencies
+  | 'REJECTED_OUTSIDE_HORIZON'    // Pre-horizon operation that cannot be verified
+  | 'REJECTED_CLOCK_INFLATION'    // Rejected due to rate inflation
+  | 'REJECTED_SEQUENCE_CONFLICT'  // Sequence collision detected
+  | 'REJECTED_CAUSAL_VIOLATION'   // Causal or Lamport timestamp invalid
+  | 'REJECTED_OBSOLETE_EPOCH';    // Membership epoch obsolete
 
 export interface EngineDecision {
   /** True if the event was semantically accepted and processed without error. */

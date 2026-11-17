@@ -48,3 +48,24 @@ export type { EngineSnapshotData, ValidatedSnapshotResult } from './snapshot.js'
 
 // ── Implementation ───────────────────────────────────────────
 export { BaselineSyncEngine } from './baseline-sync-engine.js';
+export { LeaderlessSyncEngine } from './engine/leaderless-sync-engine.js';
+export type { LeaderlessSyncEngineConfig } from './engine/leaderless-sync-engine.js';
+
+// ── Phase 7 Distributed Ordering & Conflict Components ───────
+export { LogicalClockManager } from './clock/logical-clock-manager.js';
+export type { ILogicalClockManager, ClockValidationContext } from './clock/types.js';
+
+export { OrderedOperationLog } from './log/ordered-operation-log.js';
+export { PendingDependencyQueue } from './log/pending-dependency-queue.js';
+export type {
+  StoredOperation,
+  InsertOperationCode,
+  InsertOperationResult,
+  IOrderedOperationLog,
+} from './log/types.js';
+
+export { ConflictResolver, happensBefore, areConcurrent } from './conflict/conflict-resolver.js';
+export type { IConflictResolver, ReducerContext } from './conflict/types.js';
+
+export { compareOperations } from './ordering/comparator.js';
+export type { OperationOrderingKey } from './ordering/comparator.js';

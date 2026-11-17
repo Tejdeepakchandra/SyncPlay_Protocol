@@ -184,9 +184,40 @@ describe('ProtocolMessageSchema', () => {
     expect(result.success).toBe(false);
   });
 
-  // ── Non-object input ───────────────────────────────────────
+  it('should accept a message with valid Phase 7 distributed metadata', () => {
+    const result = ProtocolMessageSchema.safeParse(
+      validMessage({
+        logicalEventId: 'op-456',
+        originPeerId: 'peer-abc',
+        membershipEpoch: 1,
+        logicalTimestamp: 14,
+        originSequenceNumber: 5,
+        causalContext: { 'peer-abc': 4, 'peer-xyz': 2 },
+      }),
+    );
+    expect(result.success).toBe(true);
+    if (result.success) {
+      expect(result.data.originPeerId).toBe('peer-abc');
+      expect(result.data.membershipEpoch).toBe(1);
+      expect(result.data.logicalTimestamp).toBe(14);
+      expect(result.data.originSequenceNumber).toBe(5);
+      expect(result.data.causalContext).toEqual({ 'peer-abc': 4, 'peer-xyz': 2 });
+    }
+  });
 
-  it('should reject null', () => {
+  it('should reject invalid Phase 7 metadata (negative timestamp or sequence)', () => {
+    expect(
+      ProtocolMessageSchema.safeParse(validMessage({ logicalTimestamp: -1 })).success,
+    ).toBe(false);
+    expect(
+      ProtocolMessageSchema.safeParse(validMessage({ originSequenceNumber: 0 })).success,
+    ).toBe(false);
+    expect(
+      ProtocolMessageSchema.safeParse(validMessage({ membershipEpoch: -1 })).success,
+    ).toBe(false);
+  });
+
+  it('should reject non-object input', () => {
     expect(ProtocolMessageSchema.safeParse(null).success).toBe(false);
   });
 

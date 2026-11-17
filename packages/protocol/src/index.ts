@@ -68,6 +68,21 @@ export {
   STATE_REQUEST_REASONS,
 } from './payloads/state.js';
 
+export type {
+  SerializedControlOperation,
+  OperationBatchPayload,
+  RepairRequestPayload,
+  CompactedCheckpointItem,
+  StateSnapshotPayloadV2,
+} from './payloads/repair.js';
+export {
+  SerializedControlOperationSchema,
+  OperationBatchPayloadSchema,
+  RepairRequestPayloadSchema,
+  CompactedCheckpointItemSchema,
+  StateSnapshotPayloadV2Schema,
+} from './payloads/repair.js';
+
 // ── Payload schema registry ─────────────────────────────────
 export { PAYLOAD_SCHEMAS } from './payloads/index.js';
 

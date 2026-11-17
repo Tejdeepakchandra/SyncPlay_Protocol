@@ -38,6 +38,31 @@ export interface ProtocolMessage<TPayload = unknown> {
    * Required for control events; optional for transport messages.
    */
   readonly logicalEventId?: LogicalEventId;
+  /**
+   * Logical author identity of the operation.
+   * Stamped by originating peer; immutable across multi-hop relay.
+   */
+  readonly originPeerId?: PeerId;
+  /**
+   * Room membership epoch from Bootstrap at the moment this message was created.
+   * Used for strict epoch fencing: events from obsolete epochs are discarded.
+   */
+  readonly membershipEpoch?: number;
+  /**
+   * Monotonic Lamport logical timestamp.
+   * Required for all distributed control operations.
+   */
+  readonly logicalTimestamp?: number;
+  /**
+   * Origin-specific contiguous sequence counter for anti-entropy replication tracking.
+   * Stamped by originating peer; immutable across retransmissions.
+   */
+  readonly originSequenceNumber?: number;
+  /**
+   * Causal Context Version Vector.
+   * Highest consecutive origin sequences observed by author at event creation.
+   */
+  readonly causalContext?: Record<string, number>;
   /** Message payload, validated per messageType. */
   readonly payload: TPayload;
 }
@@ -58,5 +83,15 @@ export const ProtocolMessageSchema = z.object({
   senderPeerId: z.string().min(1).max(128),
   messageId: z.string().min(1).max(128),
   logicalEventId: z.string().min(1).max(128).optional(),
+  originPeerId: z.string().min(1).max(128).optional(),
+  membershipEpoch: z.number().int().nonnegative().optional(),
+  logicalTimestamp: z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER).optional(),
+  originSequenceNumber: z.number().int().positive().max(Number.MAX_SAFE_INTEGER).optional(),
+  causalContext: z
+    .record(
+      z.string().min(1).max(128),
+      z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER),
+    )
+    .optional(),
   payload: z.unknown(),
 });

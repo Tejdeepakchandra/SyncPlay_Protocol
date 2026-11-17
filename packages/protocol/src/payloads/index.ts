@@ -31,6 +31,20 @@ export {
   StateSnapshotPayloadSchema,
   StateDigestPayloadSchema,
 } from './state.js';
+export {
+  SerializedControlOperationSchema,
+  OperationBatchPayloadSchema,
+  RepairRequestPayloadSchema,
+  CompactedCheckpointItemSchema,
+  StateSnapshotPayloadV2Schema,
+} from './repair.js';
+export type {
+  SerializedControlOperation,
+  OperationBatchPayload,
+  RepairRequestPayload,
+  CompactedCheckpointItem,
+  StateSnapshotPayloadV2,
+} from './repair.js';
 
 /**
  * Registry mapping each MessageType to its payload Zod schema.
