@@ -7,7 +7,7 @@
 **Frozen Phase 7.3-R5-H Trust Boundary Baseline:** `e49b81a`  
 **Parent / M1 Implementation Baseline:** `309b808` (amending `5cadc03`)  
 **M2 Initial Commit:** `7049ca6`  
-**M2 Final Correction Commit:** Current (to be committed)  
+**M2 Final Correction Commit:** `022d430`  
 **Date:** 2026-11-17  
 
 ---
@@ -34,7 +34,7 @@ Milestones M3 (Repair Request Pipeline), M4 (Supplier Servicing), M5 (Transport 
 - **Frozen Phase 7.3-R5-H Trust Boundary Baseline:** `e49b81a`
 - **Milestone M1 Baseline:** Commit `309b808` (amending `5cadc03`)
 - **Milestone M2 Initial Implementation:** Commit `7049ca6`
-- **Milestone M2 Targeted Corrections:** Current commit
+- **Milestone M2 Targeted Corrections:** Commit `022d430`
 
 ---
 
