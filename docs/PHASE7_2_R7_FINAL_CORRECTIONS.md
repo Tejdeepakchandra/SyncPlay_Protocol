@@ -125,24 +125,61 @@ $$\mathbf{L_{\text{local}} \leftarrow \text{snapshot.maxLogicalTimestamp}}$$
 
 ---
 
-### Correction 3: Exact Semantics of `originFrontierTimestamps`
+### Correction 3: Sufficiency, Retention, and Validation of `originFrontierTimestamps`
 
-#### 1. Exact Field Definition
+#### 1. Evaluation of Metadata Sufficiency
+The architecture evaluation considered whether `originFrontierTimestamps` alone is sufficient to reconcile snapshot import with exact Lamport validation:
+- **Sufficiency Proof:**
+  - A newly authoring peer after snapshot import must declare dependencies for every origin whose state is folded into the snapshot.
+  - The latest operation for each origin $p$ included in the snapshot is precisely $\text{snapshotFrontier}[p]$.
+  - The exact timestamp of that sequence is given by $\text{originFrontierTimestamps}[p]$.
+  - Therefore, the author has the exact timestamp for every frontier dependency:
+    $$\forall p \in \text{keys}(\text{snapshotFrontier}), \quad L(p, \text{snapshotFrontier}[p]) = \text{originFrontierTimestamps}[p]$$
+  - The maximum dependency timestamp is:
+    $$\max_{p \in \text{keys}(\text{snapshotFrontier})} \text{originFrontierTimestamps}[p] \equiv \text{maxLogicalTimestamp}$$
+  - No additional metadata or protocol schema modifications are required. `originFrontierTimestamps` is **100% mathematically and operationally sufficient**.
+
+#### 2. Exact Field Semantics & Invariants
 `originFrontierTimestamps` is an authoritative mapping from each origin peer ID in `snapshotFrontier` to the exact integer Lamport timestamp of that origin's frontier sequence:
 $$\text{originFrontierTimestamps}: \text{Record}\langle \text{originPeerId}, \text{logicalTimestamp} \rangle$$
 - **Precondition:** For every $p \in \text{keys}(\text{snapshotFrontier})$, there exists exactly one entry $\text{originFrontierTimestamps}[p] \in \mathbb{N}^+$.
 - **Relation to Compacted Checkpoints:**
   `originFrontierTimestamps[p]` is the exact checkpoint for $(p, \text{snapshotFrontier}[p])$.
-  `compactedCheckpoints` contains checkpoints for sequences preceding the frontier: $(p, s)$ where $s < \text{snapshotFrontier}[p]$.
+  `compactedCheckpoints` contains checkpoints for sequences preceding the frontier: $(p, s)$ where $s < \text{snapshotFrontier}[p]$ up to $K=256$ entries.
+  Upon snapshot import, all entries from `originFrontierTimestamps` are injected into `compactedCheckpoints` with key `${p}:${s_p}`.
+- **Retention Policy:**
+  `originFrontierTimestamps` is retained as an immutable component of the current base snapshot in memory. Ingested checkpoints in `compactedCheckpoints` are retained in the FIFO checkpoint ring buffer ($K=256$) across subsequent compactions.
 - **Digest Coverage:** `originFrontierTimestamps` is an immutable element of the RFC 8785 canonical JSON pre-image hashed into `stateDigestSha256`.
 
-#### 2. Receiver Validation Rules on Import
-When `RecoveryManager.installSnapshot(payload)` runs:
+#### 3. Receiver Validation Rules on Snapshot Import
+When `RecoveryManager.installSnapshot(payload)` executes:
 1. **Key Equivalence:** $\text{keys}(\text{payload.originFrontierTimestamps}) \equiv \text{keys}(\text{payload.snapshotFrontier})$.
 2. **Global Maximum Consistency:**
    $$\max_{p \in \text{keys}(\text{payload.snapshotFrontier})} \text{payload.originFrontierTimestamps}[p] \equiv \text{payload.maxLogicalTimestamp}$$
    If `maxLogicalTimestamp` does not exactly equal the maximum value in `originFrontierTimestamps`, the snapshot is rejected with `INVALID_SNAPSHOT_METADATA`.
 3. **Safe Integer Bounds:** Every timestamp in `originFrontierTimestamps` is a positive safe integer $< \text{Number.MAX\_SAFE\_INTEGER} - 1$.
+
+---
+
+### Correction 4: Bounded Checkpoint Horizon & Unavailable Historical Dependencies
+
+#### 1. The Pre-Compaction Checkpoint Boundary
+A critical architectural inquiry is how exact Lamport validation behaves when historical checkpoints older than the retained $K=256$ entries are unavailable:
+- Suppose a delayed or rejoining peer emits an event $X$ referencing an origin sequence $s < W_{\text{stable}}[p] - 256$.
+- The receiver's `compactedCheckpoints` ring buffer retains at most 256 entries prior to $W_{\text{stable}}$. Thus, the checkpoint lookup for $(p, s)$ returns `undefined`.
+
+#### 2. Rejection Invariant — Never Weaken Exact Equality
+Under NO circumstances may the receiver:
+1. Guess the timestamp of the missing dependency.
+2. Substitute the frontier timestamp $L(p, \text{snapshotFrontier}[p])$.
+3. Substitute the global ceiling `maxLogicalTimestamp`.
+4. Fall back to a weak lower-bound check ($L(X) > \dots$).
+
+Substituting a frontier or ceiling timestamp would introduce an artificial expectation that rejects valid events or accepts corrupted timestamps. Instead:
+- If $(p, s)$ is absent from both `OrderedOperationLog` and `compactedCheckpoints`, the event cannot be verified.
+- The receiver **rejects** the event with `REJECTED_OUTSIDE_HORIZON`.
+- Neither `replicationVector` nor $L_{\text{local}}$ advances.
+- The receiving engine transitions to `DEGRADED_OUT_OF_SYNC` and initiates a state repair request or waits for host re-seek.
 
 ---
 
@@ -201,16 +238,17 @@ A room consists of active peers A and B. Safe compaction occurs at stable fronti
 
 ## 4. Simulation Test Requirements (Suite 11 Extension)
 
-`docs/PHASE7_2_SIMULATION_TEST_STRATEGY.md` is updated with formal specification test cases in a dedicated **Suite 11: Snapshot Import & Post-Import Causal Consistency**:
+`docs/PHASE7_2_SIMULATION_TEST_STRATEGY.md` is updated with formal specification test cases in a dedicated **Suite 11: Snapshot Import & Post-Import Causal Consistency**, addressing the 9 required scenarios:
 
-1. **Test 11.1 (First Post-Import Event Exact Equality):** Peer D imports snapshot with frontier $\{A: 10, B: 5\}$ ($L=12, 8$) and authors $D_1$. Assert $D_1.\text{causalContext} \equiv \{A: 10, B: 5\}$ and $D_1.\text{logicalTimestamp} === 13$.
-2. **Test 11.2 (Receiver Independent Validation via Snapshot Frontier):** Peer B receives $D_1$, resolves $A_{10} \to 12, B_5 \to 8$, asserts $\text{expected} === 13$, and admits $D_1$.
-3. **Test 11.3 (Multi-Origin Distinct Timestamps):** Snapshot has 4 origins with timestamps $\{A: 20, B: 15, C: 45, D: 30\}$. Assert $\text{maxLogicalTimestamp} === 45$. Next event includes all 4 in `causalContext` and has $L = 46$.
-4. **Test 11.4 (Global Maximum Non-Substitution):** Verify receiver does not substitute $45$ for $B$'s dependency ($15$). An event depending only on $B_5$ must have $L = 16$, not $46$.
-5. **Test 11.5 (Missing Pre-Compaction Checkpoint Recovery):** Event references sequence $s < W_{\text{stable}}[p] - 256$ (older than checkpoint capacity). Assert receiver rejects with `REJECTED_OUTSIDE_HORIZON` and transitions to `DEGRADED_OUT_OF_SYNC`.
-6. **Test 11.6 (Chained Post-Import Progression):** Peer D authors $D_1$ ($L=13$), then $D_2$. Assert $D_2.\text{causalContext} \equiv \{A: 10, B: 5, D: 1\}$ and $D_2.\text{logicalTimestamp} === 14$.
-7. **Test 11.7 (No Silent Reseeding Advancement):** Assert that snapshot import does not advance $L_{\text{local}}$ to $\text{maxLogicalTimestamp} + 1$, preventing the double-increment defect.
-8. **Test 11.8 (Rejection Isolation on Post-Import Violation):** Inject post-import event with $L = 14$ (when expected is $13$). Assert receiver rejects with `INVALID_LOGICAL_TIMESTAMP` and verifies local clocks and vectors do not advance.
+1. **Test 11.1 (Peer Imports Snapshot and Authors First Event):** Peer D imports snapshot with frontier $\{A: 10, B: 5\}$ where $L(A, 10) = 12$ and $L(B, 5) = 8$ ($\text{maxLogicalTimestamp} = 12$). Peer D authors its first post-import event $D_1$.
+2. **Test 11.2 (First Post-Import Event Exact Equality Verification):** Assert $D_1.\text{causalContext} \equiv \{A: 10, B: 5\}$ and $D_1.\text{logicalTimestamp} === 13$ ($1 + \max(12, 8)$). Peer B receives $D_1$, resolves dependencies, calculates $\text{expectedTimestamp} = 13$, asserts $13 === 13$, and admits $D_1$.
+3. **Test 11.3 (Receiver Independent Validation via Snapshot Frontier):** Receiver validates $D_1$ using only its local history and imported frontier metadata, without contacting any snapshot author or external server.
+4. **Test 11.4 (Snapshot with Multiple Origins Having Distinct Frontier Timestamps):** Snapshot contains 4 origins with frontier timestamps $\{A_{20} \to 20, B_{15} \to 15, C_{40} \to 45, D_{30} \to 30\}$. Assert $\text{maxLogicalTimestamp} \equiv 45 \equiv \max_p \text{originFrontierTimestamps}[p]$. Peer E imports snapshot and authors $E_1$. Assert $E_1.\text{causalContext} \equiv \{A: 20, B: 15, C: 40, D: 30\}$ and $E_1.\text{logicalTimestamp} === 46$.
+5. **Test 11.5 (Global Maximum Non-Substitution Invariant):** Receiver processes concurrent event $X_1$ that depends solely on $\{B: 15\}$. Receiver queries `compactedCheckpoints.get("B:15")` and resolves $L(B, 15) = 15$. Assert receiver calculates expected timestamp $16$, and strictly avoids substituting $\text{maxLogicalTimestamp} = 45$ (which would have erroneously expected $46$ and rejected $X_1$).
+6. **Test 11.6 (Missing Pre-Compaction Checkpoint Recovery):** Peer emits event referencing sequence $s < W_{\text{stable}}[p] - 256$ (older than the retained checkpoint capacity). Checkpoint lookup fails. Assert receiver rejects with `REJECTED_OUTSIDE_HORIZON`, does not advance local clock, and transitions to `DEGRADED_OUT_OF_SYNC`.
+7. **Test 11.7 (Snapshot Import Followed by Sequential Events and Replication):** Following Test 11.1, Peer D authors sequential event $D_2$. Assert $D_2.\text{causalContext} \equiv \{A: 10, B: 5, D: 1\}$ and $D_2.\text{logicalTimestamp} === 14$ ($1 + \max(12, 8, 13)$). Receiver validates exact equality and advances replication vector to $\{A: 10, B: 5, D: 2\}$.
+8. **Test 11.8 (No Silent Reseeding Advancement / Double-Increment Prevention):** Assert that snapshot import sets $L_{\text{local}} = \text{maxLogicalTimestamp}$ directly (WITHOUT $+1$). Verify that an implementation adding $+1$ upon import would produce $L(D_1) = 14$, triggering `INVALID_LOGICAL_TIMESTAMP` rejection at receiver expecting $13$.
+9. **Test 11.9 (Invalid Post-Import Events Do Not Advance Clocks or Vectors):** Peer D artificially authors $D_1$ with $L = 14$ (inflated by $+1$). Receiver computes expected $13$, rejects $D_1$ with `INVALID_LOGICAL_TIMESTAMP`, and asserts its local Lamport clock ($L_{\text{local}}$) and replication vector remain completely untouched.
 
 ---
 
@@ -225,3 +263,4 @@ A room consists of active peers A and B. Safe compaction occurs at stable fronti
 | `docs/PHASE7_2_SIMULATION_TEST_STRATEGY.md` | Added dedicated Suite 11 covering snapshot import causal consistency and post-import event creation. | Updated |
 | `docs/PHASE7_2_FINAL_DESIGN_REVIEW.md` | AD-701, AD-708, and AD-709 updated with exact post-import causal consistency proofs. | Updated |
 | `docs/design/README.md` | Index updated to feature `PHASE7_2_R7_FINAL_CORRECTIONS.md`. | Updated |
+
