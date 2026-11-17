@@ -3,6 +3,7 @@
 **Milestone:** Phase 7.3-R5-H (Event Ordering & Conflict Engine — Final Transport Boundary Closure)  
 **Date:** 2026-11-17  
 **Baseline Commit:** `f4109fc` (`docs(reports): update commit hash in Phase 7.3-R5-G closure report`)  
+**Implementation Commit:** `e49b81a` (`e49b81a95923a2fbc62af05429ad80d07a09fde4`)  
 **Approved Architecture Baseline:** Phase 7.2-R9 (`1825de1`)  
 **Status:** Verification Complete — Phase 7.3 Frozen  
 
