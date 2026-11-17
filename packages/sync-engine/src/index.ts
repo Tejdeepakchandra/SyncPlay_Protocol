@@ -88,3 +88,7 @@ export type { IConflictResolver, ReducerContext } from './conflict/types.js';
 
 export { compareOperations } from './ordering/comparator.js';
 export type { OperationOrderingKey } from './ordering/comparator.js';
+
+// ── Phase 7.4 State Replication & Anti-Entropy Components ──────
+export * from './replication/index.js';
+

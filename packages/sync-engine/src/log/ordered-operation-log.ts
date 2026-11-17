@@ -125,6 +125,62 @@ export class OrderedOperationLog implements IOrderedOperationLog {
     }
   }
 
+  /**
+   * Retrieves the canonical SHA-256 fingerprint for an origin at a target sequence,
+   * or the highest sequence retained in the log / compacted checkpoints.
+   *
+   * Reuses the canonical computeOperationFingerprint() implementation.
+   */
+  public getTailFingerprint(originPeerId: string, atSequence?: number): string | undefined {
+    let targetSeq = atSequence;
+    if (targetSeq === undefined) {
+      for (let i = this.operations.length - 1; i >= 0; i--) {
+        const op = this.operations[i];
+        if (op && op.originPeerId === originPeerId) {
+          targetSeq = op.originSequenceNumber;
+          break;
+        }
+      }
+      if (targetSeq === undefined) {
+        const snapSeq = this.baseSnapshotFrontier[originPeerId];
+        if (snapSeq !== undefined && snapSeq > 0) {
+          targetSeq = snapSeq;
+        }
+      }
+    }
+
+    if (targetSeq === undefined || targetSeq <= 0) {
+      return undefined;
+    }
+
+    const op = this.getOperationAt(originPeerId, targetSeq);
+    if (op) {
+      return computeOperationFingerprint(op);
+    }
+
+    const checkpoint = this.getCompactedCheckpointRecord(originPeerId, targetSeq);
+    if (checkpoint?.fingerprint && checkpoint.fingerprint.length === 64) {
+      return checkpoint.fingerprint;
+    }
+
+    return undefined;
+  }
+
+  /**
+   * Returns a copy of the highest sequence numbers observed per origin across
+   * retained operations and compacted base snapshot frontiers.
+   */
+  public getReplicationFrontier(): Record<string, number> {
+    const frontier: Record<string, number> = { ...this.baseSnapshotFrontier };
+    for (const op of this.operations) {
+      const current = frontier[op.originPeerId] ?? 0;
+      if (op.originSequenceNumber > current) {
+        frontier[op.originPeerId] = op.originSequenceNumber;
+      }
+    }
+    return frontier;
+  }
+
   public getRange(
     originPeerId: string,
     fromSeq: number,

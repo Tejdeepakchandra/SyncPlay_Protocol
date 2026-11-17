@@ -81,6 +81,12 @@ export interface IOrderedOperationLog {
     sequenceNumber: number,
   ): CompactedCheckpointRecord | undefined;
 
+  /** Retrieves tail fingerprint for an origin at an optional target sequence. */
+  getTailFingerprint?(originPeerId: string, atSequence?: number): string | undefined;
+
+  /** Gets the replication frontier of highest sequences per origin. */
+  getReplicationFrontier?(): Record<string, number>;
+
   /** Sets compacted checkpoint with timestamp, optional logical event id, and optional fingerprint. */
   setCompactedCheckpoint?(
     originPeerId: string,

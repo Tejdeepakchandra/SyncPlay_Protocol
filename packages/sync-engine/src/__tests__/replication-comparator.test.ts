@@ -1,0 +1,348 @@
+import { describe, it, expect } from 'vitest';
+import type { StateDigestPayload } from '@syncplay/protocol';
+import { compareDigests } from '../replication/replication-comparator.js';
+import { computeOperationFingerprint } from '../log/operation-fingerprint.js';
+
+function makeDigest(overrides: Partial<StateDigestPayload> = {}): StateDigestPayload {
+  return {
+    formatVersion: 2,
+    sessionId: 'session-test-room',
+    senderPeerId: 'peer-local',
+    connectionGeneration: 1,
+    membershipEpoch: 1,
+    stateVersion: 10,
+    replicationVector: {},
+    snapshotFrontier: {},
+    historyFingerprints: {},
+    sentAt: 1000,
+    ...overrides,
+  };
+}
+
+const sampleFp1 = computeOperationFingerprint({
+  originPeerId: 'peer-A',
+  originSequenceNumber: 5,
+  logicalEventId: 'evt-1',
+  logicalTimestamp: 10,
+  causalContext: {},
+  messageType: 'PLAY',
+  payload: { positionMs: 5000 },
+  membershipEpoch: 1,
+});
+
+const sampleFp2 = computeOperationFingerprint({
+  originPeerId: 'peer-A',
+  originSequenceNumber: 5,
+  logicalEventId: 'evt-2-divergent',
+  logicalTimestamp: 10,
+  causalContext: {},
+  messageType: 'PLAY',
+  payload: { positionMs: 6000 },
+  membershipEpoch: 1,
+});
+
+const sampleFpB = computeOperationFingerprint({
+  originPeerId: 'peer-B',
+  originSequenceNumber: 3,
+  logicalEventId: 'evt-b',
+  logicalTimestamp: 12,
+  causalContext: { 'peer-A': 5 },
+  messageType: 'PAUSE',
+  payload: {},
+  membershipEpoch: 1,
+});
+
+describe('ReplicationComparator', () => {
+  describe('Preconditions and Session/Epoch validation', () => {
+    it('returns INCONCLUSIVE when session IDs do not match', () => {
+      const local = makeDigest({ sessionId: 'session-alpha' });
+      const remote = makeDigest({ sessionId: 'session-beta', senderPeerId: 'peer-remote' });
+
+      const result = compareDigests(local, remote);
+      expect(result.classification).toBe('INCONCLUSIVE');
+      expect(result.remotePeerId).toBe('peer-remote');
+      expect(result.missingFromLocal).toEqual([]);
+      expect(result.missingFromRemote).toEqual([]);
+      expect(result.diagnosticReasons?.[0]).toContain('Session mismatch');
+    });
+
+    it('returns INCONCLUSIVE when membership epochs do not match', () => {
+      const local = makeDigest({ membershipEpoch: 1 });
+      const remote = makeDigest({ membershipEpoch: 2, senderPeerId: 'peer-remote' });
+
+      const result = compareDigests(local, remote);
+      expect(result.classification).toBe('INCONCLUSIVE');
+      expect(result.diagnosticReasons?.[0]).toContain('Epoch mismatch');
+    });
+  });
+
+  describe('Identical Digests', () => {
+    it('classifies empty replication vectors as IDENTICAL', () => {
+      const local = makeDigest();
+      const remote = makeDigest({ senderPeerId: 'peer-remote' });
+
+      const result = compareDigests(local, remote);
+      expect(result.classification).toBe('IDENTICAL');
+      expect(result.forkDetected).toBe(false);
+      expect(result.missingFromLocal).toEqual([]);
+      expect(result.missingFromRemote).toEqual([]);
+      expect(result.conflictingOrigins).toEqual([]);
+      expect(result.outsideLocalHorizon).toBe(false);
+      expect(result.outsideRemoteHorizon).toBe(false);
+    });
+
+    it('classifies matching non-empty vectors with matching fingerprints as IDENTICAL', () => {
+      const local = makeDigest({
+        replicationVector: { 'peer-A': 5, 'peer-B': 3 },
+        historyFingerprints: { 'peer-A': sampleFp1, 'peer-B': sampleFpB },
+      });
+      const remote = makeDigest({
+        senderPeerId: 'peer-remote',
+        replicationVector: { 'peer-A': 5, 'peer-B': 3 },
+        historyFingerprints: { 'peer-A': sampleFp1, 'peer-B': sampleFpB },
+      });
+
+      const result = compareDigests(local, remote);
+      expect(result.classification).toBe('IDENTICAL');
+      expect(result.forkDetected).toBe(false);
+      expect(result.missingFromLocal).toHaveLength(0);
+      expect(result.missingFromRemote).toHaveLength(0);
+      expect(result.originDetails.every((d) => d.status === 'IDENTICAL')).toBe(true);
+    });
+  });
+
+  describe('Domination and Lag (Missing Sequences)', () => {
+    it('detects local ahead (LOCAL_DOMINATES) when local has higher sequence', () => {
+      const local = makeDigest({
+        replicationVector: { 'peer-A': 5 },
+        historyFingerprints: { 'peer-A': sampleFp1 },
+      });
+      const remote = makeDigest({
+        senderPeerId: 'peer-remote',
+        replicationVector: { 'peer-A': 2 },
+      });
+
+      const result = compareDigests(local, remote);
+      expect(result.classification).toBe('LOCAL_DOMINATES');
+      expect(result.missingFromLocal).toHaveLength(0);
+      expect(result.missingFromRemote).toHaveLength(1);
+      expect(result.missingFromRemote[0]).toEqual({
+        originPeerId: 'peer-A',
+        fromSequence: 3,
+        toSequence: 5,
+      });
+    });
+
+    it('detects remote ahead (REMOTE_DOMINATES) when remote has higher sequence within horizon', () => {
+      const local = makeDigest({
+        replicationVector: { 'peer-A': 2 },
+      });
+      const remote = makeDigest({
+        senderPeerId: 'peer-remote',
+        replicationVector: { 'peer-A': 7 },
+        snapshotFrontier: { 'peer-A': 0 },
+        historyFingerprints: { 'peer-A': sampleFp1 },
+      });
+
+      const result = compareDigests(local, remote);
+      expect(result.classification).toBe('REMOTE_DOMINATES');
+      expect(result.missingFromLocal).toHaveLength(1);
+      expect(result.missingFromLocal[0]).toEqual({
+        originPeerId: 'peer-A',
+        fromSequence: 3,
+        toSequence: 7,
+      });
+      expect(result.missingFromRemote).toHaveLength(0);
+      expect(result.outsideRemoteHorizon).toBe(false);
+    });
+
+    it('detects origin present only on local side (LOCAL_ONLY)', () => {
+      const local = makeDigest({
+        replicationVector: { 'peer-A': 4 },
+        historyFingerprints: { 'peer-A': sampleFp1 },
+      });
+      const remote = makeDigest({
+        senderPeerId: 'peer-remote',
+        replicationVector: {},
+      });
+
+      const result = compareDigests(local, remote);
+      expect(result.classification).toBe('LOCAL_DOMINATES');
+      expect(result.missingFromRemote).toEqual([
+        { originPeerId: 'peer-A', fromSequence: 1, toSequence: 4 },
+      ]);
+    });
+
+    it('detects origin present only on remote side (REMOTE_ONLY)', () => {
+      const local = makeDigest();
+      const remote = makeDigest({
+        senderPeerId: 'peer-remote',
+        replicationVector: { 'peer-B': 3 },
+        snapshotFrontier: { 'peer-B': 0 },
+        historyFingerprints: { 'peer-B': sampleFpB },
+      });
+
+      const result = compareDigests(local, remote);
+      expect(result.classification).toBe('REMOTE_DOMINATES');
+      expect(result.missingFromLocal).toEqual([
+        { originPeerId: 'peer-B', fromSequence: 1, toSequence: 3 },
+      ]);
+    });
+
+    it('detects concurrent incomparable progress across multiple origins', () => {
+      const local = makeDigest({
+        replicationVector: { 'peer-A': 5, 'peer-B': 2 },
+        historyFingerprints: { 'peer-A': sampleFp1 },
+      });
+      const remote = makeDigest({
+        senderPeerId: 'peer-remote',
+        replicationVector: { 'peer-A': 3, 'peer-B': 6 },
+        historyFingerprints: { 'peer-B': sampleFpB },
+      });
+
+      const result = compareDigests(local, remote);
+      expect(result.classification).toBe('CONCURRENT_INCOMPARABLE');
+      expect(result.missingFromLocal).toEqual([
+        { originPeerId: 'peer-B', fromSequence: 3, toSequence: 6 },
+      ]);
+      expect(result.missingFromRemote).toEqual([
+        { originPeerId: 'peer-A', fromSequence: 4, toSequence: 5 },
+      ]);
+      expect(result.forkDetected).toBe(false);
+    });
+  });
+
+  describe('Fingerprint Conflicts and Fork Detection', () => {
+    it('detects sequence collision/fork when vectors match but tail fingerprints differ', () => {
+      const local = makeDigest({
+        replicationVector: { 'peer-A': 5 },
+        historyFingerprints: { 'peer-A': sampleFp1 },
+      });
+      const remote = makeDigest({
+        senderPeerId: 'peer-remote',
+        replicationVector: { 'peer-A': 5 },
+        historyFingerprints: { 'peer-A': sampleFp2 }, // divergent SHA-256 for same origin:seq
+      });
+
+      const result = compareDigests(local, remote);
+      expect(result.classification).toBe('DIVERGENT_FORK');
+      expect(result.forkDetected).toBe(true);
+      expect(result.conflictingOrigins).toContain('peer-A');
+      expect(result.missingFromLocal).toHaveLength(0);
+      expect(result.missingFromRemote).toHaveLength(0);
+
+      const detail = result.originDetails.find((d) => d.originPeerId === 'peer-A');
+      expect(detail?.status).toBe('CONFLICT_FORK');
+      expect(detail?.reason).toContain('Fingerprint mismatch');
+    });
+
+    it('flags unprovable equality when equal sequence has no tail fingerprint', () => {
+      const local = makeDigest({
+        replicationVector: { 'peer-A': 5 },
+        // No fingerprint
+      });
+      const remote = makeDigest({
+        senderPeerId: 'peer-remote',
+        replicationVector: { 'peer-A': 5 },
+        historyFingerprints: { 'peer-A': sampleFp1 },
+      });
+
+      const result = compareDigests(local, remote);
+      expect(result.classification).toBe('INCONCLUSIVE');
+      expect(result.forkDetected).toBe(false);
+      expect(result.unprovableOrigins).toContain('peer-A');
+
+      const detail = result.originDetails.find((d) => d.originPeerId === 'peer-A');
+      expect(detail?.status).toBe('HISTORICAL_EQUALITY_UNPROVABLE');
+    });
+  });
+
+  describe('Compacted History and Snapshot Horizon Detection', () => {
+    it('flags REQUIRES_SNAPSHOT_RECOVERY when remote has compacted needed sequence into snapshot', () => {
+      const local = makeDigest({
+        replicationVector: { 'peer-A': 2 }, // needs 3..10
+      });
+      const remote = makeDigest({
+        senderPeerId: 'peer-remote',
+        replicationVector: { 'peer-A': 10 },
+        snapshotFrontier: { 'peer-A': 5 }, // sequences 1..5 compacted
+      });
+
+      const result = compareDigests(local, remote);
+      expect(result.classification).toBe('REQUIRES_SNAPSHOT_RECOVERY');
+      expect(result.outsideRemoteHorizon).toBe(true);
+      expect(result.requiresSnapshotRecovery).toBe(true);
+      // Because remote compacted seq 3, remote log cannot serve [3..10]
+      expect(result.missingFromLocal).toHaveLength(0);
+
+      const detail = result.originDetails.find((d) => d.originPeerId === 'peer-A');
+      expect(detail?.status).toBe('OUTSIDE_REMOTE_HORIZON');
+      expect(detail?.reason).toContain('Remote compacted needed sequence range');
+    });
+
+    it('flags outsideLocalHorizon when remote needs sequence that local has already compacted', () => {
+      const local = makeDigest({
+        replicationVector: { 'peer-A': 10 },
+        snapshotFrontier: { 'peer-A': 6 }, // local compacted 1..6
+      });
+      const remote = makeDigest({
+        senderPeerId: 'peer-remote',
+        replicationVector: { 'peer-A': 3 }, // remote needs 4..10
+      });
+
+      const result = compareDigests(local, remote);
+      expect(result.outsideLocalHorizon).toBe(true);
+      expect(result.missingFromRemote).toHaveLength(0);
+
+      const detail = result.originDetails.find((d) => d.originPeerId === 'peer-A');
+      expect(detail?.status).toBe('OUTSIDE_LOCAL_HORIZON');
+      expect(detail?.reason).toContain('Local compacted needed sequence range');
+    });
+  });
+
+  describe('Determinism & Immutability', () => {
+    it('guarantees identical output regardless of object key insertion order', () => {
+      const digest1 = makeDigest({
+        replicationVector: { 'peer-Z': 1, 'peer-A': 2, 'peer-M': 3 },
+      });
+      const digest2 = makeDigest({
+        senderPeerId: 'peer-remote',
+        replicationVector: { 'peer-A': 2, 'peer-M': 4, 'peer-Z': 1 },
+      });
+
+      // Forward comparison
+      const resForward = compareDigests(digest1, digest2);
+
+      // Same data constructed with reversed key insertion order
+      const digest1Reversed = makeDigest({
+        replicationVector: { 'peer-M': 3, 'peer-Z': 1, 'peer-A': 2 },
+      });
+      const digest2Reversed = makeDigest({
+        senderPeerId: 'peer-remote',
+        replicationVector: { 'peer-Z': 1, 'peer-M': 4, 'peer-A': 2 },
+      });
+
+      const resReversed = compareDigests(digest1Reversed, digest2Reversed);
+
+      expect(resForward.classification).toBe(resReversed.classification);
+      expect(resForward.missingFromLocal).toEqual(resReversed.missingFromLocal);
+      expect(resForward.missingFromRemote).toEqual(resReversed.missingFromRemote);
+      expect(resForward.originDetails).toEqual(resReversed.originDetails);
+      // Check alphabetical ordering
+      expect(resForward.originDetails.map((d) => d.originPeerId)).toEqual(['peer-A', 'peer-M', 'peer-Z']);
+    });
+
+    it('returns deeply frozen immutable comparison structures', () => {
+      const local = makeDigest({ replicationVector: { 'peer-A': 5 } });
+      const remote = makeDigest({ senderPeerId: 'peer-remote', replicationVector: { 'peer-A': 8 } });
+
+      const result = compareDigests(local, remote);
+      expect(Object.isFrozen(result)).toBe(true);
+      expect(Object.isFrozen(result.missingFromLocal)).toBe(true);
+      expect(Object.isFrozen(result.originDetails)).toBe(true);
+      if (result.originDetails[0]) {
+        expect(Object.isFrozen(result.originDetails[0])).toBe(true);
+      }
+    });
+  });
+});

@@ -36,7 +36,14 @@ import { ConflictResolver } from '../conflict/conflict-resolver.js';
 import { computeOperationFingerprint } from '../log/operation-fingerprint.js';
 import type { StoredOperation } from '../log/types.js';
 import type { ReducerContext } from '../conflict/types.js';
-import type { OperationBatchPayload, StateSnapshotPayloadV2 } from '@syncplay/protocol';
+import {
+  type OperationBatchPayload,
+  type StateSnapshotPayloadV2,
+  type StateDigestPayload,
+  StateDigestPayloadSchema,
+} from '@syncplay/protocol';
+import { compareDigests } from '../replication/replication-comparator.js';
+import type { DigestComparisonResult } from '../replication/types.js';
 
 interface MutableStats {
   eventsReceivedCount: number;
@@ -1473,6 +1480,141 @@ export class LeaderlessSyncEngine implements SyncEngine {
     }
 
     return decision;
+  }
+
+  /**
+   * Generates a consistent point-in-time StateDigestPayload snapshot for broadcasting.
+   * Conforms to Phase 7.4 multi-vector formatVersion 2.
+   */
+  public createLocalDigest(sentAtOverride?: number): StateDigestPayload {
+    if (this.disposed) {
+      throw new SyncEngineError('DISPOSED', 'Cannot create digest from disposed engine');
+    }
+
+    // 1. Consistent snapshot read
+    const replicationVector: Record<string, number> = { ...this.replicationVector };
+    const snapshotFrontier: Record<string, number> = {
+      ...(this.operationLog.getBaseSnapshotFrontier
+        ? this.operationLog.getBaseSnapshotFrontier()
+        : {}),
+    };
+
+    // 2. Extract tail fingerprints for all origins with sequence > 0
+    const historyFingerprints: Record<string, string> = {};
+    for (const [origin, seq] of Object.entries(replicationVector)) {
+      if (seq > 0) {
+        const fp = this.operationLog.getTailFingerprint?.(origin, seq);
+        if (fp && fp.length === 64) {
+          historyFingerprints[origin] = fp;
+        }
+      }
+    }
+
+    const payload: StateDigestPayload = {
+      formatVersion: 2,
+      sessionId: this.config.sessionId,
+      senderPeerId: this.config.localPeerId,
+      connectionGeneration: this.peerGenerations.get(this.config.localPeerId) ?? 1,
+      membershipEpoch: this.currentEpoch,
+      stateVersion: this.state.stateVersion,
+      replicationVector,
+      snapshotFrontier,
+      historyFingerprints,
+      sentAt: sentAtOverride ?? this.clock.now(),
+    };
+
+    // 3. Schema validation to guarantee structural invariants
+    return StateDigestPayloadSchema.parse(payload);
+  }
+
+  /**
+   * Evaluates an incoming remote digest against local replication knowledge.
+   * Handles format version discrimination, schema validation, and pure comparison.
+   */
+  public compareRemoteDigest(remoteDigest: unknown): DigestComparisonResult {
+    if (this.disposed) {
+      throw new SyncEngineError('DISPOSED', 'Cannot compare digest on disposed engine');
+    }
+
+    const senderPeerId =
+      typeof remoteDigest === 'object' &&
+      remoteDigest !== null &&
+      typeof (remoteDigest as any).senderPeerId === 'string'
+        ? (remoteDigest as any).senderPeerId
+        : 'unknown';
+
+    // 1. Legacy format discrimination (Phase 2 legacy digests lacking formatVersion or formatVersion !== 2)
+    if (
+      typeof remoteDigest !== 'object' ||
+      remoteDigest === null ||
+      (remoteDigest as any).formatVersion === undefined ||
+      'digestId' in remoteDigest
+    ) {
+      return Object.freeze({
+        remotePeerId: senderPeerId,
+        missingFromLocal: Object.freeze([]),
+        missingFromRemote: Object.freeze([]),
+        forkDetected: false,
+        conflictingOrigins: Object.freeze([]),
+        outsideLocalHorizon: false,
+        classification: 'INCONCLUSIVE',
+        outsideRemoteHorizon: false,
+        requiresSnapshotRecovery: false,
+        unprovableOrigins: Object.freeze([]),
+        originDetails: Object.freeze([]),
+        diagnosticReasons: Object.freeze([
+          'Ignoring legacy Phase 2 state digest: incompatible format',
+        ]),
+      });
+    }
+
+    // 2. Future version discrimination (formatVersion > 2)
+    if (
+      typeof (remoteDigest as any).formatVersion === 'number' &&
+      (remoteDigest as any).formatVersion > 2
+    ) {
+      return Object.freeze({
+        remotePeerId: senderPeerId,
+        missingFromLocal: Object.freeze([]),
+        missingFromRemote: Object.freeze([]),
+        forkDetected: false,
+        conflictingOrigins: Object.freeze([]),
+        outsideLocalHorizon: false,
+        classification: 'INCONCLUSIVE',
+        outsideRemoteHorizon: false,
+        requiresSnapshotRecovery: false,
+        unprovableOrigins: Object.freeze([]),
+        originDetails: Object.freeze([]),
+        diagnosticReasons: Object.freeze([
+          `Unsupported future protocol format version: ${(remoteDigest as any).formatVersion}`,
+        ]),
+      });
+    }
+
+    // 3. Strict schema validation
+    const parsed = StateDigestPayloadSchema.safeParse(remoteDigest);
+    if (!parsed.success) {
+      return Object.freeze({
+        remotePeerId: senderPeerId,
+        missingFromLocal: Object.freeze([]),
+        missingFromRemote: Object.freeze([]),
+        forkDetected: false,
+        conflictingOrigins: Object.freeze([]),
+        outsideLocalHorizon: false,
+        classification: 'INCONCLUSIVE',
+        outsideRemoteHorizon: false,
+        requiresSnapshotRecovery: false,
+        unprovableOrigins: Object.freeze([]),
+        originDetails: Object.freeze([]),
+        diagnosticReasons: Object.freeze(
+          parsed.error.issues.map((e) => `${e.path.join('.')}: ${e.message}`),
+        ),
+      });
+    }
+
+    // 4. Pure deterministic comparison
+    const localDigest = this.createLocalDigest();
+    return compareDigests(localDigest, parsed.data);
   }
 
   public dispose(): void {
