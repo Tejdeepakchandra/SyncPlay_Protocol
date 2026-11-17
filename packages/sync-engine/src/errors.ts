@@ -4,6 +4,7 @@
 
 export type SyncEngineErrorCode =
   | 'DISPOSED'
+  | 'UNAUTHORIZED'
   | 'INVALID_ARGUMENT'
   | 'INVALID_PAYLOAD'
   | 'CLOCK_ERROR'

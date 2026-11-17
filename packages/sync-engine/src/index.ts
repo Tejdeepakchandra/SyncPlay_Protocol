@@ -49,7 +49,10 @@ export type { EngineSnapshotData, ValidatedSnapshotResult } from './snapshot.js'
 // ── Implementation ───────────────────────────────────────────
 export { BaselineSyncEngine } from './baseline-sync-engine.js';
 export { LeaderlessSyncEngine } from './engine/leaderless-sync-engine.js';
-export type { LeaderlessSyncEngineConfig } from './engine/leaderless-sync-engine.js';
+export type {
+  LeaderlessSyncEngineConfig,
+  EpochTransitionCapability,
+} from './engine/leaderless-sync-engine.js';
 
 // ── Phase 7 Distributed Ordering & Conflict Components ───────
 export { LogicalClockManager } from './clock/logical-clock-manager.js';

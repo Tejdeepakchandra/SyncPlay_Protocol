@@ -562,20 +562,23 @@ describe('Phase 7.3-R3 Final Identity & Authorization Audit', () => {
   describe('Task 3: Explicit Epoch Transition Semantics', () => {
     it('valid authorized epoch transition advances currentEpoch', () => {
       expect(engine.epoch).toBe(1);
-      engine.transitionEpoch(2);
+      const auth = engine.getEpochTransitionCapability();
+      engine.transitionEpoch(2, auth);
       expect(engine.epoch).toBe(2);
     });
 
     it('unauthorized transition with non-integer or smaller/equal epoch throws INVALID_ARGUMENT', () => {
-      expect(() => engine.transitionEpoch(1)).toThrow(SyncEngineError);
-      expect(() => engine.transitionEpoch(0)).toThrow(SyncEngineError);
-      expect(() => engine.transitionEpoch(-1)).toThrow(SyncEngineError);
-      expect(() => engine.transitionEpoch(2.5 as any)).toThrow(SyncEngineError);
-      expect(() => engine.transitionEpoch('2' as any)).toThrow(SyncEngineError);
+      const auth = engine.getEpochTransitionCapability();
+      expect(() => engine.transitionEpoch(1, auth)).toThrow(SyncEngineError);
+      expect(() => engine.transitionEpoch(0, auth)).toThrow(SyncEngineError);
+      expect(() => engine.transitionEpoch(-1, auth)).toThrow(SyncEngineError);
+      expect(() => engine.transitionEpoch(2.5 as any, auth)).toThrow(SyncEngineError);
+      expect(() => engine.transitionEpoch('2' as any, auth)).toThrow(SyncEngineError);
     });
 
     it('old-epoch events arriving after transition are rejected with REJECTED_OBSOLETE_EPOCH', () => {
-      engine.transitionEpoch(2);
+      const auth = engine.getEpochTransitionCapability();
+      engine.transitionEpoch(2, auth);
 
       const oldEpochEvent = makeRemoteEvent('ev-old', 'peer-A', 'PLAY', {}, 1, 1, {}, 1);
       engine.receive(oldEpochEvent);
@@ -603,7 +606,8 @@ describe('Phase 7.3-R3 Final Identity & Authorization Audit', () => {
       expect(engine.pendingQueueSize).toBe(1);
 
       // 2. Authoritative epoch transition to epoch 2 occurs
-      engine.transitionEpoch(2);
+      const auth = engine.getEpochTransitionCapability();
+      engine.transitionEpoch(2, auth);
 
       // 3. Crucial: The old-epoch operation MUST be purged from the pending queue
       expect(engine.pendingQueueSize).toBe(0);
@@ -623,7 +627,8 @@ describe('Phase 7.3-R3 Final Identity & Authorization Audit', () => {
       const versionBefore = engine.getState().stateVersion;
 
       // Transition epoch
-      engine.transitionEpoch(2);
+      const auth = engine.getEpochTransitionCapability();
+      engine.transitionEpoch(2, auth);
 
       // State is preserved
       expect(engine.getState().status).toBe('playing');

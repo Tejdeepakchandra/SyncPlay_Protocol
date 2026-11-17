@@ -10,54 +10,96 @@
 
 /**
  * Serializes any JavaScript value into a deterministic RFC 8785 canonical JSON string.
- * - Object keys are sorted lexicographically by UTF-16 code units.
- * - Number formatting handles -0 as 0 and non-finite numbers as null.
- * - Arrays preserve order and canonicalize elements recursively.
+ *
+ * Conforms strictly to RFC 8785 (JSON Canonicalization Scheme):
+ * - Input values must be valid JSON data (RFC 8259).
+ * - Rejects non-finite numbers (NaN, Infinity, -Infinity).
+ * - Rejects undefined (at top-level, in objects, or in arrays).
+ * - Rejects functions, symbols, BigInt, and cyclic object references.
+ * - Rejects unsupported object instances (Map, Set, Date, RegExp, etc.).
+ * - Canonicalizes -0 to 0.
+ * - Serializes numbers using IEEE 754 canonical representation.
+ * - Sorts object keys lexicographically by UTF-16 code units.
+ * - Preserves deterministic nested object and array serialization.
  */
-export function canonicalizeJson(value: unknown): string {
-  if (value === null || typeof value !== 'object') {
-    if (typeof value === 'number') {
-      if (!Number.isFinite(value)) {
-        return 'null';
-      }
-      if (Object.is(value, -0)) {
-        return '0';
-      }
-      return JSON.stringify(value);
-    }
-    if (typeof value === 'boolean') {
-      return value ? 'true' : 'false';
-    }
-    if (typeof value === 'string') {
-      return JSON.stringify(value);
-    }
-    // undefined, function, symbol outside of object/array
+export function canonicalizeJson(value: unknown, seen: Set<object> = new Set()): string {
+  if (value === undefined) {
+    throw new TypeError('Cannot canonicalize invalid JSON value: undefined');
+  }
+  if (typeof value === 'function') {
+    throw new TypeError('Cannot canonicalize unsupported type: function');
+  }
+  if (typeof value === 'symbol') {
+    throw new TypeError('Cannot canonicalize unsupported type: symbol');
+  }
+  if (typeof value === 'bigint') {
+    throw new TypeError('Cannot canonicalize unsupported type: bigint');
+  }
+  if (value === null) {
     return 'null';
   }
-
-  if (Array.isArray(value)) {
-    const items = value.map((item) => {
-      if (item === undefined || typeof item === 'function' || typeof item === 'symbol') {
-        return 'null';
-      }
-      return canonicalizeJson(item);
-    });
-    return `[${items.join(',')}]`;
+  if (typeof value === 'boolean') {
+    return value ? 'true' : 'false';
   }
-
-  // Plain object: sort keys lexicographically
-  const obj = value as Record<string, unknown>;
-  const keys = Object.keys(obj).sort();
-  const entries: string[] = [];
-
-  for (const key of keys) {
-    const val = obj[key];
-    if (val !== undefined && typeof val !== 'function' && typeof val !== 'symbol') {
-      entries.push(`${JSON.stringify(key)}:${canonicalizeJson(val)}`);
+  if (typeof value === 'number') {
+    if (!Number.isFinite(value)) {
+      throw new TypeError(`Cannot canonicalize non-finite number: ${value}`);
     }
+    if (Object.is(value, -0)) {
+      return '0';
+    }
+    return JSON.stringify(value);
+  }
+  if (typeof value === 'string') {
+    return JSON.stringify(value);
   }
 
-  return `{${entries.join(',')}}`;
+  // Object or Array
+  if (typeof value !== 'object') {
+    throw new TypeError(`Cannot canonicalize unsupported type: ${typeof value}`);
+  }
+
+  if (seen.has(value)) {
+    throw new TypeError('Cannot canonicalize cyclic object reference');
+  }
+
+  seen.add(value);
+  try {
+    if (Array.isArray(value)) {
+      const items: string[] = [];
+      for (let i = 0; i < value.length; i++) {
+        const item = value[i];
+        if (item === undefined) {
+          throw new TypeError(`Cannot canonicalize invalid JSON array element at index ${i}: undefined`);
+        }
+        items.push(canonicalizeJson(item, seen));
+      }
+      return `[${items.join(',')}]`;
+    }
+
+    // Check plain object: prototype must be Object.prototype or null
+    const proto = Object.getPrototypeOf(value);
+    if (proto !== null && proto !== Object.prototype) {
+      const typeName = (value as any).constructor?.name ?? 'CustomObject';
+      throw new TypeError(`Cannot canonicalize unsupported object type: ${typeName}`);
+    }
+
+    const obj = value as Record<string, unknown>;
+    const keys = Object.keys(obj).sort();
+    const entries: string[] = [];
+
+    for (const key of keys) {
+      const val = obj[key];
+      if (val === undefined) {
+        throw new TypeError(`Cannot canonicalize invalid JSON property "${key}": undefined`);
+      }
+      entries.push(`${JSON.stringify(key)}:${canonicalizeJson(val, seen)}`);
+    }
+
+    return `{${entries.join(',')}}`;
+  } finally {
+    seen.delete(value);
+  }
 }
 
 /**
