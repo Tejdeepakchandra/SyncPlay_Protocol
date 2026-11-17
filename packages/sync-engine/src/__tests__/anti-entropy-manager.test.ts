@@ -550,11 +550,14 @@ describe('AntiEntropyManager & Digest Engine Integration', () => {
       manager.dispose();
     });
 
-    it('strictly preserves M3/M4 separation by throwing on unimplemented repair methods', () => {
+    it('strictly preserves M4 separation by throwing on unimplemented serveRepairRequest', () => {
       const callbacks: AntiEntropyCallbacks = { onBroadcastDigest: vi.fn() };
       const manager = new AntiEntropyManager(engine, callbacks, {}, fakeClock);
 
-      expect(() => manager.reconcileGaps()).toThrowError(/Phase 7\.4 M3/);
+      // reconcileGaps() is now implemented in M3 (requester-side pipeline)
+      expect(() => manager.reconcileGaps()).not.toThrow();
+
+      // serveRepairRequest() remains strictly deferred to Phase 7.4 M4
       expect(() =>
         manager.serveRepairRequest({
           requestId: 'e1074a9a-f4ef-4b9e-b2d3-18ef557163ef',

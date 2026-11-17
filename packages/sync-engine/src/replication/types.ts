@@ -12,8 +12,9 @@ import type {
   OperationBatchPayload,
   RepairRejectedPayload,
 } from '@syncplay/protocol';
-import type { Clock } from '../types.js';
+import type { Clock, EngineDecision } from '../types.js';
 import type { MissingSequenceRange } from '../log/pending-dependency-queue.js';
+import type { AuthenticatedSupplierContext } from '../engine/leaderless-sync-engine.js';
 
 export type { MissingSequenceRange };
 
@@ -178,6 +179,69 @@ export interface SchedulerClock extends Clock {
 }
 
 /**
+ * In-flight unicast repair request record tracked by the requester-side pipeline.
+ */
+export interface InFlightRepairRequest {
+  readonly requestId: string;
+  readonly supplierPeerId: string;
+  readonly originPeerId: string;
+  readonly fromSequence: number;
+  readonly toSequence: number;
+  readonly membershipEpoch: number;
+  readonly sentAtMonotonic: number;
+  readonly timerId: unknown;
+  retryCount: number;
+  readonly attemptedSuppliers: Set<string>;
+}
+
+/**
+ * Peer replication knowledge tracked from incoming StateDigestPayloads.
+ */
+export interface PeerReplicationKnowledge {
+  readonly peerId: string;
+  readonly generation: number;
+  readonly epoch: number;
+  readonly replicationVector: Record<string, number>;
+  readonly snapshotFrontier: Record<string, number>;
+  readonly lastObservedAt: number;
+}
+
+/**
+ * Diagnostic and telemetry status of the repair request pipeline.
+ */
+export interface RepairPipelineStatus {
+  readonly activeRequestsCount: number;
+  readonly pendingGapsCount: number;
+  readonly totalRepairsCompleted: number;
+  readonly totalRepairsFailed: number;
+  readonly degraded: boolean;
+  readonly degradedReason?: string;
+}
+
+/**
+ * Configuration options for the repair request pipeline.
+ */
+export interface RepairPipelineOptions {
+  /** Unicast repair request timeout in milliseconds before retry/failover (default: 1500ms). */
+  readonly repairRequestTimeoutMs?: number;
+
+  /** Maximum retries per missing range before marking history exhausted (default: 3). */
+  readonly maxRetries?: number;
+
+  /** Base interval for exponential backoff in milliseconds (default: 1000ms). */
+  readonly backoffBaseMs?: number;
+
+  /** Maximum concurrent in-flight requests per supplier peer (default: 2). */
+  readonly maxConcurrentRequestsPerPeer?: number;
+
+  /** Maximum concurrent in-flight requests room-wide (default: 16). */
+  readonly maxConcurrentRequestsTotal?: number;
+
+  /** Optional RTT provider returning smoothed RTT in milliseconds for supplier ranking. */
+  readonly rttProvider?: (peerId: string) => number | undefined;
+}
+
+/**
  * Configuration options for the anti-entropy digest scheduler.
  */
 export interface AntiEntropySchedulerOptions {
@@ -234,6 +298,15 @@ export interface IAntiEntropyManager {
 
   /** Serves an inbound REPAIR_REQUEST from local log history (M4). */
   serveRepairRequest(request: RepairRequestPayload): OperationBatchPayload | RepairRejectedPayload;
+
+  /** Processes an inbound OPERATION_BATCH fulfilling an active repair request (M3). */
+  handleRepairBatch(
+    batch: OperationBatchPayload,
+    context?: AuthenticatedSupplierContext,
+  ): EngineDecision[];
+
+  /** Processes an inbound REPAIR_REJECTED response handling failover/backoff (M3). */
+  handleRepairRejected(rejection: RepairRejectedPayload): void;
 
   /** Schedules targeted repair requests for all currently detected sequence gaps (M3). */
   reconcileGaps(): void;

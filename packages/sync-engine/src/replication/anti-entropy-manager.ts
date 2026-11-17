@@ -24,16 +24,19 @@ import type {
   OperationBatchPayload,
   RepairRejectedPayload,
 } from '@syncplay/protocol';
-import type { LeaderlessSyncEngine } from '../engine/leaderless-sync-engine.js';
+import type { LeaderlessSyncEngine, AuthenticatedSupplierContext } from '../engine/leaderless-sync-engine.js';
+import type { EngineDecision } from '../types.js';
 import { SyncEngineError } from '../errors.js';
 import type {
   IAntiEntropyManager,
   AntiEntropyStatus,
   AntiEntropyCallbacks,
   AntiEntropySchedulerOptions,
+  RepairPipelineOptions,
   SchedulerClock,
   DigestComparisonResult,
 } from './types.js';
+import { RepairRequestPipeline } from './repair-request-pipeline.js';
 
 export const DEFAULT_PERIODIC_INTERVAL_MS = 5000;
 export const DEFAULT_JITTER_MS = 1000;
@@ -53,6 +56,7 @@ export class AntiEntropyManager implements IAntiEntropyManager {
   private readonly engine: LeaderlessSyncEngine;
   private readonly callbacks: AntiEntropyCallbacks;
   private readonly clock: SchedulerClock;
+  private readonly pipeline: RepairRequestPipeline;
   private readonly periodicIntervalMs: number;
   private readonly jitterMs: number;
   private readonly rateLimitMinIntervalMs: number;
@@ -71,12 +75,13 @@ export class AntiEntropyManager implements IAntiEntropyManager {
   constructor(
     engine: LeaderlessSyncEngine,
     callbacks: AntiEntropyCallbacks,
-    options?: AntiEntropySchedulerOptions,
+    options?: AntiEntropySchedulerOptions & RepairPipelineOptions,
     clock?: SchedulerClock,
   ) {
     this.engine = engine;
     this.callbacks = callbacks;
     this.clock = clock ?? defaultSchedulerClock;
+    this.pipeline = new RepairRequestPipeline(engine, callbacks, options, this.clock);
     this.periodicIntervalMs = options?.periodicIntervalMs ?? DEFAULT_PERIODIC_INTERVAL_MS;
     this.jitterMs = options?.jitterMs ?? DEFAULT_JITTER_MS;
     this.rateLimitMinIntervalMs =
@@ -95,6 +100,10 @@ export class AntiEntropyManager implements IAntiEntropyManager {
     return this.disposed;
   }
 
+  public get repairPipeline(): RepairRequestPipeline {
+    return this.pipeline;
+  }
+
   /**
    * Generates local StateDigestPayload for broadcasting.
    */
@@ -107,12 +116,18 @@ export class AntiEntropyManager implements IAntiEntropyManager {
 
   /**
    * Evaluates an incoming remote digest against local replication knowledge.
+   * Records remote peer knowledge and schedules targeted repairs for missing ranges.
    */
   public processRemoteDigest(digest: StateDigestPayload): DigestComparisonResult {
     if (this.disposed) {
       throw new SyncEngineError('DISPOSED', 'Cannot process digest on disposed manager');
     }
-    return this.engine.compareRemoteDigest(digest);
+    this.pipeline.recordPeerDigestKnowledge(digest);
+    const result = this.engine.compareRemoteDigest(digest);
+    if (result.missingFromLocal.length > 0) {
+      this.pipeline.addGaps(result.missingFromLocal, digest.senderPeerId);
+    }
+    return result;
   }
 
   /**
@@ -166,18 +181,17 @@ export class AntiEntropyManager implements IAntiEntropyManager {
 
   /**
    * Cancels any active repair requests to a departing peer.
-   * Purges peer tracking and reset peer rate limits.
+   * Purges peer tracking and fails over in-flight requests.
    */
-  public onPeerDisconnected(_peerId: string): void {
+  public onPeerDisconnected(peerId: string): void {
     if (this.disposed) return;
-    // M3 will cancel active repair requests to departing peers.
-    // For M2, we ensure no dangling timer or state exists.
+    this.pipeline.onPeerDisconnected(peerId);
   }
 
   /**
    * Resets anti-entropy scheduling upon membership epoch transition.
    */
-  public onEpochTransition(_newEpoch: number): void {
+  public onEpochTransition(newEpoch: number): void {
     if (this.disposed) return;
 
     // Cancel in-flight reactive timers
@@ -185,6 +199,9 @@ export class AntiEntropyManager implements IAntiEntropyManager {
       this.clock.clearTimeout(this.reactiveTimerId);
       this.reactiveTimerId = undefined;
     }
+
+    // Cancel in-flight repair requests from older epochs
+    this.pipeline.onEpochTransition(newEpoch);
 
     // Reset periodic timer with fresh jitter
     this.scheduleNextPeriodicTick();
@@ -195,7 +212,7 @@ export class AntiEntropyManager implements IAntiEntropyManager {
 
   /**
    * Serves an inbound REPAIR_REQUEST from local log history (M4).
-   * Unimplemented in M2.
+   * Unimplemented in M3.
    */
   public serveRepairRequest(
     _request: RepairRequestPayload,
@@ -204,24 +221,49 @@ export class AntiEntropyManager implements IAntiEntropyManager {
   }
 
   /**
+   * Processes inbound OPERATION_BATCH fulfilling an active repair request (M3).
+   */
+  public handleRepairBatch(
+    batch: OperationBatchPayload,
+    context?: AuthenticatedSupplierContext,
+  ): EngineDecision[] {
+    if (this.disposed) {
+      throw new SyncEngineError('DISPOSED', 'Cannot handle repair batch on disposed manager');
+    }
+    return this.pipeline.handleRepairBatch(batch, context);
+  }
+
+  /**
+   * Processes an inbound REPAIR_REJECTED response handling failover/backoff (M3).
+   */
+  public handleRepairRejected(rejection: RepairRejectedPayload): void {
+    if (this.disposed) return;
+    this.pipeline.handleRepairRejected(rejection);
+  }
+
+  /**
    * Schedules targeted repair requests for detected sequence gaps (M3).
-   * Unimplemented in M2.
    */
   public reconcileGaps(): void {
-    throw new Error('AntiEntropyManager.reconcileGaps() is scheduled for Phase 7.4 M3');
+    if (this.disposed) return;
+    const pendingGaps = this.engine.getPendingGaps();
+    if (pendingGaps.length > 0) {
+      this.pipeline.addGaps(pendingGaps);
+    }
   }
 
   /**
    * Retrieves operational status and telemetry for diagnostics.
    */
   public getStatus(): AntiEntropyStatus {
+    const pipelineStatus = this.pipeline.getStatus();
     return {
-      activeRequestsCount: 0,
-      pendingGapsCount: this.engine.pendingQueueSize,
+      activeRequestsCount: pipelineStatus.activeRequestsCount,
+      pendingGapsCount: pipelineStatus.pendingGapsCount + this.engine.pendingQueueSize,
       lastDigestSentAt: this.lastDigestSentAt,
-      totalRepairsCompleted: 0,
-      totalRepairsFailed: 0,
-      degraded: false,
+      totalRepairsCompleted: pipelineStatus.totalRepairsCompleted,
+      totalRepairsFailed: pipelineStatus.totalRepairsFailed,
+      degraded: pipelineStatus.degraded,
     };
   }
 
@@ -232,6 +274,8 @@ export class AntiEntropyManager implements IAntiEntropyManager {
   public dispose(): void {
     if (this.disposed) return;
     this.disposed = true;
+
+    this.pipeline.dispose();
 
     if (this.periodicTimerId !== undefined) {
       this.clock.clearTimeout(this.periodicTimerId);

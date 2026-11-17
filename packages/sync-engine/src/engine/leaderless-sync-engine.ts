@@ -31,7 +31,7 @@ import { calculateExtrapolatedPosition } from '../reducer.js';
 import { exportEngineSnapshot, validateSnapshotPayload } from '../snapshot.js';
 import { LogicalClockManager } from '../clock/logical-clock-manager.js';
 import { OrderedOperationLog } from '../log/ordered-operation-log.js';
-import { PendingDependencyQueue } from '../log/pending-dependency-queue.js';
+import { PendingDependencyQueue, type MissingSequenceRange } from '../log/pending-dependency-queue.js';
 import { ConflictResolver } from '../conflict/conflict-resolver.js';
 import { computeOperationFingerprint } from '../log/operation-fingerprint.js';
 import type { StoredOperation } from '../log/types.js';
@@ -281,6 +281,26 @@ export class LeaderlessSyncEngine implements SyncEngine {
 
   public get epoch(): number {
     return this.currentEpoch;
+  }
+
+  public get localPeerId(): string {
+    return this.config.localPeerId;
+  }
+
+  public get sessionId(): string {
+    return this.config.sessionId;
+  }
+
+  public getActivePeerGenerations(): ReadonlyMap<string, number> {
+    return new Map(this.peerGenerations);
+  }
+
+  /**
+   * Retrieves all currently detected sequence gaps required to unblock operations
+   * in the pending dependency queue.
+   */
+  public getPendingGaps(): MissingSequenceRange[] {
+    return this.pendingQueue.getMissingRanges(this.replicationVector);
   }
 
   /**
