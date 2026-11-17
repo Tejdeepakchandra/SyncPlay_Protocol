@@ -38,12 +38,13 @@ import type { StoredOperation } from '../log/types.js';
 import type { ReducerContext } from '../conflict/types.js';
 import {
   type OperationBatchPayload,
+  type RepairRejectedPayload,
   type StateSnapshotPayloadV2,
   type StateDigestPayload,
   StateDigestPayloadSchema,
 } from '@syncplay/protocol';
 import { compareDigests } from '../replication/replication-comparator.js';
-import type { DigestComparisonResult } from '../replication/types.js';
+import type { DigestComparisonResult, IAntiEntropyManager } from '../replication/types.js';
 
 interface MutableStats {
   eventsReceivedCount: number;
@@ -130,9 +131,12 @@ export function createAuthenticatedSupplierContext(
  * Created by the composition root and provided to transport drivers (PeerMesh, ControlEventService).
  */
 export class TrustedTransportAdapter {
+  private antiEntropyManager?: IAntiEntropyManager;
+
   constructor(
     private readonly engine: LeaderlessSyncEngine,
     private readonly capability: TransportRegistrationCapability,
+    antiEntropyManager?: IAntiEntropyManager,
   ) {
     if (!engine) {
       throw new SyncEngineError('INVALID_ARGUMENT', 'TrustedTransportAdapter requires an engine instance');
@@ -143,6 +147,15 @@ export class TrustedTransportAdapter {
         'TrustedTransportAdapter requires an authorized TransportRegistrationCapability',
       );
     }
+    this.antiEntropyManager = antiEntropyManager;
+  }
+
+  public setAntiEntropyManager(manager: IAntiEntropyManager): void {
+    this.antiEntropyManager = manager;
+  }
+
+  public getAntiEntropyManager(): IAntiEntropyManager | undefined {
+    return this.antiEntropyManager;
   }
 
   public registerContext(
@@ -156,13 +169,43 @@ export class TrustedTransportAdapter {
     );
   }
 
+  /**
+   * Processes an inbound OPERATION_BATCH packet received from the trusted transport layer.
+   * Derives supplier identity and connection generation strictly from transport state.
+   */
+  public handleInboundRepairBatch(
+    batch: OperationBatchPayload,
+    transportSupplierPeerId: string,
+    transportConnectionGeneration: number,
+  ): EngineDecision[] {
+    const context = this.registerContext(transportSupplierPeerId, transportConnectionGeneration);
+    if (this.antiEntropyManager) {
+      return this.antiEntropyManager.handleRepairBatch(batch, context);
+    }
+    return this.engine.ingestRepairBatch(batch, context);
+  }
+
+  /**
+   * Processes an inbound REPAIR_REJECTED packet received from the trusted transport layer.
+   * Derives supplier identity and connection generation strictly from transport state.
+   */
+  public handleInboundRepairRejected(
+    rejection: RepairRejectedPayload,
+    transportSupplierPeerId: string,
+    transportConnectionGeneration: number,
+  ): void {
+    const context = this.registerContext(transportSupplierPeerId, transportConnectionGeneration);
+    if (this.antiEntropyManager) {
+      this.antiEntropyManager.handleRepairRejected(rejection, context);
+    }
+  }
+
   public ingestRepairBatch(
     batch: OperationBatchPayload,
     supplierPeerId: string,
     connectionGeneration: number,
   ): EngineDecision[] {
-    const context = this.registerContext(supplierPeerId, connectionGeneration);
-    return this.engine.ingestRepairBatch(batch, context);
+    return this.handleInboundRepairBatch(batch, supplierPeerId, connectionGeneration);
   }
 }
 

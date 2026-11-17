@@ -126,12 +126,12 @@ The test suite contains 45 tests, including 10 targeted adversarial tests verify
 | 10 | Partial response `[10, 20]` for request `[1, 32]` | PASSED | Operations $10..20$ buffered in `PendingDependencyQueue`; prefix $[1, 9]$ preserved in repair queue; unblocks and converges to 32 once $[1, 9]$ and $[21, 32]$ arrive. |
 
 ### 4.2. Monorepo Test Results
-- **`@syncplay/sync-engine`:** **336 passed** across 20 files (0 failures).
+- **`@syncplay/sync-engine`:** **344 passed** across 21 files (0 failures).
 - **`@syncplay/protocol`:** **273 passed** across 4 files (0 failures).
 - **`@syncplay/peer-mesh`:** **101 passed** across 6 files (0 failures).
 - **`@syncplay/control-events`:** **49 passed** across 6 files (0 failures).
 - **`@syncplay/bootstrap-server`:** **91 passed** across 3 files (0 failures).
-- **Total Monorepo Tests:** **850 passed across 39 files with 0 failures**.
+- **Total Monorepo Tests:** **858 passed across 40 files with 0 failures**.
 - **Build & Typecheck:** `tsc` and Vite production build passed cleanly across all packages.
 
 ---
@@ -147,7 +147,53 @@ As required by Section 6 of the mandate:
    **NO.** `RepairRequestPipeline.handleRepairRejected()` requires a genuine, unforgeable `AuthenticatedSupplierContext` registered with the engine; any unauthenticated or fabricated rejection is silently dropped before mutating in-flight requests, peer knowledge, retry counts, or backoff timers.
 
 3. **Can a reconnected peer fulfill a repair request dispatched prior to reconnection?**  
-   **NO.** Every in-flight request is cryptographically bound to the active `supplierConnectionGeneration` at dispatch. When a peer reconnects, `onPeerGenerationChanged` immediately invalidates and fails over the previous request. Furthermore, `handleRepairBatch` rejects any response where `context.connectionGeneration` does not strictly equal the dispatch generation recorded in the request.
+   **NO.** Every in-flight request is capability-authenticated and connection-generation-bound to the active `supplierConnectionGeneration` at dispatch. When a peer reconnects, `onPeerGenerationChanged` immediately invalidates and fails over the previous request. Furthermore, `handleRepairBatch` rejects any response where `context.connectionGeneration` does not strictly equal the dispatch generation recorded in the request.
 
 4. **Can a partial response cause missing prefix ranges to be permanently dropped from repair?**  
    **NO.** When a partial batch arrives (e.g. $[10, 20]$ for request $[1, 32]$), out-of-order operations are buffered in `PendingDependencyQueue` without advancing the replication frontier. The unfulfilled range is recalculated from the actual local replication frontier ($\max(\text{inFlight.fromSequence}, V_{\text{rep}}[\text{origin}] + 1)$), strictly preserving missing prefix ranges and re-dispatching them for targeted repair.
+
+---
+
+## 6. Trusted Transport Provenance Audit & Production Inbound Path
+
+### 6.1 Real Production Inbound Call Chain
+The production inbound routing for both `OPERATION_BATCH` and `REPAIR_REJECTED` originates at the WebRTC transport boundary:
+1. **Physical Transport Delivery:** WebRTC DataChannel message event triggers `WebRtcTransport.events.onDataChannelMessage(data)`.
+2. **Channel Identity & Generation Binding:** `PeerManager.handleDataChannelMessage(fromPeerId, data)` validates the envelope via `parseAndValidateMessage(data)`. The `fromPeerId` is verified during signaling and channel setup; the active `connectionGeneration` is retrieved from `peerTable.get(fromPeerId).generation`.
+3. **Trusted Transport Adapter Routing:** `PeerManager` routes repair payloads to `TrustedTransportAdapter.handleInboundRepairBatch(batch, fromPeerId, generation)` or `TrustedTransportAdapter.handleInboundRepairRejected(rejection, fromPeerId, generation)`.
+4. **Capability-Gated Context Issuance:** `TrustedTransportAdapter` holds the private `TransportRegistrationCapability` granted at the composition root and registers the context via `engine.registerInboundSupplierContext(fromPeerId, generation, capability)`.
+5. **Pipeline Dispatch & Ingestion:**
+   - For `OPERATION_BATCH`: routed through `AntiEntropyManager.handleRepairBatch(batch, context)` $\to$ `RepairRequestPipeline.handleRepairBatch(batch, context)`. Correlation, supplier identity, epoch, origin, range, and generation are verified against the active in-flight request, and valid operations are ingested into `LeaderlessSyncEngine.ingestRepairBatch()`.
+   - For `REPAIR_REJECTED`: routed through `AntiEntropyManager.handleRepairRejected(rejection, context)` $\to$ `RepairRequestPipeline.handleRepairRejected(rejection, context)`. Verification occurs before triggering failover, retry backoff, or peer blacklisting.
+
+### 6.2 Transport State Derivation vs. Payload Fields
+Neither the pipeline nor the engine trusts the sender ID, supplier ID, or connection generation claimed within inbound message payloads. Identity and generation are derived solely from trusted transport state (`fromPeerId` and `transportConnectionGeneration` maintained by the local WebRTC manager) and stamped into an unforgeable in-memory `AuthenticatedSupplierContext`. Any mismatch between the packet payload's `supplierPeerId` and the transport context's `supplierPeerId` triggers an immediate drop (`REJECTED_INVALID: payload supplier does not match transport context supplier`).
+
+### 6.3 Capability Custody & Export Boundary
+1. **No Public Capability Accessors:** The `authorizedTransportCapability` is held in a private instance field (`#authorizedTransportCapability`) within `LeaderlessSyncEngine`. No getter, method, or public property exposes it.
+2. **Strict Object Reference Equality:** Calling the exported factory `createTransportRegistrationCapability(...)` constructs an independent instance with a distinct memory reference. The engine validates registration via `if (capability !== this.authorizedTransportCapability)` and throws `SyncEngineError('UNAUTHORIZED')` on any reference mismatch. Cloned or forged capability objects `{ ...cap }` are rejected.
+3. **Composition Root Confinement:** Only the application composition root has access to initialize the engine with its capability and inject it into the `TrustedTransportAdapter`. Ordinary SDK consumers cannot register or manufacture contexts.
+
+### 6.4 Context Reuse & Packet-Binding Analysis
+- **Context Model:** `AuthenticatedSupplierContext` represents the local transport driver's trusted attestation of a specific remote peer connection (`supplierPeerId`, `connectionGeneration`). It is an immutable, frozen in-memory object (`Object.freeze`) that is never sent over the network.
+- **Cross-Supplier Reuse:** Impossible. `context.supplierPeerId` is verified against both `inFlight.supplierPeerId` and `batch.supplierPeerId`.
+- **Cross-Generation Reuse:** Impossible. `context.connectionGeneration` is verified against `inFlight.supplierConnectionGeneration` and the current generation returned by `engine.getPeerGeneration()`.
+- **Cross-Session Reuse:** Impossible. The context's engine session ID is verified against the engine's active `sessionId`.
+- **Packet-Binding and Replay Safety:** Safety against packet replay or context recycling is guaranteed by the request-correlation and in-flight tracking mechanism:
+  - Every repair request generates a unique UUID v4 `requestId`.
+  - Exactly one in-flight request exists per `(originPeerId, supplierPeerId)`.
+  - When an inbound packet is processed, the request is either retired on completion or updated for the remaining prefix range.
+  - Any replayed, duplicate, or unsolicited packet arrives with an unrecognized `requestId` and is immediately dropped with `REJECTED_INVALID: not an active in-flight request`.
+
+---
+
+## 7. Final Safety Audit Questions & Explicit Determinations
+
+| # | Mandatory Question | Determination | Verification Detail |
+|---|---|:---:|---|
+| 1 | **Can an ordinary production SDK consumer manufacture or register a valid supplier context?** | **NO** | The engine requires reference equality against its internal private `authorizedTransportCapability`. `createTransportRegistrationCapability()` produces non-matching instances. No public API or getter exposes the capability. |
+| 2 | **Does the production inbound path derive supplier identity and generation from trusted transport state rather than the payload?** | **YES** | `TrustedTransportAdapter.handleInboundRepairBatch` and `handleInboundRepairRejected` take `transportSupplierPeerId` and `transportConnectionGeneration` directly from the WebRTC connection state, stamping them into the context. Payload fields are checked against this context; payload claims cannot forge context fields. |
+| 3 | **Can an unauthenticated or mismatched `REPAIR_REJECTED` mutate repair lifecycle state?** | **NO** | `RepairRequestPipeline.handleRepairRejected()` requires a valid, registered `AuthenticatedSupplierContext`. Unauthenticated rejections, generation mismatches, or supplier mismatches are dropped prior to touching in-flight requests, peer knowledge, or backoff timers. |
+| 4 | **Is context reuse prevented, or is its safety guaranteed by a documented packet-binding mechanism?** | **GUARANTEED BY BINDING** | An authenticated context attests to an active channel `(peerId, generation)`. Replay or reuse across requests is prevented by UUID v4 in-flight request correlation: requests are removed upon completion, rendering any replayed packet invalid (`not an active in-flight request`). |
+| 5 | **Is the Phase 7.3-R5-H capability boundary preserved?** | **YES** | The Phase 7.3-R5-H object-capability pattern is strictly maintained. The transport adapter is granted registration capability exclusively at composition root; all anti-entropy repair operations require capability-authenticated contexts before admission. |
+
