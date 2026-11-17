@@ -39,7 +39,6 @@ import {
   StateDigestPayloadV2Schema,
   StateSnapshotPayloadV2Schema,
   OperationBatchPayloadSchema,
-  PushOperationBatchPayloadSchema,
   CompatibilityOperationBatchPayloadSchema,
   RepairRequestPayloadSchema,
   RepairRejectedPayloadSchema,
@@ -57,8 +56,6 @@ import {
   UUIDv4Schema,
   isLegacyStateDigest,
   isStateDigestV2,
-  isRequestDrivenOperationBatch,
-  isPushOperationBatch,
   validateContiguousSequenceBatch,
 
   // Validation
@@ -169,7 +166,6 @@ describe('Public exports', () => {
     expect(typeof StateDigestPayloadV1Schema.safeParse).toBe('function');
     expect(typeof StateDigestPayloadV2Schema.safeParse).toBe('function');
     expect(typeof OperationBatchPayloadSchema.safeParse).toBe('function');
-    expect(typeof PushOperationBatchPayloadSchema.safeParse).toBe('function');
     expect(typeof CompatibilityOperationBatchPayloadSchema.safeParse).toBe('function');
     expect(typeof RepairRequestPayloadSchema.safeParse).toBe('function');
     expect(typeof RepairRejectedPayloadSchema.safeParse).toBe('function');
@@ -193,8 +189,6 @@ describe('Public exports', () => {
     expect(typeof serializeAndCheckSize).toBe('function');
     expect(typeof isLegacyStateDigest).toBe('function');
     expect(typeof isStateDigestV2).toBe('function');
-    expect(typeof isRequestDrivenOperationBatch).toBe('function');
-    expect(typeof isPushOperationBatch).toBe('function');
     expect(typeof validateContiguousSequenceBatch).toBe('function');
   });
 

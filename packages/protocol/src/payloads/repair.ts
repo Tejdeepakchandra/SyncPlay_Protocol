@@ -169,10 +169,26 @@ export function validateContiguousSequenceBatch(
 }
 
 /**
- * Request-driven Operation Batch Payload Schema (Phase 7.4).
- * Enforces mandatory UUID v4 requestId for request-response correlation,
- * sessionId to prevent cross-room repair pollution, explicit membershipEpoch,
- * and contiguous sequence coverage.
+ * Canonical Operation Batch Payload Schema (Phase 7.4).
+ *
+ * Anti-entropy operation batch delivery in Phase 7.4 is strictly request-driven:
+ * a supplier serves an OPERATION_BATCH only in response to a correlated REPAIR_REQUEST.
+ *
+ * NOTE: Unsolicited or push-based batch delivery is NOT part of the approved Phase 7.4
+ * architecture and is not an active network contract. Introducing a separate push-based
+ * delivery path would require future architectural authorization.
+ *
+ * Enforces:
+ * - Mandatory canonical UUID v4 requestId matching originating RepairRequestPayload.requestId.
+ * - Mandatory sessionId to enforce room scoping.
+ * - Mandatory supplierPeerId and originPeerId.
+ * - Mandatory membershipEpoch under which operations are authorized.
+ * - Contiguous sequence coverage (validateContiguousSequenceBatch):
+ *   - Strictly ascending originSequenceNumber with zero gaps and zero duplicates.
+ *   - First sequence equals fromSequence, last sequence equals toSequence.
+ *   - Operation count exactly equals toSequence - fromSequence + 1 (<= MAX_OPERATIONS_PER_BATCH).
+ *   - Every contained operation belongs to originPeerId and membershipEpoch.
+ *   - Empty batches are strictly prohibited (suppliers must dispatch REPAIR_REJECTED).
  */
 export const OperationBatchPayloadSchema = z
   .object({
@@ -208,40 +224,11 @@ export const OperationBatchPayloadSchema = z
 export type OperationBatchPayload = z.infer<typeof OperationBatchPayloadSchema>;
 
 /**
- * Push-based Operation Batch Payload Schema (unsolicited delivery).
- * Requires sessionId for room scoping and membershipEpoch, but has no correlating requestId.
- */
-export const PushOperationBatchPayloadSchema = z
-  .object({
-    /** Session identifier to ensure batch belongs to the active room session. */
-    sessionId: z.string().min(1).max(128),
-
-    /** The supplier peer pushing this batch. */
-    supplierPeerId: z.string().min(1).max(64),
-
-    /** The author / origin peer of the contained operations. */
-    originPeerId: z.string().min(1).max(64),
-
-    /** First sequence number in this batch (inclusive). */
-    fromSequence: z.number().int().positive().max(Number.MAX_SAFE_INTEGER),
-
-    /** Last sequence number in this batch (inclusive). */
-    toSequence: z.number().int().positive().max(Number.MAX_SAFE_INTEGER),
-
-    /** Membership epoch under which operations are authorized. */
-    membershipEpoch: z.number().int().positive().max(Number.MAX_SAFE_INTEGER),
-
-    /** Contained operations ordered by sequence number (at most 32). */
-    operations: z.array(SerializedControlOperationSchema).max(MAX_OPERATIONS_PER_BATCH),
-  })
-  .superRefine(validateContiguousSequenceBatch);
-
-export type PushOperationBatchPayload = z.infer<typeof PushOperationBatchPayloadSchema>;
-
-/**
  * Phase 7.3 backward-compatibility operation batch schema.
  * Defines the contract for legacy/internal engine repair batches where
  * requestId and sessionId were optional.
+ *
+ * Isolated strictly to Phase 7.3 engine test fixtures; NOT registered in PAYLOAD_SCHEMAS.
  */
 export const CompatibilityOperationBatchPayloadSchema = z
   .object({
@@ -460,29 +447,6 @@ export function isStateDigestV2(payload: unknown): payload is StateDigestPayload
     payload !== null &&
     (payload as { formatVersion?: unknown }).formatVersion === 2
   );
-}
-
-/**
- * Type guard verifying whether an incoming operation batch is a request-driven repair batch.
- */
-export function isRequestDrivenOperationBatch(
-  payload: unknown,
-): payload is OperationBatchPayload {
-  if (typeof payload !== 'object' || payload === null) return false;
-  const p = payload as Record<string, unknown>;
-  const reqId = p['requestId'];
-  return typeof reqId === 'string' && UUID_V4_REGEX.test(reqId);
-}
-
-/**
- * Type guard verifying whether an incoming operation batch is an unsolicited push batch.
- */
-export function isPushOperationBatch(
-  payload: unknown,
-): payload is PushOperationBatchPayload {
-  if (typeof payload !== 'object' || payload === null) return false;
-  const p = payload as Record<string, unknown>;
-  return typeof p['sessionId'] === 'string' && p['requestId'] === undefined;
 }
 
 export const CompactedCheckpointItemSchema = z.object({

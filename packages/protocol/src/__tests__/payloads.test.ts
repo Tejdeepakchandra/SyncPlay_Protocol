@@ -28,11 +28,8 @@ import {
   StateDigestPayloadSchema,
   StateDigestPayloadV2Schema,
   isStateDigestV2,
-  isRequestDrivenOperationBatch,
-  isPushOperationBatch,
   RepairRequestPayloadSchema,
   OperationBatchPayloadSchema,
-  PushOperationBatchPayloadSchema,
   CompatibilityOperationBatchPayloadSchema,
   RepairRejectedPayloadSchema,
   REPAIR_REJECTION_REASONS,
@@ -1221,29 +1218,11 @@ describe('OperationBatchPayloadSchema (Phase 7.4 Request-Driven)', () => {
       expect(result.data.operations.length).toBe(5);
     }
   });
-
-  it('should verify delivery path type guards distinguish request-driven vs push batches', () => {
-    expect(isRequestDrivenOperationBatch(validBatch)).toBe(true);
-    expect(isPushOperationBatch(validBatch)).toBe(false);
-
-    const pushBatch = {
-      sessionId: 'session-room-1',
-      supplierPeerId: 'peer-supplier-1',
-      originPeerId: 'peer-author-1',
-      fromSequence: 1,
-      toSequence: 2,
-      membershipEpoch: 1,
-      operations: [createTestOp(1), createTestOp(2)],
-    };
-
-    expect(isPushOperationBatch(pushBatch)).toBe(true);
-    expect(isRequestDrivenOperationBatch(pushBatch)).toBe(false);
-  });
 });
 
-// ── PUSH & COMPATIBILITY OPERATION BATCHES ───────────────────
+// ── COMPATIBILITY OPERATION BATCH SCHEMA ──────────────────────
 
-describe('PushOperationBatchPayloadSchema & Compatibility Schema', () => {
+describe('CompatibilityOperationBatchPayloadSchema (Phase 7.3 Fixture Isolation)', () => {
   const createTestOp = (seq: number) => ({
     logicalEventId: `op-evt-${seq}`,
     originPeerId: 'peer-author-1',
@@ -1255,54 +1234,6 @@ describe('PushOperationBatchPayloadSchema & Compatibility Schema', () => {
     payload: { targetPositionMs: seq * 1000 },
   });
 
-  const validPushBatch = {
-    sessionId: 'session-room-1',
-    supplierPeerId: 'peer-supplier-1',
-    originPeerId: 'peer-author-1',
-    fromSequence: 1,
-    toSequence: 1,
-    membershipEpoch: 1,
-    operations: [createTestOp(1)],
-  };
-
-  it('should accept valid push batch with sessionId and no requestId', () => {
-    const result = PushOperationBatchPayloadSchema.safeParse(validPushBatch);
-    expect(result.success).toBe(true);
-  });
-
-  it('should reject push batch missing sessionId', () => {
-    const { sessionId, ...withoutSession } = validPushBatch;
-    expect(PushOperationBatchPayloadSchema.safeParse(withoutSession).success).toBe(false);
-  });
-
-  it('should reject push batch missing membershipEpoch', () => {
-    const { membershipEpoch, ...withoutEpoch } = validPushBatch;
-    expect(PushOperationBatchPayloadSchema.safeParse(withoutEpoch).success).toBe(false);
-  });
-
-  it('should reject push batch with sequence coverage defect (e.g. duplicate sequence)', () => {
-    const result = PushOperationBatchPayloadSchema.safeParse({
-      ...validPushBatch,
-      fromSequence: 1,
-      toSequence: 2,
-      operations: [createTestOp(1), createTestOp(1)],
-    });
-    expect(result.success).toBe(false);
-  });
-
-  it('should reject push batch with empty operations array', () => {
-    const result = PushOperationBatchPayloadSchema.safeParse({
-      ...validPushBatch,
-      fromSequence: 1,
-      toSequence: 1,
-      operations: [],
-    });
-    expect(result.success).toBe(false);
-    if (!result.success) {
-      expect(result.error.issues[0]?.message).toContain('Empty operation batches are prohibited');
-    }
-  });
-
   it('should validate Phase 7.3 compatibility batch without requestId or sessionId', () => {
     const legacyBatch = {
       supplierPeerId: 'peer-supplier-1',
@@ -1312,6 +1243,20 @@ describe('PushOperationBatchPayloadSchema & Compatibility Schema', () => {
       operations: [createTestOp(1)],
     };
     const result = CompatibilityOperationBatchPayloadSchema.safeParse(legacyBatch);
+    expect(result.success).toBe(true);
+  });
+
+  it('should validate Phase 7.3 compatibility batch with optional requestId and sessionId', () => {
+    const legacyBatchWithIds = {
+      requestId: 'f47ac10b-58cc-4372-a567-0e02b2c3d479',
+      sessionId: 'session-room-1',
+      supplierPeerId: 'peer-supplier-1',
+      originPeerId: 'peer-author-1',
+      fromSequence: 1,
+      toSequence: 1,
+      operations: [createTestOp(1)],
+    };
+    const result = CompatibilityOperationBatchPayloadSchema.safeParse(legacyBatchWithIds);
     expect(result.success).toBe(true);
   });
 });

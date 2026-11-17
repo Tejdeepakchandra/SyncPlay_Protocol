@@ -29,15 +29,28 @@ export const MAX_PAYLOAD_BYTES = 32_768;
  * SCTP interoperability recommendations, NOT a universal browser WebRTC guarantee.
  *
  * Standard WebRTC 1.0 (W3C) defines negotiated message size limits on the underlying
- * SCTP transport: `RTCPeerConnection.sctp?.maxMessageSize` (or the default 65,536 bytes if not signaled),
- * rather than on `RTCDataChannel`. The SCTP layer handles lower-level packet fragmentation
- * and reassembly, but application-level frames exceeding the remote peer's negotiated
- * `sctp?.maxMessageSize` will truncate or fail at the transport boundary.
+ * SCTP transport: `RTCPeerConnection.sctp?.maxMessageSize`, NOT on `RTCDataChannel`.
  *
- * In Milestone M5 (Transport Integration), the transport adapter layer must inspect
- * `RTCPeerConnection.sctp?.maxMessageSize` (handling undefined gracefully with 65,536 fallback)
- * and paginate, slice, or sub-batch frames accordingly so that the serialized envelope
- * stays strictly within min(65,536, sctp.maxMessageSize).
+ * Send-Size Contract & Transport Semantics:
+ * 1. Negotiated Limit Discovery: The remote peer's maximum incoming message size limit
+ *    is read from `RTCPeerConnection.sctp?.maxMessageSize`.
+ * 2. Conservative Fallback: If SCTP information is unavailable (e.g. `sctp` is undefined or
+ *    `maxMessageSize` is null/unannounced), the implementation must handle it conservatively
+ *    by falling back to the standard baseline limit of 65,536 bytes.
+ * 3. Pre-Send Byte-Length Verification: Before transmitting an operation batch or repair message
+ *    over the DataChannel, the sender must measure the actual UTF-8 byte length of the serialized
+ *    message (`serializeAndCheckSize`).
+ * 4. Prevention of Oversized Sends: Any send where the serialized UTF-8 byte length exceeds
+ *    `min(MAX_BATCH_PAYLOAD_BYTES, sctp.maxMessageSize)` must be prevented upfront by the
+ *    application layer or treated as an unrecoverable send failure.
+ * 5. No Truncation or Partial Delivery: The application MUST NEVER rely on truncation or partial
+ *    delivery. WebRTC DataChannels do not support frame truncation; transmitting an oversized
+ *    frame triggers an immediate RTCError / transport failure.
+ * 6. SCTP Fragmentation Boundaries: Lower-layer SCTP packet fragmentation and reassembly handles
+ *    wire-level packetization, but is NOT a substitute for application-level message-size compliance.
+ * 7. Application-Level Slicing: Application-level pagination, slicing, and sub-batching into
+ *    contiguous sequence ranges that strictly conform to the negotiated message-size envelope
+ *    is an M5 (Transport Integration) responsibility.
  */
 export const MAX_BATCH_PAYLOAD_BYTES = 65_536;
 

@@ -1042,4 +1042,57 @@ describe('Compatibility Schema Isolation & Inbound Wire Validation', () => {
       expect(result.error.code).toBe('INVALID_PAYLOAD');
     }
   });
+
+  it('rejects inbound OPERATION_BATCH wire message with empty operations array', () => {
+    const emptyBatch = {
+      ...validBatchPayload,
+      operations: [],
+    };
+    const msg = fullMessage(MessageType.OPERATION_BATCH, emptyBatch);
+    const result = validateMessage(msg);
+    expect(result.ok).toBe(false);
+    if (!result.ok) {
+      expect(result.error.code).toBe('INVALID_PAYLOAD');
+      expect(result.error.message).toContain('Empty operation batches are prohibited');
+    }
+  });
+
+  it('rejects inbound OPERATION_BATCH wire message with mismatched operation origin', () => {
+    const mismatchedOriginBatch = {
+      ...validBatchPayload,
+      operations: [
+        {
+          ...validBatchPayload.operations[0],
+          originPeerId: 'peer-different',
+        },
+      ],
+    };
+    const msg = fullMessage(MessageType.OPERATION_BATCH, mismatchedOriginBatch);
+    const result = validateMessage(msg);
+    expect(result.ok).toBe(false);
+    if (!result.ok) {
+      expect(result.error.code).toBe('INVALID_PAYLOAD');
+      expect(result.error.message).toContain("does not match batch originPeerId 'peer-orig-1'");
+    }
+  });
+
+  it('rejects inbound OPERATION_BATCH wire message with mismatched operation epoch', () => {
+    const mismatchedEpochBatch = {
+      ...validBatchPayload,
+      membershipEpoch: 1,
+      operations: [
+        {
+          ...validBatchPayload.operations[0],
+          membershipEpoch: 2,
+        },
+      ],
+    };
+    const msg = fullMessage(MessageType.OPERATION_BATCH, mismatchedEpochBatch);
+    const result = validateMessage(msg);
+    expect(result.ok).toBe(false);
+    if (!result.ok) {
+      expect(result.error.code).toBe('INVALID_PAYLOAD');
+      expect(result.error.message).toContain('does not match batch membershipEpoch 1');
+    }
+  });
 });
