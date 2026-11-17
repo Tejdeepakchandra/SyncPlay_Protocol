@@ -7,8 +7,9 @@
 **Frozen Phase 7.3-R5-H Trust Boundary Baseline:** `e49b81a`  
 **Parent / M1 Implementation Baseline:** `309b808` (amending `5cadc03`)  
 **M2 Initial Commit:** `7049ca6`  
-**M2 Final Correction Commit:** `022d430`  
-**Date:** 2026-11-17  
+**M2 Targeted Correction Commit:** `022d430` (docs: `5589be8`)  
+**M2 Final Historical Completeness Correction Commit:** `bded62d`  
+**Date:** 2026-11-17 / 2026-11-18  
 
 ---
 
@@ -16,10 +17,17 @@
 
 Milestone M2 implements the decentralized state digest generation, pure deterministic replication comparison, and anti-entropy scheduling subsystem for the SyncPlay Protocol.
 
-Following the targeted architectural review pass, M2 strictly standardizes:
-1. **Exact Snapshot Frontier Semantics:** `snapshotFrontier[origin]` is the highest contiguous sequence for that origin already incorporated into the compacted base snapshot (sequences $\le \text{snapshotFrontier}$ are compacted out of the active log).
-2. **Bounded Fingerprint Guarantees (Option 1):** Tail fingerprints represent the operation at sequence $k = V_{\text{rep}}[\text{origin}]$. They detect conflicting operations at the frontier, but do NOT prove equality across arbitrary unchained predecessor operations in earlier history.
-3. **Structured Completeness Indicator:** Added `hasUnverifiedHistory: boolean` (`unprovableOrigins.length > 0`) to `DigestComparisonResult` so callers never mistake vector dominance for complete historical verification when origins lack fingerprint evidence.
+Following the final historical completeness correction, M2 strictly standardizes:
+1. **Property A vs. Property B Separation:**
+   - **Property A (`frontierAgreement: boolean`):** The operation at the current replication frontier has matching fingerprints (or both at sequence 0).
+   - **Property B (`historyVerified: boolean`):** Preceding operation history has been independently verified to match. Matching frontier fingerprints establish Property A, NOT Property B.
+2. **Exact Status & Completeness Semantics:**
+   - For $k = 0$: `status: 'IDENTICAL'`, `frontierAgreement: true`, `historyVerified: true`.
+   - For $k = 1$ with matching fingerprint: `status: 'IDENTICAL'`, `frontierAgreement: true`, `historyVerified: true` (operation 1 has no preceding intermediate operations).
+   - For $k > 1$ with matching tail fingerprint: `status: 'FRONTIER_IDENTICAL'`, `frontierAgreement: true`, `historyVerified: false` (intermediate history $1..k-1$ is unverified under a single tail fingerprint).
+   - `unverifiedHistoryOrigins: ReadonlyArray<string>` records all origins where historical equality is unverified.
+   - `hasUnverifiedHistory: boolean` (`unverifiedHistoryOrigins.length > 0`) explicitly prevents callers from falsely assuming complete historical equality when only frontier fingerprints match.
+3. **Exact Snapshot Frontier Semantics:** `snapshotFrontier[origin]` is the highest contiguous sequence for that origin already incorporated into the compacted base snapshot (sequences $\le \text{snapshotFrontier}$ are compacted out of the active log).
 4. **Reconciled Rate-Limiting Policy:** Token-bucket capacity 2, refill rate 1 token per 1000ms ($1\text{ digest/sec}$), strictly shared across periodic and reactive triggers.
 5. **Preserved Trust Boundaries:** Digest payloads are untrusted remote claims. Digest comparison does not authorize repair suppliers or authenticate connection generations.
 
@@ -34,101 +42,85 @@ Milestones M3 (Repair Request Pipeline), M4 (Supplier Servicing), M5 (Transport 
 - **Frozen Phase 7.3-R5-H Trust Boundary Baseline:** `e49b81a`
 - **Milestone M1 Baseline:** Commit `309b808` (amending `5cadc03`)
 - **Milestone M2 Initial Implementation:** Commit `7049ca6`
-- **Milestone M2 Targeted Corrections:** Commit `022d430`
+- **Milestone M2 Targeted Corrections:** Commit `022d430` (docs: `5589be8`)
+- **Milestone M2 Final Historical Completeness Correction:** Commit `bded62d`
 
 ---
 
-## 3. Targeted Review Corrections Summary
+## 3. Historical Completeness & Phase 7.3 Collision Detection Clarifications
 
-### 3.1 Correction A: Standardized `snapshotFrontier` Semantics
+### 3.1 The Historical Completeness Problem
 
-- **Exact Definition:**
-  $$\text{snapshotFrontier}[p] = \text{highest contiguous sequence for origin } p \text{ already incorporated into the compacted base snapshot}$$
-- **Operational Horizon:**
-  - Sequences $1 \le s \le \text{snapshotFrontier}[p]$ have been compacted into the base snapshot and removed from the active log.
-  - The oldest retained operation in the active operation log is $\text{snapshotFrontier}[p] + 1$.
-  - Missing ranges $[fromSeq, toSeq]$ where $fromSeq \le \text{snapshotFrontier}[p]$ cannot be served from the log and trigger `OUTSIDE_REMOTE_HORIZON` (`requiresSnapshotRecovery = true`).
-  - Missing ranges where $fromSeq > \text{snapshotFrontier}[p]$ are retained in the log and served via `REMOTE_AHEAD`.
-  - An invariant check detects and reports any structural inconsistency where $\text{snapshotFrontier}[p] > \text{replicationVector}[p]$.
+Under Phase 7.4 M1 contracts, the state digest contains at most one operation fingerprint per origin, at sequence $k = V_{\text{rep}}[\text{origin}]$.
 
-### 3.2 Correction B: Fingerprint Completeness Audit (Option 1 Selected)
+Consider the following scenario:
 
-- **Audit Findings:** A single tail fingerprint $H[p]$ at $k = V_{\text{rep}}[p]$ hashes only the operation at sequence $k$. If two peers share op C at sequence 12 but hold conflicting operations at sequence 11 (e.g. op B vs op X), their tail fingerprints at sequence 12 match if op C's causal context does not chain the hash of sequence 11.
-- **Option 1 Conformance:** The existing M1 schema contract (one tail fingerprint per origin) is strictly preserved without inventing wire extensions.
-- **Documented Guarantees:**
-  - The state digest tail fingerprint detects a conflicting operation at the compared frontier ($V_{\text{rep}}[p]$).
-  - It does **not** prove universal equality across intermediate operations in preceding history.
-  - Intermediate divergence is detected by Phase 7.3 operation admission (`originSeqIndex` collision detection and exact Lamport checks) during event ingestion or replay, not by the state digest.
-  - Compacted sequences lacking retained fingerprints are explicitly classified as `HISTORICAL_EQUALITY_UNPROVABLE`.
+| Sequence | Peer A | Peer B |
+|---|---|---|
+| 10 | Operation A | Operation A |
+| 11 | Operation B | Different operation X |
+| 12 | Operation C | Operation C |
 
-### 3.3 Correction C: Completeness Indicator & Multi-Origin Combination
+Both peers report replication sequence 12 and advertise identical tail fingerprints for Operation C.
 
-- **Completeness Indicator:** Added `hasUnverifiedHistory: boolean` to `DigestComparisonResult` (`unprovableOrigins.length > 0`).
-- **Global Classification Semantics:**
-  - A global dominance classification (`LOCAL_DOMINATES` / `REMOTE_DOMINATES`) indicates that across verified origins, one peer holds a superset of operations.
-  - If `hasUnverifiedHistory === true`, the caller is explicitly warned that historical equality could not be proven for unverified origins.
-  - If an active fork is detected on any origin ($H_L \ne H_R$), `DIVERGENT_FORK` is prioritized regardless of other origins.
-  - If any origin requires snapshot recovery ($fromSeq \le S_R$), `REQUIRES_SNAPSHOT_RECOVERY` is prioritized for the overall classification.
+If the comparator classified this origin as `IDENTICAL` without qualification, callers would assume historical equality. That assumption is mathematically unsound because intermediate operations ($1..k-1$) are neither chained in a cumulative hash nor Merkle-verified.
 
-### 3.4 Correction D: Reconciled Anti-Entropy Scheduling Limits
+### 3.2 Formal Semantic Separation: Property A vs Property B
 
-- **Unified Policy:**
-  - Token-bucket capacity: 2 tokens.
-  - Token refill rate: 1 token per 1000ms ($1\text{ digest/sec}$).
-  - Shared bucket: Both periodic timer ticks and reactive triggers pass through `broadcastDigestIfPermitted()`, preventing accidental rate-limit bypasses.
-  - Reactive trigger coalescing: Multiple reactive triggers within the same event loop tick are coalesced into a single 0ms task.
+To resolve this defect without violating frozen M1 wire contracts, M2 introduces two explicit properties:
 
-### 3.5 Correction E: Trusted Transport Identity & Capability Boundaries
+1. **Property A (`frontierAgreement: boolean`):**
+   - The operation at the current replication frontier ($k = V_{\text{rep}}[p]$) has matching SHA-256 fingerprints between local and remote peers (or both frontiers are at sequence 0).
+2. **Property B (`historyVerified: boolean`):**
+   - The relevant preceding operation history has been independently verified to match.
+   - A matching frontier fingerprint establishes Property A, **NOT** Property B.
+   - For single tail fingerprints without cumulative hashing:
+     - At $k = 0$: History is empty; `historyVerified = true`.
+     - At $k = 1$: Operation 1 is the frontier and has no predecessors ($1..0$ is empty); `historyVerified = true`.
+     - At $k > 1$: Intermediate operations $1..k-1$ have not been verified; `historyVerified = false`.
 
-- **Trust Boundary Invariant:** In `LeaderlessSyncEngine.compareRemoteDigest()`, `remoteDigest.senderPeerId` and `remoteDigest.connectionGeneration` are untrusted remote payload claims.
-- **Non-Authorization:** Digest comparison does **not** authorize a peer as a repair supplier and does **not** authenticate connection generations.
-- **Phase 7.3 Preservation:** Authoritative supplier authorization strictly requires Phase 7.3-R5-H capability-gated registration via `AuthenticatedSupplierContext` injected by the trusted transport adapter.
+### 3.3 Status Classification Mapping
+
+| Sequence & Fingerprint Relationship | `status` | `frontierAgreement` | `historyVerified` | In `unverifiedHistoryOrigins` | In `conflictingOrigins` |
+|---|---|---|---|---|---|
+| $localSeq = remoteSeq = 0$ | `'IDENTICAL'` | `true` | `true` | No | No |
+| $localSeq = remoteSeq = 1$, $localFp = remoteFp$ | `'IDENTICAL'` | `true` | `true` | No | No |
+| $localSeq = remoteSeq > 1$, $localFp = remoteFp$ | `'FRONTIER_IDENTICAL'` | `true` | `false` | **Yes** | No |
+| $localSeq = remoteSeq \ge 1$, $localFp \ne remoteFp$ | `'CONFLICT_FORK'` | `false` | `false` | No | **Yes** |
+| $localSeq = remoteSeq \ge 1$, missing fingerprint | `'HISTORICAL_EQUALITY_UNPROVABLE'` | `false` | `false` | **Yes** | No |
+| $localSeq < remoteSeq$, within horizon | `'REMOTE_AHEAD'` / `'REMOTE_ONLY'` | `false` | `false` | No (tracked as gap) | No |
+| $localSeq > remoteSeq$, within horizon | `'LOCAL_AHEAD'` / `'LOCAL_ONLY'` | `false` | `false` | No (tracked as gap) | No |
+| Missing sequence $\le snapshotFrontier$ | `'OUTSIDE_REMOTE_HORIZON'` / `'OUTSIDE_LOCAL_HORIZON'` | `false` | `false` | No (tracked as snapshot req) | No |
+
+### 3.4 Clarification of Phase 7.3 Collision Detection Capabilities
+
+1. **Detection Upon Admission:** Phase 7.3 detects conflicting origin/sequence operations when conflicting operations are *actually received and admitted* for comparison via the `originSeqIndex` and exact Lamport timestamp checks in `OrderedOperationLog`.
+2. **Unseen Historical Conflicts:** Phase 7.3 *cannot* discover an unseen conflicting operation merely because two peers advertise matching tail fingerprints in their state digests.
+3. **No Intermediate Fork Elimination:** Matching tail fingerprints do **not** eliminate the possibility of an intermediate historical fork.
+4. **Mandatory M3 Design Constraint:** Milestone M3 (Repair Request Pipeline) must **not** treat matching tail fingerprints as proof that all preceding operations are identical. Anti-entropy repair pipelines must account for unverified intermediate history and rely on Phase 7.3 admission gates when ingesting repaired batches.
 
 ---
 
 ## 4. Verification and Test Results
 
-### 4.1 Focused Test Suites
+### 4.1 Regression & Completeness Test Suites
 
-1. **`packages/sync-engine/src/__tests__/replication-comparator.test.ts` (23 tests passed):**
-   - Session and epoch mismatch detection.
-   - Identical empty and non-empty vector comparison.
-   - `LOCAL_DOMINATES` and `REMOTE_DOMINATES` with exact missing sequence ranges.
-   - `LOCAL_ONLY` and `REMOTE_ONLY` origin handling.
-   - `CONCURRENT_INCOMPARABLE` multi-origin gaps.
-   - `CONFLICT_FORK` detection on tail fingerprint divergence.
-   - `HISTORICAL_EQUALITY_UNPROVABLE` detection on missing tail fingerprints.
-   - **Boundary Tests (Correction A):**
-     - Requested missing range entirely below compacted frontier ($toSeq \le S_R$).
-     - Missing range starting exactly at compacted frontier ($fromSeq = S_R$).
-     - Missing range starting immediately after compacted frontier ($fromSeq = S_R + 1$).
-     - Origin with no compacted operations ($S_R = 0$).
-     - Structural inconsistency detection ($S_R > V_R$).
-   - **Mandatory Completeness Case (Correction B):**
-     - Verified that matching tail fingerprints at sequence 12 with divergence at sequence 11 evaluates to `IDENTICAL` at the frontier, proving that a single tail fingerprint does not detect intermediate divergence.
-   - **Multi-Origin Combinations (Correction C):**
-     - Clear missing range on origin 1 + unprovable origin on origin 2 (`hasUnverifiedHistory === true`).
-     - Confirmed fork on origin 1 + normal missing range on origin 2 (`DIVERGENT_FORK`).
-     - Outside-horizon on origin 1 + normal missing range on origin 2 (`REQUIRES_SNAPSHOT_RECOVERY`).
-   - Lexicographical determinism under reversed key construction order.
-   - Deep object immutability and frozen return structures.
+The test suite in `packages/sync-engine/src/__tests__/replication-comparator.test.ts` (31 tests passed) explicitly proves all 7 required completeness behaviors:
 
-2. **`packages/sync-engine/src/__tests__/anti-entropy-manager.test.ts` (18 tests passed):**
-   - Schema-compliant digest generation in empty sessions.
-   - Accurate replication vector, snapshot frontier, and tail SHA-256 fingerprint generation.
-   - Multi-origin concurrent digest generation.
-   - Distinction between compacted base snapshot frontier and active log.
-   - Schema enforcement of 64-origin bound (64 origins pass, 65 origins fail).
-   - Consistent point-in-time reads under rapid state updates.
-   - Safe dropping of legacy Phase 2 digests and future format versions.
-   - Fake-clock periodic scheduling within $[4000\text{ms}, 6000\text{ms}]$ jitter bounds.
-   - Reactive trigger coalescing within single tick.
-   - **Token-bucket rate limiting (Correction D):**
-     - Verified capacity 2, refill 1 token/sec.
-     - Verified periodic and reactive triggers share the exact same token bucket.
-   - Clean disposal and cancellation of all timers.
-   - Epoch transition reset and reactive trigger.
-   - Strict separation: throwing on unimplemented M3 (`reconcileGaps`) and M4 (`serveRepairRequest`) methods.
+1. **Equal vectors + equal tail fingerprints do not claim complete historical equality:**
+   - At sequence 12 with matching tail fingerprints, `classification = 'IDENTICAL'`, `detail.frontierAgreement = true`, `detail.historyVerified = false`, `detail.status = 'FRONTIER_IDENTICAL'`, `hasUnverifiedHistory = true`, and `unverifiedHistoryOrigins = ['peer-A']`.
+2. **Equal vectors + different tail fingerprints produce a confirmed frontier conflict:**
+   - At sequence 5 with mismatched fingerprints, `classification = 'DIVERGENT_FORK'`, `forkDetected = true`, `conflictingOrigins = ['peer-A']`, `detail.status = 'CONFLICT_FORK'`, and `frontierAgreement = false`.
+3. **Equal vectors + missing fingerprints remain historically unverified:**
+   - At sequence 5 with missing fingerprint on one/both sides, `classification = 'INCONCLUSIVE'`, `unprovableOrigins = ['peer-A']`, `unverifiedHistoryOrigins = ['peer-A']`, and `hasUnverifiedHistory = true`.
+4. **A peer missing an operation range remains correctly classified as behind, while separate historical uncertainty is preserved:**
+   - Origin A has lag ($2$ vs $7$, `REMOTE_DOMINATES`), while Origin B has $k = 5$ with matching tail fingerprint (`FRONTIER_IDENTICAL`). Result: `classification = 'REMOTE_DOMINATES'` while `hasUnverifiedHistory = true` (`unverifiedHistoryOrigins = ['peer-B']`).
+5. **A multi-origin comparison with one verified frontier and another unverified history preserves that uncertainty:**
+   - Origin A has $k = 1$ with matching fingerprint (`IDENTICAL`, `historyVerified = true`). Origin B has $k = 5$ with matching tail fingerprint (`FRONTIER_IDENTICAL`, `historyVerified = false`). Result: `hasUnverifiedHistory = true` (`unverifiedHistoryOrigins = ['peer-B']`).
+6. **A confirmed fork still takes precedence over ordinary dominance:**
+   - Origin A has a confirmed fork (`CONFLICT_FORK`), while Origin B has an ordinary missing range (`REMOTE_AHEAD`). Result: `classification = 'DIVERGENT_FORK'`, `forkDetected = true`.
+7. **Snapshot recovery requirements remain correctly represented:**
+   - Origin A has a missing sequence range starting at or below the snapshot frontier. Result: `classification = 'REQUIRES_SNAPSHOT_RECOVERY'`, `outsideRemoteHorizon = true`, `requiresSnapshotRecovery = true`.
 
 ### 4.2 Full Monorepo Test Totals
 
@@ -139,10 +131,10 @@ Packages:
 - @syncplay/control-events:   6 test files,  49 passed (49 total)
 - @syncplay/peer-mesh:        6 test files, 101 passed (101 total)
 - @syncplay/protocol:         4 test files, 273 passed (273 total)
-- @syncplay/sync-engine:     19 test files, 282 passed (282 total)  [+41 tests from M1]
+- @syncplay/sync-engine:     19 test files, 290 passed (290 total)  [+49 tests from M1]
 - @syncplay/bootstrap-server: 3 test files,  91 passed (91 total)
 
-Total Monorepo Tests: 796 tests passed across 38 test files (0 failures).
+Total Monorepo Tests: 804 tests passed across 38 test files (0 failures).
 ```
 
 ### 4.3 Monorepo Build Results
@@ -166,4 +158,4 @@ The following subsystems remain **STRICTLY UNIMPLEMENTED**:
 
 ---
 
-**PHASE 7.4 M2 — TARGETED CORRECTIONS COMPLETE. AWAITING ARCHITECTURAL REVIEW AND EXPLICIT AUTHORIZATION FOR M3.**
+**PHASE 7.4 M2 — HISTORICAL COMPLETENESS CORRECTION COMPLETE. AWAITING FINAL ARCHITECTURAL ACCEPTANCE AND EXPLICIT AUTHORIZATION FOR M3.**
