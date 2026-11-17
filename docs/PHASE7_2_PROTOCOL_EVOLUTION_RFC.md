@@ -310,6 +310,10 @@ export const OperationBatchPayloadSchema = z.object({
   - Byte integrity and vector dominance do **NOT** prove semantic correctness (truthfulness of the computed playback state). Semantic correctness relies on the Cooperative Non-Byzantine Trust Model (Option C).
 - **Supplier vs. Author Decoupling:** The transport peer supplying the snapshot (`supplierPeerId`) is explicitly distinguished from the author who computed the snapshot (`snapshotAuthorPeerId`). Neither is a permanent authority.
 - **Incomparable Snapshot Policy:** Incomparable snapshots ($V_{\text{snap}} \parallel V_{\text{local}}$) that cannot be repaired via log history trigger transition to `DEGRADED_OUT_OF_SYNC` (no arbitrary tie-breaking). Local operations newer than the snapshot frontier are replayed atomically.
+- **Post-Import Causal Consistency & Clock Reseeding:**
+  - `maxLogicalTimestamp` is derived directly as $\max_{p \in \text{keys}(\text{snapshotFrontier})} \text{originFrontierTimestamps}[p]$.
+  - Upon snapshot import, the peer initializes its causal context to `snapshotFrontier` and reseeds its clock to $L_{\text{local}} = \text{maxLogicalTimestamp}$ (without an extra $+1$).
+  - The first locally authored event includes `snapshotFrontier` in its `causalContext`, so both author and receiver independently compute $L(e) = 1 + \max_{(p, s) \in e.\text{causalContext}} L(p, s) \equiv 1 + \text{maxLogicalTimestamp}$. Exact Lamport equality is preserved without hidden clock jumps.
 
 #### Proposed TypeScript Schema (Documentation Only):
 ```ts

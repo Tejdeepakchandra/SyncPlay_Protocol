@@ -1,11 +1,16 @@
 # Phase 7.2-R6 — Exact Lamport Validation & Compacted Dependency Checkpoints
 
-> **Document Version:** 1.0.0  
-> **Status:** AUTHORITATIVE ARCHITECTURAL SPECIFICATION (Revision P7.2-R6)  
-> **Baseline Commit:** `990b3f4`  
-> **Preceding Baselines:** `a809612` (P7.2-R2), `c7188fc` (P7.2-R3), `16dfe7a` (P7.2-R4), `990b3f4` (P7.2-R5)  
+> **Document Version:** 1.1.0  
+> **Status:** AMENDED & REFINED IN PART BY REVISION P7.2-R7 (See [`PHASE7_2_R7_FINAL_CORRECTIONS.md`](file:///c:/Users/tejde/OneDrive/Desktop/SyncPlay_Protocol/SyncPlay_Protocol/docs/PHASE7_2_R7_FINAL_CORRECTIONS.md))  
+> **Baseline Commit:** `990b3f4` (Amended in `c420cae`, Reconciled in P7.2-R7)  
 > **Mode:** Specification & Architecture Only — Strict Stop Condition Observed  
 > **Target Subsystems:** `@syncplay/sync-engine`, `@syncplay/protocol`, `@syncplay/control-events`, `@syncplay/peer-mesh`  
+
+> [!NOTE]
+> Revision P7.2-R7 reconciles the snapshot import reseeding rule with exact Lamport creation equality:
+> 1. **Snapshot Clock Reseeding:** Corrected to $L_{\text{local}} \leftarrow \text{snapshot.maxLogicalTimestamp}$ (without an extra $+1$).
+> 2. **Causal Knowledge Propagation:** The imported `snapshotFrontier` directly initializes the peer's `localCausalContext`, ensuring the first post-import event includes the frontier and evaluates to $1 + \text{maxLogicalTimestamp}$.
+> 3. **Worked Example & Derivation:** Proves $\text{maxLogicalTimestamp} \equiv \max_p \text{originFrontierTimestamps}[p]$ and provides a concrete 2-origin worked walkthrough.  
 
 ---
 
@@ -202,3 +207,4 @@ flowchart TD
 | `docs/PHASE7_2_SIMULATION_TEST_STRATEGY.md` | Suite 10 updated with 9 explicit test cases for exact equality, off-by-one rejection, and checkpoint lookups. | Updated |
 | `docs/PHASE7_2_FINAL_DESIGN_REVIEW.md` | AD-701, AD-706, AD-709 updated with exact equality validation, bounded checkpoint retention, and specification freeze status. | Updated |
 | `docs/design/README.md` | Index updated to feature `PHASE7_2_R6_FINAL_CORRECTIONS.md` as the authoritative final architecture specification freeze. | Updated |
+

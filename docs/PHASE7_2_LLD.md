@@ -238,7 +238,7 @@ class LogicalClockManager {
     if (!Number.isSafeInteger(maxObservedClock) || maxObservedClock < 0) {
       throw new SyncEngineError('INVALID_CLOCK', `Malformed reseed timestamp: ${maxObservedClock}`);
     }
-    this.currentClock = Math.max(this.currentClock, Math.floor(maxObservedClock)) + 1;
+    this.currentClock = Math.max(this.currentClock, Math.floor(maxObservedClock));
     this.originRateStates.clear();
   }
 }
@@ -514,9 +514,13 @@ When `RecoveryManager.installSnapshot(payload)` is called:
      - *Host Re-Seek:* Host issues an explicit seek to establish a new agreed baseline.
      - *Room Reload:* Client reloads session and obtains a fresh identity and snapshot from Bootstrap.
 7. **No Permanent Authority:** The snapshot author or supplier never becomes a permanent playback authority; snapshot installation is strictly an atomic catch-up re-anchor.
-8. **Checkpoint Ingestion & Clock Reseeding:**
-   - Populates local `compactedCheckpoints` map from `payload.compactedCheckpoints` (retaining the exact timestamps of recent compacted sequences).
-   - Re-seeds local `LogicalClockManager` to $\max(L_{\text{local}}, \text{payload.maxLogicalTimestamp}) + 1$.
+8. **Causal State Initialization, Checkpoint Ingestion & Clock Reseeding:**
+   - Populates local `compactedCheckpoints` map from `payload.compactedCheckpoints` and `payload.originFrontierTimestamps`.
+   - Initializes local authoring causal knowledge: `localCausalContext` $\leftarrow \text{payload.snapshotFrontier}$.
+   - Initializes local replication vector: $V_{\text{rep}} \leftarrow \text{payload.snapshotFrontier}$.
+   - Re-seeds local `LogicalClockManager` to $\max(L_{\text{local}}, \text{payload.maxLogicalTimestamp})$ (without adding an unrepresented $+1$).
+   - *Post-Import Event Authoring:* When the importing peer authors its next event $e$, $e.\text{causalContext}$ incorporates `snapshotFrontier`. Both author and receiver compute the exact expected timestamp:
+     $$L(e) = 1 + \max_{(p, s) \in e.\text{causalContext}} L(p, s) \equiv 1 + \text{payload.maxLogicalTimestamp}$$
    - *Non-Substitution Invariant:* `maxLogicalTimestamp` is strictly a global snapshot ceiling for clock reseeding and diagnostics; it is **never** substituted as the timestamp of an individual origin sequence dependency.
 9. Installs base state atomically:
    $$v_{\text{local}} = v_{\text{current}} + 1$$

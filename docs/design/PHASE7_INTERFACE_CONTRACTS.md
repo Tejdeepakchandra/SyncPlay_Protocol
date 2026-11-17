@@ -119,7 +119,7 @@ export interface ILogicalClockManager {
 
   /**
    * Reseeds clock upon reconnect or snapshot recovery.
-   * Sets: L = max(L_local, maxObservedClock) + 1.
+   * Sets: L = max(L_local, maxObservedClock) (without an extra +1, so subsequent tickLocal evaluates exactly to 1 + maxObservedClock).
    */
   reseed(maxObservedClock: number): void;
 }
@@ -314,6 +314,14 @@ export interface IRecoveryManager {
    * Verifies RFC 8785 canonical SHA-256 digest (preimage binds formatVersion, sessionId, epoch, author, frontier, maxClock, state).
    * Note: Byte integrity and vector dominance do NOT prove semantic correctness; relies on Cooperative Non-Byzantine Trust Model.
    * Sets isImportedProvenance = true, and replays newer local operations.
+   *
+   * R7 Causal & Lamport Invariants:
+   *   - Atomically initializes `localCausalContext` to `snapshot.snapshotFrontier` (cloned).
+   *   - Updates local replication vector to `snapshot.snapshotFrontier`.
+   *   - Ingests `originFrontierTimestamps` into `compactedCheckpoints` (mapping `(p, snapshotFrontier[p]) -> originFrontierTimestamps[p]`).
+   *   - Reseeds local Lamport clock: `clockManager.reseed(snapshot.maxLogicalTimestamp)` (without extra +1).
+   *   - Guarantees subsequent post-import event D_1 ticks clock to `1 + maxLogicalTimestamp`, strictly matching
+   *     receiver exact validation: `1 + max_{(p, s) in D_1.causalContext} L(p, s)`.
    */
   installSnapshot(
     snapshot: StateSnapshotPayloadV2,
