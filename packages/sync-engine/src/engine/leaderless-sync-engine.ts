@@ -33,6 +33,7 @@ import { LogicalClockManager } from '../clock/logical-clock-manager.js';
 import { OrderedOperationLog } from '../log/ordered-operation-log.js';
 import { PendingDependencyQueue } from '../log/pending-dependency-queue.js';
 import { ConflictResolver } from '../conflict/conflict-resolver.js';
+import { computeOperationFingerprint } from '../log/operation-fingerprint.js';
 import type { StoredOperation } from '../log/types.js';
 import type { ReducerContext } from '../conflict/types.js';
 import type { OperationBatchPayload, StateSnapshotPayloadV2 } from '@syncplay/protocol';
@@ -149,6 +150,17 @@ export class LeaderlessSyncEngine implements SyncEngine {
     return this.currentEpoch;
   }
 
+  /**
+   * Authoritatively transitions the engine to a new membership epoch.
+   *
+   * State Transition Invariants:
+   * 1. currentEpoch: advances strictly forward to newEpoch.
+   * 2. pendingQueue: any buffered pending operations with membershipEpoch < newEpoch are purged
+   *    so obsolete-epoch operations cannot leak into the new epoch.
+   * 3. orderedOperationLog & baseSnapshot: preserved; valid state remains authoritative.
+   * 4. localCausalContext & replicationVector & Lamport clock: preserved monotonically.
+   * 5. peerGenerations: preserved across epoch boundary.
+   */
   public transitionEpoch(newEpoch: number): void {
     if (
       typeof newEpoch !== 'number' ||
@@ -161,9 +173,26 @@ export class LeaderlessSyncEngine implements SyncEngine {
       );
     }
     this.currentEpoch = newEpoch;
+    // Purge obsolete-epoch operations from pending dependency queue
+    this.pendingQueue.pruneObsoleteEpoch(newEpoch);
   }
 
+  /**
+   * Authoritative lifecycle registration for a peer's connection generation.
+   * Informs the engine of the trusted local peer connection manager's authorized generation.
+   * Incoming events cannot unilaterally advance or set this generation.
+   */
   public setPeerGeneration(peerId: string, generation: number): void {
+    this.authorizePeerGeneration(peerId, generation);
+  }
+
+  public authorizePeerGeneration(peerId: string, generation: number): void {
+    if (typeof generation !== 'number' || !Number.isInteger(generation) || generation < 1) {
+      throw new SyncEngineError(
+        'INVALID_ARGUMENT',
+        `Invalid connection generation ${generation}: must be positive integer`,
+      );
+    }
     if (this.peerGenerations.size >= 64 && !this.peerGenerations.has(peerId)) {
       const firstKey = this.peerGenerations.keys().next().value;
       if (firstKey) this.peerGenerations.delete(firstKey);
@@ -253,16 +282,20 @@ export class LeaderlessSyncEngine implements SyncEngine {
         const code =
           err instanceof SyncEngineError && err.code === 'SEQUENCE_COLLISION_DETECTED'
             ? 'REJECTED_SEQUENCE_CONFLICT'
-            : err instanceof SyncEngineError && err.code === 'REJECTED_CLOCK_INFLATION'
-              ? 'REJECTED_CLOCK_INFLATION'
-              : err instanceof SyncEngineError &&
-                  (err.code === 'INVALID_CAUSAL_TIMESTAMP' ||
-                    err.code === 'INVALID_LOGICAL_TIMESTAMP' ||
-                    err.code === 'CLOCK_REGRESSION')
-                ? 'REJECTED_CAUSAL_VIOLATION'
-                : err instanceof SyncEngineError && err.code === 'REJECTED_OUTSIDE_HORIZON'
-                  ? 'REJECTED_OUTSIDE_HORIZON'
-                  : 'REJECTED_INVALID';
+            : err instanceof SyncEngineError && err.code === 'IDENTITY_CONFLICT_DETECTED'
+              ? 'REJECTED_IDENTITY_CONFLICT'
+              : err instanceof SyncEngineError && err.code === 'REJECTED_CAPACITY'
+                ? 'REJECTED_CAPACITY'
+                : err instanceof SyncEngineError && err.code === 'REJECTED_CLOCK_INFLATION'
+                  ? 'REJECTED_CLOCK_INFLATION'
+                  : err instanceof SyncEngineError &&
+                      (err.code === 'INVALID_CAUSAL_TIMESTAMP' ||
+                        err.code === 'INVALID_LOGICAL_TIMESTAMP' ||
+                        err.code === 'CLOCK_REGRESSION')
+                    ? 'REJECTED_CAUSAL_VIOLATION'
+                    : err instanceof SyncEngineError && err.code === 'REJECTED_OUTSIDE_HORIZON'
+                      ? 'REJECTED_OUTSIDE_HORIZON'
+                      : 'REJECTED_INVALID';
 
         this.recordDecision(event, {
           accepted: false,
@@ -427,28 +460,71 @@ export class LeaderlessSyncEngine implements SyncEngine {
       }
     }
 
-    // Strict connection generation check: reject stale connection generations
-    if (event.message.connectionGeneration !== undefined) {
-      const activeGen = this.peerGenerations.get(senderPeerId);
-      if (activeGen !== undefined && event.message.connectionGeneration < activeGen) {
-        this.recordDecision(event, {
-          accepted: false,
-          code: 'REJECTED_INVALID',
-          stateVersion: this.state.stateVersion,
-          decidedAt: now,
-          message: `Event from stale connection generation ${event.message.connectionGeneration} < active ${activeGen}`,
-        });
-        return;
-      }
-      if (activeGen === undefined || event.message.connectionGeneration > activeGen) {
-        this.setPeerGeneration(senderPeerId, event.message.connectionGeneration);
+    // Strict connection generation check:
+    // Only applies to LIVE_BROADCAST events.
+    // In REPAIR_BATCH, senderPeerId is the supplier, but originPeerId is the original author;
+    // repair batches must not confuse supplier transport generation with event origin identity.
+    if (validationContext === 'LIVE_BROADCAST') {
+      const activeGen = this.peerGenerations.get(senderPeerId) ?? 1;
+      const claimedGen = event.message.connectionGeneration;
+
+      if (claimedGen !== undefined) {
+        if (claimedGen < activeGen) {
+          this.recordDecision(event, {
+            accepted: false,
+            code: 'REJECTED_INVALID',
+            stateVersion: this.state.stateVersion,
+            decidedAt: now,
+            message: `Event from stale connection generation ${claimedGen} < active ${activeGen}`,
+          });
+          return;
+        }
+        if (claimedGen > activeGen) {
+          // Incoming event cannot independently authorize a generation increase!
+          this.recordDecision(event, {
+            accepted: false,
+            code: 'REJECTED_INVALID',
+            stateVersion: this.state.stateVersion,
+            decidedAt: now,
+            message: `Event claims unannounced connection generation ${claimedGen} > authorized ${activeGen}`,
+          });
+          return;
+        }
       }
     }
 
     const originSeq = event.message.originSequenceNumber ?? 1;
+    const causalContext = event.message.causalContext ?? {};
 
-    // 1. Check duplicate by logicalEventId
-    if (this.operationLog.has(logicalEventId)) {
+    const logicalTimestamp = event.message.logicalTimestamp;
+    if (typeof logicalTimestamp !== 'number') {
+      throw new SyncEngineError('INVALID_CLOCK', 'Remote event missing logicalTimestamp');
+    }
+
+    const storedOp: StoredOperation = {
+      logicalEventId,
+      originPeerId,
+      senderPeerId,
+      membershipEpoch: event.message.membershipEpoch ?? this.currentEpoch,
+      messageType: event.message.messageType as any,
+      logicalTimestamp,
+      originSequenceNumber: originSeq,
+      causalContext,
+      appliedAtMonotonic: now,
+      payload: event.message.payload,
+    };
+
+    // 1. Check duplicate by logicalEventId with identity reuse verification
+    const existingById = this.operationLog.get(logicalEventId);
+    if (existingById) {
+      const incomingFp = computeOperationFingerprint(storedOp);
+      const existingFp = computeOperationFingerprint(existingById);
+      if (incomingFp !== existingFp) {
+        throw new SyncEngineError(
+          'IDENTITY_CONFLICT_DETECTED',
+          `Operation identity conflict for event ${logicalEventId}: immutable content altered`,
+        );
+      }
       this.recordDecision(event, {
         accepted: true,
         code: 'IGNORED_DUPLICATE',
@@ -465,6 +541,14 @@ export class LeaderlessSyncEngine implements SyncEngine {
         throw new SyncEngineError(
           'SEQUENCE_COLLISION_DETECTED',
           `Sequence collision detected for origin ${originPeerId} seq ${originSeq}`,
+        );
+      }
+      const incomingFp = computeOperationFingerprint(storedOp);
+      const existingFp = computeOperationFingerprint(existingBySeq);
+      if (incomingFp !== existingFp) {
+        throw new SyncEngineError(
+          'IDENTITY_CONFLICT_DETECTED',
+          `Operation identity conflict for event ${logicalEventId}: immutable content altered`,
         );
       }
       this.recordDecision(event, {
@@ -486,6 +570,15 @@ export class LeaderlessSyncEngine implements SyncEngine {
             `Sequence collision detected for compacted origin ${originPeerId} seq ${originSeq}: compacted ${cpRecord.logicalEventId} vs incoming ${logicalEventId}`,
           );
         }
+        if (cpRecord.fingerprint) {
+          const incomingFp = computeOperationFingerprint(storedOp);
+          if (incomingFp !== cpRecord.fingerprint) {
+            throw new SyncEngineError(
+              'IDENTITY_CONFLICT_DETECTED',
+              `Identity conflict detected for compacted event ${logicalEventId}: immutable content altered`,
+            );
+          }
+        }
         this.recordDecision(event, {
           accepted: true,
           code: 'IGNORED_ALREADY_COMPACTED',
@@ -506,8 +599,6 @@ export class LeaderlessSyncEngine implements SyncEngine {
       }
     }
 
-    const causalContext = event.message.causalContext ?? {};
-
     // 4. For any sequence > 1, author's immediate predecessor MUST be declared in causalContext
     if (originSeq > 1 && causalContext[originPeerId] !== originSeq - 1) {
       throw new SyncEngineError(
@@ -515,24 +606,6 @@ export class LeaderlessSyncEngine implements SyncEngine {
         `Event from ${originPeerId} seq ${originSeq} missing immediate predecessor seq ${originSeq - 1} in causalContext`,
       );
     }
-
-    const logicalTimestamp = event.message.logicalTimestamp;
-    if (typeof logicalTimestamp !== 'number') {
-      throw new SyncEngineError('INVALID_CLOCK', 'Remote event missing logicalTimestamp');
-    }
-
-    const storedOp: StoredOperation = {
-      logicalEventId,
-      originPeerId,
-      senderPeerId,
-      membershipEpoch: event.message.membershipEpoch ?? this.currentEpoch,
-      messageType: event.message.messageType as any,
-      logicalTimestamp,
-      originSequenceNumber: originSeq,
-      causalContext,
-      appliedAtMonotonic: now,
-      payload: event.message.payload,
-    };
 
     // Check missing dependencies and same-origin sequence gaps
     const currentOriginSeq = this.replicationVector[originPeerId] ?? 0;
@@ -552,14 +625,28 @@ export class LeaderlessSyncEngine implements SyncEngine {
 
     if (missingDep) {
       // Buffer in PendingDependencyQueue. Clock and vector DO NOT advance!
-      this.pendingQueue.enqueue(storedOp);
-      this.recordDecision(event, {
-        accepted: false,
-        code: 'BUFFERED_PENDING_DEPENDENCY',
-        stateVersion: this.state.stateVersion,
-        decidedAt: now,
-        message: `Buffered operation ${logicalEventId} awaiting missing causal dependencies`,
-      });
+      try {
+        this.pendingQueue.enqueue(storedOp);
+        this.recordDecision(event, {
+          accepted: false,
+          code: 'BUFFERED_PENDING_DEPENDENCY',
+          stateVersion: this.state.stateVersion,
+          decidedAt: now,
+          message: `Buffered operation ${logicalEventId} awaiting missing causal dependencies`,
+        });
+      } catch (err) {
+        if (err instanceof SyncEngineError && err.code === 'REJECTED_CAPACITY') {
+          this.recordDecision(event, {
+            accepted: false,
+            code: 'REJECTED_CAPACITY',
+            stateVersion: this.state.stateVersion,
+            decidedAt: now,
+            message: err.message,
+          });
+          return;
+        }
+        throw err;
+      }
       return;
     }
 
@@ -933,6 +1020,7 @@ export class LeaderlessSyncEngine implements SyncEngine {
         cp.sequenceNumber,
         cp.logicalTimestamp,
         (cp as any).logicalEventId ?? '',
+        (cp as any).fingerprint ?? '',
       );
     }
     // Also ingest frontier timestamps if not already present in compactedCheckpoints

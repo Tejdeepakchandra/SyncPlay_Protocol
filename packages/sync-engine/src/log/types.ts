@@ -24,6 +24,7 @@ export interface StoredOperation {
 export interface CompactedCheckpointRecord {
   readonly logicalTimestamp: number;
   readonly logicalEventId: string;
+  readonly fingerprint?: string;
 }
 
 export type InsertOperationCode =
@@ -35,6 +36,8 @@ export type InsertOperationCode =
   | 'REJECTED_OUTSIDE_HORIZON'
   | 'REJECTED_INVALID_ORIGIN'
   | 'REJECTED_SEQUENCE_CONFLICT'
+  | 'REJECTED_IDENTITY_CONFLICT'
+  | 'REJECTED_CAPACITY'
   | 'REJECTED_OBSOLETE_EPOCH';
 
 export interface InsertOperationResult {
@@ -78,12 +81,13 @@ export interface IOrderedOperationLog {
     sequenceNumber: number,
   ): CompactedCheckpointRecord | undefined;
 
-  /** Sets compacted checkpoint with timestamp and optional logical event id. */
+  /** Sets compacted checkpoint with timestamp, optional logical event id, and optional fingerprint. */
   setCompactedCheckpoint?(
     originPeerId: string,
     sequenceNumber: number,
     logicalTimestamp: number,
     logicalEventId?: string,
+    fingerprint?: string,
   ): void;
 
   /** Gets base snapshot frontier representation. */

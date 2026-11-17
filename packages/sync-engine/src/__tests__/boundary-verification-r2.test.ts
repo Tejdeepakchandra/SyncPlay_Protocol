@@ -202,12 +202,12 @@ describe('Phase 7.3-R2 Final Boundary Verification', () => {
       queue.enqueue(op3);
       expect(queue.size).toBe(3);
 
-      // 4th enqueue must throw REJECTED_OUTSIDE_HORIZON
+      // 4th enqueue must throw REJECTED_CAPACITY
       expect(() => queue.enqueue(op4)).toThrow(SyncEngineError);
       try {
         queue.enqueue(op4);
       } catch (err) {
-        expect((err as SyncEngineError).code).toBe('REJECTED_OUTSIDE_HORIZON');
+        expect((err as SyncEngineError).code).toBe('REJECTED_CAPACITY');
       }
 
       // Crucial: The original 3 operations MUST still be present in the queue (no silent eviction)
@@ -218,7 +218,7 @@ describe('Phase 7.3-R2 Final Boundary Verification', () => {
       expect(queue.has('op-4')).toBe(false);
     });
 
-    it('LeaderlessSyncEngine records REJECTED_OUTSIDE_HORIZON when pending queue capacity is exceeded', () => {
+    it('LeaderlessSyncEngine records REJECTED_CAPACITY when pending queue capacity is exceeded', () => {
       const boundedEngine = new LeaderlessSyncEngine({
         sessionId: 'session-001',
         localPeerId: 'peer-local',
@@ -238,7 +238,7 @@ describe('Phase 7.3-R2 Final Boundary Verification', () => {
       // 3rd missing-dependency operation exceeds pending queue capacity
       boundedEngine.receive(makeRemoteEvent('gap-3', 'peer-A', 'PLAY', {}, 5, 4, { 'peer-A': 3 }));
       expect(boundedEngine.getLastDecision()?.accepted).toBe(false);
-      expect(boundedEngine.getLastDecision()?.code).toBe('REJECTED_OUTSIDE_HORIZON');
+      expect(boundedEngine.getLastDecision()?.code).toBe('REJECTED_CAPACITY');
 
       // Existing 2 operations are retained
       expect(boundedEngine.pendingQueueSize).toBe(2);
@@ -352,7 +352,7 @@ describe('Phase 7.3-R2 Final Boundary Verification', () => {
       expect(engine.logicalClock).toBe(0);
     });
 
-    it('accepts events with matching or advancing connection generation', () => {
+    it('accepts events with matching connection generation and requires explicit authorization for advancement', () => {
       engine.setPeerGeneration('peer-A', 2);
 
       // Message with generation 2 matches active generation
@@ -373,7 +373,7 @@ describe('Phase 7.3-R2 Final Boundary Verification', () => {
       expect(engine.getLastDecision()?.accepted).toBe(true);
       expect(engine.getLastDecision()?.code).toBe('APPLIED');
 
-      // Message with generation 3 advances active generation
+      // Unannounced generation 3 is rejected without advancing active generation
       const advanceGenEvent = makeRemoteEvent(
         'adv-gen-3',
         'peer-A',
@@ -386,6 +386,14 @@ describe('Phase 7.3-R2 Final Boundary Verification', () => {
         'peer-A',
         3,
       );
+      engine.receive(advanceGenEvent);
+
+      expect(engine.getLastDecision()?.accepted).toBe(false);
+      expect(engine.getLastDecision()?.code).toBe('REJECTED_INVALID');
+      expect(engine.getPeerGeneration('peer-A')).toBe(2);
+
+      // After peer manager authorizes generation 3, event is accepted
+      engine.authorizePeerGeneration('peer-A', 3);
       engine.receive(advanceGenEvent);
 
       expect(engine.getLastDecision()?.accepted).toBe(true);
@@ -502,3 +510,4 @@ describe('Phase 7.3-R2 Final Boundary Verification', () => {
     });
   });
 });
+

@@ -57,6 +57,12 @@ export type { ILogicalClockManager, ClockValidationContext } from './clock/types
 
 export { OrderedOperationLog } from './log/ordered-operation-log.js';
 export { PendingDependencyQueue } from './log/pending-dependency-queue.js';
+export {
+  canonicalizeJson,
+  sha256,
+  computeOperationFingerprint,
+} from './log/operation-fingerprint.js';
+export type { OperationFingerprintInput } from './log/operation-fingerprint.js';
 export type {
   StoredOperation,
   InsertOperationCode,

@@ -10,6 +10,7 @@
 
 import { SyncEngineError } from '../errors.js';
 import { compareOperations } from '../ordering/comparator.js';
+import { computeOperationFingerprint } from './operation-fingerprint.js';
 import type { PlaybackState } from '../types.js';
 import type {
   StoredOperation,
@@ -107,10 +108,12 @@ export class OrderedOperationLog implements IOrderedOperationLog {
     sequenceNumber: number,
     logicalTimestamp: number,
     logicalEventId: string = '',
+    fingerprint: string = '',
   ): void {
     this.compactedCheckpoints.set(`${originPeerId}:${sequenceNumber}`, {
       logicalTimestamp,
       logicalEventId,
+      fingerprint,
     });
     // Strict global bound K = 256 entries across all origins
     if (this.compactedCheckpoints.size > this._capacity) {
@@ -142,9 +145,17 @@ export class OrderedOperationLog implements IOrderedOperationLog {
    * Performs deduplication and collision detection.
    */
   public insert(operation: StoredOperation): InsertOperationResult {
-    // 1. Deduplication check by logicalEventId
+    // 1. Deduplication check by logicalEventId with identity reuse verification
     const existingById = this.idIndex.get(operation.logicalEventId);
     if (existingById) {
+      const incomingFp = computeOperationFingerprint(operation);
+      const existingFp = computeOperationFingerprint(existingById);
+      if (incomingFp !== existingFp) {
+        throw new SyncEngineError(
+          'IDENTITY_CONFLICT_DETECTED',
+          `Operation identity conflict for event ${operation.logicalEventId}: immutable content altered`,
+        );
+      }
       return {
         inserted: false,
         isHead: false,
@@ -161,6 +172,14 @@ export class OrderedOperationLog implements IOrderedOperationLog {
         throw new SyncEngineError(
           'SEQUENCE_COLLISION_DETECTED',
           `Sequence collision detected for origin ${operation.originPeerId} seq ${operation.originSequenceNumber}: existing ${existingBySeq.logicalEventId} vs incoming ${operation.logicalEventId}`,
+        );
+      }
+      const incomingFp = computeOperationFingerprint(operation);
+      const existingFp = computeOperationFingerprint(existingBySeq);
+      if (incomingFp !== existingFp) {
+        throw new SyncEngineError(
+          'IDENTITY_CONFLICT_DETECTED',
+          `Operation identity conflict for event ${operation.logicalEventId}: immutable content altered`,
         );
       }
       return {
@@ -183,6 +202,15 @@ export class OrderedOperationLog implements IOrderedOperationLog {
             'SEQUENCE_COLLISION_DETECTED',
             `Sequence collision detected for compacted origin ${operation.originPeerId} seq ${operation.originSequenceNumber}: compacted ${checkpoint.logicalEventId} vs incoming ${operation.logicalEventId}`,
           );
+        }
+        if (checkpoint.fingerprint) {
+          const incomingFp = computeOperationFingerprint(operation);
+          if (incomingFp !== checkpoint.fingerprint) {
+            throw new SyncEngineError(
+              'IDENTITY_CONFLICT_DETECTED',
+              `Identity conflict detected for compacted event ${operation.logicalEventId}: immutable content altered`,
+            );
+          }
         }
         return {
           inserted: false,
@@ -210,6 +238,15 @@ export class OrderedOperationLog implements IOrderedOperationLog {
           'SEQUENCE_COLLISION_DETECTED',
           `Sequence collision detected for compacted origin ${operation.originPeerId} seq ${operation.originSequenceNumber}: compacted ${checkpoint.logicalEventId} vs incoming ${operation.logicalEventId}`,
         );
+      }
+      if (checkpoint.fingerprint) {
+        const incomingFp = computeOperationFingerprint(operation);
+        if (incomingFp !== checkpoint.fingerprint) {
+          throw new SyncEngineError(
+            'IDENTITY_CONFLICT_DETECTED',
+            `Identity conflict detected for compacted event ${operation.logicalEventId}: immutable content altered`,
+          );
+        }
       }
       return {
         inserted: false,
@@ -249,11 +286,13 @@ export class OrderedOperationLog implements IOrderedOperationLog {
       this.originSeqIndex.delete(
         `${evicted.originPeerId}:${evicted.originSequenceNumber}`,
       );
+      const evictedFp = computeOperationFingerprint(evicted);
       this.setCompactedCheckpoint(
         evicted.originPeerId,
         evicted.originSequenceNumber,
         evicted.logicalTimestamp,
         evicted.logicalEventId,
+        evictedFp,
       );
       // Fold evicted operation into base snapshot
       if (this.baseSnapshot && this.reducer) {
@@ -291,11 +330,13 @@ export class OrderedOperationLog implements IOrderedOperationLog {
         this.operations.splice(i, 1);
         this.idIndex.delete(op.logicalEventId);
         this.originSeqIndex.delete(`${op.originPeerId}:${op.originSequenceNumber}`);
+        const opFp = computeOperationFingerprint(op);
         this.setCompactedCheckpoint(
           op.originPeerId,
           op.originSequenceNumber,
           op.logicalTimestamp,
           op.logicalEventId,
+          opFp,
         );
         toPrune.push(op);
       }

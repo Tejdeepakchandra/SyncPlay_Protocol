@@ -38,7 +38,7 @@ export class PendingDependencyQueue {
 
   /**
    * Buffers an operation awaiting dependencies.
-   * Throws SyncEngineError('REJECTED_OUTSIDE_HORIZON') if queue capacity is exceeded.
+   * Throws SyncEngineError('REJECTED_CAPACITY') if queue capacity is exceeded.
    */
   public enqueue(operation: StoredOperation): void {
     if (this.idIndex.has(operation.logicalEventId)) {
@@ -47,7 +47,7 @@ export class PendingDependencyQueue {
 
     if (this.queue.length >= this.capacity) {
       throw new SyncEngineError(
-        'REJECTED_OUTSIDE_HORIZON',
+        'REJECTED_CAPACITY',
         `Pending dependency queue capacity (${this.capacity}) exceeded`,
       );
     }
@@ -157,6 +157,26 @@ export class PendingDependencyQueue {
     }
 
     return ranges;
+  }
+
+  public getAll(): ReadonlyArray<StoredOperation> {
+    return [...this.queue];
+  }
+
+  /**
+   * Prunes all buffered operations belonging to obsolete membership epochs (< currentEpoch).
+   * Prevents old-epoch operations from leaking into the new epoch.
+   */
+  public pruneObsoleteEpoch(currentEpoch: number): number {
+    let prunedCount = 0;
+    for (let i = this.queue.length - 1; i >= 0; i--) {
+      if (this.queue[i]!.membershipEpoch < currentEpoch) {
+        const removed = this.queue.splice(i, 1)[0]!;
+        this.idIndex.delete(removed.logicalEventId);
+        prunedCount++;
+      }
+    }
+    return prunedCount;
   }
 
   public clear(): void {

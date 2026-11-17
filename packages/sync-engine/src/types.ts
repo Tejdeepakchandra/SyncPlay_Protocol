@@ -115,6 +115,8 @@ export type EngineDecisionCode =
   | 'REJECTED_OUTSIDE_HORIZON'    // Pre-horizon operation that cannot be verified
   | 'REJECTED_CLOCK_INFLATION'    // Rejected due to rate inflation
   | 'REJECTED_SEQUENCE_CONFLICT'  // Sequence collision detected
+  | 'REJECTED_IDENTITY_CONFLICT'  // Operation identity reuse with altered immutable content
+  | 'REJECTED_CAPACITY'           // Pending dependency queue or buffer capacity exceeded
   | 'REJECTED_CAUSAL_VIOLATION'   // Causal or Lamport timestamp invalid
   | 'REJECTED_OBSOLETE_EPOCH';    // Membership epoch obsolete
 
