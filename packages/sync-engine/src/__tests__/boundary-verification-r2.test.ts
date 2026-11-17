@@ -22,7 +22,11 @@
  */
 
 import { describe, it, expect, beforeEach } from 'vitest';
-import { LeaderlessSyncEngine } from '../engine/leaderless-sync-engine.js';
+import {
+  LeaderlessSyncEngine,
+  createEpochTransitionCapability,
+  type EpochTransitionCapability,
+} from '../engine/leaderless-sync-engine.js';
 import { OrderedOperationLog } from '../log/ordered-operation-log.js';
 import { PendingDependencyQueue } from '../log/pending-dependency-queue.js';
 import { SyncEngineError } from '../errors.js';
@@ -120,12 +124,15 @@ function makeStoredOp(
 
 describe('Phase 7.3-R2 Final Boundary Verification', () => {
   let engine: LeaderlessSyncEngine;
+  let epochCapability: EpochTransitionCapability;
 
   beforeEach(() => {
+    epochCapability = createEpochTransitionCapability('peer-local', 'session-001');
     engine = new LeaderlessSyncEngine({
       sessionId: 'session-001',
       localPeerId: 'peer-local',
       clock: { now: () => 1000 },
+      epochCapability,
     });
   });
 
@@ -267,8 +274,7 @@ describe('Phase 7.3-R2 Final Boundary Verification', () => {
   describe('2. Membership Epoch & Connection Generation Validation', () => {
     it('rejects events with older membership epoch (REJECTED_OBSOLETE_EPOCH)', () => {
       // Transition engine to epoch 2
-      const auth = engine.getEpochTransitionCapability();
-      engine.transitionEpoch(2, auth);
+      engine.transitionEpoch(2, epochCapability);
       expect(engine.epoch).toBe(2);
 
       // Remote event from obsolete epoch 1
@@ -281,8 +287,7 @@ describe('Phase 7.3-R2 Final Boundary Verification', () => {
     });
 
     it('accepts events matching exact current membership epoch', () => {
-      const auth = engine.getEpochTransitionCapability();
-      engine.transitionEpoch(2, auth);
+      engine.transitionEpoch(2, epochCapability);
 
       const evCurrentEpoch = makeRemoteEvent('ev-1', 'peer-A', 'PLAY', {}, 1, 1, {}, 2);
       engine.receive(evCurrentEpoch);
@@ -316,17 +321,16 @@ describe('Phase 7.3-R2 Final Boundary Verification', () => {
     it('explicit authorized epoch transition procedure advances epoch correctly', () => {
       expect(engine.epoch).toBe(1);
 
-      const auth = engine.getEpochTransitionCapability();
-      engine.transitionEpoch(2, auth);
+      engine.transitionEpoch(2, epochCapability);
       expect(engine.epoch).toBe(2);
 
-      engine.transitionEpoch(5, auth);
+      engine.transitionEpoch(5, epochCapability);
       expect(engine.epoch).toBe(5);
 
       // Transitioning to same or lower epoch throws INVALID_ARGUMENT
-      expect(() => engine.transitionEpoch(5, auth)).toThrow(SyncEngineError);
-      expect(() => engine.transitionEpoch(4, auth)).toThrow(SyncEngineError);
-      expect(() => engine.transitionEpoch(NaN, auth)).toThrow(SyncEngineError);
+      expect(() => engine.transitionEpoch(5, epochCapability)).toThrow(SyncEngineError);
+      expect(() => engine.transitionEpoch(4, epochCapability)).toThrow(SyncEngineError);
+      expect(() => engine.transitionEpoch(NaN, epochCapability)).toThrow(SyncEngineError);
     });
 
     it('rejects events from stale connection generation after peer reconnected (REJECTED_INVALID)', () => {

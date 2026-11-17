@@ -11,7 +11,11 @@
 import { describe, it, expect, beforeEach } from 'vitest';
 import { PROTOCOL_VERSION, type StateSnapshotPayloadV2 } from '@syncplay/protocol';
 import type { AnyControlSyncEvent } from '@syncplay/control-events';
-import { LeaderlessSyncEngine } from '../engine/leaderless-sync-engine.js';
+import {
+  LeaderlessSyncEngine,
+  createEpochTransitionCapability,
+  type EpochTransitionCapability,
+} from '../engine/leaderless-sync-engine.js';
 import { OrderedOperationLog } from '../log/ordered-operation-log.js';
 import { PendingDependencyQueue } from '../log/pending-dependency-queue.js';
 import {
@@ -116,12 +120,15 @@ function makeStoredOp(
 
 describe('Phase 7.3-R3 Final Identity & Authorization Audit', () => {
   let engine: LeaderlessSyncEngine;
+  let epochCapability: EpochTransitionCapability;
 
   beforeEach(() => {
+    epochCapability = createEpochTransitionCapability('peer-local', 'session-001');
     engine = new LeaderlessSyncEngine({
       sessionId: 'session-001',
       localPeerId: 'peer-local',
       clock: { now: () => 1000 },
+      epochCapability,
     });
   });
 
@@ -562,23 +569,20 @@ describe('Phase 7.3-R3 Final Identity & Authorization Audit', () => {
   describe('Task 3: Explicit Epoch Transition Semantics', () => {
     it('valid authorized epoch transition advances currentEpoch', () => {
       expect(engine.epoch).toBe(1);
-      const auth = engine.getEpochTransitionCapability();
-      engine.transitionEpoch(2, auth);
+      engine.transitionEpoch(2, epochCapability);
       expect(engine.epoch).toBe(2);
     });
 
     it('unauthorized transition with non-integer or smaller/equal epoch throws INVALID_ARGUMENT', () => {
-      const auth = engine.getEpochTransitionCapability();
-      expect(() => engine.transitionEpoch(1, auth)).toThrow(SyncEngineError);
-      expect(() => engine.transitionEpoch(0, auth)).toThrow(SyncEngineError);
-      expect(() => engine.transitionEpoch(-1, auth)).toThrow(SyncEngineError);
-      expect(() => engine.transitionEpoch(2.5 as any, auth)).toThrow(SyncEngineError);
-      expect(() => engine.transitionEpoch('2' as any, auth)).toThrow(SyncEngineError);
+      expect(() => engine.transitionEpoch(1, epochCapability)).toThrow(SyncEngineError);
+      expect(() => engine.transitionEpoch(0, epochCapability)).toThrow(SyncEngineError);
+      expect(() => engine.transitionEpoch(-1, epochCapability)).toThrow(SyncEngineError);
+      expect(() => engine.transitionEpoch(2.5 as any, epochCapability)).toThrow(SyncEngineError);
+      expect(() => engine.transitionEpoch('2' as any, epochCapability)).toThrow(SyncEngineError);
     });
 
     it('old-epoch events arriving after transition are rejected with REJECTED_OBSOLETE_EPOCH', () => {
-      const auth = engine.getEpochTransitionCapability();
-      engine.transitionEpoch(2, auth);
+      engine.transitionEpoch(2, epochCapability);
 
       const oldEpochEvent = makeRemoteEvent('ev-old', 'peer-A', 'PLAY', {}, 1, 1, {}, 1);
       engine.receive(oldEpochEvent);
@@ -606,8 +610,7 @@ describe('Phase 7.3-R3 Final Identity & Authorization Audit', () => {
       expect(engine.pendingQueueSize).toBe(1);
 
       // 2. Authoritative epoch transition to epoch 2 occurs
-      const auth = engine.getEpochTransitionCapability();
-      engine.transitionEpoch(2, auth);
+      engine.transitionEpoch(2, epochCapability);
 
       // 3. Crucial: The old-epoch operation MUST be purged from the pending queue
       expect(engine.pendingQueueSize).toBe(0);
@@ -627,8 +630,7 @@ describe('Phase 7.3-R3 Final Identity & Authorization Audit', () => {
       const versionBefore = engine.getState().stateVersion;
 
       // Transition epoch
-      const auth = engine.getEpochTransitionCapability();
-      engine.transitionEpoch(2, auth);
+      engine.transitionEpoch(2, epochCapability);
 
       // State is preserved
       expect(engine.getState().status).toBe('playing');

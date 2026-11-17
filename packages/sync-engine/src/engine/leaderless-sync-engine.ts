@@ -54,10 +54,35 @@ export interface EpochTransitionCapability {
   readonly token: string;
 }
 
+/**
+ * Creates an authorized EpochTransitionCapability for trusted coordinator initialization.
+ */
+export function createEpochTransitionCapability(
+  authority: string,
+  sessionId: string,
+  token?: string,
+): EpochTransitionCapability {
+  return Object.freeze({
+    authority,
+    sessionId,
+    token:
+      token ??
+      `epoch-cap-${sessionId}-${Math.random().toString(36).slice(2)}-${Date.now()}`,
+  });
+}
+
+/**
+ * Authenticated transport supplier metadata supplied by the trusted transport layer.
+ */
+export interface AuthenticatedSupplierContext {
+  readonly supplierPeerId: string;
+  readonly connectionGeneration?: number;
+}
+
 export interface LeaderlessSyncEngineConfig extends SyncEngineConfig {
   readonly initialClock?: number;
   readonly logCapacity?: number;
-  readonly epochAuthorityToken?: string;
+  readonly epochCapability?: EpochTransitionCapability;
 }
 
 export class LeaderlessSyncEngine implements SyncEngine {
@@ -79,7 +104,7 @@ export class LeaderlessSyncEngine implements SyncEngine {
   private readonly localCausalContext: Record<string, number> = {};
   private readonly replicationVector: Record<string, number> = {};
   private readonly peerGenerations = new Map<string, number>();
-  private readonly epochAuthorityToken: string;
+  private readonly authorizedEpochCapability?: EpochTransitionCapability;
   private localOriginSequence = 0;
   private currentEpoch = 1;
 
@@ -119,9 +144,7 @@ export class LeaderlessSyncEngine implements SyncEngine {
     this.state = initialState;
     this.baseSnapshot = initialState;
 
-    this.epochAuthorityToken =
-      config.epochAuthorityToken ??
-      `epoch-auth-${config.sessionId}-${Math.random().toString(36).slice(2)}-${Date.now()}`;
+    this.authorizedEpochCapability = config.epochCapability;
 
     const logCapacity = config.logCapacity ?? 256;
     this.clockManager = new LogicalClockManager(config.initialClock ?? 0);
@@ -163,23 +186,12 @@ export class LeaderlessSyncEngine implements SyncEngine {
   }
 
   /**
-   * Returns an EpochTransitionCapability authorized to transition the engine's membership epoch.
-   * Only the authorized coordinator / session manager holding this capability can trigger an epoch transition.
-   */
-  public getEpochTransitionCapability(): EpochTransitionCapability {
-    return Object.freeze({
-      authority: this.config.localPeerId,
-      sessionId: this.config.sessionId,
-      token: this.epochAuthorityToken,
-    });
-  }
-
-  /**
    * Authoritatively transitions the engine to a new membership epoch.
    *
    * Authorization:
-   * Requires a valid EpochTransitionCapability or matching authority token.
-   * Unauthorized callers are rejected with SyncEngineError('UNAUTHORIZED').
+   * Requires possession of the authorized EpochTransitionCapability that was injected
+   * during trusted engine initialization. An arbitrary caller without the capability
+   * or attempting to use a raw string token is rejected with SyncEngineError('UNAUTHORIZED').
    *
    * State Transition Invariants:
    * 1. currentEpoch: advances strictly forward to newEpoch.
@@ -191,25 +203,19 @@ export class LeaderlessSyncEngine implements SyncEngine {
    */
   public transitionEpoch(
     newEpoch: number,
-    authorization?: EpochTransitionCapability | string,
+    capability: EpochTransitionCapability,
   ): void {
-    const token =
-      typeof authorization === 'string'
-        ? authorization
-        : authorization?.token;
-    const authSessionId =
-      typeof authorization === 'object' && authorization !== null
-        ? authorization.sessionId
-        : undefined;
-
     if (
-      !token ||
-      token !== this.epochAuthorityToken ||
-      (authSessionId !== undefined && authSessionId !== this.config.sessionId)
+      !capability ||
+      typeof capability !== 'object' ||
+      !this.authorizedEpochCapability ||
+      capability.token !== this.authorizedEpochCapability.token ||
+      capability.sessionId !== this.config.sessionId ||
+      capability.authority !== this.authorizedEpochCapability.authority
     ) {
       throw new SyncEngineError(
         'UNAUTHORIZED',
-        'Epoch transition requires valid EpochTransitionCapability authorization',
+        'Epoch transition requires authorized EpochTransitionCapability',
       );
     }
 
@@ -886,8 +892,10 @@ export class LeaderlessSyncEngine implements SyncEngine {
   /**
    * Ingests a repair batch supplying missing historical operations.
    *
-   * Validates supplier connection generation:
-   * - Validates supplierPeerId against authorized peerGenerations.
+   * Authenticated transport binding:
+   * - Resolves the trusted transport supplier identity (from AuthenticatedSupplierContext or payload).
+   * - Rejects forged supplier identities if the payload claims a supplier differing from transport identity.
+   * - Validates supplier connection generation against authorized peerGenerations.
    * - Stale or unannounced supplier generations are rejected with REJECTED_INVALID.
    * - Validates that batch.originPeerId matches each rawOp.originPeerId (rejects origin rewriting).
    * - Historical author generation is not compared against supplier generation.
@@ -895,34 +903,61 @@ export class LeaderlessSyncEngine implements SyncEngine {
    */
   public ingestRepairBatch(
     batch: OperationBatchPayload,
-    supplierConnectionGeneration?: number,
+    transportContext?: AuthenticatedSupplierContext | number,
   ): EngineDecision[] {
     const now = this.clock.now();
     const decisions: EngineDecision[] = [];
 
-    // Validate supplier connection generation
-    const activeSupplierGen = this.peerGenerations.get(batch.supplierPeerId) ?? 1;
-    if (supplierConnectionGeneration !== undefined) {
-      if (supplierConnectionGeneration < activeSupplierGen) {
+    // 1. Resolve authenticated transport supplier identity and connection generation
+    const isContextObj = typeof transportContext === 'object' && transportContext !== null;
+    const transportSupplierPeerId = isContextObj
+      ? transportContext.supplierPeerId
+      : batch.supplierPeerId;
+
+    const transportSupplierGen = isContextObj
+      ? transportContext.connectionGeneration
+      : typeof transportContext === 'number'
+        ? transportContext
+        : undefined;
+
+    // 2. Reject forged supplier identity if payload claims a different peer than authenticated transport
+    if (isContextObj && batch.supplierPeerId && batch.supplierPeerId !== transportContext.supplierPeerId) {
+      const decision: EngineDecision = {
+        accepted: false,
+        code: 'REJECTED_INVALID',
+        stateVersion: this.state.stateVersion,
+        decidedAt: now,
+        message: `Forged supplier identity: payload claims ${batch.supplierPeerId} but authenticated transport supplier is ${transportContext.supplierPeerId}`,
+      };
+      this.lastDecision = decision;
+      this.mutableStats.eventsReceivedCount += Math.max(1, batch.operations.length);
+      this.mutableStats.eventsRejectedCount += Math.max(1, batch.operations.length);
+      return [decision];
+    }
+
+    // 3. Validate supplier connection generation against authorized peerGenerations
+    const activeSupplierGen = this.peerGenerations.get(transportSupplierPeerId) ?? 1;
+    if (transportSupplierGen !== undefined) {
+      if (transportSupplierGen < activeSupplierGen) {
         const decision: EngineDecision = {
           accepted: false,
           code: 'REJECTED_INVALID',
           stateVersion: this.state.stateVersion,
           decidedAt: now,
-          message: `Repair batch from stale supplier connection generation ${supplierConnectionGeneration} < active ${activeSupplierGen}`,
+          message: `Repair batch from stale supplier connection generation ${transportSupplierGen} < active ${activeSupplierGen}`,
         };
         this.lastDecision = decision;
         this.mutableStats.eventsReceivedCount += Math.max(1, batch.operations.length);
         this.mutableStats.eventsRejectedCount += Math.max(1, batch.operations.length);
         return [decision];
       }
-      if (supplierConnectionGeneration > activeSupplierGen) {
+      if (transportSupplierGen > activeSupplierGen) {
         const decision: EngineDecision = {
           accepted: false,
           code: 'REJECTED_INVALID',
           stateVersion: this.state.stateVersion,
           decidedAt: now,
-          message: `Repair batch claims unannounced supplier connection generation ${supplierConnectionGeneration} > authorized ${activeSupplierGen}`,
+          message: `Repair batch claims unannounced supplier connection generation ${transportSupplierGen} > authorized ${activeSupplierGen}`,
         };
         this.lastDecision = decision;
         this.mutableStats.eventsReceivedCount += Math.max(1, batch.operations.length);
@@ -956,7 +991,7 @@ export class LeaderlessSyncEngine implements SyncEngine {
       const storedOp: StoredOperation = {
         logicalEventId: rawOp.logicalEventId,
         originPeerId: rawOp.originPeerId,
-        senderPeerId: batch.supplierPeerId,
+        senderPeerId: transportSupplierPeerId,
         membershipEpoch: rawOp.membershipEpoch,
         messageType: rawOp.messageType,
         logicalTimestamp: rawOp.logicalTimestamp,

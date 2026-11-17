@@ -10,9 +10,11 @@
 import { describe, it, expect, beforeEach } from 'vitest';
 import {
   LeaderlessSyncEngine,
+  createEpochTransitionCapability,
   canonicalizeJson,
   sha256,
   computeOperationFingerprint,
+  type EpochTransitionCapability,
 } from '../index.js';
 import { SyncEngineError } from '../errors.js';
 import type { AnyControlSyncEvent } from '@syncplay/control-events';
@@ -54,14 +56,20 @@ function makeRemoteEvent(
 describe('Phase 7.3-R4: Final Trust-Boundary Verification', () => {
   let engine: LeaderlessSyncEngine;
   let simulatedTime: number;
+  let epochCapability: EpochTransitionCapability;
 
   beforeEach(() => {
     simulatedTime = 1000;
+    epochCapability = createEpochTransitionCapability(
+      'peer-local',
+      'test-session',
+      'coordinator-secret-token-12345',
+    );
     engine = new LeaderlessSyncEngine({
       sessionId: 'test-session',
       localPeerId: 'peer-local',
       clock: { now: () => simulatedTime },
-      epochAuthorityToken: 'coordinator-secret-token-12345',
+      epochCapability,
     });
   });
 
@@ -351,18 +359,28 @@ describe('Phase 7.3-R4: Final Trust-Boundary Verification', () => {
   // ════════════════════════════════════════════════════════════════
   describe('Task 2: Enforceable Membership Epoch Transition Authorization', () => {
     it('authorized coordinator holding capability can successfully transition epoch', () => {
-      const capability = engine.getEpochTransitionCapability();
-      expect(capability.sessionId).toBe('test-session');
-      expect(capability.authority).toBe('peer-local');
-      expect(capability.token).toBe('coordinator-secret-token-12345');
+      expect(epochCapability.sessionId).toBe('test-session');
+      expect(epochCapability.authority).toBe('peer-local');
+      expect(epochCapability.token).toBe('coordinator-secret-token-12345');
 
-      engine.transitionEpoch(2, capability);
+      engine.transitionEpoch(2, epochCapability);
       expect(engine.epoch).toBe(2);
     });
 
-    it('authorized caller with exact token string can transition epoch', () => {
-      engine.transitionEpoch(2, 'coordinator-secret-token-12345');
-      expect(engine.epoch).toBe(2);
+    it('arbitrary local caller cannot obtain the capability through the engine API', () => {
+      expect((engine as any).getEpochTransitionCapability).toBeUndefined();
+    });
+
+    it('caller with plain token string cannot bypass capability ownership', () => {
+      expect(() => (engine as any).transitionEpoch(2, 'coordinator-secret-token-12345')).toThrow(
+        SyncEngineError,
+      );
+      try {
+        (engine as any).transitionEpoch(2, 'coordinator-secret-token-12345');
+      } catch (err: any) {
+        expect(err.code).toBe('UNAUTHORIZED');
+      }
+      expect(engine.epoch).toBe(1);
     });
 
     it('unauthorized caller without capability/token throws UNAUTHORIZED SyncEngineError', () => {
@@ -371,7 +389,7 @@ describe('Phase 7.3-R4: Final Trust-Boundary Verification', () => {
         (engine as any).transitionEpoch(2);
       } catch (err: any) {
         expect(err.code).toBe('UNAUTHORIZED');
-        expect(err.message).toContain('Epoch transition requires valid EpochTransitionCapability');
+        expect(err.message).toContain('Epoch transition requires authorized EpochTransitionCapability');
       }
       expect(engine.epoch).toBe(1);
     });
@@ -439,8 +457,7 @@ describe('Phase 7.3-R4: Final Trust-Boundary Verification', () => {
       expect(engine.pendingQueueSize).toBe(1);
 
       // 2. Authorized transition
-      const auth = engine.getEpochTransitionCapability();
-      engine.transitionEpoch(2, auth);
+      engine.transitionEpoch(2, epochCapability);
       expect(engine.epoch).toBe(2);
 
       // 3. Pending queue purged
@@ -607,3 +624,4 @@ describe('Phase 7.3-R4: Final Trust-Boundary Verification', () => {
     });
   });
 });
+

@@ -48,10 +48,14 @@ export type { EngineSnapshotData, ValidatedSnapshotResult } from './snapshot.js'
 
 // ── Implementation ───────────────────────────────────────────
 export { BaselineSyncEngine } from './baseline-sync-engine.js';
-export { LeaderlessSyncEngine } from './engine/leaderless-sync-engine.js';
+export {
+  LeaderlessSyncEngine,
+  createEpochTransitionCapability,
+} from './engine/leaderless-sync-engine.js';
 export type {
   LeaderlessSyncEngineConfig,
   EpochTransitionCapability,
+  AuthenticatedSupplierContext,
 } from './engine/leaderless-sync-engine.js';
 
 // ── Phase 7 Distributed Ordering & Conflict Components ───────
