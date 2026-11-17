@@ -126,12 +126,12 @@ The test suite contains 45 tests, including 10 targeted adversarial tests verify
 | 10 | Partial response `[10, 20]` for request `[1, 32]` | PASSED | Operations $10..20$ buffered in `PendingDependencyQueue`; prefix $[1, 9]$ preserved in repair queue; unblocks and converges to 32 once $[1, 9]$ and $[21, 32]$ arrive. |
 
 ### 4.2. Monorepo Test Results
-- **`@syncplay/sync-engine`:** **344 passed** across 21 files (0 failures).
+- **`@syncplay/sync-engine`:** **351 passed** across 22 files (0 failures).
 - **`@syncplay/protocol`:** **273 passed** across 4 files (0 failures).
 - **`@syncplay/peer-mesh`:** **101 passed** across 6 files (0 failures).
 - **`@syncplay/control-events`:** **49 passed** across 6 files (0 failures).
 - **`@syncplay/bootstrap-server`:** **91 passed** across 3 files (0 failures).
-- **Total Monorepo Tests:** **858 passed across 40 files with 0 failures**.
+- **Total Monorepo Tests:** **865 passed across 41 files with 0 failures**.
 - **Build & Typecheck:** `tsc` and Vite production build passed cleanly across all packages.
 
 ---
@@ -196,4 +196,51 @@ Neither the pipeline nor the engine trusts the sender ID, supplier ID, or connec
 | 3 | **Can an unauthenticated or mismatched `REPAIR_REJECTED` mutate repair lifecycle state?** | **NO** | `RepairRequestPipeline.handleRepairRejected()` requires a valid, registered `AuthenticatedSupplierContext`. Unauthenticated rejections, generation mismatches, or supplier mismatches are dropped prior to touching in-flight requests, peer knowledge, or backoff timers. |
 | 4 | **Is context reuse prevented, or is its safety guaranteed by a documented packet-binding mechanism?** | **GUARANTEED BY BINDING** | An authenticated context attests to an active channel `(peerId, generation)`. Replay or reuse across requests is prevented by UUID v4 in-flight request correlation: requests are removed upon completion, rendering any replayed packet invalid (`not an active in-flight request`). |
 | 5 | **Is the Phase 7.3-R5-H capability boundary preserved?** | **YES** | The Phase 7.3-R5-H object-capability pattern is strictly maintained. The transport adapter is granted registration capability exclusively at composition root; all anti-entropy repair operations require capability-authenticated contexts before admission. |
+
+---
+
+## 8. Final Duplicate Repair Response and Replay-Safety Audit
+
+### 8.1 Mechanism: Atomic Retirement Before Performing Side Effects
+To guarantee that duplicate, replayed, or re-entrant repair responses can never cause duplicate state mutations or corrupt request lifecycle state, the pipeline enforces strict **atomic retirement before side effects**:
+1. **`RepairRequestPipeline.handleRepairBatch()`:**
+   - Synchronously clears the in-flight request timer: `this.clock.clearTimeout(inFlight.timerId)`.
+   - **Immediately and atomically deletes the request from tracking**: `this.inFlightRequests.delete(batch.requestId)` **prior** to invoking `this.engine.ingestRepairBatch(batch, context)`.
+   - Any duplicate packet delivered sequentially or re-entrantly (e.g., via synchronous `stateChangeListener` callbacks fired during operation admission) immediately fails the correlation check `!this.inFlightRequests.has(batch.requestId)` and is rejected with `REJECTED_INVALID`.
+   - It cannot re-ingest operations, advance replication vectors, enqueue duplicate pending-queue entries, increment `totalRepairsCompleted` multiple times, or create duplicate remainder ranges.
+2. **`RepairRequestPipeline.handleRepairRejected()`:**
+   - Synchronously clears the in-flight request timer: `this.clock.clearTimeout(inFlight.timerId)`.
+   - **Immediately and atomically deletes the request from tracking**: `this.inFlightRequests.delete(rejection.requestId)` **prior** to mutating `inFlight.attemptedSuppliers`, updating peer knowledge, or scheduling backoff timers.
+   - Any duplicate rejection packet delivered with the same `requestId` is silently dropped without consuming another retry, scheduling another backoff timer, penalizing a supplier twice, or triggering duplicate failover.
+
+### 8.2 Explicit Context Terminology
+The architectural boundaries are strictly differentiated:
+- **`AuthenticatedSupplierContext`:** Authenticates the remote peer connection and its active connection generation within the local in-process object-capability boundary.
+- **`requestId` (UUID v4):** Correlates a response with an active, outstanding logical request. It does not provide cryptographic packet authentication.
+- **Duplicate-Response Handling:** Protects the internal request lifecycle, retry budgets, and state transitions against network replays, retransmissions, and re-entrant deliveries.
+
+### 8.3 Adversarial Test Matrix (`packages/sync-engine/src/__tests__/duplicate-repair-safety.test.ts`)
+The 7 dedicated tests verify all edge cases:
+
+| # | Test Scenario | Result | State & Lifecycle Invariants Verified |
+|---|---|:---:|---|
+| 1 | Identical `OPERATION_BATCH` delivered twice while request is active | PASSED | Re-entrant duplicate during admission rejected with `REJECTED_INVALID`; sequential duplicate rejected; $V_{\text{rep}}$ advances once; `totalRepairsCompleted` is 1. |
+| 2 | Identical `OPERATION_BATCH` delivered after request completion | PASSED | Rejected with `REJECTED_INVALID`; engine stats and state version untouched; no re-admission. |
+| 3 | Identical partial `OPERATION_BATCH` delivered twice | PASSED | Operations $1..5$ applied; remainder $[6..10]$ dispatched under new $R_2$; duplicate of $R_1$ rejected; no duplicate remainder gap. |
+| 4 | Identical `REPAIR_REJECTED` delivered twice while request is active | PASSED | Duplicate rejection dropped; retry count increments once; exactly one backoff timer scheduled; one retry dispatched. |
+| 5 | Duplicate response after supplier failover | PASSED | Delayed response from old supplier rejected; active failover request to secondary supplier unaffected and converges cleanly. |
+| 6 | Duplicate response after epoch transition | PASSED | Request tracking wiped on epoch transition; old epoch duplicate rejected with `REJECTED_INVALID`; zero operations admitted in new epoch. |
+| 7 | Legitimate subsequent partial response completes remaining range | PASSED | Partial batch 1 admitted; duplicate rejected; subsequent partial batch 2 completes range; convergence verified. |
+
+### 8.4 Answers to Duplicate-Response Audit Questions
+
+1. **Can a duplicate `OPERATION_BATCH` mutate repair lifecycle state twice?**  
+   **NO.** The request is atomically removed from `inFlightRequests` before `ingestRepairBatch` is called. Any duplicate (re-entrant or sequential) fails `inFlightRequests.has(batch.requestId)` and is rejected with `REJECTED_INVALID` without touching engine state or pipeline stats.
+2. **Can a duplicate `REPAIR_REJECTED` consume retry budget twice?**  
+   **NO.** The request is atomically removed from `inFlightRequests` before `reEnqueueForFailover` or backoff scheduling occurs. Any duplicate rejection is immediately dropped on `!inFlightRequests.has(rejection.requestId)`, preventing duplicate retry consumption or redundant timer creation.
+3. **Can a duplicate partial response lose or corrupt a missing range?**  
+   **NO.** A partial batch updates the local replication frontier and dispatches the remainder range with a fresh `requestId`. The duplicate of the original partial batch is rejected, leaving the active remainder request intact and preserving all missing ranges.
+4. **Does legitimate partial repair still work after the correction?**  
+   **YES.** When the supplier legitimately returns the subsequent chunk matching the newly dispatched request ID, it is correlated, admitted, and converges the remaining sequence range.
+
 
