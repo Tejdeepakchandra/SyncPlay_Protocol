@@ -1,11 +1,16 @@
 # Phase 7.2-R7 — Snapshot Import and Exact Lamport Causal Consistency
 
-> **Document Version:** 1.0.0  
-> **Status:** AUTHORITATIVE ARCHITECTURAL SPECIFICATION (Revision P7.2-R7)  
+> **Document Version:** 1.1.0  
+> **Status:** AMENDED & REFINED IN PART BY REVISION P7.2-R8 (See [`PHASE7_2_R8_FINAL_CORRECTIONS.md`](file:///c:/Users/tejde/OneDrive/Desktop/SyncPlay_Protocol/SyncPlay_Protocol/docs/PHASE7_2_R8_FINAL_CORRECTIONS.md))  
 > **Baseline Commit:** `c420cae`  
 > **Preceding Baselines:** `a809612` (P7.2-R2), `c7188fc` (P7.2-R3), `16dfe7a` (P7.2-R4), `990b3f4` (P7.2-R5), `c420cae` (P7.2-R6)  
 > **Mode:** Specification & Architecture Only — Strict Stop Condition Observed  
 > **Target Subsystems:** `@syncplay/sync-engine`, `@syncplay/protocol`, `@syncplay/control-events`, `@syncplay/peer-mesh`  
+
+> [!NOTE]
+> Revision P7.2-R8 refines the receive-side clock semantics:
+> 1. **Receive Operation Semantics:** An accepted remote event updates local clock to $\max(L_{\text{local}}, L_{\text{received}})$ **WITHOUT an extra $+1$** (receiving an event is not a local event creation).
+> 2. **Post-Receive Authoring:** The receiving peer authors its subsequent event with timestamp $1 + \max_{(p, s) \in e.\text{causalContext}} L(p, s) \equiv 1 + L_{\text{local}}$, preserving exact receiver validation.  
 
 ---
 
@@ -58,7 +63,7 @@ sequenceDiagram
     Note over Rejoining: 4. Authoring First Local Event D1<br/>D1.origin = "D", D1.seq = 1<br/>D1.causalContext = {A: 10, B: 5}<br/>expected = 1 + max(12, 8) = 13<br/>D1.logicalTimestamp = 13<br/>L_local advances to 13
     Rejoining->>Receiver: Live Broadcast D1
 
-    Note over Receiver: 5. Exact Timestamp Validation<br/>Resolves (A, 10) -> 12, (B, 5) -> 8<br/>expected = 1 + max(12, 8) = 13<br/>Asserts D1.logicalTimestamp === 13<br/>ADMITTED! Clock advances to 14
+    Note over Receiver: 5. Exact Timestamp Validation<br/>Resolves (A, 10) -> 12, (B, 5) -> 8<br/>expected = 1 + max(12, 8) = 13<br/>Asserts D1.logicalTimestamp === 13<br/>ADMITTED! Clock updates to max(L_local, 13) = 13 (no +1, per P7.2-R8)
 ```
 
 1. **Snapshot Creation & Serialization (Peer A):**
@@ -231,8 +236,29 @@ A room consists of active peers A and B. Safe compaction occurs at stable fronti
 - Peer B compares claimed against expected:
   $$D_1.\text{logicalTimestamp} === 13 \equiv \text{expectedTimestamp}(D_1) \implies \mathbf{EXACT\ MATCH\ (PASS)}$$
 - Peer B admits $D_1$ into `OrderedOperationLog`.
-- Peer B advances local Lamport clock: $\max(L_{\text{local}}, 13) + 1$.
+- Peer B updates local Lamport clock: $L_{\text{local}}(B) \leftarrow \max(L_{\text{local}}, 13) = 13$ (WITHOUT $+1$, per Revision P7.2-R8).
 - Peer B updates `replicationVector["D"] = 1`.
+- Peer B updates `localCausalContext` $\leftarrow \{ \text{"A"}: 10, \text{"B"}: 5, \text{"D"}: 1 \}$.
+
+#### Step 5: Peer B Authors Local Operation $B_6$ & Independent Receiver Validation
+- Peer B user clicks `PAUSE`:
+  - Sequence assignment: $\text{originSequenceNumber} = 6$.
+  - Dependencies: $B_6.\text{causalContext} = \{ \text{"A"}: 10, \text{"B"}: 5, \text{"D"}: 1 \}$.
+  - Dependency timestamps: $L(A, 10) = 12, L(B, 5) = 8, L(D, 1) = 13$.
+  - Maximum dependency timestamp: $\max(12, 8, 13) = 13$.
+  - Clock tick on authoring:
+    $$L(B_6) = 1 + L_{\text{local}}(B) = 1 + 13 = \mathbf{14}$$
+  - Stamped: $B_6.\text{logicalTimestamp} = 14$.
+  - Peer B advances clock: $L_{\text{local}}(B) \leftarrow 14$.
+  - Peer B broadcasts $B_6$ to room.
+- Peer A (or Peer D) receives wire message $B_6$:
+  - Resolves dependencies: $(A, 10) \to 12, (B, 5) \to 8, (D, 1) \to 13$.
+  - Computes exact expected timestamp:
+    $$\text{expectedTimestamp}(B_6) = 1 + \max(12, 8, 13) = 1 + 13 = \mathbf{14}$$
+  - Verifies exact match:
+    $$B_6.\text{logicalTimestamp} \equiv 14 === \text{expectedTimestamp}(B_6) \equiv 14 \implies \mathbf{EXACT\ MATCH\ (PASS)}$$
+  - Receiver admits $B_6$, updates `replicationVector["B"] = 6`, and updates clock:
+    $$L_{\text{local}} \leftarrow \max(L_{\text{local}}, 14) \quad \text{(without }+1\text{)}$$
 
 ---
 

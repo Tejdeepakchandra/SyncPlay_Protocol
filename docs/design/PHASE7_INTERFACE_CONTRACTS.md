@@ -95,7 +95,7 @@ export interface ILogicalClockManager {
 
   /**
    * Validates and advances local clock upon receiving a remote operation.
-   * Advances: L = max(L_local, remoteClock) + 1.
+   * Advances: L = max(L_local, remoteClock) (without +1; receiving an event is not a local event creation).
    * Validates non-negative integer, per-origin monotonicity, and safe integer bounds.
    * The caller evaluates dependencies in causalContext across the 3 tiers (Log, Compacted Checkpoints, or PendingBuffer).
    * If any causal dependency is missing (s > replicationVector[p]), caller MUST buffer in PendingDependencyQueue

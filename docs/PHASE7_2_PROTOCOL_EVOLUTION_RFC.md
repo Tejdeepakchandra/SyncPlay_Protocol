@@ -104,6 +104,7 @@ export interface ProtocolMessageV2<TPayload = unknown> {
 >   - *Compacted Base Snapshot:* Looked up from `compactedCheckpoints` (retaining exact timestamps of the last $K=256$ compacted operations).
 >   - *Non-Substitution Invariant:* The receiver **NEVER** substitutes the latest frontier timestamp or `maxLogicalTimestamp` as the timestamp of an earlier dependency $s$.
 >   - *Pre-Horizon Checkpoint Unavailable:* If $s$ predates the retained checkpoint horizon ($> K=256$), rejected with `REJECTED_OUTSIDE_HORIZON`.
+> - **Receive-Side Clock Advancement (Revision P7.2-R8):** Upon admitting an accepted event, the receiver advances its observed clock to $L_{\text{local}} = \max(L_{\text{local}}, L(e))$ WITHOUT an extra $+1$. Receiving an event is not a local event creation.
 > - Token-bucket rate limiting restricts arrival frequency over wall-clock time, not timestamp magnitude.
 > 
 > **Superseding Single Predecessor Pointers:**
@@ -314,6 +315,7 @@ export const OperationBatchPayloadSchema = z.object({
   - `maxLogicalTimestamp` is derived directly as $\max_{p \in \text{keys}(\text{snapshotFrontier})} \text{originFrontierTimestamps}[p]$.
   - Upon snapshot import, the peer initializes its causal context to `snapshotFrontier` and reseeds its clock to $L_{\text{local}} = \text{maxLogicalTimestamp}$ (without an extra $+1$).
   - The first locally authored event includes `snapshotFrontier` in its `causalContext`, so both author and receiver independently compute $L(e) = 1 + \max_{(p, s) \in e.\text{causalContext}} L(p, s) \equiv 1 + \text{maxLogicalTimestamp}$. Exact Lamport equality is preserved without hidden clock jumps.
+  - Upon remote event receipt, the receiver updates its observed clock to $L_{\text{local}} = \max(L_{\text{local}}, L(e))$ without $+1$. Subsequent local events execute the $+1$ tick, guaranteeing receiver-side exact equality across all sequences.
 
 #### Proposed TypeScript Schema (Documentation Only):
 ```ts

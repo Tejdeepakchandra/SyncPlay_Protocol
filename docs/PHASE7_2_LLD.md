@@ -76,12 +76,12 @@ To eliminate ambiguity between what an author observed and what a receiver has p
 
 #### 1. Universal Event Creation Rule
 When originating any local control operation $e$:
-$$L(e) = 1 + \max\left(L_{\text{local}}, \max_{d \in \text{dependencies}} L(d)\right)$$
+$$L(e) = 1 + \max_{(p, s) \in e.\text{causalContext}} L(p, s) \equiv 1 + L_{\text{local}}$$
 
 - **First Event from Origin:** $L(e) = 1 + L_{\text{local}}$, sequence $= 1$.
 - **Normal Local Event Creation:** $L(e) = 1 + L_{\text{local}}$, sequence $= \text{seq}_{\text{local}} + 1$.
-- **Remote Event Reception:**
-  $$L_{\text{local}} \leftarrow 1 + \max(L_{\text{local}}, L(e))$$
+- **Remote Event Reception (Revision P7.2-R8):**
+  $$L_{\text{local}} \leftarrow \max(L_{\text{local}}, L(e)) \quad \text{(WITHOUT }+1\text{; receipt does not create a new event)}$$
 
 #### 2. Rigorous Multi-Factor Clock & Exact Monotonicity Validation
 Incoming remote operations are verified against five strict mathematical invariants:
@@ -228,9 +228,9 @@ class LogicalClockManager {
       }
     }
 
-    // All validation passed: safely advance local clock
+    // All validation passed: safely advance local clock (R8: without +1; receiving an event is not a local creation)
     this.maxObservedByOrigin.set(originPeerId, remoteClock);
-    this.currentClock = Math.max(this.currentClock, remoteClock) + 1;
+    this.currentClock = Math.max(this.currentClock, remoteClock);
     return this.currentClock;
   }
 
