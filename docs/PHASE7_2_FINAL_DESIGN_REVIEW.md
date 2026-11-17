@@ -14,15 +14,15 @@ During Milestone P7.2, the following ten fundamental architectural decisions wer
 
 | Decision ID | Area | Selected Architectural Policy | Core Justification |
 | :---: | :--- | :--- | :--- |
-| **AD-701** | Total Ordering | **Lamport Clock + Lexicographic Tie-Breaker** | Strict total order $\langle L, \text{originPeerId}, \text{logicalEventId} \rangle$ with only 8 bytes wire overhead; roster-independent. Validated via per-origin token bucket rate limit and Strict No-Forwarding policy. |
+| **AD-701** | Total Ordering | **Lamport Clock + Lexicographic Tie-Breaker** | Strict total order $\langle L, \text{originPeerId}, \text{logicalEventId} \rangle$ with only 8 bytes wire overhead; roster-independent. Validated via 5-category validation contexts (`LIVE_BROADCAST`, `REPAIR_BATCH`, `LOCAL_REPLAY`), token bucket rate limiter, and Strict No-Forwarding policy. Rejected operations never advance local clocks. |
 | **AD-702** | Concurrency Detection | **Causal Context Vector (`causalContext`)** | Replaces single predecessor pointer to enable mathematically sound multi-branch concurrency detection ($e_1 \parallel e_2 \iff e_1 \not\to e_2 \land e_2 \not\to e_1$). |
 | **AD-703** | Play/Pause Conflict | **Concurrency-Aware Pause Priority** | When causally concurrent ($e_{\text{pause}} \parallel e_{\text{play}}$), `PAUSE` overrides `PLAY` to eliminate uncommanded audio blast hazards. Causally sequential play ($e_{\text{pause}} \to e_{\text{play}}$) cleanly resumes. Media muting strictly isolated in Phase 8 MediaAdapter. |
 | **AD-704** | Seek/Rate Conflict | **Total-Order Last-Write-Wins (LWW)** | Non-commutative seeks and scalar rate updates deterministically resolve to the operation with the highest total key. |
 | **AD-705** | Anti-Entropy Model | **Per-Origin Replication Vectors (`STATE_DIGEST`)** | Avoids the multi-origin scalar flaw. Contiguous vector of $\text{PeerId} \to \text{ContiguousSeqNum}$ ($\approx 392\text{ B}$ for 4 peers) emitted at 0.2 Hz. Separated from author-stamped `causalContext`. |
-| **AD-706** | Missing Event Repair | **Targeted Range Requests (`REPAIR_REQUEST`)** | Bounded batches (`OPERATION_BATCH`, max 32 ops) prevent WebRTC DataChannel buffer flooding. Missing dependencies tracked via `SparseGapTracker`. Decouples `supplierPeerId` from historical `originPeerId`. |
+| **AD-706** | Missing Event Repair | **Targeted Range Requests (`REPAIR_REQUEST`)** | Bounded batches (`OPERATION_BATCH`, max 32 ops) prevent WebRTC DataChannel buffer flooding. Missing dependencies tracked via `SparseGapTracker`. Operates under the Cooperative Non-Byzantine Trust Model; decouples `supplierPeerId` from `originPeerId`. |
 | **AD-707** | Bounded History | **Circular Ring Buffer ($K = 256$ Operations)** | Strict memory bounding ($O(K)$) with 5-way horizon classification. Pure reducer replay targeted to execute in $< 2.0\text{ ms}$ (empirical benchmark in P7.7). |
 | **AD-708** | Safe Compaction | **Strict Epoch Fencing with Snapshot Fallback** | Operations older than $W_{\text{stable}} = \min(V_{\text{rep}})$ compacted into base snapshots. Offline operations from obsolete epochs are fenced/discarded. Bootstrap is non-authoritative. |
-| **AD-709** | Reconnect Recovery | **RFC 8785 Verified Snapshot Recovery** | Rejoining peers enter `RECOVERING`: repair via log if within horizon ($< 256$ ops); fallback to `StateSnapshotPayloadV2` with canonical SHA-256 digest validation and component-wise domination ($V_{\text{snap}} \ge V_{\text{local}}$); incomparable frontiers trigger log repair or transition to `DEGRADED_OUT_OF_SYNC` (arbitrary tie-breaking strictly eliminated). |
+| **AD-709** | Reconnect Recovery | **RFC 8785 Verified Snapshot Recovery** | Rejoining peers enter `RECOVERING`: repair via log if within horizon ($< 256$ ops); fallback to `StateSnapshotPayloadV2` with canonical SHA-256 digest binding `{ formatVersion, sessionId, epoch, author, frontier, maxClock, state }` and component-wise domination ($V_{\text{snap}} \ge V_{\text{local}}$). Byte integrity and vector dominance do NOT prove semantic truth; snapshot installation relies on cooperative trust. Incomparable frontiers trigger log repair or transition to `DEGRADED_OUT_OF_SYNC` (arbitrary tie-breaking strictly eliminated). |
 | **AD-710** | Testing Strategy | **Headless Deterministic Simulation Harness** | Discrete virtual clock, seedable PRNG (Mulberry32), and network impairment injection (loss, delay, jitter, partition). |
 
 ---
@@ -91,4 +91,22 @@ PHASE 7 IMPLEMENTATION SEQUENCE:
 - [x] **Principle 4 (Replaceable Algorithms):** `BaselineSyncEngine` remains completely unmodified as a reference.
 - [x] **Principle 5 (Stable Interfaces First):** All specifications completed and verified prior to coding.
 - [x] **Principle 6 (Honest Guarantees):** Explicit conditional guarantees documented; CAP-theorem trade-offs formalized.
+
+---
+
+## 6. MVP Trust Model & Out-of-Scope Threat Register
+
+To maintain theoretical rigor and prevent false security claims, the SyncPlay MVP defines an explicit trust boundary:
+
+1. **Cooperative Non-Byzantine Trust Model (Option C):**
+   - Participants in a room ($N \le 8$) are assumed to be cooperative peers running compliant client software.
+   - Live control operations require direct author broadcast ($\text{originPeerId} \equiv \text{senderPeerId} \equiv \text{fromPeerId}$).
+   - Historical operations in repair batches decouple `supplierPeerId` from `originPeerId`. Authorship of historical operations is **not cryptographically verified** in the MVP.
+   - Snapshot byte integrity is validated via RFC 8785 canonical SHA-256, but semantic truthfulness relies on the cooperative trust model.
+
+2. **Out-of-Scope Threats for Phase 7 MVP:**
+   - **Malicious Historical Forgery:** A compromised peer fabricating operations under another peer's identity during repair. (Defended in Phase 9+ via Ed25519 signatures).
+   - **Fabricated Snapshot State:** A compromised peer fabricating arbitrary positions or rates in a snapshot with a valid hash.
+   - **Byzantine Consensus Attacks:** Sybil attacks or collusive state poisoning within private rooms.
+   - **Client Binary Modification:** Users tampering with browser JavaScript to bypass client-side assertions.
 

@@ -136,9 +136,10 @@ interface NetworkImpairmentConfig {
   1. Peer D rejoins after missing $> 256$ operations (Class 3 horizon gap).
   2. Peer D requests `STATE_SNAPSHOT` from Peer A.
   3. **Stale Snapshot Test:** Peer C (slow peer) attempts to offer an outdated snapshot ($V_{\text{snap}} < V_{\text{local}}$). Assert Peer D rejects with `SNAPSHOT_STALE`.
-  4. **Corrupt Digest Test:** Inject a snapshot where `stateDigestSha256` does not match the computed hash of the payload. Assert rejection with `DIGEST_MISMATCH`.
-  5. **Atomic Installation & Local Replay:** Peer D holds 2 locally generated pending operations created during reconnect. Peer D receives valid snapshot from Peer A, atomically installs base state, and successfully replays the 2 local operations.
-  6. Assert Peer D transitions from `'recovering'` to `'active'` and converges with Peer A.
+  4. **Corrupt Digest Test:** Inject a snapshot where `stateDigestSha256` does not match the computed hash of the bound canonical preimage `{ formatVersion: 2, sessionId, membershipEpoch, snapshotAuthorPeerId, snapshotFrontier, maxLogicalTimestamp, state }`. Assert rejection with `DIGEST_MISMATCH`.
+  5. **Atomic Installation & Local Replay:** Peer D holds 2 locally generated pending operations created during reconnect. Peer D receives valid snapshot from Peer A, atomically installs base state, and successfully replays the 2 local operations (`context: 'LOCAL_REPLAY'`).
+  6. **No Supplier Available Test:** If all peers provide stale or corrupt snapshots, assert Peer D remains in `RECOVERING` without state corruption or speculative advances.
+  7. Assert Peer D transitions from `'recovering'` to `'active'` upon valid install and converges with Peer A.
 
 ### Suite 6: Empirical Replay Latency & Performance Benchmark Harness
 - **Objective:** Empirically evaluate the unverified performance target hypothesis: *"In-memory replay of 256 operations through pure functional reducer executes in $< 2.0\text{ ms}$."*
@@ -196,6 +197,6 @@ interface NetworkImpairmentConfig {
   2. Assert receiver rejects with `INVALID_CAUSAL_TIMESTAMP`.
   3. **Inflation Violation:** Peer attempts to advance Lamport clock faster than token-bucket capacity (refill 10 tokens/sec, burst 50 tokens).
   4. Assert receiver rejects with `REJECTED_CLOCK_INFLATION` without state corruption, and **verifies that rejected events NEVER advance the local Lamport clock**.
-  5. **Repair Exemption:** Replay 100 historical operations via repair batch (`isRepairOrReplay = true`); assert all 100 operations are accepted and clocks advance without triggering `REJECTED_CLOCK_INFLATION`.
+  5. **Repair Exemption & Invariant Enforcement:** Replay 100 historical operations via repair batch (`context: 'REPAIR_BATCH'`); assert all 100 operations are accepted and clocks advance without triggering `REJECTED_CLOCK_INFLATION`. Inject a repaired operation with non-monotonic Lamport timestamp ($L \le L_{\text{prev}}$); assert receiver rejects with `CLOCK_REGRESSION` and verifies local Lamport clock and replication vector do NOT advance.
   6. **Strict No-Forwarding Violation:** Peer C sends a live control event with `originPeerId = "peerA"` and `senderPeerId = "peerB"`. Assert receiver rejects with `REJECTED_UNAUTHORIZED_ORIGIN`.
 

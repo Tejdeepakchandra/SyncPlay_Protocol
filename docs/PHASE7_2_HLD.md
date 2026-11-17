@@ -99,11 +99,17 @@ flowchart TD
    - `connectionGeneration`: Monotonic integer from Bootstrap tracking the WebRTC connection lifecycle between `fromPeerId` and receiver.
    - `membershipEpoch`: Monotonic integer tracking the room membership roster configuration from the Bootstrap Server.
 
-2. **Strict No-Forwarding Policy for Live Operations (MVP):**
-   - In the direct full-mesh architecture ($N \le 8$), every live control operation (`PLAY`, `PAUSE`, `SEEK`, `RATE_CHANGE`) must be sent directly by its author:
+2. **Strict No-Forwarding Policy for Live Operations & Historical Trust Model (MVP):**
+   - **Live Broadcasts:** In the direct full-mesh architecture ($N \le 8$), every live control operation (`PLAY`, `PAUSE`, `SEEK`, `RATE_CHANGE`) must be sent directly by its author:
      $$\text{originPeerId} \equiv \text{senderPeerId} \equiv \text{fromPeerId}$$
-   - Relaying or rebroadcasting another peer's live control event is strictly forbidden. Any live control message where $\text{originPeerId} \neq \text{fromPeerId}$ is immediately rejected at the transport boundary with `REJECTED_UNAUTHORIZED_ORIGIN`.
-   - **Historical Repair Batches:** Handled via `OPERATION_BATCH`, where `supplierPeerId` (immediate transport sender) is formally decoupled from `originPeerId` (author of historical operations).
+     Relaying or rebroadcasting another peer's live control event is strictly forbidden. Any live control message where $\text{originPeerId} \neq \text{fromPeerId}$ is immediately rejected at the transport boundary with `REJECTED_UNAUTHORIZED_ORIGIN`.
+   - **Historical Repair Batches (`OPERATION_BATCH`):** Handled via anti-entropy repair, where `supplierPeerId` (immediate transport sender) is decoupled from `originPeerId` (historical author).
+   - **Cooperative Non-Byzantine Trust Model (MVP):**
+     - Historical event authorship is **not cryptographically verified** (asymmetric signatures deferred to post-MVP).
+     - Transport identity (`supplierPeerId`) certifies who delivered the batch, **not that `originPeerId` genuinely authored the event**.
+     - A malicious room participant fabricating historical events is explicitly **out of scope** for the MVP.
+     - **Mandatory Receiver Validation:** Before admitting any repaired operation, the receiver strictly verifies schema conformance, recognized origin identity, origin sequence continuity, collision absence (`SEQUENCE_COLLISION_DETECTED`), causal context integrity, Lamport causality ($L(e) > \max \text{deps}$), and safe integer bounds ($L < 2^{53}-1$).
+     - Repaired operations bypass ONLY the wall-clock rate limiter; if any check fails, the operation is rejected and the local Lamport clock never advances.
 
 3. **Causal Context vs. Replication Vector Separation:**
    - **Event Causal Context (`causalContext: Record<originPeerId, number>`):** Immutable vector stamped by the author at event creation, recording the highest consecutive sequence observed from each origin prior to generating the event. Used for exact concurrency detection ($e_1 \parallel e_2$).
@@ -118,12 +124,22 @@ flowchart TD
 5. **Browser Reload & Ephemeral Identity Policy:**
    In a browser runtime without durable IndexedDB sequence persistence, a page reload (F5) wipes in-memory sequence numbers. A reloading peer **MUST obtain a fresh `peerId` from the Bootstrap Server upon rejoining**. It starts sequence numbers at $1$ under the new identity. Its old `peerId` is marked departed via Bootstrap `session:peer-left`. This prevents sequence collisions without requiring complex disk persistence.
 
-6. **Snapshot Integrity vs. Semantic Consistency:**
-   - `stateDigestSha256` computed over RFC 8785 canonical JSON proves **byte-level payload integrity** across the wire. It does **not** prove semantic correctness.
-   - The immediate transport peer transmitting a snapshot (`supplierPeerId`) is formally distinguished from the snapshot author (`snapshotAuthorPeerId`). A supplier is not trusted as the author of historical operations.
-   - Semantic consistency is enforced via strict boundary checks, `snapshotFrontier` domination ($V_{\text{snap}} \ge V_{\text{local}}$), and multi-peer digest verification. Snapshots are marked `isImportedProvenance = true`.
+6. **Snapshot Acceptance, Integrity & Semantic Boundaries:**
+   - **5 Disambiguated Snapshot Properties:**
+     1. *Byte Integrity:* RFC 8785 canonical serialization hashed with SHA-256 (`stateDigestSha256`) guarantees that the payload was received without network corruption.
+     2. *Supplier Identity:* Verified WebRTC DTLS transport identity (`fromPeerId` / `supplierPeerId`) certifies who delivered the wire message.
+     3. *Claimed Authorship:* `snapshotAuthorPeerId` declares who generated the snapshot. In the cooperative trust model, this claim is trusted.
+     4. *Frontier Completeness:* Component-wise domination ($V_{\text{snap}} \ge V_{\text{local}}$) proves that the snapshot causally encompasses all historical events known to the local receiver.
+     5. *Semantic Correctness:* **CANNOT be verified independently without the complete event history from Genesis.** Vector dominance and SHA-256 do NOT prove that the computed playback position or rate truthfully reflect the underlying operations.
+   - **Cooperative Model Reliance:** Snapshot installation relies on the cooperative non-Byzantine trust model. The author is trusted to have correctly executed the pure functional reducer on genuine room history.
+   - **Incomparable Snapshot Handling:** If frontiers are incomparable ($V_{\text{snap}} \parallel V_{\text{local}}$) and missing operations are compacted beyond the horizon ($K = 256$), the engine **never applies arbitrary tie-breakers** ($\max(\text{epoch}) \to \max(L) \to \max_{\text{lex}}$). It transitions to `DEGRADED_OUT_OF_SYNC` and halts state mutations until resolved via explicit Host Re-Seek or Room Reload.
+   - **Non-Authority Invariant:** A snapshot supplier or author never becomes a permanent playback authority. Local operations newer than the snapshot frontier are immediately replayed upon installation.
 
-7. **Connection Generation Isolation:** Stale packets arriving from previous connection generations ($G < G_{\text{active}}$) are discarded at the transport boundary before reaching the synchronization engine.
+7. **MVP Threat Model & Out-of-Scope Security Register:**
+   - *In-Scope (Defended):* Crash-stop failures, network loss/jitter/reordering, temporary partitions, ephemeral reload resets, client runaway loops/jitter (token-bucket throttled), live sender impersonation (strict no-forwarding).
+   - *Out-of-Scope (Not Defended in MVP):* Byzantine fabrication of historical events in repair batches, deliberate fabrication of false snapshot playback states, or compromised clients modifying open-source JS code. Private cooperative small rooms ($N \le 8$) are assumed.
+
+8. **Connection Generation Isolation:** Stale packets arriving from previous connection generations ($G < G_{\text{active}}$) are discarded at the transport boundary before reaching the synchronization engine.
 
 ---
 
@@ -252,6 +268,10 @@ Let $\mathcal{P}$ be the set of non-faulty, connected browser peers in session $
 
 > **Engineering Design Assumption:**  
 > The duration $\tau_{\text{quiesce}} \ge 2\Delta + \text{digestInterval} + \text{repairRTT}$ represents an **engineering design target and test parameter**, under which all in-flight messages and repair handshakes are expected to resolve in practice. It is not an intrinsic mathematical proof of convergence.
+
+> [!NOTE]
+> **Independence from Physical Clock Drift:**  
+> Bounded physical clock drift is intentionally **omitted** from the logical convergence preconditions. Discrete event ordering and state reduction depend solely on Lamport integer counters and discrete string identifiers ($\langle L, \text{originPeerId}, \text{logicalEventId} \rangle$). Physical clock drift affects continuous media position extrapolation and token-bucket wall-clock replenishment, but has zero effect on discrete state convergence.
 
 *Limitation:* If network partitions persist permanently, or if users continuously scrub controls without quiescence, convergence is conditionally deferred until communication, snapshot recovery, and quiescence are restored.
 

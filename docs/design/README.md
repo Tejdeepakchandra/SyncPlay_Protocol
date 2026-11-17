@@ -34,8 +34,9 @@ The master planning suite for Phase 7 is located at the root of the `docs/` dire
 - `docs/PHASE7_1_FINAL_RECOMMENDATION.md`: Answers to 10 core architectural decisions, alternative rejections, and P7.2 scope.
 
 ### Milestone P7.2 Architecture & Interface Specifications
-- `docs/PHASE7_2_R3_FINAL_CORRECTIONS.md`: Definitive authoritative architectural correction register (P7.2-R3) resolving snapshot safety (elimination of arbitrary tie-breaking), transport vs origin identity (Strict No-Forwarding policy), implementable token-bucket Lamport clock validation, and conditional eventual convergence theorem.
-- `docs/PHASE7_2_R2_FINAL_CORRECTIONS.md`: Architectural correction register (P7.2-R2) resolving causal-context vs replication vectors, strict epoch fencing, RFC 8785 snapshot integrity, and exact Lamport rules (superseded by R3 where amended).
+- `docs/PHASE7_2_R4_FINAL_CORRECTIONS.md`: Definitive authoritative architectural correction register (P7.2-R4) resolving historical event trust (Cooperative Non-Byzantine Model Option C), snapshot semantic boundaries (canonical digest preimage & non-proof of semantic truth), tightened 5-category event validation rules (`ValidationContext`), and revised convergence preconditions.
+- `docs/PHASE7_2_R3_FINAL_CORRECTIONS.md`: Architectural correction register (P7.2-R3) resolving snapshot safety (elimination of arbitrary tie-breaking), transport vs origin identity (Strict No-Forwarding policy), implementable token-bucket Lamport clock validation, and conditional eventual convergence theorem (superseded where amended by R4).
+- `docs/PHASE7_2_R2_FINAL_CORRECTIONS.md`: Architectural correction register (P7.2-R2) resolving causal-context vs replication vectors, strict epoch fencing, RFC 8785 snapshot integrity, and exact Lamport rules (superseded where amended).
 - `docs/PHASE7_2_ARCHITECTURAL_CORRECTIONS.md`: Initial architectural correction register (P7.2-R1).
 - `docs/PHASE7_2_HLD.md`: High-Level Design for `LeaderlessSyncEngine`, trust boundaries, data flows, and module responsibilities.
 - `docs/PHASE7_2_LLD.md`: Low-Level Design covering ordering keys, conflict policies, bounded ring buffer ($K=256$), and anti-entropy version vectors.

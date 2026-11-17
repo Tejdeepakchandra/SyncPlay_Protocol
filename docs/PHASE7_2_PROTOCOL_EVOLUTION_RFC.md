@@ -230,6 +230,7 @@ export const RepairRequestPayloadSchema = z.object({
 - **Purpose:** Response to a `REPAIR_REQUEST`, delivering missing operations.
 - **Direction:** Targeted unicast over WebRTC DataChannel.
 - **Bounding:** Maximum of $32$ operations per batch.
+- **Trust Model (MVP):** Operates under the Cooperative Non-Byzantine Trust Model (Option C). The transport peer delivering the batch (`supplierPeerId`) is decoupled from historical `originPeerId`. Historical authorship is not cryptographically verified. The receiver validates schema, recognized origin, sequence continuity, collision absence (`SEQUENCE_COLLISION_DETECTED`), causal dependencies, Lamport causality ($L(e) > \max \text{deps}$), and safe integer bounds ($L < 2^{53}-1$). Repaired operations bypass ONLY the physical wall-clock token-bucket rate limiter. Rejection never advances local clocks or replication vectors.
 
 #### Proposed TypeScript Schema (Documentation Only):
 ```ts
@@ -287,8 +288,11 @@ export const OperationBatchPayloadSchema = z.object({
 
 - **Purpose:** Full authoritative baseline snapshot transfer for rejoining peers or peers whose gap exceeds the retained history horizon ($> K$).
 - **Direction:** Targeted unicast over WebRTC DataChannel in response to `STATE_REQUEST`.
-- **Integrity vs. Semantic Truth:** `stateDigestSha256` computed via RFC 8785 canonical JSON proves **byte-level payload integrity** across the network. It does not prove the state was faithfully reduced from history; semantic consistency is validated by state bounding, frontier monotonicity ($V_{\text{snap}} \ge V_{\text{rep, local}}$), and multi-peer digest agreement.
-- **Supplier vs. Author Decoupling:** The transport peer supplying the snapshot (`supplierPeerId`) is explicitly distinguished from the author who computed the snapshot (`snapshotAuthorPeerId`).
+- **Integrity vs. Semantic Truth:**
+  - `stateDigestSha256` computed via RFC 8785 canonical JSON proves **byte-level payload integrity** across the network. The digest pre-image strictly binds `{ formatVersion: 2, sessionId, membershipEpoch, snapshotAuthorPeerId, snapshotFrontier, maxLogicalTimestamp, state }` (excluding `snapshotId` and `stateDigestSha256` itself).
+  - Byte integrity and vector dominance do **NOT** prove semantic correctness (truthfulness of the computed playback state). Semantic correctness relies on the Cooperative Non-Byzantine Trust Model (Option C).
+- **Supplier vs. Author Decoupling:** The transport peer supplying the snapshot (`supplierPeerId`) is explicitly distinguished from the author who computed the snapshot (`snapshotAuthorPeerId`). Neither is a permanent authority.
+- **Incomparable Snapshot Policy:** Incomparable snapshots ($V_{\text{snap}} \parallel V_{\text{local}}$) that cannot be repaired via log history trigger transition to `DEGRADED_OUT_OF_SYNC` (no arbitrary tie-breaking). Local operations newer than the snapshot frontier are replayed atomically.
 
 #### Proposed TypeScript Schema (Documentation Only):
 ```ts

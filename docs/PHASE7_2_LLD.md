@@ -93,13 +93,18 @@ Incoming remote operations are verified against five strict mathematical invaria
 3. **Duplicate Sequence Handling:** If $e.\text{originSequence} \le \text{replicationVector}[e.\text{originPeerId}]$:
    - If $e.\text{logicalEventId} == \text{storedOperation}.\text{logicalEventId}$: resolve as `IGNORED_DUPLICATE` (idempotent NO-OP).
    - If $e.\text{logicalEventId} \neq \text{storedOperation}.\text{logicalEventId}$: reject with `SEQUENCE_COLLISION_DETECTED` (critical origin defect; isolates peer).
-4. **Token-Bucket Clock Inflation Detection (Heuristic Filter):**
-   - Applies **only to live real-time broadcasts**. Historical operations arriving via `OPERATION_BATCH` (anti-entropy repair) or local log replays are **EXEMPT** from monotonic rate checks, as historical batches naturally arrive in rapid bursts.
+4. **Token-Bucket Clock Inflation Detection & Validation Contexts:**
+   - Incoming events are classified into 5 strict validation contexts:
+     1. *Exact Duplicate:* $e.\text{logicalEventId}$ in log/index. Fast-path NO-OP; clock does not tick.
+     2. *Unchanged Retransmission:* Identical wire event already reduced. Ignored; clock does not tick.
+     3. *Newly Received Repair Batch (`context === 'REPAIR_BATCH'`):* Bypasses ONLY the physical wall-clock rate limit. Must pass all schema, recognized origin, sequence continuity, collision check, causal context, Lamport timestamp ($L(e) > \max \text{deps}$), and safe integer bounds ($L < 2^{53}-1$).
+     4. *Local Snapshot Replay (`context === 'LOCAL_REPLAY'`):* Trusted internal replay of locally retained operations newer than snapshot.
+     5. *Newly Received Live Broadcast (`context === 'LIVE_BROADCAST'`):* Must pass Strict No-Forwarding ($\text{originPeerId} \equiv \text{fromPeerId}$) AND the token-bucket rate limiter.
    - Evaluated per `(originPeerId, membershipEpoch)` using a local token bucket:
      - Token refill rate: $10\text{ tokens/sec}$ ($0.01\text{ tokens/ms}$).
      - Burst capacity: $50\text{ tokens}$.
      - When receiving a live event with clock jump $\Delta L = L(e) - L_{\text{prev}}(p)$, if $\Delta L > \text{tokens}$, the event is classified as `CLOCK_INFLATION` and rejected with `REJECTED_CLOCK_INFLATION`.
-   - **Critical Clock Safety Invariant:** Rejected or quarantined events **MUST NEVER advance the local Lamport clock**.
+   - **Critical Clock Safety Invariant:** Rejected or quarantined events **MUST NEVER advance the local Lamport clock or replication vector**.
    - *Heuristic Limitation:* This rate check is an implementation safeguard against runaway client loops and buggy timers, not a cryptographic Byzantine security guarantee.
 5. **Safe Integer Limits:** $0 \le L \le \text{Number.MAX\_SAFE\_INTEGER} - 1$ ($2^{53} - 1$). If local clock reaches this threshold, the engine throws `CLOCK_OVERFLOW`, enters degraded mode, and halts local event generation until a room snapshot resets the baseline.
 
@@ -138,8 +143,12 @@ class LogicalClockManager {
     remoteClock: number,
     dependencyClocks: ReadonlyArray<number>,
     monotonicNow: number,
-    isRepairOrReplay: boolean = false
+    context: 'LIVE_BROADCAST' | 'REPAIR_BATCH' | 'LOCAL_REPLAY' = 'LIVE_BROADCAST'
   ): number {
+    if (context === 'LOCAL_REPLAY') {
+      return this.currentClock; // Trusted internal replay; clock already advanced on ingestion
+    }
+
     if (!Number.isSafeInteger(remoteClock) || remoteClock < 0) {
       throw new SyncEngineError('INVALID_CLOCK', `Malformed remote timestamp: ${remoteClock}`);
     }
@@ -163,8 +172,8 @@ class LogicalClockManager {
       }
     }
 
-    // 3. Token-bucket rate check (live broadcasts only; repair batches exempt)
-    if (!isRepairOrReplay) {
+    // 3. Token-bucket rate check (LIVE_BROADCAST only; REPAIR_BATCH is exempt)
+    if (context === 'LIVE_BROADCAST') {
       const rateKey = `${originPeerId}:${membershipEpoch}`;
       let rate = this.originRateStates.get(rateKey);
       if (!rate) {
@@ -461,22 +470,25 @@ sequenceDiagram
 ### 6.1. Atomic Snapshot Installation & Verification Contract
 When `RecoveryManager.installSnapshot(payload)` is called:
 1. Validates that `payload.sessionId == this.config.sessionId`.
-2. Validates that `payload.state.anchorPositionMs` is non-negative and finite.
-3. Validates that `payload.state.playbackRate` is within configured $[minRate, maxRate]$.
-4. **Byte-Level Integrity Verification (RFC 8785):** Verifies `payload.stateDigestSha256` against the canonical JSON serialization of the payload. (Guarantees payload bytes are uncorrupted; does not prove semantic truth).
-5. **Frontier Monotonicity Verification:** Verifies that `payload.snapshotFrontier` dominates or matches known history ($V_{\text{snap}} \ge V_{\text{rep, local}}$). Rejects stale snapshots ($V_{\text{snap}} < V_{\text{rep, local}}$).
+2. Validates that `payload.membershipEpoch >= this.currentMembershipEpoch`.
+3. Validates that `payload.state.anchorPositionMs` is non-negative and finite, and `payload.state.playbackRate` is within $[minRate, maxRate]$.
+4. **Byte-Level Integrity Verification (RFC 8785):** Recomputes SHA-256 over the canonical JSON serialization of the digest input binding `{ formatVersion: 2, sessionId, membershipEpoch, snapshotAuthorPeerId, snapshotFrontier, maxLogicalTimestamp, state }`.
+   - *Guarantee:* Proves bytes were not corrupted in transit.
+   - *Limitation:* Does **NOT** prove semantic correctness of the state; receiver relies on the Cooperative Non-Byzantine Trust Model for the truthfulness of the author's state computation.
+5. **Frontier Monotonicity Verification:** Verifies that `payload.snapshotFrontier` dominates or matches known history ($V_{\text{snap}} \ge V_{\text{rep, local}}$). Rejects stale snapshots ($V_{\text{snap}} < V_{\text{rep, local}}$) with `SNAPSHOT_STALE`.
 6. **Handling Incomparable Version Vectors ($V_A \not\ge V_B \land V_B \not\ge V_A$):**
    - Comparing vector sums ($\sum V[p]$) or scalar tie-breakers ($\max(\text{epoch})$, $\max(L)$, $\max_{\text{lex}}(\text{peerId})$) is **strictly forbidden**. A higher Lamport clock or peer ID does not prove event-set completeness.
    - If missing history is available in peer logs ($\le K=256$), the engine requests the missing operations via `REPAIR_REQUEST` and merges/replays them in total order.
    - If required history has been compacted beyond the log horizon and no verifiable common recovery point exists, the engine **must not silently choose a winner**. It transitions immediately to `DEGRADED_OUT_OF_SYNC`, sets `EngineStatus.isDegraded = true` and `degradedReason = 'INCOMPARABLE_SNAPSHOT_DIVERGENCE'`, and prompts the user/host to perform an explicit recovery action:
      - *Host Re-Seek:* Host issues an explicit seek to establish a new agreed baseline.
      - *Room Reload:* Client reloads session and obtains a fresh identity and snapshot from Bootstrap.
-7. Re-seeds local `LogicalClockManager` to $\max(L_{\text{local}}, \text{payload.maxLogicalTimestamp}) + 1$.
-8. Installs base state atomically:
+7. **No Permanent Authority:** The snapshot author or supplier never becomes a permanent playback authority; snapshot installation is strictly an atomic catch-up re-anchor.
+8. Re-seeds local `LogicalClockManager` to $\max(L_{\text{local}}, \text{payload.maxLogicalTimestamp}) + 1$.
+9. Installs base state atomically:
    $$v_{\text{local}} = v_{\text{current}} + 1$$
    *(Never copies remote version as local version; maintains local engine monotonicity).*
-9. **Preserves Newer Operations:** Replays any locally held operations that are strictly newer than the snapshot frontier ($V > V_{\text{snap}}$).
-10. Clears older operations from log and initializes `baseSnapshot` to the imported state.
-11. Sets `isImportedProvenance = true` on `lastAppliedEvent`.
-12. Transitions engine status from `'recovering'` to `'active'`.
+10. **Preserves Newer Operations:** Replays any locally held operations that are strictly newer than the snapshot frontier ($V > V_{\text{snap}}$) using `context: 'LOCAL_REPLAY'`.
+11. Clears older operations from log and initializes `baseSnapshot` to the imported state.
+12. Sets `isImportedProvenance = true` on `lastAppliedEvent`.
+13. Transitions engine status from `'recovering'` to `'active'`.
 

@@ -1,10 +1,17 @@
 # Phase 7.2-R3 — Snapshot Safety, Identity & Convergence Corrections
 
-> **Document Version:** 1.0.0  
-> **Status:** AUTHORITATIVE ARCHITECTURAL SPECIFICATION (Revision P7.2-R3)  
-> **Baseline Commit:** `a809612`  
+> **Document Version:** 1.1.0  
+> **Status:** SUPERSEDED IN PART BY REVISION P7.2-R4 (See [`PHASE7_2_R4_FINAL_CORRECTIONS.md`](file:///c:/Users/tejde/OneDrive/Desktop/SyncPlay_Protocol/SyncPlay_Protocol/docs/PHASE7_2_R4_FINAL_CORRECTIONS.md))  
+> **Baseline Commit:** `a809612` (Amended in `c7188fc`, Refined in P7.2-R4)  
 > **Mode:** Specification & Architecture Only — Strict Stop Condition Observed  
 > **Target Subsystems:** `@syncplay/sync-engine`, `@syncplay/protocol`, `@syncplay/control-events`, `@syncplay/peer-mesh`  
+
+> [!NOTE]
+> Revision P7.2-R4 builds on P7.2-R3 with three critical clarifications:
+> 1. **Historical Event Trust:** Explicitly establishes the Cooperative Non-Byzantine Trust Model (Option C). Acknowledges historical authorship is not cryptographically verified, and documents that `supplierPeerId` does not prove `originPeerId`.
+> 2. **Snapshot Semantic Boundaries:** Formally separates byte integrity (SHA-256) and vector dominance from semantic correctness. Defines the exact canonical digest preimage and cooperative snapshot trust.
+> 3. **Tightened Token-Bucket Rules:** Replaces generic `isRepairOrReplay` with 5 distinct event categories (`ValidationContext`). Mandates all structural, causal, and sequence checks for repaired events while exempting only the wall-clock rate limit.
+> 4. **Convergence Preconditions:** Removes physical clock drift from the preconditions of the logical state convergence theorem.  
 
 ---
 
@@ -200,3 +207,4 @@ To eliminate theoretical ambiguity, the protocol strictly separates four layers:
 | `docs/PHASE7_2_COMPATIBILITY_AND_MIGRATION.md` | Documented strict no-forwarding limitation; documented explicit recovery from `DEGRADED_OUT_OF_SYNC`. |
 | `docs/PHASE7_2_FINAL_DESIGN_REVIEW.md` | Updated architectural decisions AD-701, AD-709; updated AC-7.2.1–7.2.5 assessments. |
 | `docs/design/README.md` | Added `PHASE7_2_R3_FINAL_CORRECTIONS.md` to design index. |
+

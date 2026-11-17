@@ -1,8 +1,8 @@
 # Phase 7.2-R2 — Final Consistency, Membership & Recovery Review
 
-> **Document Version:** 1.0.0  
-> **Status:** AUTHORITATIVE ARCHITECTURAL SPECIFICATION (Revision P7.2-R2)  
-> **Baseline Commit:** `55e3240`  
+> **Document Version:** 1.2.0  
+> **Status:** SUPERSEDED WHERE AMENDED BY REVISIONS P7.2-R3 AND P7.2-R4 (See [`PHASE7_2_R4_FINAL_CORRECTIONS.md`](file:///c:/Users/tejde/OneDrive/Desktop/SyncPlay_Protocol/SyncPlay_Protocol/docs/PHASE7_2_R4_FINAL_CORRECTIONS.md))  
+> **Baseline Commit:** `55e3240` (Amended in `a809612`, `c7188fc`, Refined in P7.2-R4)  
 > **Mode:** Specification & Architecture Only — Strict Stop Condition Observed  
 > **Target Subsystems:** `@syncplay/sync-engine`, `@syncplay/protocol`, `@syncplay/control-events`, `@syncplay/peer-mesh`  
 

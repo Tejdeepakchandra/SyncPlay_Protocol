@@ -96,9 +96,11 @@ export interface ILogicalClockManager {
   /**
    * Validates and advances local clock upon receiving a remote operation.
    * Advances: L = max(L_local, remoteClock) + 1.
-   * Validates non-negative integer, per-origin monotonicity, causal timestamp integrity, and per-origin/epoch token bucket rate inflation.
-   * If isRepairOrReplay is true, rate inflation checks are bypassed (repair batches and replayed operations are exempt).
-   * Note: If validation fails, the local clock is NEVER advanced.
+   * Validates non-negative integer, per-origin monotonicity, causal timestamp integrity, and safe integer bounds.
+   * When context === 'LIVE_BROADCAST': strictly evaluates token-bucket rate limiter ($10\text{ ops/sec}$, burst $50$).
+   * When context === 'REPAIR_BATCH': bypasses token bucket rate limiter, but strictly evaluates all causal, monotonic, and integer bounds.
+   * When context === 'LOCAL_REPLAY': trusted internal replay; returns current clock without mutation.
+   * Critical safety invariant: If validation fails, the local clock is NEVER advanced.
    * Throws SyncEngineError('INVALID_CLOCK'), 'CLOCK_REGRESSION', 'INVALID_CAUSAL_TIMESTAMP', or 'REJECTED_CLOCK_INFLATION'.
    */
   validateAndAdvanceRemote(
@@ -107,7 +109,7 @@ export interface ILogicalClockManager {
     dependencyClocks: ReadonlyArray<number>,
     monotonicNow: number,
     membershipEpoch: number,
-    isRepairOrReplay?: boolean
+    context?: 'LIVE_BROADCAST' | 'REPAIR_BATCH' | 'LOCAL_REPLAY'
   ): number;
 
   /**
@@ -298,7 +300,9 @@ export interface IRecoveryManager {
    *   1. If history log retains missing causal gaps, requests log repair.
    *   2. If history is compacted beyond horizon (K = 256), NO tie-breaker is used.
    *      Transitions engine to 'DEGRADED_OUT_OF_SYNC' lifecycle state.
-   * Verifies RFC 8785 canonical SHA-256 digest, sets isImportedProvenance = true, and replays newer local operations.
+   * Verifies RFC 8785 canonical SHA-256 digest (preimage binds formatVersion, sessionId, epoch, author, frontier, maxClock, state).
+   * Note: Byte integrity and vector dominance do NOT prove semantic correctness; relies on Cooperative Non-Byzantine Trust Model.
+   * Sets isImportedProvenance = true, and replays newer local operations.
    */
   installSnapshot(
     snapshot: StateSnapshotPayloadV2,
