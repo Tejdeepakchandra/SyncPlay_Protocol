@@ -87,26 +87,43 @@ $$L(e) = 1 + \max\left(L_{\text{local}}, \max_{d \in \text{dependencies}} L(d)\r
 Incoming remote operations are verified against five strict mathematical invariants:
 1. **Per-Origin Monotonicity:** Successive operations from origin $p$ must satisfy:
    $$L(e_{k+1}) > L(e_k) \quad \land \quad \text{originSequence}_{k+1} = \text{originSequence}_k + 1$$
-2. **Causal Timestamp Integrity:** For every dependency $d$ in $e.\text{causalContext}$:
-   $$L(d) < L(e)$$
-   If $L(e) \le L(d)$, the operation violates causal ordering and is rejected with `INVALID_CAUSAL_TIMESTAMP`.
-3. **Duplicate Sequence Handling:** If $e.\text{originSequence} \le \text{replicationVector}[e.\text{originPeerId}]$:
-   - If $e.\text{logicalEventId} == \text{storedOperation}.\text{logicalEventId}$: resolve as `IGNORED_DUPLICATE` (idempotent NO-OP).
-   - If $e.\text{logicalEventId} \neq \text{storedOperation}.\text{logicalEventId}$: reject with `SEQUENCE_COLLISION_DETECTED` (critical origin defect; isolates peer).
-4. **Token-Bucket Clock Inflation Detection & Validation Contexts:**
+   If $L(e) \le L_{\text{prev}}(p)$, rejected with `CLOCK_REGRESSION`.
+2. **Causal Timestamp Integrity & 3-Tier Dependency Lookup:**
+   For every dependency entry $(p, s) \in e.\text{causalContext}$, the receiver resolves $L(d)$ across three storage tiers:
+   - *Tier 1 (Missing Dependency: $s > \text{replicationVector}[p]$):* Operation $s$ has not yet arrived. The event $e$ **CANNOT be verified or evaluated yet**. It is buffered in `PendingDependencyQueue`, and a `REPAIR_REQUEST` is dispatched. **The local Lamport clock and replication vector DO NOT advance.**
+   - *Tier 2 (Retained in Log: $s \in \text{OrderedOperationLog}$):* Direct lookup from log: $L(d) = \text{log.get}(p, s).\text{logicalTimestamp}$.
+   - *Tier 3 (Compacted in Base Snapshot: $s \le W_{\text{stable}}[p]$):* Operation was folded into base state during safe compaction. $L(d)$ is bounded by `originFrontierTimestamps[p]` (or `baseSnapshot.maxLogicalTimestamp`).
+   - *Tier 4 (Unverifiable Pre-Horizon):* If $s$ predates the retained log horizon and base snapshot metadata, $e$ is rejected with `REJECTED_OUTSIDE_HORIZON`.
+   - *Integrity Condition:* The operation must satisfy:
+     $$L(e) > \max_{(p, s) \in e.\text{causalContext}} L(p, s)$$
+     If $L(e) \le L(d)$, the operation violates causal precedence and is rejected with `INVALID_CAUSAL_TIMESTAMP`.
+3. **Collision Detection & Duplicate Handling:** If $e.\text{originSequence} \le \text{replicationVector}[e.\text{originPeerId}]$:
+   - If $e.\text{logicalEventId} == \text{storedOperation}.\text{logicalEventId}$ AND canonical payloads match: resolve as `IGNORED_DUPLICATE` (idempotent NO-OP; clock does not advance).
+   - If $e.\text{logicalEventId} \neq \text{storedOperation}.\text{logicalEventId}$ OR payloads differ: reject with `SEQUENCE_COLLISION_DETECTED` (critical origin defect; peer quarantined). Duplicate detection **never** masks a sequence collision.
+4. **Token-Bucket Arrival Throttling & Validation Contexts:**
    - Incoming events are classified into 5 strict validation contexts:
      1. *Exact Duplicate:* $e.\text{logicalEventId}$ in log/index. Fast-path NO-OP; clock does not tick.
      2. *Unchanged Retransmission:* Identical wire event already reduced. Ignored; clock does not tick.
      3. *Newly Received Repair Batch (`context === 'REPAIR_BATCH'`):* Bypasses ONLY the physical wall-clock rate limit. Must pass all schema, recognized origin, sequence continuity, collision check, causal context, Lamport timestamp ($L(e) > \max \text{deps}$), and safe integer bounds ($L < 2^{53}-1$).
-     4. *Local Snapshot Replay (`context === 'LOCAL_REPLAY'`):* Trusted internal replay of locally retained operations newer than snapshot.
+     4. *Local Snapshot Replay (`context === 'LOCAL_REPLAY'`):* Trusted internal replay of locally retained operations newer than snapshot. Applies strictly and exclusively to immutable operations already accepted and retained in `OrderedOperationLog`. Cannot introduce new origins, sequences, or timestamps.
      5. *Newly Received Live Broadcast (`context === 'LIVE_BROADCAST'`):* Must pass Strict No-Forwarding ($\text{originPeerId} \equiv \text{fromPeerId}$) AND the token-bucket rate limiter.
    - Evaluated per `(originPeerId, membershipEpoch)` using a local token bucket:
      - Token refill rate: $10\text{ tokens/sec}$ ($0.01\text{ tokens/ms}$).
      - Burst capacity: $50\text{ tokens}$.
      - When receiving a live event with clock jump $\Delta L = L(e) - L_{\text{prev}}(p)$, if $\Delta L > \text{tokens}$, the event is classified as `CLOCK_INFLATION` and rejected with `REJECTED_CLOCK_INFLATION`.
+   - **Crucial Clarification:** The token bucket restricts event arrival rate / frequency over wall-clock time; it does **not** bound scalar timestamp magnitude. Scalar magnitude is bounded by causal dependency propagation and safe integer limits.
    - **Critical Clock Safety Invariant:** Rejected or quarantined events **MUST NEVER advance the local Lamport clock or replication vector**.
-   - *Heuristic Limitation:* This rate check is an implementation safeguard against runaway client loops and buggy timers, not a cryptographic Byzantine security guarantee.
-5. **Safe Integer Limits:** $0 \le L \le \text{Number.MAX\_SAFE\_INTEGER} - 1$ ($2^{53} - 1$). If local clock reaches this threshold, the engine throws `CLOCK_OVERFLOW`, enters degraded mode, and halts local event generation until a room snapshot resets the baseline.
+5. **Safe Integer Limits:** $0 \le L \le \text{Number.MAX\_SAFE\_INTEGER} - 1$ ($2^{53} - 1$). If remote clock reaches or exceeds this threshold, the engine throws `CLOCK_OVERFLOW`, enters `DEGRADED_OUT_OF_SYNC` mode, and halts event generation until a room snapshot resets the baseline.
+
+#### 3. Classification of Anomalous Timestamp Jumps
+
+| Scenario | Condition | Diagnostic Outcome | State Action | Clock & Frontier Effect |
+| :--- | :--- | :--- | :--- | :---: |
+| **Valid Advance** | $L(e) > \max(L_{\text{prev}}, L_{\text{max\_dep}})$ and $L < 2^{53}-1$ | `VALID_OPERATION` | Store in log; reduce to state | **Advance** $L_{\text{local}}$ and $V_{\text{rep}}$ |
+| **Missing Dependencies** | $\exists p: e.\text{causalContext}[p] > V_{\text{rep}}[p]$ | `BUFFERED_PENDING_DEPENDENCY` | Hold in buffer; send `REPAIR_REQUEST` | **HELD (No advance)** |
+| **Causal Inconsistency** | $L(e) \le L_{\text{max\_dep}}$ OR $L(e) \le L_{\text{prev}}(p)$ | `INVALID_CAUSAL_TIMESTAMP` or `CLOCK_REGRESSION` | Reject and discard; isolate sender | **REJECTED (No advance)** |
+| **Integer Overflow** | $L(e) \ge \text{Number.MAX\_SAFE\_INTEGER} - 1$ | `CLOCK_OVERFLOW` | Reject; transition to `DEGRADED_OUT_OF_SYNC` | **REJECTED (No advance)** |
+| **Unverifiable Pre-Horizon** | $e$ predates compaction horizon ($> K=256$) | `REJECTED_OUTSIDE_HORIZON` | Reject; if unbridgeable, `DEGRADED_OUT_OF_SYNC` | **REJECTED (No advance)** |
 
 ```ts
 interface OriginRateState {

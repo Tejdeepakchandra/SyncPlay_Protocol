@@ -97,9 +97,12 @@ export interface ILogicalClockManager {
    * Validates and advances local clock upon receiving a remote operation.
    * Advances: L = max(L_local, remoteClock) + 1.
    * Validates non-negative integer, per-origin monotonicity, causal timestamp integrity, and safe integer bounds.
+   * The caller evaluates dependencies in causalContext across the 3 tiers (Log, Snapshot, or PendingBuffer).
+   * If any causal dependency is missing (s > replicationVector[p]), caller MUST buffer in PendingDependencyQueue
+   * and MUST NOT call validateAndAdvanceRemote (clock does not advance).
    * When context === 'LIVE_BROADCAST': strictly evaluates token-bucket rate limiter ($10\text{ ops/sec}$, burst $50$).
    * When context === 'REPAIR_BATCH': bypasses token bucket rate limiter, but strictly evaluates all causal, monotonic, and integer bounds.
-   * When context === 'LOCAL_REPLAY': trusted internal replay; returns current clock without mutation.
+   * When context === 'LOCAL_REPLAY': trusted internal replay of already accepted immutable events; returns current clock without mutation.
    * Critical safety invariant: If validation fails, the local clock is NEVER advanced.
    * Throws SyncEngineError('INVALID_CLOCK'), 'CLOCK_REGRESSION', 'INVALID_CAUSAL_TIMESTAMP', or 'REJECTED_CLOCK_INFLATION'.
    */

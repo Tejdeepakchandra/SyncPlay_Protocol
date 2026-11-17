@@ -89,6 +89,14 @@ export interface ProtocolMessageV2<TPayload = unknown> {
 > $$\text{originPeerId} \equiv \text{senderPeerId}$$
 > Relaying or rebroadcasting live control operations authored by another peer is strictly forbidden. Any incoming live message where `originPeerId !== senderPeerId` is rejected at the transport boundary with `REJECTED_UNAUTHORIZED_ORIGIN`. Multi-hop live relaying is deferred beyond Phase 7.
 > 
+> **Exact Timestamp Integrity & Causal Frontier Evaluation:**
+> A receiving peer validates $L(e)$ against the causal dependency frontier defined by `causalContext`:
+> $$L(e) > \max_{(p, s) \in e.\text{causalContext}} L(p, s) \quad \land \quad L(e) > L_{\text{prev}}(e.\text{originPeerId})$$
+> - If any dependency $(p, s)$ is missing from local history ($s > \text{replicationVector}[p]$), the event is **BUFFERED** in `PendingDependencyQueue`. Local clock and replication vector **DO NOT ADVANCE**.
+> - If all dependencies are present in log or base snapshot, $L(e)$ is evaluated. If $L(e) \le L_{\text{max\_dep}}$, rejected with `INVALID_CAUSAL_TIMESTAMP`.
+> - If an event predates the compaction horizon ($K=256$) and cannot be verified via base snapshot, rejected with `REJECTED_OUTSIDE_HORIZON`.
+> - Token-bucket rate limiting restricts arrival frequency over wall-clock time, not timestamp magnitude.
+> 
 > **Superseding Single Predecessor Pointers:**
 > A single predecessor pointer (`predecessorEventId`) failed because it could not represent multiple concurrent branches merging into a single causal history. The `causalContext` vector provides complete, mathematically rigorous concurrency detection. For an 8-peer room, `causalContext` adds only $\approx 120\text{ bytes}$ per control event, which is negligible at human interaction rates ($\le 5\text{ ops/sec}$).
 

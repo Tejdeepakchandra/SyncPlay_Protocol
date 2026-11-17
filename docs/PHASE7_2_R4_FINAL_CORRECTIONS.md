@@ -1,11 +1,16 @@
 # Phase 7.2-R4 — Historical Event Trust & Snapshot Acceptance Corrections
 
-> **Document Version:** 1.0.0  
-> **Status:** AUTHORITATIVE ARCHITECTURAL SPECIFICATION (Revision P7.2-R4)  
-> **Baseline Commit:** `c7188fc`  
-> **Preceding Baselines:** `a809612` (P7.2-R2), `c7188fc` (P7.2-R3)  
+> **Document Version:** 1.1.0  
+> **Status:** AMENDED & REFINED IN PART BY REVISION P7.2-R5 (See [`PHASE7_2_R5_FINAL_CORRECTIONS.md`](file:///c:/Users/tejde/OneDrive/Desktop/SyncPlay_Protocol/SyncPlay_Protocol/docs/PHASE7_2_R5_FINAL_CORRECTIONS.md))  
+> **Baseline Commit:** `c7188fc` (Amended in `16dfe7a`, Refined in P7.2-R5)  
 > **Mode:** Specification & Architecture Only — Strict Stop Condition Observed  
 > **Target Subsystems:** `@syncplay/sync-engine`, `@syncplay/protocol`, `@syncplay/control-events`, `@syncplay/peer-mesh`  
+
+> [!NOTE]
+> Revision P7.2-R5 provides the final mathematical freezing of:
+> 1. **Exact Logical Timestamp Validation:** 3-tier lookup of dependency timestamps ($L_{\text{max\_dep}}$) via in-memory log, compacted base snapshots (`originFrontierTimestamps`), and buffering of missing dependencies.
+> 2. **Anomalous Timestamp Jumps:** Precise classification across Valid, Missing Dependency, Causal Inconsistency, Safe Integer Overflow, and Unverifiable Compacted History.
+> 3. **Tightened Replay Boundaries:** Formally restricting `LOCAL_REPLAY` exclusively to already accepted immutable operations, and asserting that duplicate detection cannot mask sequence collisions.  
 
 ---
 
@@ -313,3 +318,4 @@ export interface ILogicalClockManager {
 | `docs/PHASE7_2_COMPATIBILITY_AND_MIGRATION.md` | Sections 3.4 and 3.5 updated to articulate the cooperative trust model and explicit out-of-scope threats. | Updated |
 | `docs/PHASE7_2_FINAL_DESIGN_REVIEW.md` | AD-701, AD-706, AD-709 updated with R4 specifications; Section 4 updated with explicit MVP Trust Model and Out-of-Scope Threat Register. | Updated |
 | `docs/design/README.md` | Index updated to feature `PHASE7_2_R4_FINAL_CORRECTIONS.md`. | Updated |
+
