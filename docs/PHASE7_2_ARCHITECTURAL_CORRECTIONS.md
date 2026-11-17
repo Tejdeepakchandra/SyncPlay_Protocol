@@ -159,4 +159,6 @@ This document serves as the authoritative architectural correction record for **
 | `docs/PHASE7_2_SIMULATION_TEST_STRATEGY.md` | Added tests for causal context, concurrency races, and snapshot frontier verification. |
 | `docs/PHASE7_2_COMPATIBILITY_AND_MIGRATION.md` | Updated migration rules for `causalContext` and ephemeral reload identity. |
 | `docs/PHASE7_2_FINAL_DESIGN_REVIEW.md` | Revised decisions AD-701 to AD-710, updated acceptance criteria assessment. |
-| `docs/design/README.md` | Added `PHASE7_2_ARCHITECTURAL_CORRECTIONS.md` to design index. |
+| `docs/PHASE7_2_R2_FINAL_CORRECTIONS.md` | Final R2 specification: Causal vs Replication vector, Strict Epoch Fencing, RFC 8785 snapshot integrity, exact Lamport clock rules. |
+| `docs/design/README.md` | Added architectural correction records to design index. |
+

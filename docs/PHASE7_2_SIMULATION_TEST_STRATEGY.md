@@ -153,3 +153,46 @@ interface NetworkImpairmentConfig {
   - Garbage collection overhead and heap allocation per replay.
 - **Pass / Fail Threshold:** $p99 < 2.0\text{ ms}$ on baseline testing machines. Results will be published in the Milestone P7.7 Performance Evaluation Report.
 
+### Suite 7: Strict Membership Epoch Fencing & Partition Recovery
+- **Execution:**
+  1. Initialize mesh with Peers A, B, and C in `membershipEpoch: 5`.
+  2. Partition Peer C.
+  3. Bootstrap advances room to `membershipEpoch: 6` (Peer C marked departed).
+  4. Peers A and B emit 30 operations in epoch 6 and compact history past the old frontier.
+  5. Peer C generates 5 local playback operations (`SEEK`, `PLAY`) under `membershipEpoch: 5`.
+  6. Heal partition between C and {A, B}.
+- **Assertions:**
+  1. Peers A and B reject C's epoch-5 operations with code `REJECTED_OBSOLETE_EPOCH`.
+  2. Peer C detects epoch mismatch, purges speculative intents, and transitions to `'recovering'`.
+  3. Peer C requests `STATE_SNAPSHOT` from Peer A (epoch 6) and installs it cleanly.
+  4. Final state across all 3 peers is 100% identical.
+
+### Suite 8: Out-of-Order Gap Tracking & Non-Advancement of Replication Vector
+- **Execution:**
+  1. Peer A emits sequential operations $A_1$, $A_2$, and $A_3$.
+  2. Network delivers $A_1$ and $A_3$ to Peer B, while dropping $A_2$.
+- **Assertions:**
+  1. Peer B applies $A_1$; `replicationVector[A] === 1`.
+  2. Peer B receives $A_3$; verifies $A_3$ depends on $A_2$ ($A_3.\text{causalContext}[A] === 2$).
+  3. Peer B buffers $A_3$ in `PendingDependencyQueue`; `replicationVector[A]` remains $1$ (does NOT advance to 3).
+  4. Peer B emits `REPAIR_REQUEST` for sequence range $[2, 2]$.
+  5. Network delivers $A_2$; Peer B applies $A_2$, cascades to unblock $A_3$, and advances `replicationVector[A]` to $3$.
+
+### Suite 9: Incomparable Snapshot Frontiers & Deterministic Tie-Breaking
+- **Execution:**
+  1. Simulate temporary split-brain partition creating incomparable snapshots between sub-meshes.
+  2. Sub-mesh 1 produces Snapshot 1 with frontier $\{A: 10, B: 5\}$ at epoch 6.
+  3. Sub-mesh 2 produces Snapshot 2 with frontier $\{A: 5, B: 10\}$ at epoch 6.
+- **Assertions:**
+  1. Verifies receiver never chooses a snapshot by comparing entry sums ($\sum V$).
+  2. Receiver attempts log repair to bridge the gap.
+  3. If log history is compacted, receiver applies deterministic epoch-monotonic tie-breaker: $\max(\text{epoch}) \to \max(L) \to \max_{\text{lex}}(\text{authorPeerId})$.
+  4. All nodes converge to the identical tie-breaker winner.
+
+### Suite 10: Rate-Based Clock Inflation & Causal Timestamp Integrity
+- **Execution:**
+  1. **Integrity Violation:** Peer B emits operation with $L(e) = 5$, but declares dependency with $L(d) = 10$.
+  2. Assert receiver rejects with `INVALID_CAUSAL_TIMESTAMP`.
+  3. **Inflation Violation:** Malicious/buggy peer attempts to advance Lamport clock by $10^9$ ticks in $1\text{ ms}$.
+  4. Assert receiver rejects with `CLOCK_INFLATION` without state corruption.
+

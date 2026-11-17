@@ -87,19 +87,24 @@ export interface ILogicalClockManager {
   readonly clock: number;
 
   /**
-   * Advances the local clock for an outbound operation.
-   * Increments: L = L + 1.
+   * Advances the local clock for an outbound operation:
+   * L = 1 + max(L_local, max_deps L).
    * Throws SyncEngineError('CLOCK_OVERFLOW') if L >= Number.MAX_SAFE_INTEGER - 1.
    */
-  tickLocal(): number;
+  tickLocal(dependencies?: ReadonlyArray<{ logicalTimestamp: number }>): number;
 
   /**
    * Validates and advances local clock upon receiving a remote operation.
    * Advances: L = max(L_local, remoteClock) + 1.
-   * Validates non-negative integer and checks per-origin Lamport monotonicity.
-   * Throws SyncEngineError('INVALID_CLOCK') or SyncEngineError('CLOCK_REGRESSION').
+   * Validates non-negative integer, per-origin monotonicity, causal timestamp integrity, and rate inflation.
+   * Throws SyncEngineError('INVALID_CLOCK'), 'CLOCK_REGRESSION', 'INVALID_CAUSAL_TIMESTAMP', or 'CLOCK_INFLATION'.
    */
-  validateAndAdvanceRemote(originPeerId: string, remoteClock: number): number;
+  validateAndAdvanceRemote(
+    originPeerId: string,
+    remoteClock: number,
+    dependencyClocks: ReadonlyArray<number>,
+    monotonicNow: number
+  ): number;
 
   /**
    * Reseeds clock upon reconnect or snapshot recovery.
@@ -121,6 +126,7 @@ export interface StoredOperation {
   readonly logicalEventId: string;
   readonly originPeerId: string;
   readonly senderPeerId: string;
+  readonly membershipEpoch: number;
   readonly messageType: 'PLAY' | 'PAUSE' | 'SEEK' | 'RATE_CHANGE';
   readonly logicalTimestamp: number;
   readonly originSequenceNumber: number;
@@ -145,7 +151,8 @@ export interface InsertOperationResult {
     | 'BUFFERED_PENDING_DEPENDENCY'
     | 'REJECTED_OUTSIDE_HORIZON'
     | 'REJECTED_INVALID_ORIGIN'
-    | 'REJECTED_SEQUENCE_CONFLICT';
+    | 'REJECTED_SEQUENCE_CONFLICT'
+    | 'REJECTED_OBSOLETE_EPOCH';
 }
 
 export interface IOrderedOperationLog {
@@ -232,14 +239,14 @@ export interface IConflictResolver {
 
 ```ts
 export interface IReplicationController {
-  /** Current local Version Vector (originPeerId -> highestConsecutiveSeq). */
-  readonly versionVector: Readonly<Record<string, number>>;
+  /** Current local Replication Vector (originPeerId -> highestConsecutiveSeq received and reduced). */
+  readonly replicationVector: Readonly<Record<string, number>>;
 
-  /** Generates a StateDigestPayload to announce local frontier. */
+  /** Generates a StateDigestPayload to announce local contiguous frontier. */
   createDigest(): StateDigestPayload;
 
   /**
-   * Evaluates an incoming remote digest against local version vector.
+   * Evaluates an incoming remote digest against local replication vector.
    * Returns array of RepairRequests needed to fill local gaps.
    */
   processRemoteDigest(digest: StateDigestPayload): ReadonlyArray<RepairRequestPayload>;
@@ -253,8 +260,11 @@ export interface IReplicationController {
   /** Increments local sequence counter for a new locally originated operation. */
   nextLocalSequence(): number;
 
-  /** Updates version vector upon receiving an operation. */
-  recordOperationReceived(originPeerId: string, sequenceNumber: number): void;
+  /**
+   * Updates replication vector upon consecutively receiving and reducing an operation.
+   * Out-of-order operations do NOT advance this vector.
+   */
+  recordOperationReduced(originPeerId: string, sequenceNumber: number): void;
 
   /** Disposes background anti-entropy timers. */
   dispose(): void;
@@ -278,7 +288,8 @@ export interface IRecoveryManager {
   /**
    * Atomically validates and installs an imported snapshot.
    * Verifies frontier dominates local history (V_snap >= V_local).
-   * Verifies SHA-256 digest, sets isImportedProvenance = true, and replays newer local operations.
+   * Verifies RFC 8785 canonical SHA-256 digest, sets isImportedProvenance = true, and replays newer local operations.
+   * Resolves incomparable frontiers via epoch-monotonic tie-breaking.
    */
   installSnapshot(
     snapshot: StateSnapshotPayloadV2,
@@ -305,12 +316,17 @@ The existing `SyncEngineError` is extended with standardized Phase 7 error codes
 | :--- | :--- | :--- |
 | `'CLOCK_OVERFLOW'` | Lamport clock reached `Number.MAX_SAFE_INTEGER`. | Local clock manager |
 | `'CLOCK_REGRESSION'` | Remote timestamp does not strictly exceed previous timestamp from same origin. | Clock validation |
-| `'SEQUENCE_REGRESSION'` | Operation sequence number is lower than or equal to known sequence for origin. | Sequence validation |
+| `'INVALID_CAUSAL_TIMESTAMP'` | Remote timestamp does not strictly exceed declared dependency timestamps. | Causal verification |
+| `'CLOCK_INFLATION'` | Remote clock advances faster than physical monotonic rate limit. | Rate inflation check |
+| `'SEQUENCE_REGRESSION'` | Operation sequence number is lower than known sequence for origin. | Sequence validation |
+| `'SEQUENCE_COLLISION_DETECTED'`| Different logicalEventId received for an already processed origin sequence. | Duplicate detection |
 | `'INVALID_ORIGIN_SEQUENCE'` | Sequence number is non-positive or non-safe integer. | Boundary check |
+| `'REJECTED_OBSOLETE_EPOCH'` | Operation originated under an obsolete membership epoch. | Strict epoch fencing |
 | `'REJECTED_OUTSIDE_HORIZON'` | Late operation sequence predates compacted horizon ($K=256$). | Log insertion |
 | `'REPAIR_GAP_EXCEEDED'` | Requested sequence range cannot be fulfilled by log. | Anti-entropy repair |
 | `'SNAPSHOT_STALE'` | Imported snapshot frontier is older than local known history. | Recovery manager |
 | `'DIGEST_MISMATCH'` | Snapshot payload SHA-256 digest failed cryptographic validation. | Snapshot verification |
+| `'DEGRADED_OUT_OF_SYNC'` | Snapshot frontiers are incomparable and cannot be reconciled. | Recovery manager |
 | `'INVALID_VERSION_VECTOR'` | Version vector contains negative or non-integer sequences. | Anti-entropy parser |
 | `'BATCH_OVERFLOW'` | `OPERATION_BATCH` exceeds maximum allowed size ($> 32$). | Wire validation |
 

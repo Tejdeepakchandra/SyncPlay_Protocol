@@ -53,6 +53,12 @@ export interface ProtocolMessageV2<TPayload = unknown> {
   readonly originPeerId?: PeerId;
 
   /**
+   * Room membership epoch from Bootstrap at the moment this message was created.
+   * Used for strict epoch fencing: events from obsolete epochs are discarded.
+   */
+  readonly membershipEpoch?: number;
+
+  /**
    * Monotonic Lamport logical timestamp.
    * Required for all control events ('PLAY', 'PAUSE', 'SEEK', 'RATE_CHANGE').
    * Optional for transport/diagnostics ('PING', 'PONG') and signaling messages.
@@ -60,7 +66,7 @@ export interface ProtocolMessageV2<TPayload = unknown> {
   readonly logicalTimestamp?: number;
 
   /**
-   * Origin-specific sequence counter for anti-entropy version vector tracking.
+   * Origin-specific sequence counter for anti-entropy replication tracking.
    * Stamped by the originating peer; immutable across retransmissions.
    */
   readonly originSequenceNumber?: number;
@@ -126,10 +132,11 @@ export interface StateDigestPayload {
   readonly membershipEpoch: number;
 
   /**
-   * Version Vector mapping Origin Peer ID to highest consecutively received sequence number.
+   * Replication Vector mapping Origin Peer ID to highest consecutively received and reduced sequence number.
    * Key: PeerId, Value: Non-negative integer.
+   * Gaps do NOT advance this vector.
    */
-  readonly versionVector: Record<string, number>;
+  readonly replicationVector: Record<string, number>;
 
   /**
    * Version Vector frontier covered by this peer's base snapshot.
@@ -151,7 +158,7 @@ export const StateDigestPayloadSchema = z.object({
   senderPeerId: z.string().min(1).max(128),
   connectionGeneration: z.number().int().positive(),
   membershipEpoch: z.number().int().nonnegative(),
-  versionVector: z.record(
+  replicationVector: z.record(
     z.string().min(1).max(128),
     z.number().int().nonnegative()
   ),
@@ -166,7 +173,7 @@ export const StateDigestPayloadSchema = z.object({
 
 #### Byte Overhead Calculation:
 - Base JSON envelope & fields: $\approx 200\text{ bytes}$.
-- Version Vector entry per peer: $\approx 24\text{ bytes}$ (e.g., `"peer_abc123": 45`).
+- Vector entry per peer: $\approx 24\text{ bytes}$ (e.g., `"peer_abc123": 45`).
 - For a 4-peer room: $200 + (4 \times 24 \times 2) \approx \mathbf{392\text{ bytes}}$.
 - For an 8-peer room (maximum capacity): $200 + (8 \times 24 \times 2) \approx \mathbf{584\text{ bytes}}$.
 - Well within the protocol limit of $\text{MAX\_PAYLOAD\_BYTES} = 65,536\text{ bytes}$.
@@ -225,6 +232,7 @@ export interface SerializedControlOperation {
   readonly logicalEventId: string;
   readonly originPeerId: string;
   readonly senderPeerId: string;
+  readonly membershipEpoch: number;
   readonly messageType: 'PLAY' | 'PAUSE' | 'SEEK' | 'RATE_CHANGE';
   readonly logicalTimestamp: number;
   readonly originSequenceNumber: number;
@@ -247,6 +255,7 @@ export const SerializedControlOperationSchema = z.object({
   logicalEventId: z.string().min(1).max(128),
   originPeerId: z.string().min(1).max(128),
   senderPeerId: z.string().min(1).max(128),
+  membershipEpoch: z.number().int().nonnegative(),
   messageType: z.enum(['PLAY', 'PAUSE', 'SEEK', 'RATE_CHANGE']),
   logicalTimestamp: z.number().int().nonnegative(),
   originSequenceNumber: z.number().int().positive(),
@@ -271,6 +280,7 @@ export const OperationBatchPayloadSchema = z.object({
 
 - **Purpose:** Full authoritative baseline snapshot transfer for rejoining peers or peers whose gap exceeds the retained history horizon ($> K$).
 - **Direction:** Targeted unicast over WebRTC DataChannel in response to `STATE_REQUEST`.
+- **Integrity vs. Semantic Truth:** `stateDigestSha256` computed via RFC 8785 canonical JSON proves **byte-level payload integrity** across the network. It does not prove the state was faithfully reduced from history; semantic consistency is validated by state bounding, frontier monotonicity ($V_{\text{snap}} \ge V_{\text{rep, local}}$), and multi-peer digest agreement.
 
 #### Proposed TypeScript Schema (Documentation Only):
 ```ts
@@ -336,5 +346,5 @@ export const StateSnapshotPayloadV2Schema = z.object({
 2. **Bounded Batches:** An `OPERATION_BATCH` is strictly capped at $32$ operations. An operation typically serializes to $\approx 250\text{ bytes}$, yielding a batch size of $\approx 8\text{ KB}$, well within SCTP MTU and buffer limits.
 3. **Safe Integer Enforcement:** All counters (`logicalTimestamp`, `originSequenceNumber`, `fromSequence`, `toSequence`, `membershipEpoch`) are validated with `z.number().int().nonnegative()` and `Number.isSafeInteger()`.
 4. **Origin Validation:** In `OPERATION_BATCH`, the receiving peer validates that all operations in the batch have `originPeerId == targetOriginPeerId`, preventing peers from injecting forged operations on behalf of third parties.
-5. **Cryptographic Integrity & Stale Snapshot Rejection:** In `STATE_SNAPSHOT`, the receiver verifies the SHA-256 digest of the serialized state and rejects the snapshot if `snapshotFrontier` is older than local known history ($V_{\text{snap}} < V_{\text{local}}$).
+5. **Canonical Integrity Verification (RFC 8785):** In `STATE_SNAPSHOT`, the receiver computes the SHA-256 digest of the canonical JSON representation of the payload. Stale snapshots ($V_{\text{snap}} < V_{\text{rep, local}}$) are rejected immediately. Incomparable snapshots are resolved via epoch-monotonic tie-breaking rather than summing vector entries.
 
