@@ -24,7 +24,11 @@ import type {
   OperationBatchPayload,
   RepairRejectedPayload,
 } from '@syncplay/protocol';
-import type { LeaderlessSyncEngine, AuthenticatedSupplierContext } from '../engine/leaderless-sync-engine.js';
+import type {
+  LeaderlessSyncEngine,
+  AuthenticatedSupplierContext,
+  AuthenticatedRequesterContext,
+} from '../engine/leaderless-sync-engine.js';
 import type { EngineDecision } from '../types.js';
 import { SyncEngineError } from '../errors.js';
 import type {
@@ -33,10 +37,12 @@ import type {
   AntiEntropyCallbacks,
   AntiEntropySchedulerOptions,
   RepairPipelineOptions,
+  RepairSupplierOptions,
   SchedulerClock,
   DigestComparisonResult,
 } from './types.js';
 import { RepairRequestPipeline } from './repair-request-pipeline.js';
+import { RepairSupplierService } from './repair-supplier-service.js';
 
 export const DEFAULT_PERIODIC_INTERVAL_MS = 5000;
 export const DEFAULT_JITTER_MS = 1000;
@@ -57,6 +63,7 @@ export class AntiEntropyManager implements IAntiEntropyManager {
   private readonly callbacks: AntiEntropyCallbacks;
   private readonly clock: SchedulerClock;
   private readonly pipeline: RepairRequestPipeline;
+  private readonly supplierService: RepairSupplierService;
   private readonly periodicIntervalMs: number;
   private readonly jitterMs: number;
   private readonly rateLimitMinIntervalMs: number;
@@ -75,13 +82,14 @@ export class AntiEntropyManager implements IAntiEntropyManager {
   constructor(
     engine: LeaderlessSyncEngine,
     callbacks: AntiEntropyCallbacks,
-    options?: AntiEntropySchedulerOptions & RepairPipelineOptions,
+    options?: AntiEntropySchedulerOptions & RepairPipelineOptions & RepairSupplierOptions,
     clock?: SchedulerClock,
   ) {
     this.engine = engine;
     this.callbacks = callbacks;
     this.clock = clock ?? defaultSchedulerClock;
     this.pipeline = new RepairRequestPipeline(engine, callbacks, options, this.clock);
+    this.supplierService = new RepairSupplierService(engine, callbacks, options, this.clock);
     this.periodicIntervalMs = options?.periodicIntervalMs ?? DEFAULT_PERIODIC_INTERVAL_MS;
     this.jitterMs = options?.jitterMs ?? DEFAULT_JITTER_MS;
     this.rateLimitMinIntervalMs =
@@ -96,6 +104,9 @@ export class AntiEntropyManager implements IAntiEntropyManager {
     this.engine.onPeerGenerationChange?.((peerId, newGen) => {
       this.onPeerGenerationChanged(peerId, newGen);
     });
+
+    // Register this manager with the engine
+    this.engine.setAntiEntropyManager(this);
 
     // Start background periodic digest exchange timer
     this.scheduleNextPeriodicTick();
@@ -191,6 +202,7 @@ export class AntiEntropyManager implements IAntiEntropyManager {
   public onPeerDisconnected(peerId: string): void {
     if (this.disposed) return;
     this.pipeline.onPeerDisconnected(peerId);
+    this.supplierService.onPeerDisconnected(peerId);
   }
 
   /**
@@ -205,8 +217,9 @@ export class AntiEntropyManager implements IAntiEntropyManager {
       this.reactiveTimerId = undefined;
     }
 
-    // Cancel in-flight repair requests from older epochs
+    // Cancel in-flight repair requests and purge supplier cache from older epochs
     this.pipeline.onEpochTransition(newEpoch);
+    this.supplierService.onEpochTransition(newEpoch);
 
     // Reset periodic timer with fresh jitter
     this.scheduleNextPeriodicTick();
@@ -217,12 +230,16 @@ export class AntiEntropyManager implements IAntiEntropyManager {
 
   /**
    * Serves an inbound REPAIR_REQUEST from local log history (M4).
-   * Unimplemented in M3.
+   * Requires a registered AuthenticatedRequesterContext.
    */
   public serveRepairRequest(
-    _request: RepairRequestPayload,
+    request: RepairRequestPayload,
+    context?: AuthenticatedRequesterContext,
   ): OperationBatchPayload | RepairRejectedPayload {
-    throw new Error('AntiEntropyManager.serveRepairRequest() is scheduled for Phase 7.4 M4');
+    if (this.disposed) {
+      throw new SyncEngineError('DISPOSED', 'Cannot serve repair request on disposed manager');
+    }
+    return this.supplierService.serveRepairRequest(request, context);
   }
 
   /**
@@ -294,6 +311,7 @@ export class AntiEntropyManager implements IAntiEntropyManager {
     this.disposed = true;
 
     this.pipeline.dispose();
+    this.supplierService.dispose();
 
     if (this.periodicTimerId !== undefined) {
       this.clock.clearTimeout(this.periodicTimerId);

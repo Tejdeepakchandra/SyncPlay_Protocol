@@ -54,6 +54,7 @@ export {
   createTransportRegistrationCapability,
   createSupplierContextRegistrationCapability,
   createAuthenticatedSupplierContext,
+  createAuthenticatedRequesterContext,
   TrustedTransportAdapter,
 } from './engine/leaderless-sync-engine.js';
 export type {
@@ -62,6 +63,7 @@ export type {
   TransportRegistrationCapability,
   SupplierContextRegistrationCapability,
   AuthenticatedSupplierContext,
+  AuthenticatedRequesterContext,
 } from './engine/leaderless-sync-engine.js';
 
 // ── Phase 7 Distributed Ordering & Conflict Components ───────

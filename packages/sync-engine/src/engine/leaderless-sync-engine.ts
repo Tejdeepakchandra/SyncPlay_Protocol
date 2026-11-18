@@ -37,6 +37,7 @@ import { computeOperationFingerprint } from '../log/operation-fingerprint.js';
 import type { StoredOperation } from '../log/types.js';
 import type { ReducerContext } from '../conflict/types.js';
 import {
+  type RepairRequestPayload,
   type OperationBatchPayload,
   type RepairRejectedPayload,
   type StateSnapshotPayloadV2,
@@ -87,6 +88,14 @@ export interface AuthenticatedSupplierContext {
   readonly connectionGeneration?: number;
 }
 
+/**
+ * Authenticated transport requester metadata supplied by the trusted transport layer (M4).
+ */
+export interface AuthenticatedRequesterContext {
+  readonly requesterPeerId: string;
+  readonly connectionGeneration?: number;
+}
+
 export interface TransportRegistrationCapability {
   readonly authority: string;
   readonly sessionId: string;
@@ -127,6 +136,19 @@ export function createAuthenticatedSupplierContext(
 }
 
 /**
+ * Creates an authenticated requester transport context registered with the target engine (M4).
+ * Requires the authorized TransportRegistrationCapability held by the trusted transport adapter.
+ */
+export function createAuthenticatedRequesterContext(
+  engine: LeaderlessSyncEngine,
+  requesterPeerId: string,
+  connectionGeneration: number,
+  capability: TransportRegistrationCapability,
+): AuthenticatedRequesterContext {
+  return engine.registerInboundRequesterContext(requesterPeerId, connectionGeneration, capability);
+}
+
+/**
  * Trusted transport adapter that wraps the engine and holds the transport registration capability.
  * Created by the composition root and provided to transport drivers (PeerMesh, ControlEventService).
  */
@@ -148,10 +170,14 @@ export class TrustedTransportAdapter {
       );
     }
     this.antiEntropyManager = antiEntropyManager;
+    if (antiEntropyManager) {
+      this.engine.setAntiEntropyManager(antiEntropyManager);
+    }
   }
 
   public setAntiEntropyManager(manager: IAntiEntropyManager): void {
     this.antiEntropyManager = manager;
+    this.engine.setAntiEntropyManager(manager);
   }
 
   public getAntiEntropyManager(): IAntiEntropyManager | undefined {
@@ -200,6 +226,36 @@ export class TrustedTransportAdapter {
     }
   }
 
+  public registerRequesterContext(
+    requesterPeerId: string,
+    connectionGeneration: number,
+  ): AuthenticatedRequesterContext {
+    return this.engine.registerInboundRequesterContext(
+      requesterPeerId,
+      connectionGeneration,
+      this.capability,
+    );
+  }
+
+  /**
+   * Processes an inbound REPAIR_REQUEST packet received from the trusted transport layer (M4).
+   * Derives requester identity and connection generation strictly from transport state.
+   */
+  public handleInboundRepairRequest(
+    request: RepairRequestPayload,
+    transportRequesterPeerId: string,
+    transportConnectionGeneration: number,
+  ): OperationBatchPayload | RepairRejectedPayload {
+    const context = this.registerRequesterContext(
+      transportRequesterPeerId,
+      transportConnectionGeneration,
+    );
+    if (this.antiEntropyManager) {
+      return this.antiEntropyManager.serveRepairRequest(request, context);
+    }
+    return this.engine.serveRepairRequest(request, context);
+  }
+
   public ingestRepairBatch(
     batch: OperationBatchPayload,
     supplierPeerId: string,
@@ -239,6 +295,8 @@ export class LeaderlessSyncEngine implements SyncEngine {
   private readonly authorizedEpochCapability?: EpochTransitionCapability;
   private readonly authorizedTransportCapability?: TransportRegistrationCapability;
   private readonly validSupplierContexts = new WeakSet<AuthenticatedSupplierContext>();
+  private readonly validRequesterContexts = new WeakSet<AuthenticatedRequesterContext>();
+  private antiEntropyManager?: IAntiEntropyManager;
   private localOriginSequence = 0;
   private currentEpoch = 1;
 
@@ -487,6 +545,85 @@ export class LeaderlessSyncEngine implements SyncEngine {
   public isValidSupplierContext(context?: AuthenticatedSupplierContext): boolean {
     if (!context || typeof context !== 'object') return false;
     return this.validSupplierContexts.has(context);
+  }
+
+  /**
+   * Registers an unforgeable AuthenticatedRequesterContext for a connected peer session (M4).
+   * Requires the authorized TransportRegistrationCapability.
+   */
+  public registerInboundRequesterContext(
+    requesterPeerId: string,
+    connectionGeneration: number,
+    capability: TransportRegistrationCapability,
+  ): AuthenticatedRequesterContext {
+    if (
+      !this.authorizedTransportCapability ||
+      !capability ||
+      capability !== this.authorizedTransportCapability
+    ) {
+      throw new SyncEngineError(
+        'UNAUTHORIZED',
+        'Requester context registration requires authorized TransportRegistrationCapability',
+      );
+    }
+    if (!requesterPeerId || typeof requesterPeerId !== 'string') {
+      throw new SyncEngineError('INVALID_ARGUMENT', 'requesterPeerId must be non-empty string');
+    }
+    if (
+      typeof connectionGeneration !== 'number' ||
+      !Number.isInteger(connectionGeneration) ||
+      connectionGeneration < 1
+    ) {
+      throw new SyncEngineError(
+        'INVALID_ARGUMENT',
+        `Invalid connection generation ${connectionGeneration}: must be positive integer`,
+      );
+    }
+    const context: AuthenticatedRequesterContext = Object.freeze({
+      requesterPeerId,
+      connectionGeneration,
+    });
+    this.validRequesterContexts.add(context);
+    return context;
+  }
+
+  /**
+   * Verifies whether the provided context is an unforgeable, genuinely registered requester context (M4).
+   */
+  public isValidRequesterContext(context?: AuthenticatedRequesterContext): boolean {
+    if (!context || typeof context !== 'object') return false;
+    return this.validRequesterContexts.has(context);
+  }
+
+  /**
+   * Exposes the internal OrderedOperationLog for anti-entropy supplier range inspection (M4).
+   */
+  public getOperationLog(): OrderedOperationLog {
+    return this.operationLog;
+  }
+
+  public setAntiEntropyManager(manager: IAntiEntropyManager): void {
+    this.antiEntropyManager = manager;
+  }
+
+  public getAntiEntropyManager(): IAntiEntropyManager | undefined {
+    return this.antiEntropyManager;
+  }
+
+  /**
+   * Serves an inbound REPAIR_REQUEST using the anti-entropy supplier subsystem (M4).
+   */
+  public serveRepairRequest(
+    request: RepairRequestPayload,
+    context: AuthenticatedRequesterContext,
+  ): OperationBatchPayload | RepairRejectedPayload {
+    if (this.disposed) {
+      throw new SyncEngineError('DISPOSED', 'Cannot serve repair request on disposed engine');
+    }
+    if (this.antiEntropyManager) {
+      return this.antiEntropyManager.serveRepairRequest(request, context);
+    }
+    throw new SyncEngineError('INVALID_ARGUMENT', 'AntiEntropyManager is not configured for repair servicing');
   }
 
   public getState(): Readonly<PlaybackState> {

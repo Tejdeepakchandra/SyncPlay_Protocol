@@ -72,6 +72,9 @@ export interface IOrderedOperationLog {
   /** Returns slice of operations originating from originPeerId in range [fromSeq, toSeq]. */
   getRange(originPeerId: string, fromSeq: number, toSeq: number): ReadonlyArray<StoredOperation>;
 
+  /** Retrieves the lowest origin sequence number currently retained in the active log for an origin. */
+  getOldestRetainedSequence?(originPeerId: string): number | undefined;
+
   /** Retrieves exact Lamport timestamp for a compacted sequence. */
   getCompactedCheckpoint(originPeerId: string, sequenceNumber: number): number | undefined;
 

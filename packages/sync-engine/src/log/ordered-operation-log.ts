@@ -197,6 +197,22 @@ export class OrderedOperationLog implements IOrderedOperationLog {
   }
 
   /**
+   * Retrieves the lowest origin sequence number currently retained in the active log
+   * for a given origin peer, or undefined if no operations are retained for that origin.
+   */
+  public getOldestRetainedSequence(originPeerId: string): number | undefined {
+    let oldest: number | undefined = undefined;
+    for (const op of this.operations) {
+      if (op.originPeerId === originPeerId) {
+        if (oldest === undefined || op.originSequenceNumber < oldest) {
+          oldest = op.originSequenceNumber;
+        }
+      }
+    }
+    return oldest;
+  }
+
+  /**
    * Inserts an operation into the log maintaining strict total ordering.
    * Performs deduplication and collision detection.
    */

@@ -14,7 +14,7 @@ import type {
 } from '@syncplay/protocol';
 import type { Clock, EngineDecision } from '../types.js';
 import type { MissingSequenceRange } from '../log/pending-dependency-queue.js';
-import type { AuthenticatedSupplierContext } from '../engine/leaderless-sync-engine.js';
+import type { AuthenticatedSupplierContext, AuthenticatedRequesterContext } from '../engine/leaderless-sync-engine.js';
 
 export type { MissingSequenceRange };
 
@@ -244,6 +244,35 @@ export interface RepairPipelineOptions {
 }
 
 /**
+ * Configuration options for supplier range servicing (M4).
+ */
+export interface RepairSupplierOptions {
+  /** Maximum concurrent repair requests serviced room-wide (default: 16). */
+  readonly maxConcurrentRequests?: number;
+
+  /** Maximum concurrent repair requests serviced per requesting peer (default: 4). */
+  readonly maxConcurrentRequestsPerPeer?: number;
+
+  /** Rate limiter: maximum repair requests accepted per second per peer (default: 10). */
+  readonly rateLimitMaxRequestsPerSecond?: number;
+
+  /** Rate limiter: maximum burst of repair requests allowed per peer (default: 20). */
+  readonly rateLimitBurst?: number;
+
+  /** Bounded capacity for recent response cache to handle duplicate request replays (default: 64). */
+  readonly responseCacheCapacity?: number;
+
+  /** Maximum operations per batch (default: 32). */
+  readonly maxOperationsPerBatch?: number;
+
+  /** Maximum application payload bytes per batch frame (default: 65536). */
+  readonly maxPayloadBytes?: number;
+
+  /** Optional provider for negotiated DataChannel / SCTP max message size per peer. */
+  readonly negotiatedSctpMaxMessageSizeProvider?: (peerId: string) => number | undefined;
+}
+
+/**
  * Configuration options for the anti-entropy digest scheduler.
  */
 export interface AntiEntropySchedulerOptions {
@@ -298,8 +327,11 @@ export interface IAntiEntropyManager {
   /** Evaluates an incoming remote digest against local replication knowledge. */
   processRemoteDigest(digest: StateDigestPayload): DigestComparisonResult;
 
-  /** Serves an inbound REPAIR_REQUEST from local log history (M4). */
-  serveRepairRequest(request: RepairRequestPayload): OperationBatchPayload | RepairRejectedPayload;
+  /** Serves an inbound REPAIR_REQUEST from local log history (M4). Requires genuine AuthenticatedRequesterContext. */
+  serveRepairRequest(
+    request: RepairRequestPayload,
+    context?: AuthenticatedRequesterContext,
+  ): OperationBatchPayload | RepairRejectedPayload;
 
   /** Processes an inbound OPERATION_BATCH fulfilling an active repair request (M3). Requires genuine AuthenticatedSupplierContext. */
   handleRepairBatch(

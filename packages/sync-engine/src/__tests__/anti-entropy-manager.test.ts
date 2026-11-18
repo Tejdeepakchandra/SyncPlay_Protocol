@@ -550,14 +550,14 @@ describe('AntiEntropyManager & Digest Engine Integration', () => {
       manager.dispose();
     });
 
-    it('strictly preserves M4 separation by throwing on unimplemented serveRepairRequest', () => {
+    it('enforces mandatory transport context on serveRepairRequest', () => {
       const callbacks: AntiEntropyCallbacks = { onBroadcastDigest: vi.fn() };
       const manager = new AntiEntropyManager(engine, callbacks, {}, fakeClock);
 
-      // reconcileGaps() is now implemented in M3 (requester-side pipeline)
+      // reconcileGaps() is implemented in M3 (requester-side pipeline)
       expect(() => manager.reconcileGaps()).not.toThrow();
 
-      // serveRepairRequest() remains strictly deferred to Phase 7.4 M4
+      // serveRepairRequest() strictly requires an authenticated transport context in M4
       expect(() =>
         manager.serveRepairRequest({
           requestId: 'e1074a9a-f4ef-4b9e-b2d3-18ef557163ef',
@@ -568,7 +568,7 @@ describe('AntiEntropyManager & Digest Engine Integration', () => {
           toSequence: 5,
           membershipEpoch: 1,
         }),
-      ).toThrowError(/Phase 7\.4 M4/);
+      ).toThrowError(/AuthenticatedRequesterContext/);
 
       manager.dispose();
     });
