@@ -7,7 +7,7 @@
 **Frozen Phase 7.3-R5-H Trust Boundary Baseline:** `e49b81a`  
 **Milestone M1 Baseline:** `309b808` (amending `5cadc03`)  
 **Milestone M2 Baseline:** `2d5e9f3` (docs: `4926c52`)  
-**Milestone M3 Implementation Commit:** `9ae0f0b`  
+**Milestone M3 Implementation Commit:** `c143972`  
 **Date:** 2026-11-18  
 
 ---
