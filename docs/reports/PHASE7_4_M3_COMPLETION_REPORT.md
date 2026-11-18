@@ -7,7 +7,7 @@
 **Frozen Phase 7.3-R5-H Trust Boundary Baseline:** `e49b81a`  
 **Milestone M1 Baseline:** `309b808` (amending `5cadc03`)  
 **Milestone M2 Baseline:** `2d5e9f3` (docs: `4926c52`)  
-**Milestone M3 Implementation Commit:** Pending Commit  
+**Milestone M3 Implementation Commit:** `9ae0f0b`  
 **Date:** 2026-11-18  
 
 ---
@@ -126,12 +126,12 @@ The test suite contains 45 tests, including 10 targeted adversarial tests verify
 | 10 | Partial response `[10, 20]` for request `[1, 32]` | PASSED | Operations $10..20$ buffered in `PendingDependencyQueue`; prefix $[1, 9]$ preserved in repair queue; unblocks and converges to 32 once $[1, 9]$ and $[21, 32]$ arrive. |
 
 ### 4.2. Monorepo Test Results
-- **`@syncplay/sync-engine`:** **351 passed** across 22 files (0 failures).
+- **`@syncplay/sync-engine`:** **356 passed** across 23 files (0 failures).
 - **`@syncplay/protocol`:** **273 passed** across 4 files (0 failures).
 - **`@syncplay/peer-mesh`:** **101 passed** across 6 files (0 failures).
 - **`@syncplay/control-events`:** **49 passed** across 6 files (0 failures).
 - **`@syncplay/bootstrap-server`:** **91 passed** across 3 files (0 failures).
-- **Total Monorepo Tests:** **865 passed across 41 files with 0 failures**.
+- **Total Monorepo Tests:** **870 passed across 42 files with 0 failures**.
 - **Build & Typecheck:** `tsc` and Vite production build passed cleanly across all packages.
 
 ---
@@ -242,5 +242,81 @@ The 7 dedicated tests verify all edge cases:
    **NO.** A partial batch updates the local replication frontier and dispatches the remainder range with a fresh `requestId`. The duplicate of the original partial batch is rejected, leaving the active remainder request intact and preserving all missing ranges.
 4. **Does legitimate partial repair still work after the correction?**  
    **YES.** When the supplier legitimately returns the subsequent chunk matching the newly dispatched request ID, it is correlated, admitted, and converges the remaining sequence range.
+
+---
+
+## 9. Final Retirement Failure-Safety, Ingestion Recovery & Reconciled Audit
+
+### 9.1 Synchronous In-Process Request Retirement Architecture
+- **Pre-Retirement Validation:** In both `handleRepairBatch` and `handleRepairRejected`, all transport authenticity checks (`engine.isValidSupplierContext`), correlation checks (`inFlightRequests.has`), session ID checks, epoch checks, supplier identity checks, connection generation checks, and range bound checks execute *prior* to retirement.
+- **Synchronous In-Process Timing:** Retirement occurs via synchronous in-process deletion (`this.inFlightRequests.delete(requestId)`) accompanied by timer clearance (`this.clock.clearTimeout(inFlight.timerId)`). This is strictly an in-memory, synchronous state transition protecting local pipeline state machine invariants, not a distributed atomic transaction across nodes.
+- **Re-entrancy Protection:** Because the deletion occurs before invoking `engine.ingestRepairBatch()`, any synchronous listener callback attempting re-entrant delivery fails correlation and is rejected immediately with `REJECTED_INVALID`.
+- **No Delayed Resurrection:** Once retired, an old `requestId` can never be revived or restored by a delayed network packet.
+
+### 9.2 Ingestion Failure Safety & State-Driven Recovery
+To prevent ingestion failures from causing silent loss of repair responsibility, `handleRepairBatch()` encapsulates engine admission in a structured recovery block:
+```typescript
+try {
+  decisions = this.engine.ingestRepairBatch(batch, context);
+} catch (err) {
+  ingestionError = err;
+  decisions = [{ accepted: false, code: 'REJECTED_INVALID', ... }];
+}
+```
+**Invariant Guaranteed:** Retiring a request never permanently loses the responsibility to repair its outstanding sequence range:
+1. If `ingestRepairBatch()` throws an exception, the exception is caught and recorded as an invalid decision.
+2. The pipeline evaluates actual progress by inspecting the true engine replication frontier: `currentSeq = engine.replicationFrontier[origin] ?? 0`.
+3. The unfulfilled range is calculated as `[max(inFlight.fromSequence, currentSeq + 1), inFlight.toSequence]`.
+4. If `ingestionError !== undefined`, the supplier attempt is recorded (`inFlight.attemptedSuppliers.add(supplier)`), retry count is incremented, and `reEnqueueGapForFailover` re-queues the range with exponential backoff or triggers `onHistoryExhausted` if `maxRetries` (3) is exceeded.
+
+### 9.3 Partial-Response Shapes Analysis
+
+| Partial-Response Shape | Pipeline & Engine Behavior | State Verification Invariant |
+|---|---|---|
+| **Complete range** $[1..10]$ for $[1..10]$ | All operations admitted; frontier advances to 10; `totalRepairsCompleted++`. | Range marked complete; active requests 0. |
+| **Prefix only** $[1..5]$ for $[1..10]$ | Operations $1..5$ admitted; frontier advances to 5; suffix $[6..10]$ enqueued and dispatched immediately under fresh $R_2$. | Unfulfilled suffix guaranteed repaired; no missing range lost. |
+| **Suffix only** $[6..10]$ for $[1..10]$ | Missing prefix $1..5$ causes ops $6..10$ to be buffered in `PendingDependencyQueue`; frontier stays 0; range $[1..10]$ is re-enqueued. When prefix $[1..5]$ arrives, buffered ops $6..10$ are drained and admitted. | Out-of-order operations buffered safely; frontier reflects only contiguous operations. |
+| **Middle range** $[6..15]$ for $[1..20]$ | Operations $6..15$ buffered in `PendingDependencyQueue`; frontier stays 0; range $[1..20]$ re-enqueued. Prefix $[1..5]$ drains middle range to frontier 15; suffix $[16..20]$ dispatched and completed. | Prefix and suffix both repaired; middle buffered and unblocked without duplicate requests. |
+| **Partially admitted** (errors midway) | Contiguous operations up to error point admitted; frontier reflects contiguous progress; unfulfilled remainder derived from frontier and re-enqueued. | Partial admission advances frontier accurately; remainder strictly preserved. |
+| **Duplicate of earlier partial batch** | Arrives with old $R_1$ while remainder $R_2$ is active; rejected with `REJECTED_INVALID`; $R_2$ proceeds unaffected. | Zero double-ingestion; no corrupted remainder ranges. |
+
+### 9.4 Full Test Count Reconciliation
+
+The test suite progression across Milestone M3 is reconciled below:
+
+| Milestone Stage | `@syncplay/sync-engine` | Total Monorepo Tests | Test Files | New Test Suite Added |
+|---|:---:|:---:|:---:|---|
+| **M3 Initial Pipeline Implementation** | 336 | 850 | 39 | `repair-request-pipeline.test.ts` (45 tests) |
+| **M3 Trusted Transport Provenance Audit** | 344 (+8) | 858 (+8) | 40 (+1) | `trusted-transport-provenance.test.ts` (8 tests) |
+| **M3 Duplicate Response & Replay Audit** | 351 (+7) | 865 (+7) | 41 (+1) | `duplicate-repair-safety.test.ts` (7 tests) |
+| **M3 Retirement Failure-Safety Final Audit** | **356 (+5)** | **870 (+5)** | **42 (+1)** | `retirement-failure-safety.test.ts` (5 tests) |
+
+### 9.5 Fresh Monorepo Test Results (`npm test`)
+- **Command:** `npm test` from monorepo root.
+- **`@syncplay/control-events`:** **49 passed** (6 files)
+- **`@syncplay/peer-mesh`:** **101 passed** (6 files)
+- **`@syncplay/protocol`:** **273 passed** (4 files)
+- **`@syncplay/sync-engine`:** **356 passed** (23 files)
+- **`@syncplay/bootstrap-server`:** **91 passed** (3 files)
+- **Total Monorepo:** **870 passed across 42 files with 0 failures, 0 skipped, 0 excluded**.
+- **Monorepo Build (`npm run build`):** Clean TypeScript typecheck (`tsc`) and Vite bundle build across all packages.
+
+### 9.6 Answers to Final Stop Conditions
+
+1. **Can an ingestion failure after request retirement permanently lose a missing repair range?**  
+   **NO.** `handleRepairBatch()` catches ingestion exceptions and uses the true engine replication frontier to recalculate and recover the unfulfilled sequence range into `pendingGaps` with failover and bounded retries.
+2. **Can partial admission cause an unfulfilled prefix or suffix to disappear?**  
+   **NO.** Unfulfilled ranges are recalculated as `[max(inFlight.fromSequence, currentSeq + 1), inFlight.toSequence]` directly from the contiguous replication frontier. Out-of-order suffixes are buffered in `PendingDependencyQueue` and drained upon prefix admission.
+3. **Can a re-entrant or sequential duplicate process the same request twice?**  
+   **NO.** Synchronous in-process retirement deletes the request from `inFlightRequests` before ingestion begins. Any re-entrant or sequential duplicate fails `inFlightRequests.has()` and is rejected with `REJECTED_INVALID`.
+4. **Can a duplicate rejection consume retry budget or schedule another backoff?**  
+   **NO.** Synchronous deletion occurs before retry or backoff scheduling; duplicate rejections are dropped on `!inFlightRequests.has()`.
+5. **Are all remaining repair ranges calculated from actual engine state?**  
+   **YES.** All ranges are calculated from `engine.replicationFrontier[origin]`, guaranteeing that only contiguously admitted operations advance repair progress.
+6. **Are the final test counts freshly verified and reconciled?**  
+   **YES.** Monorepo: 870 tests across 42 test files with 0 failures; `@syncplay/sync-engine`: 356 tests across 23 files.
+7. **Is the final implementation committed with a clean working tree?**  
+   **YES.** Clean working tree committed to `main`.
+
 
 

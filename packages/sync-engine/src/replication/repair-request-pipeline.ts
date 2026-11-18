@@ -408,12 +408,28 @@ export class RepairRequestPipeline {
       return [decision];
     }
 
-    // Clear timer and remove from inFlight tracking
+    // Clear timer and remove from inFlight tracking (synchronous in-process retirement)
     this.clock.clearTimeout(inFlight.timerId);
     this.inFlightRequests.delete(batch.requestId);
 
-    // Pass repaired operations directly into the Phase 7.3 capability-gated admission pipeline
-    const decisions = this.engine.ingestRepairBatch(batch, context);
+    let decisions: EngineDecision[] = [];
+    let ingestionError: unknown;
+
+    try {
+      // Pass repaired operations directly into the Phase 7.3 capability-gated admission pipeline
+      decisions = this.engine.ingestRepairBatch(batch, context);
+    } catch (err) {
+      ingestionError = err;
+      decisions = [
+        {
+          accepted: false,
+          code: 'REJECTED_INVALID',
+          stateVersion: this.engine.getState().stateVersion,
+          decidedAt: now,
+          message: `Ingestion failed: ${err instanceof Error ? err.message : String(err)}`,
+        },
+      ];
+    }
 
     // Check for sequence collisions or identity conflicts
     for (const d of decisions) {
@@ -428,23 +444,41 @@ export class RepairRequestPipeline {
     }
 
     // Evaluate progress against local replication frontier
-    const currentSeq = this.engine.replicationFrontier[batch.originPeerId] ?? 0;
+    const currentSeq = this.engine.replicationFrontier[inFlight.originPeerId] ?? 0;
     const targetEnd = inFlight.toSequence;
 
     if (currentSeq >= targetEnd) {
       // Completed this range
       this.totalRepairsCompleted++;
     } else {
-      // Partial batch fulfillment: recalculate unfulfilled range from actual replication frontier
+      // Range is unfulfilled or partially fulfilled (or ingestion failed):
+      // Calculate remaining needed range strictly from the actual engine replication frontier
       const neededStart = Math.max(inFlight.fromSequence, currentSeq + 1);
       const neededEnd = inFlight.toSequence;
+
       if (neededStart <= neededEnd) {
-        this.enqueueGapSlice(
-          inFlight.originPeerId,
-          neededStart,
-          neededEnd,
-          inFlight.supplierPeerId,
-        );
+        if (ingestionError !== undefined) {
+          // Ingestion threw an unhandled runtime error:
+          // Record supplier attempt, consume retry budget, and failover/retry with backoff
+          inFlight.attemptedSuppliers.add(inFlight.supplierPeerId);
+          this.reEnqueueGapForFailover(
+            inFlight.originPeerId,
+            neededStart,
+            neededEnd,
+            inFlight.retryCount,
+            inFlight.attemptedSuppliers,
+            true,
+          );
+        } else {
+          // Legitimate partial progress or buffered forward operations:
+          // Unfulfilled range is enqueued for immediate continuation
+          this.enqueueGapSlice(
+            inFlight.originPeerId,
+            neededStart,
+            neededEnd,
+            inFlight.supplierPeerId,
+          );
+        }
       }
     }
 
@@ -670,36 +704,51 @@ export class RepairRequestPipeline {
   }
 
   /**
-   * Re-enqueues an in-flight request for failover or retry.
+   * Re-enqueues an unfulfilled sequence range for failover or retry with bounded retries.
    */
-  private reEnqueueForFailover(
-    inFlight: InFlightRepairRequest,
+  private reEnqueueGapForFailover(
+    originPeerId: string,
+    fromSequence: number,
+    toSequence: number,
+    currentRetryCount: number,
+    attemptedSuppliers: Set<string>,
     withBackoff: boolean,
   ): void {
-    inFlight.retryCount++;
+    const nextRetryCount = currentRetryCount + 1;
 
-    if (inFlight.retryCount > this.maxRetries) {
+    if (nextRetryCount > this.maxRetries) {
       this.totalRepairsFailed++;
       this.degraded = true;
       this.degradedReason = 'MAX_RETRIES_EXCEEDED';
       this.callbacks.onHistoryExhausted?.({
-        originPeerId: inFlight.originPeerId,
-        missingSequence: inFlight.fromSequence,
+        originPeerId,
+        missingSequence: fromSequence,
         highestRetainedSequence: 0,
       });
       return;
     }
 
+    // Check if an identical or enclosing range is already pending
+    for (const pending of this.pendingGaps) {
+      if (
+        pending.originPeerId === originPeerId &&
+        pending.fromSequence <= fromSequence &&
+        pending.toSequence >= toSequence
+      ) {
+        return; // Already pending
+      }
+    }
+
     const task: PendingGapTask = {
-      originPeerId: inFlight.originPeerId,
-      fromSequence: inFlight.fromSequence,
-      toSequence: inFlight.toSequence,
-      retryCount: inFlight.retryCount,
-      attemptedSuppliers: inFlight.attemptedSuppliers,
+      originPeerId,
+      fromSequence,
+      toSequence,
+      retryCount: nextRetryCount,
+      attemptedSuppliers,
     };
 
     if (withBackoff) {
-      const delayMs = this.backoffBaseMs * Math.pow(2, inFlight.retryCount - 1);
+      const delayMs = this.backoffBaseMs * Math.pow(2, nextRetryCount - 1);
       task.backoffTimerId = this.clock.setTimeout(() => {
         task.backoffTimerId = undefined;
         this.drainQueue();
@@ -707,6 +756,23 @@ export class RepairRequestPipeline {
     }
 
     this.pendingGaps.unshift(task); // Re-queue at head for priority failover
+  }
+
+  /**
+   * Re-enqueues an in-flight request for failover or retry.
+   */
+  private reEnqueueForFailover(
+    inFlight: InFlightRepairRequest,
+    withBackoff: boolean,
+  ): void {
+    this.reEnqueueGapForFailover(
+      inFlight.originPeerId,
+      inFlight.fromSequence,
+      inFlight.toSequence,
+      inFlight.retryCount,
+      inFlight.attemptedSuppliers,
+      withBackoff,
+    );
   }
 
   /**
