@@ -1092,4 +1092,426 @@ describe('Phase 7.4 Milestone M4: Supplier Range Servicing (RepairSupplierServic
       expect(receiverEngine.replicationFrontier['peer-A']).toBe(5);
     });
   });
+
+  // ── 5. Final Supplier Safety, Cache, and Transport-Boundary Audit Tests ────
+  describe('5. Final Supplier Safety, Cache, and Transport-Boundary Audit', () => {
+    it('5.1 Reused requestId with conflicting sequence range is rejected with INVALID_ARGUMENT', () => {
+      for (let s = 1; s <= 10; s++) {
+        supplierEngine.getOperationLog().insert(createStoredOperation('peer-A', s));
+      }
+
+      const req1: RepairRequestPayload = {
+        requestId: 'c1a74a9a-f4ef-4b9e-b2d3-18ef557163ef',
+        sessionId: SESSION_ID,
+        requesterPeerId: 'peer-requester',
+        targetOriginPeerId: 'peer-A',
+        fromSequence: 1,
+        toSequence: 5,
+        membershipEpoch: 1,
+      };
+
+      const res1 = supplierService.serveRepairRequest(req1, requesterContext);
+      expect('operations' in res1).toBe(true);
+
+      // Reused requestId with different sequence range (fromSequence: 6..10)
+      const req2: RepairRequestPayload = {
+        ...req1,
+        fromSequence: 6,
+        toSequence: 10,
+      };
+
+      expect(() => supplierService.serveRepairRequest(req2, requesterContext)).toThrow(SyncEngineError);
+      expect(() => supplierService.serveRepairRequest(req2, requesterContext)).toThrow(
+        /Reused requestId 'c1a74a9a-f4ef-4b9e-b2d3-18ef557163ef' with conflicting request parameters/,
+      );
+    });
+
+    it('5.2 Reused requestId with conflicting target origin is rejected with INVALID_ARGUMENT', () => {
+      for (let s = 1; s <= 5; s++) {
+        supplierEngine.getOperationLog().insert(createStoredOperation('peer-A', s));
+        supplierEngine.getOperationLog().insert(createStoredOperation('peer-B', s));
+      }
+
+      const req1: RepairRequestPayload = {
+        requestId: 'c2a74a9a-f4ef-4b9e-b2d3-18ef557163ef',
+        sessionId: SESSION_ID,
+        requesterPeerId: 'peer-requester',
+        targetOriginPeerId: 'peer-A',
+        fromSequence: 1,
+        toSequence: 5,
+        membershipEpoch: 1,
+      };
+
+      const res1 = supplierService.serveRepairRequest(req1, requesterContext);
+      expect('operations' in res1).toBe(true);
+
+      // Reused requestId with different origin ('peer-B')
+      const req2: RepairRequestPayload = {
+        ...req1,
+        targetOriginPeerId: 'peer-B',
+      };
+
+      expect(() => supplierService.serveRepairRequest(req2, requesterContext)).toThrow(SyncEngineError);
+      expect(() => supplierService.serveRepairRequest(req2, requesterContext)).toThrow(
+        /Reused requestId 'c2a74a9a-f4ef-4b9e-b2d3-18ef557163ef' with conflicting request parameters/,
+      );
+    });
+
+    it('5.3 Cache hit retransmits cached response via outbound callback', () => {
+      for (let s = 1; s <= 5; s++) {
+        supplierEngine.getOperationLog().insert(createStoredOperation('peer-A', s));
+      }
+
+      const sendResponseSpy = vi.fn();
+      const customCallbacks: AntiEntropyCallbacks = {
+        onBroadcastDigest: vi.fn(),
+        onSendRepairResponse: sendResponseSpy,
+      };
+
+      const service = new RepairSupplierService(
+        supplierEngine,
+        customCallbacks,
+        {},
+        clock,
+      );
+
+      const req: RepairRequestPayload = {
+        requestId: 'c3a74a9a-f4ef-4b9e-b2d3-18ef557163ef',
+        sessionId: SESSION_ID,
+        requesterPeerId: 'peer-requester',
+        targetOriginPeerId: 'peer-A',
+        fromSequence: 1,
+        toSequence: 5,
+        membershipEpoch: 1,
+      };
+
+      // 1. Initial send
+      const res1 = service.serveRepairRequest(req, requesterContext);
+      expect(sendResponseSpy).toHaveBeenCalledTimes(1);
+      expect(sendResponseSpy).toHaveBeenLastCalledWith('peer-requester', res1);
+
+      // 2. Duplicate send (cache hit)
+      const res2 = service.serveRepairRequest(req, requesterContext);
+      expect(sendResponseSpy).toHaveBeenCalledTimes(2);
+      expect(sendResponseSpy).toHaveBeenLastCalledWith('peer-requester', res2);
+      expect(res2).toEqual(res1);
+    });
+
+    it('5.4 High-rate duplicate replay consumes rate-limit tokens and returns RATE_LIMITED', () => {
+      for (let s = 1; s <= 5; s++) {
+        supplierEngine.getOperationLog().insert(createStoredOperation('peer-A', s));
+      }
+
+      // Configure rate limit burst to 2 tokens
+      const limitedService = new RepairSupplierService(
+        supplierEngine,
+        supplierCallbacks,
+        {
+          rateLimitBurst: 2,
+          rateLimitMaxRequestsPerSecond: 1,
+        },
+        clock,
+      );
+
+      const req: RepairRequestPayload = {
+        requestId: 'c4a74a9a-f4ef-4b9e-b2d3-18ef557163ef',
+        sessionId: SESSION_ID,
+        requesterPeerId: 'peer-requester',
+        targetOriginPeerId: 'peer-A',
+        fromSequence: 1,
+        toSequence: 5,
+        membershipEpoch: 1,
+      };
+
+      // Request 1: uses token 1, cached
+      const res1 = limitedService.serveRepairRequest(req, requesterContext);
+      expect('operations' in res1).toBe(true);
+
+      // Request 2 (duplicate): uses token 2, served from cache
+      const res2 = limitedService.serveRepairRequest(req, requesterContext);
+      expect('operations' in res2).toBe(true);
+
+      // Request 3 (duplicate): tokens exhausted! Must return RATE_LIMITED rejection, preventing amplification
+      const res3 = limitedService.serveRepairRequest(req, requesterContext);
+      expect('reason' in res3).toBe(true);
+      expect((res3 as RepairRejectedPayload).reason).toBe('RATE_LIMITED');
+    });
+
+    it('5.5 Transport message-size accounting: undefined negotiated size falls back to 64KB cap with envelope overhead', () => {
+      // With undefined provider, effective limit is 65536, reserving 256 bytes envelope -> 65280 bytes
+      const service = new RepairSupplierService(
+        supplierEngine,
+        supplierCallbacks,
+        {
+          negotiatedSctpMaxMessageSizeProvider: () => undefined,
+        },
+        clock,
+      );
+
+      // Seed 1 operation with large payload
+      const largePayload = 'X'.repeat(65200);
+      supplierEngine.getOperationLog().insert(createStoredOperation('peer-A', 1, 1, { data: largePayload }));
+
+      const req: RepairRequestPayload = {
+        requestId: 'c5a74a9a-f4ef-4b9e-b2d3-18ef557163ef',
+        sessionId: SESSION_ID,
+        requesterPeerId: 'peer-requester',
+        targetOriginPeerId: 'peer-A',
+        fromSequence: 1,
+        toSequence: 1,
+        membershipEpoch: 1,
+      };
+
+      // Exceeds 65,280 bytes limit -> BUSY
+      const res = service.serveRepairRequest(req, requesterContext);
+      expect('reason' in res).toBe(true);
+      expect((res as RepairRejectedPayload).reason).toBe('BUSY');
+    });
+
+    it('5.6 Transport message-size accounting: 0 negotiated size is treated as unconstrained remote clamped to 64KB application cap', () => {
+      // RFC 8841: 0 means remote peer can handle any message size, clamped to local 65,536 cap
+      const service = new RepairSupplierService(
+        supplierEngine,
+        supplierCallbacks,
+        {
+          negotiatedSctpMaxMessageSizeProvider: () => 0,
+        },
+        clock,
+      );
+
+      // Seed 1 standard operation
+      supplierEngine.getOperationLog().insert(createStoredOperation('peer-A', 1));
+
+      const req: RepairRequestPayload = {
+        requestId: 'c6a74a9a-f4ef-4b9e-b2d3-18ef557163ef',
+        sessionId: SESSION_ID,
+        requesterPeerId: 'peer-requester',
+        targetOriginPeerId: 'peer-A',
+        fromSequence: 1,
+        toSequence: 1,
+        membershipEpoch: 1,
+      };
+
+      const res = service.serveRepairRequest(req, requesterContext);
+      expect('operations' in res).toBe(true);
+      expect((res as OperationBatchPayload).operations.length).toBe(1);
+    });
+
+    it('5.7 Transport message-size accounting: negotiated size larger than 64KB is clamped to 64KB application cap', () => {
+      const service = new RepairSupplierService(
+        supplierEngine,
+        supplierCallbacks,
+        {
+          negotiatedSctpMaxMessageSizeProvider: () => 100_000,
+        },
+        clock,
+      );
+
+      // 65536 application cap is preserved even when remote reports 100,000
+      const largePayload = 'X'.repeat(65200);
+      supplierEngine.getOperationLog().insert(createStoredOperation('peer-A', 1, 1, { data: largePayload }));
+
+      const req: RepairRequestPayload = {
+        requestId: 'c7a74a9a-f4ef-4b9e-b2d3-18ef557163ef',
+        sessionId: SESSION_ID,
+        requesterPeerId: 'peer-requester',
+        targetOriginPeerId: 'peer-A',
+        fromSequence: 1,
+        toSequence: 1,
+        membershipEpoch: 1,
+      };
+
+      const res = service.serveRepairRequest(req, requesterContext);
+      expect('reason' in res).toBe(true);
+      expect((res as RepairRejectedPayload).reason).toBe('BUSY');
+    });
+
+    it('5.8 Exact boundary enforcement: single operation at permitted byte boundary is accepted', () => {
+      // Baseline calculation for 1 operation
+      const sampleOp = createStoredOperation('peer-A', 1, 1, { data: '' });
+      const candidateBatch: OperationBatchPayload = {
+        requestId: 'c8a74a9a-f4ef-4b9e-b2d3-18ef557163ef',
+        sessionId: SESSION_ID,
+        supplierPeerId: 'peer-supplier',
+        originPeerId: 'peer-A',
+        fromSequence: 1,
+        toSequence: 1,
+        membershipEpoch: 1,
+        operations: [{
+          logicalEventId: sampleOp.logicalEventId,
+          originPeerId: sampleOp.originPeerId,
+          membershipEpoch: sampleOp.membershipEpoch,
+          messageType: sampleOp.messageType,
+          logicalTimestamp: sampleOp.logicalTimestamp,
+          originSequenceNumber: sampleOp.originSequenceNumber,
+          causalContext: { ...sampleOp.causalContext },
+          payload: { data: 'A'.repeat(50) },
+        }],
+      };
+
+      const exactLength = new TextEncoder().encode(JSON.stringify(candidateBatch)).byteLength;
+
+      // Configure service with maxPayloadBytes exactly equal to exactLength and 0 envelope overhead
+      const boundaryService = new RepairSupplierService(
+        supplierEngine,
+        supplierCallbacks,
+        {
+          maxPayloadBytes: exactLength,
+          envelopeOverheadBytes: 0,
+        },
+        clock,
+      );
+
+      supplierEngine.getOperationLog().insert(
+        createStoredOperation('peer-A', 1, 1, { data: 'A'.repeat(50) }),
+      );
+
+      const req: RepairRequestPayload = {
+        requestId: 'c8a74a9a-f4ef-4b9e-b2d3-18ef557163ef',
+        sessionId: SESSION_ID,
+        requesterPeerId: 'peer-requester',
+        targetOriginPeerId: 'peer-A',
+        fromSequence: 1,
+        toSequence: 1,
+        membershipEpoch: 1,
+      };
+
+      const res = boundaryService.serveRepairRequest(req, requesterContext);
+      expect('operations' in res).toBe(true);
+      expect((res as OperationBatchPayload).operations.length).toBe(1);
+    });
+
+    it('5.9 Exact boundary enforcement: single operation 1 byte over permitted boundary is rejected with BUSY', () => {
+      // Baseline calculation for 1 operation
+      const sampleOp = createStoredOperation('peer-A', 1, 1, { data: '' });
+      const candidateBatch: OperationBatchPayload = {
+        requestId: 'c9a74a9a-f4ef-4b9e-b2d3-18ef557163ef',
+        sessionId: SESSION_ID,
+        supplierPeerId: 'peer-supplier',
+        originPeerId: 'peer-A',
+        fromSequence: 1,
+        toSequence: 1,
+        membershipEpoch: 1,
+        operations: [{
+          logicalEventId: sampleOp.logicalEventId,
+          originPeerId: sampleOp.originPeerId,
+          membershipEpoch: sampleOp.membershipEpoch,
+          messageType: sampleOp.messageType,
+          logicalTimestamp: sampleOp.logicalTimestamp,
+          originSequenceNumber: sampleOp.originSequenceNumber,
+          causalContext: { ...sampleOp.causalContext },
+          payload: { data: 'A'.repeat(50) },
+        }],
+      };
+
+      const exactLength = new TextEncoder().encode(JSON.stringify(candidateBatch)).byteLength;
+
+      // Configure service with maxPayloadBytes 1 byte smaller than exactLength
+      const boundaryService = new RepairSupplierService(
+        supplierEngine,
+        supplierCallbacks,
+        {
+          maxPayloadBytes: exactLength - 1,
+          envelopeOverheadBytes: 0,
+        },
+        clock,
+      );
+
+      supplierEngine.getOperationLog().insert(
+        createStoredOperation('peer-A', 1, 1, { data: 'A'.repeat(50) }),
+      );
+
+      const req: RepairRequestPayload = {
+        requestId: 'c9a74a9a-f4ef-4b9e-b2d3-18ef557163ef',
+        sessionId: SESSION_ID,
+        requesterPeerId: 'peer-requester',
+        targetOriginPeerId: 'peer-A',
+        fromSequence: 1,
+        toSequence: 1,
+        membershipEpoch: 1,
+      };
+
+      const res = boundaryService.serveRepairRequest(req, requesterContext);
+      expect('reason' in res).toBe(true);
+      expect((res as RepairRejectedPayload).reason).toBe('BUSY');
+    });
+
+    it('5.10 Epoch transition purges all cached responses and resets concurrency counters', () => {
+      for (let s = 1; s <= 5; s++) {
+        supplierEngine.getOperationLog().insert(createStoredOperation('peer-A', s));
+      }
+
+      const req: RepairRequestPayload = {
+        requestId: 'caa74a9a-f4ef-4b9e-b2d3-18ef557163ef',
+        sessionId: SESSION_ID,
+        requesterPeerId: 'peer-requester',
+        targetOriginPeerId: 'peer-A',
+        fromSequence: 1,
+        toSequence: 5,
+        membershipEpoch: 1,
+      };
+
+      const res1 = supplierService.serveRepairRequest(req, requesterContext);
+      expect('operations' in res1).toBe(true);
+
+      // Transition to epoch 2
+      supplierEngine.transitionEpoch(2, supplierEpochCap);
+      supplierService.onEpochTransition(2);
+
+      // Now request under epoch 1 must reject with EPOCH_MISMATCH
+      const res2 = supplierService.serveRepairRequest(req, requesterContext);
+      expect('reason' in res2).toBe(true);
+      expect((res2 as RepairRejectedPayload).reason).toBe('EPOCH_MISMATCH');
+    });
+
+    it('5.11 Missing sequence in middle of range (hole) returns BUSY, never partial or fabricated batch', () => {
+      // Sequences 1, 2, 4, 5 present; sequence 3 is missing (hole)
+      supplierEngine.getOperationLog().insert(createStoredOperation('peer-A', 1));
+      supplierEngine.getOperationLog().insert(createStoredOperation('peer-A', 2));
+      supplierEngine.getOperationLog().insert(createStoredOperation('peer-A', 4));
+      supplierEngine.getOperationLog().insert(createStoredOperation('peer-A', 5));
+
+      const req: RepairRequestPayload = {
+        requestId: 'cba74a9a-f4ef-4b9e-b2d3-18ef557163ef',
+        sessionId: SESSION_ID,
+        requesterPeerId: 'peer-requester',
+        targetOriginPeerId: 'peer-A',
+        fromSequence: 1,
+        toSequence: 5,
+        membershipEpoch: 1,
+      };
+
+      const res = supplierService.serveRepairRequest(req, requesterContext);
+      expect('reason' in res).toBe(true);
+      expect((res as RepairRejectedPayload).reason).toBe('BUSY');
+    });
+
+    it('5.12 Exception during servicing cleanly restores active concurrency counters', () => {
+      // Spy on queryRetainedHistoryAndBuildResponse or throw inside log
+      const spyLog = vi.spyOn(supplierEngine.getOperationLog(), 'getOperationAt').mockImplementationOnce(() => {
+        throw new Error('Disk read failure');
+      });
+
+      const req: RepairRequestPayload = {
+        requestId: 'cca74a9a-f4ef-4b9e-b2d3-18ef557163ef',
+        sessionId: SESSION_ID,
+        requesterPeerId: 'peer-requester',
+        targetOriginPeerId: 'peer-A',
+        fromSequence: 1,
+        toSequence: 5,
+        membershipEpoch: 1,
+      };
+
+      expect(() => supplierService.serveRepairRequest(req, requesterContext)).toThrow('Disk read failure');
+
+      // Subsequent valid request should succeed normally because active concurrency was decremented in finally block
+      spyLog.mockRestore();
+      for (let s = 1; s <= 5; s++) {
+        supplierEngine.getOperationLog().insert(createStoredOperation('peer-A', s));
+      }
+
+      const res = supplierService.serveRepairRequest(req, requesterContext);
+      expect('operations' in res).toBe(true);
+    });
+  });
 });

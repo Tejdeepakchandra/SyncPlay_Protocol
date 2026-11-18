@@ -268,6 +268,9 @@ export interface RepairSupplierOptions {
   /** Maximum application payload bytes per batch frame (default: 65536). */
   readonly maxPayloadBytes?: number;
 
+  /** Estimated envelope overhead in bytes reserved for transport framing (default: 256). */
+  readonly envelopeOverheadBytes?: number;
+
   /** Optional provider for negotiated DataChannel / SCTP max message size per peer. */
   readonly negotiatedSctpMaxMessageSizeProvider?: (peerId: string) => number | undefined;
 }

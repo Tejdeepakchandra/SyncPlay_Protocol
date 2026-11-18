@@ -53,10 +53,15 @@ export const DEFAULT_SUPPLIER_RATE_LIMIT_BURST = 20;
 export const DEFAULT_SUPPLIER_RESPONSE_CACHE_CAPACITY = 64;
 export const DEFAULT_SUPPLIER_MAX_OPS_PER_BATCH = 32;
 export const DEFAULT_SUPPLIER_MAX_PAYLOAD_BYTES = 65536;
+export const DEFAULT_SUPPLIER_ENVELOPE_OVERHEAD_BYTES = 256;
 
 interface CachedResponse {
   readonly response: OperationBatchPayload | RepairRejectedPayload;
   readonly epoch: number;
+  readonly targetOriginPeerId: string;
+  readonly fromSequence: number;
+  readonly toSequence: number;
+  readonly sessionId: string;
 }
 
 interface PeerRateLimitState {
@@ -193,8 +198,43 @@ export class RepairSupplierService {
     // 5. Duplicate Request ID & Idempotent Response Cache Check
     const cacheKey = `${context.requesterPeerId}:${request.requestId}`;
     const cached = this.responseCache.get(cacheKey);
-    if (cached && cached.epoch === this.engine.epoch) {
-      return cached.response;
+    if (cached) {
+      if (cached.epoch !== this.engine.epoch) {
+        // Purge stale epoch cache entry
+        this.responseCache.delete(cacheKey);
+      } else {
+        // Conflicting parameter check: A reused requestId with different parameters is invalid
+        if (
+          cached.targetOriginPeerId !== targetOrigin ||
+          cached.fromSequence !== request.fromSequence ||
+          cached.toSequence !== request.toSequence ||
+          cached.sessionId !== request.sessionId
+        ) {
+          throw new SyncEngineError(
+            'INVALID_ARGUMENT',
+            `Reused requestId '${request.requestId}' with conflicting request parameters`,
+          );
+        }
+
+        // Duplicate replay rate-limiting check:
+        // Cache hits MUST consume rate-limit budget to prevent high-rate amplification attacks.
+        if (!this.consumeRateLimitToken(context.requesterPeerId)) {
+          const rejection: RepairRejectedPayload = {
+            requestId: request.requestId,
+            sessionId: request.sessionId,
+            supplierPeerId: this.engine.localPeerId,
+            targetOriginPeerId: targetOrigin,
+            fromSequence: request.fromSequence,
+            toSequence: request.toSequence,
+            reason: 'RATE_LIMITED',
+          };
+          return RepairRejectedPayloadSchema.parse(rejection);
+        }
+
+        // Retransmit cached response via outbound callback and return
+        this.callbacks.onSendRepairResponse?.(context.requesterPeerId, cached.response);
+        return cached.response;
+      }
     }
 
     // 6. Concurrency Bounds Check
@@ -240,7 +280,7 @@ export class RepairSupplierService {
 
     try {
       const response = this.queryRetainedHistoryAndBuildResponse(request, context, targetOrigin);
-      this.cacheResponse(context.requesterPeerId, request.requestId, response);
+      this.cacheResponse(context.requesterPeerId, request, response);
       this.callbacks.onSendRepairResponse?.(context.requesterPeerId, response);
       return response;
     } finally {
@@ -392,14 +432,28 @@ export class RepairSupplierService {
       payload: op.payload,
     }));
 
-    // E. Enforce WebRTC DataChannel / SCTP Frame Size Cap (64 KB)
+    // E. Enforce WebRTC DataChannel / SCTP Frame Size Cap (64 KB) and Envelope Overhead
     const negotiatedSize = this.options.negotiatedSctpMaxMessageSizeProvider?.(
       context.requesterPeerId,
     );
-    const maxBytes = Math.min(
-      this.options.maxPayloadBytes ?? DEFAULT_SUPPLIER_MAX_PAYLOAD_BYTES,
-      negotiatedSize ?? DEFAULT_SUPPLIER_MAX_PAYLOAD_BYTES,
-    );
+    // RFC 8841 / W3C WebRTC §6.2:
+    // - undefined: no negotiated size available -> fallback to application cap (65,536 bytes)
+    // - 0: remote peer can handle any message size -> unconstrained remote, clamped to local application cap (65,536 bytes)
+    // - > 0: remote peer announced explicit limit -> clamp to min(application cap, negotiatedSize)
+    const applicationCap = this.options.maxPayloadBytes ?? DEFAULT_SUPPLIER_MAX_PAYLOAD_BYTES;
+    const effectiveTransportLimit =
+      negotiatedSize !== undefined && negotiatedSize > 0
+        ? Math.min(applicationCap, negotiatedSize)
+        : applicationCap;
+
+    const envelopeOverhead =
+      this.options.envelopeOverheadBytes !== undefined
+        ? this.options.envelopeOverheadBytes
+        : (effectiveTransportLimit > DEFAULT_SUPPLIER_ENVELOPE_OVERHEAD_BYTES
+            ? DEFAULT_SUPPLIER_ENVELOPE_OVERHEAD_BYTES
+            : 0);
+
+    const maxBytes = Math.max(1, effectiveTransportLimit - envelopeOverhead);
 
     let currentOps = serializedOps;
     let currentToSeq = request.toSequence;
@@ -484,12 +538,12 @@ export class RepairSupplierService {
    */
   private cacheResponse(
     requesterPeerId: string,
-    requestId: string,
+    request: RepairRequestPayload,
     response: OperationBatchPayload | RepairRejectedPayload,
   ): void {
     const capacity =
       this.options.responseCacheCapacity ?? DEFAULT_SUPPLIER_RESPONSE_CACHE_CAPACITY;
-    const cacheKey = `${requesterPeerId}:${requestId}`;
+    const cacheKey = `${requesterPeerId}:${request.requestId}`;
 
     if (this.responseCache.size >= capacity) {
       const oldestKey = this.responseCache.keys().next().value;
@@ -498,9 +552,14 @@ export class RepairSupplierService {
       }
     }
 
+    const targetOrigin = request.targetOriginPeerId || request.originPeerId!;
     this.responseCache.set(cacheKey, {
       response,
       epoch: this.engine.epoch,
+      targetOriginPeerId: targetOrigin,
+      fromSequence: request.fromSequence,
+      toSequence: request.toSequence,
+      sessionId: request.sessionId,
     });
   }
 
