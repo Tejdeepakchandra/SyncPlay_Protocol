@@ -37,30 +37,36 @@
   2. The message is fully constructed, serialized to JSON, and measured via `TextEncoder().encode().byteLength`.
   3. If $\text{byteLength} > \text{effectiveLimit}$, the binary slice is mathematically reduced by $\Delta = \lceil \text{overshoot} \times 0.75 \rceil + 32$ and re-serialized until fitting.
   4. The exact tested string is passed unchanged to `RTCDataChannel.send()`.
-- **Verification Plan:** Unit test suite transmitting chunks across simulated SCTP boundaries of 65,536, 32,768, 16,384, and 2,048 bytes, verifying with zero exceptions that measured bytes never exceed the limit.
+  5. Hard operational bound: loop terminates in at most $K_{\text{max}} = 5$ attempts per chunk (`MAX_SIZING_ITERATIONS = 5`); aborts with `TRANSPORT_LIMIT_EXCEEDED` if exceeded.
+- **Verification Plan:** Unit test suite transmitting chunks across simulated SCTP boundaries of 65,536, 32,768, 16,384, and 2,048 bytes, verifying with zero exceptions that measured bytes never exceed the limit and converge in $\le 5$ iterations.
 
 ---
 
 ### R-M4-2: Chunk Framing Starvation on Severely Constrained Links ($< 2\text{ KB}$)
-- **Threat Description:** If a link negotiates an extremely small MTU/SCTP limit ($< 2,048$ bytes), the JSON envelope overhead ($\approx 768$ bytes) consumes the majority of the message budget, leaving trivial binary payload slices ($< 256$ bytes) that require thousands of chunks, starving the transfer.
-- **Root Cause:** Pathologically constrained network links attempting large state snapshot recovery.
+- **Threat Description:** If a link negotiates an extremely small MTU/SCTP limit ($< 2,048$ bytes), the JSON envelope overhead ($\approx 768$ bytes) consumes the majority of the message budget, leaving trivial binary payload slices ($< 256$ bytes) that require thousands of chunks, starving the transfer. Furthermore, a 4 MiB snapshot would require $\approx 4,369$ chunks over a 2 KiB link, contradicting the 128-chunk bound.
+- **Root Cause:** Attempting large state snapshot recovery over pathologically constrained network links without evaluating capacity invariants.
 - **Mitigation:**
-  1. `calculateDynamicChunkSize` throws if `effectiveLimit < MIN_SUPPORTED_SCTP_LIMIT` (2,048 bytes).
-  2. The iterative loop aborts with `TRANSPORT_LIMIT_EXCEEDED` if slice size drops below `MIN_CHUNK_BYTES = 256`.
-  3. Transfer terminates cleanly to `DEGRADED`, prompting application intervention rather than hanging.
-- **Verification Plan:** Test case with SCTP limit set to 1,024 bytes confirms immediate, clean rejection.
+  1. Safe Upfront Admission Gate: The protocol computes expected chunk count upfront: $B_{\text{req}} = \lceil \text{totalSizeBytes} / \text{chunkPayloadEstimate} \rceil$.
+  2. If $B_{\text{req}} > \text{MAX\_CHUNKS\_PER\_SNAPSHOT}$ (128) or $\text{offer.totalChunks} > 128$, the transfer is rejected immediately before allocating reassembly buffer memory (`CHUNK_COUNT_EXCEEDED`).
+  3. The protocol explicitly **does NOT claim universal 4 MiB snapshot transfer support on 2 KiB transports**; effective capacity on 2 KiB transports is bounded to $\approx 120\text{ KiB}$ for 128 chunks.
+  4. `calculateDynamicChunkSize` throws if `effectiveLimit < MIN_SUPPORTED_SCTP_LIMIT` (2,048 bytes).
+  5. The iterative loop aborts with `TRANSPORT_LIMIT_EXCEEDED` if slice size drops below `MIN_CHUNK_BYTES = 256`.
+  6. Transfer terminates cleanly to `DEGRADED`, prompting application intervention rather than hanging.
+- **Verification Plan:** Test case with SCTP limit set to 1,024 bytes confirms immediate, clean rejection; test case with 4 MiB snapshot on 2,048-byte SCTP limit confirms upfront admission rejection without buffer allocation.
 
 ---
 
 ### R-M4-3: Memory Exhaustion from Interleaved or Concurrent Transfers
-- **Threat Description:** Malicious or buggy peers sending concurrent `SNAPSHOT_OFFER` or `SNAPSHOT_CHUNK` messages could cause unbounded allocation of reassembly buffers, exhausting client memory.
-- **Root Cause:** Lack of concurrency control and buffering limits on incoming recovery messages.
+- **Threat Description:** Malicious or buggy peers sending concurrent `SNAPSHOT_OFFER` or `SNAPSHOT_CHUNK` messages could cause unbounded allocation of reassembly buffers, exhausting client memory. Additionally, previous estimates underestimated peak memory by omitting V8 heap representations.
+- **Root Cause:** Lack of concurrency control and buffering limits, plus unaccounted V8 string and object graph memory.
 - **Mitigation:**
   1. Strict single active transfer constraint: A recovering node permits at most 1 active inbound transfer context.
   2. Hard bounds on buffer: Max chunks $\le 128$, max total size $\le 4\text{ MB}$.
-  3. Pre-allocated sparse array bounded to declared `totalChunks`.
-  4. Immediate cleanup of buffers on abort, timeout, or epoch change via explicit `dispose()`.
-- **Verification Plan:** Unit test flooding concurrent offers while a transfer is in flight confirms subsequent offers are rejected without allocating secondary buffers.
+  3. Conservative theoretical memory budget established: $\approx 28\text{–}32\text{ MiB}$ upper bound accounting for sparse slices, contiguous buffer, V8 Latin-1/UTF-16 string heap, parsed `StateSnapshotPayloadV2` object tree, canonical RFC 8785 JSON string, SHA-256 buffer, and transient parser allocations.
+  4. Copy-minimizing design: In `ChunkAssembler.finalizeAssembly()`, sparse chunk slice array is immediately dereferenced (`this.chunks = null`) upon contiguous `Uint8Array` allocation.
+  5. Immediate cleanup of buffers, maps, retry state, and timers on abort, timeout, or epoch change via explicit `dispose()`.
+  6. Explicit acknowledgment that JavaScript GC is asynchronous and non-deterministic; reference nullification ensures immediate eligibility for collection.
+- **Verification Plan:** Unit test flooding concurrent offers while a transfer is in flight confirms subsequent offers are rejected without allocating secondary buffers; heap profile test confirms immediate reference release on finalization and disposal.
 
 ---
 
@@ -120,13 +126,14 @@
 ---
 
 ### R-M4-9: Compaction Exception Atomicity (Limitation C)
-- **Threat Description:** If `this.reducer` throws in loop 2 of `compactAtFrontier()`, operations have already been spliced from `this.operations`, leaving partial log mutation.
+- **Threat Description:** If `this.reducer` throws in loop 2 of `compactAtFrontier()`, operations have already been spliced from `this.operations`, leaving partial log mutation and corrupting the replication engine.
 - **Root Cause:** Splicing operations before verifying that state reduction succeeds.
 - **Mitigation:**
   1. Designated as **Milestone M4.0d (Prerequisite)**.
-  2. Transactional candidate staging: compute candidate base state reduction on an out-of-band clone before splicing active arrays or mutating indexes.
-  3. If reduction throws, zero mutations occur.
-- **Verification Plan:** Test case with throwing reducer in `compactAtFrontier` confirms active operations and checkpoints remain 100% intact.
+  2. Complete Staged Mutation Inventory: Out-of-band staging across all 7 mutable fields (`candidateBaseSnapshot`, `candidateOperations`, `candidateIdIndex`, `candidateOriginSeqIndex`, `candidateCompactedCheckpoints`, `candidateOriginFrontierTimestamps`, `candidateBaseSnapshotFrontier`, plus sequence metadata).
+  3. No active state structure or reference is modified before all candidate computations and reductions complete successfully.
+  4. If reduction throws, candidate objects are discarded, the exception propagates, and zero active mutations occur.
+- **Verification Plan:** Test case with throwing reducer in `compactAtFrontier` confirms active operations, indexes, and checkpoints remain 100% intact.
 
 ---
 

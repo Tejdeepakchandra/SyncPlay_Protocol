@@ -32,11 +32,11 @@ This document defines the formal, measurable acceptance criteria for Phase 7.5 M
   2. The function **NEVER** returns a timestamp belonging to a different sequence number.
   3. Snapshot creation fails if required frontier timestamps cannot be established exactly.
 
-### AC-M4-PRE-3: Compaction Exception Atomicity
+### AC-M4-PRE-3: Compaction Exception Atomicity (7-Component Staged Inventory)
 - **Condition:** `compactAtFrontier()` is invoked with a throwing reducer callback.
 - **Pass Threshold:**
-  1. Candidate base state reduction is staged on an out-of-band clone before modifying active log state.
-  2. If the reducer throws, the exception is propagated, and `this.operations`, `idIndex`, `originSeqIndex`, and checkpoints remain 100% untouched.
+  1. Candidate mutation set across all 7 mutable fields (`candidateBaseSnapshot`, `candidateOperations`, `candidateIdIndex`, `candidateOriginSeqIndex`, `candidateCompactedCheckpoints`, `candidateOriginFrontierTimestamps`, `candidateBaseSnapshotFrontier`, plus sequence metadata) is staged out-of-band on a clone before modifying active log state.
+  2. If the reducer throws at any point during candidate reduction, the exception is propagated, candidate structures are discarded, and `this.baseSnapshot`, `this.operations`, `this.idIndex`, `this.originSeqIndex`, `this.compactedCheckpoints`, `this.originFrontierTimestamps`, and `this.baseSnapshotFrontier` remain 100% untouched.
 
 ---
 
@@ -57,9 +57,34 @@ This document defines the formal, measurable acceptance criteria for Phase 7.5 M
   3. Canonical RFC 8785 JSON SHA-256 digest of reassembled payload matches `offer.sha256Digest` bit-exact.
   4. If supplier fails chunk hash or overall digest verification, transfer immediately aborts with `CHUNK_CORRUPTED` or `HASH_MISMATCH`.
 
+### AC-M4-AUTH-3: M3 Snapshot Digest Compatibility Verification
+- **Condition:** Audit of M4 wire structures against frozen Milestone M3 runtime implementation at commit `6fddcf90de5d4cb0e82bd711e7e217cd570c88a4`.
+- **Pass Threshold:**
+  1. Direct code inspection verifies that `snapshotId`, `authorPeerId`, `originFrontierTimestamps`, and `compactedCheckpoints` already exist in `StateSnapshotPayloadV2Schema` and `computeSnapshotDigestV2` preimage.
+  2. Zero new fields are added to the snapshot digest preimage in M4.
+  3. Format version remains `formatVersion: 2` with zero schema drift.
+
 ---
 
-## 4. Supplier Failover Criteria (AC-M4-FAILOVER)
+## 4. Upfront Admission & Capacity Criteria (AC-M4-ADMIT)
+
+### AC-M4-ADMIT-1: Upfront Admission Calculation & Chunk Ceiling Invariant
+- **Condition:** Inbound `SNAPSHOT_OFFER` received or outbound `SNAPSHOT_REQUEST` handled over any supported transport.
+- **Pass Threshold:**
+  1. `calculateSnapshotAdmission()` calculates expected chunks: $B_{\text{req}} = \lceil \text{totalSizeBytes} / \text{chunkPayloadEstimate} \rceil$.
+  2. If $B_{\text{req}} > \text{MAX\_CHUNKS\_PER\_SNAPSHOT}$ (128) or $\text{offer.totalChunks} > 128$, the transfer is rejected upfront before allocating reassembly buffer memory.
+  3. Rejection code is `CHUNK_COUNT_EXCEEDED` or `TRANSPORT_LIMIT_EXCEEDED`.
+  4. Explicitly verified that universal 4 MiB transfer is **NOT** claimed on a 2 KiB SCTP transport (which admits snapshots up to 120 KiB for 128 chunks).
+
+### AC-M4-ADMIT-2: Minimum Supported SCTP Limit Floor
+- **Condition:** Transport reporting SCTP limit $< 2,048$ bytes (`MIN_SUPPORTED_SCTP_LIMIT`).
+- **Pass Threshold:**
+  1. Transfer is immediately rejected/aborted with `TRANSPORT_LIMIT_EXCEEDED`.
+  2. Zero chunk requests or transfer buffers are allocated.
+
+---
+
+## 5. Supplier Failover Criteria (AC-M4-FAILOVER)
 
 ### AC-M4-FAILOVER-1: Chunk Retention on Matching Snapshot Failover
 - **Condition:** Supplier disconnects after transmitting chunks $0 \dots 3$ of an 8-chunk snapshot. Alternate supplier offers identical `snapshotId` and `sha256Digest`.
@@ -85,7 +110,7 @@ This document defines the formal, measurable acceptance criteria for Phase 7.5 M
 
 ---
 
-## 5. Duplicate, Stale & Corrupt Chunk Criteria (AC-M4-CHUNK)
+## 6. Duplicate, Stale & Corrupt Chunk Criteria (AC-M4-CHUNK)
 
 ### AC-M4-CHUNK-1: Idempotent Duplicate Chunk Handling
 - **Condition:** Duplicate `SNAPSHOT_CHUNK` with identical `chunkIndex` and `chunkSha256` arrives.
@@ -114,7 +139,7 @@ This document defines the formal, measurable acceptance criteria for Phase 7.5 M
 
 ---
 
-## 6. Retry & Timeout Budget Criteria (AC-M4-BUDGET)
+## 7. Retry & Timeout Budget Criteria (AC-M4-BUDGET)
 
 ### AC-M4-BUDGET-1: Bounded Per-Chunk Retries
 - **Condition:** A chunk index experiences repeated transmission failure.
@@ -136,13 +161,13 @@ This document defines the formal, measurable acceptance criteria for Phase 7.5 M
 
 ---
 
-## 7. Dynamic Sizing & Termination Criteria (AC-M4-SIZE)
+## 8. Dynamic Sizing & Termination Criteria (AC-M4-SIZE)
 
-### AC-M4-SIZE-1: Iterative Send-Boundary Measurement & Termination
+### AC-M4-SIZE-1: Iterative Send-Boundary Measurement & Strict Monotonic Decrease
 - **Condition:** `SnapshotTransferManager` prepares chunks across negotiated SCTP limits from 2,048 to 65,536 bytes.
 - **Pass Threshold:**
   1. Each unsuccessful sizing iteration strictly reduces binary slice size by at least 33 bytes ($\Delta = \lceil \text{overshoot} \times 0.75 \rceil + 32$).
-  2. Loop strictly terminates in at most 993 iterations (proven bounded by initial slice $\le 32,768$ bytes).
+  2. Loop strictly terminates in at most 993 theoretical iterations (proven bounded by initial slice $\le 32,768$ bytes).
   3. Measured UTF-8 bytes of final serialized JSON string strictly $\le \text{effectiveLimit}$.
   4. The exact tested string is passed unchanged to `RTCDataChannel.send()`.
 
@@ -151,27 +176,41 @@ This document defines the formal, measurable acceptance criteria for Phase 7.5 M
 - **Pass Threshold:**
   1. Sizing loop halts and transfer aborts with `TRANSPORT_LIMIT_EXCEEDED`.
 
+### AC-M4-SIZE-3: Hard Operational Sizing Iteration Cap
+- **Condition:** Repeated sizing reduction on pathological framing edge cases.
+- **Pass Threshold:**
+  1. Number of serialization and sizing attempts per chunk strictly capped at $K_{\text{max}} = 5$ (`MAX_SIZING_ITERATIONS = 5`).
+  2. If the serialized frame does not fit within 5 iterations, transfer aborts immediately with `TRANSPORT_LIMIT_EXCEEDED`.
+  3. Zero oversized or corrupted frames are ever transmitted to the network.
+
 ---
 
-## 8. Memory & Resource Budget Criteria (AC-M4-MEM)
+## 9. Memory & Resource Budget Criteria (AC-M4-MEM)
 
-### AC-M4-MEM-1: Hard Concurrency & Memory Ceilings
-- **Condition:** High-load multi-peer operation.
+### AC-M4-MEM-1: Hard Concurrency & Conservative Memory Budget
+- **Condition:** High-load multi-peer operation and 4 MiB snapshot transfer.
 - **Pass Threshold:**
-  1. Requester permits strictly 1 active inbound transfer.
+  1. Requester permits strictly 1 active inbound transfer context.
   2. Supplier permits at most 2 active outbound transfers.
   3. Pre-allocated reassembly buffer bounded to declared `totalChunks` ($\le 128$).
-  4. Total peak transient memory during reassembly strictly $\le 8.5\text{ MB}$.
+  4. Theoretical peak memory during reassembly and verification bounded to $\le 32\text{ MiB}$ (accounting for sparse binary slices, contiguous buffer, V8 Latin-1/UTF-16 string heap, parsed `StateSnapshotPayloadV2` object tree, canonical RFC 8785 JSON string, SHA-256 byte buffer, and parser transient allocations).
 
 ### AC-M4-MEM-2: Complete Lifecycle Memory Dereferencing
 - **Condition:** Transfer completion, timeout, cancellation, or epoch increment.
 - **Pass Threshold:**
-  1. `dispose()` sets all slice references and assembled buffer references to `null`.
-  2. Verified zero retained snapshot memory after disposal.
+  1. `dispose()` sets all slice references (`this.chunks = null`) and assembled buffer references (`this.assembledBuffer = null`).
+  2. All active timers (`overallTimeout`, `chunkTimeout`) are cleared via `clearTimeout()`.
+  3. Transfer descriptors and retry maps are deleted.
+
+### AC-M4-MEM-3: Copy Minimization and Asynchronous GC Reality
+- **Condition:** Reassembly finalization in `ChunkAssembler.finalizeAssembly()`.
+- **Pass Threshold:**
+  1. Sparse chunk slice array is dereferenced (`this.chunks = null`) immediately upon contiguous `Uint8Array` allocation, preventing simultaneous retention of duplicate binary representations during JSON parsing.
+  2. The specification and tests explicitly acknowledge that JavaScript garbage collection is asynchronous and non-deterministic; nullifying references ensures prompt eligibility for V8 garbage collection cycles without memory retention leaks.
 
 ---
 
-## 9. M5 Handoff Boundary Criteria (AC-M4-HANDOFF)
+## 10. M5 Handoff Boundary Criteria (AC-M4-HANDOFF)
 
 ### AC-M4-HANDOFF-1: Clean Handoff to M5 Callback
 - **Condition:** Successful completion of snapshot reassembly and verification.

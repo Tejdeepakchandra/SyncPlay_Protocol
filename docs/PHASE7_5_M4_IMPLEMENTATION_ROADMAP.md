@@ -37,7 +37,7 @@ flowchart TD
   - **M4.0a (`STATE_DIGEST` Identity Binding):** In `TrustedTransportAdapter.handleTransportMessage()`, verify `msg.payload.senderPeerId === inbound.fromPeerId` and `msg.payload.connectionGeneration === peerStatus.generation`. Drop and reject any identity or generation mismatches.
   - **M4.0b (Exact Timestamp Resolution):** In `OrderedOperationLog.getOriginFrontierTimestamps()`, eliminate loose fallback to non-sequence-specific `originFrontierTimestamps`. Return exact sequence timestamps or report metadata unavailable.
   - **M4.0c (Facade Gating):** Restrict `LeaderlessSyncEngine.recordPeerDigest()` to internal/capability-authorized registration.
-  - **M4.0d (Compaction Exception Staging):** In `OrderedOperationLog.compactAtFrontier()`, execute candidate base snapshot reduction before splicing operations or mutating indexes, ensuring transactional atomicity if reduction fails.
+  - **M4.0d (Compaction Exception Staging & Staged Mutation Inventory):** In `OrderedOperationLog.compactAtFrontier()`, execute candidate base snapshot reduction across the complete 7-component staged mutation inventory (`candidateBaseSnapshot`, `candidateOperations`, `candidateIdIndex`, `candidateOriginSeqIndex`, `candidateCompactedCheckpoints`, `candidateOriginFrontierTimestamps`, `candidateBaseSnapshotFrontier`, plus sequence metadata) out-of-band before mutating any active log structures. If the reducer throws, candidate objects are discarded, the exception propagates, and active engine state remains 100% untouched.
 - **Deliverables:**
   - Code changes in `packages/sync-engine/src/engine/leaderless-sync-engine.ts` and `packages/sync-engine/src/log/ordered-operation-log.ts`.
   - Targeted unit tests in `packages/sync-engine/src/__tests__/closure-m4-0.test.ts`.
@@ -48,16 +48,17 @@ flowchart TD
 ### Milestone M4.1: Wire Protocol Schemas & Chunk Assembler Primitives
 - **Objective:** Implement all recovery wire message contracts in `@syncplay/protocol` and the in-memory chunk tracking, deduplication, and failover assembly engine in `@syncplay/sync-engine`.
 - **Scope:**
-  - Add schemas to `@syncplay/protocol`: `SnapshotOfferPayloadSchema`, `SnapshotRequestPayloadSchema`, `SnapshotChunkPayloadSchema`, `SnapshotChunkRequestPayloadSchema`, `SnapshotAbortPayloadSchema`.
+  - Add schemas to `@syncplay/protocol`: `SnapshotOfferPayloadSchema`, `SnapshotRequestPayloadSchema`, `SnapshotChunkPayloadSchema`, `SnapshotChunkRequestPayloadSchema`, `SnapshotAbortPayloadSchema` (including `CHUNK_COUNT_EXCEEDED` reason).
   - Export schemas and TypeScript types in `@syncplay/protocol/index.ts`.
-  - Implement `calculateDynamicChunkSize(sctpLimit)` in `@syncplay/protocol`.
+  - Implement `calculateDynamicChunkSize(sctpLimit)` and `calculateSnapshotAdmission(totalSizeBytes, sctpLimit)` in `@syncplay/protocol` with conservative local implementation policy cap (65,536 bytes).
   - Implement `ChunkAssembler` in `packages/sync-engine/src/recovery/chunk-assembler.ts`:
-    - Fixed pre-allocation for up to 128 chunks (bounded memory footprint).
+    - Fixed pre-allocation bounded to $\le 128$ chunks.
     - Base64 binary decoding and per-chunk `chunkSha256` verification.
     - Idempotent duplicate chunk suppression (no re-verification or memory expansion).
     - Missing index computation (`getMissingChunkIndices`) with validation.
     - Failover chunk preservation (`prepareForFailover`): preserves verified chunks if snapshot ID and digest match bit-exact; purges all chunks on mismatch.
-    - Full contiguous buffer concatenation and canonical SHA-256 digest verification.
+    - Copy-minimizing `finalizeAssembly()`: immediately sets `this.chunks = null` upon creating contiguous buffer, parses UTF-8 JSON, and verifies canonical RFC 8785 SHA-256 digest.
+    - Explicit `dispose()` dereferencing all sparse arrays and assembled buffer (documenting asynchronous GC behavior).
 - **Deliverables:**
   - `@syncplay/protocol` schema updates.
   - `packages/sync-engine/src/recovery/chunk-assembler.ts`.
@@ -67,34 +68,37 @@ flowchart TD
 ---
 
 ### Milestone M4.2: Outbound Transfer Pipeline & Iterative Sizing Loop
-- **Objective:** Implement the supplier-side transfer pipeline with normative 7-step iterative send-boundary sizing and termination guarantees.
+- **Objective:** Implement the supplier-side transfer pipeline with normative 7-step iterative send-boundary sizing, operational bounds, and termination guarantees.
 - **Scope:**
   - Implement `SnapshotTransferManager` (Supplier Role):
     - Validate incoming `SNAPSHOT_REQUEST` against active epoch, supplier identity, and snapshot availability.
+    - Enforce upfront admission gate: evaluate `calculateSnapshotAdmission()`; reject if required chunks $> 128$.
     - Slice binary snapshot into chunks using `calculateDynamicChunkSize()`.
     - Execute normative 7-step iterative sizing loop: serialize `SNAPSHOT_CHUNK`, measure exact UTF-8 bytes via `TextEncoder`, reduce binary slice by $\Delta = \lceil \text{overshoot} \times 0.75 \rceil + 32$ if exceeding negotiated SCTP limit.
-    - Enforce termination condition: strictly decreasing binary slice; abort with `TRANSPORT_LIMIT_EXCEEDED` if slice $< 256$ bytes.
-    - Pass valid wire string unchanged to `PeerManager.sendSerialized()`.
+    - Enforce hard operational bound: maximum 5 sizing attempts per chunk (`MAX_SIZING_ITERATIONS = 5`); abort with `TRANSPORT_LIMIT_EXCEEDED` if exceeded or if slice $< 256$ bytes.
+    - Pass exact tested serialized string unchanged to `PeerManager.sendSerialized()`.
     - Handle `SNAPSHOT_CHUNK_REQUEST` retransmissions.
     - Bound concurrent outbound transfers to at most 2 per supplier (`MAX_SUPPLIER_CONCURRENT_TRANSFERS = 2`).
 - **Deliverables:**
   - `packages/sync-engine/src/recovery/snapshot-transfer-manager.ts` (Supplier components).
   - Unit test suite: `packages/sync-engine/src/__tests__/snapshot-transfer-supplier.test.ts`.
-- **Exit Condition:** Chunks generated under simulated SCTP limits of 64 KB, 32 KB, 16 KB, and 2 KB strictly never exceed the limit at `sendSerialized()`.
+- **Exit Condition:** Chunks generated under simulated SCTP limits of 64 KB, 32 KB, 16 KB, and 2 KB strictly never exceed the limit at `sendSerialized()`, converging in $\le 5$ iterations.
 
 ---
 
 ### Milestone M4.3: Inbound Transfer Pipeline, Retries & Supplier Failover
-- **Objective:** Implement the requester-side transfer pipeline with pipelining, bounded retry budgets, wall-clock deadlines, and supplier failover.
+- **Objective:** Implement the requester-side transfer pipeline with admission gating, pipelining, bounded retry budgets, wall-clock deadlines, and supplier failover.
 - **Scope:**
   - Implement `SnapshotTransferManager` (Requester Role):
     - Enforce single active inbound transfer invariant per node.
-    - Evaluate incoming `SNAPSHOT_OFFER` and generate `SNAPSHOT_REQUEST`.
+    - Enforce upfront admission gate on incoming `SNAPSHOT_OFFER`: calculate expected chunks and reject if required chunks $> 128$ or `offer.totalChunks > 128` before allocating reassembly buffers.
+    - Conservative memory management bounded within theoretical envelope ($\approx 28\text{–}32\text{ MiB}$).
     - Sliding-window flow control: pipeline up to 4 concurrent chunk requests (`MAX_CONCURRENT_CHUNK_REQUESTS = 4`).
     - Ingest incoming `SNAPSHOT_CHUNK` into `ChunkAssembler`.
     - Dual-level retry policy: max 3 retries per chunk, max 10 total transfer retransmissions.
     - Chunk request timer (5,000ms) and overall transfer wall-clock deadline (60,000ms).
     - Supplier failover: on supplier disconnect or generation change, transition to alternate eligible supplier offering the identical snapshot ID and digest, retaining verified chunks and issuing a new `transferId`.
+    - Explicit disposal of all timers, buffers, and retry counters upon transfer termination.
 - **Deliverables:**
   - `packages/sync-engine/src/recovery/snapshot-transfer-manager.ts` (Requester components).
   - Unit test suite: `packages/sync-engine/src/__tests__/snapshot-transfer-requester.test.ts`.
