@@ -2,8 +2,9 @@
 
 **Status:** APPROVED ARCHITECTURAL DESIGN (FINAL SAFETY CLOSURE)  
 **Date:** 2026-11-19  
-**Branch Baseline:** `main` at `377c906`  
-**Frozen Baselines:** Phase 7.3 (`e49b81a`), Phase 7.4 M1–M5 (`dbd5217`, `3a3d9e5`)  
+**Branch Baseline:** `main` at `6fddcf9` (Phase 7.5 M3 Implemented & Frozen)  
+**Frozen Baselines:** Phase 7.3 (`e49b81a`), Phase 7.4 M1–M5 (`dbd5217`, `3a3d9e5`), Phase 7.5 M3 (`6fddcf9`)  
+**Detailed M4 Milestone Specification:** See [PHASE7_5_M4_ARCHITECTURE.md](./PHASE7_5_M4_ARCHITECTURE.md)  
 
 ---
 

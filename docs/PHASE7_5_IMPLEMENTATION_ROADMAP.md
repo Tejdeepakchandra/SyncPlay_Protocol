@@ -2,8 +2,9 @@
 
 **Status:** APPROVED ARCHITECTURAL DESIGN (FINAL SAFETY CLOSURE)  
 **Date:** 2026-11-19  
-**Branch Baseline:** `main` at `377c906`  
-**Frozen Baselines:** Phase 7.3 (`e49b81a`), Phase 7.4 M1–M5 (`dbd5217`, `3a3d9e5`)  
+**Branch Baseline:** `main` at `6fddcf9` (Phase 7.5 M3 Implemented & Frozen)  
+**Frozen Baselines:** Phase 7.3 (`e49b81a`), Phase 7.4 M1–M5 (`dbd5217`, `3a3d9e5`), Phase 7.5 M3 (`6fddcf9`)  
+**Detailed M4 Implementation Roadmap:** See [PHASE7_5_M4_IMPLEMENTATION_ROADMAP.md](./PHASE7_5_M4_IMPLEMENTATION_ROADMAP.md)  
 
 ---
 
@@ -14,8 +15,8 @@ Phase 7.5 provides state recovery and fault tolerance when operation logs are co
 ```mermaid
 flowchart TD
     M1["Milestone M1: Research & Problem Definition<br/>(Complete & Final Safety Closure)"] --> M2["Milestone M2: Architecture & Interfaces<br/>(Complete & Final Safety Closure)"]
-    M2 --> M3["Milestone M3: Snapshot Creation & Compaction Horizon<br/>(Runtime Authorization Required)"]
-    M3 --> M4["Milestone M4: Iterative Chunked Transfer Protocol<br/>(Runtime Authorization Required)"]
+    M2 --> M3["Milestone M3: Snapshot Creation & Compaction Horizon<br/>(Complete & Frozen at 6fddcf9)"]
+    M3 --> M4["Milestone M4: Iterative Chunked Transfer Protocol<br/>(Planning Complete - Authorization Required)"]
     M4 --> M5["Milestone M5: Staged Atomic Installation & Quarantine<br/>(Runtime Authorization Required)"]
     M5 --> M6["Milestone M6: Full Recovery Integration & Verification<br/>(System Integration)"]
 ```
@@ -60,7 +61,7 @@ flowchart TD
 ---
 
 ### Milestone M3: Snapshot Creation, Compaction Horizon, and Canonical Serialization
-- **Status:** PENDING AUTHORIZATION (Runtime Implementation)
+- **Status:** COMPLETE & FROZEN (Commit: `6fddcf9`)
 - **Objective:** Implement deterministic snapshot generation, canonical serialization, and autonomous compaction horizon management in the sync engine.
 - **Scope:**
   - Integrate `StateSnapshotPayloadV2Schema` wire definitions into `@syncplay/protocol`.
