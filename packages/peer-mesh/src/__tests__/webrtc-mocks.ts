@@ -70,6 +70,7 @@ export class MockRTCPeerConnection extends EventTarget {
   signalingState: RTCSignalingState = 'stable';
   localDescription: RTCSessionDescription | null = null;
   remoteDescription: RTCSessionDescription | null = null;
+  sctp?: { maxMessageSize?: number } | null = null;
 
   onicecandidate: ((this: RTCPeerConnection, ev: RTCPeerConnectionIceEvent) => void) | null = null;
   onconnectionstatechange: ((this: RTCPeerConnection, ev: Event) => void) | null = null;

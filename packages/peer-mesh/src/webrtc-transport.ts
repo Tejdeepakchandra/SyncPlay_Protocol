@@ -80,6 +80,15 @@ export class WebRTCTransport {
   }
 
   /**
+   * Maximum message size supported by the SCTP transport in bytes.
+   * Defined by W3C WebRTC 1.0 §6.1 / §6.2 (RTCSctpTransport.maxMessageSize).
+   * Returns undefined if SCTP transport is not yet initialized or negotiated.
+   */
+  get sctpMaxMessageSize(): number | undefined {
+    return (this.pc as any)?.sctp?.maxMessageSize ?? undefined;
+  }
+
+  /**
    * Initialize the RTCPeerConnection and set up event handlers.
    * If this peer is the initial offerer, also creates the DataChannel.
    */

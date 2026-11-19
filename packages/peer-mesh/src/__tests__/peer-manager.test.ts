@@ -399,5 +399,117 @@ describe('PeerManager', () => {
       expect(stopSpy).toHaveBeenCalledWith('zzz');
     });
   });
+
+  // ── M5 Transport Size & Currency Enforcement ─────────────────
+
+  describe('M5 Transport Size & Currency Enforcement', () => {
+    it('should return undefined sctpMaxMessageSize before negotiation', async () => {
+      const signaling = createMockSignaling();
+      const pm = new PeerManager('local', 'session-1', 1, signaling);
+      pm.bindToRoom('room-1');
+      await pm.connect({ peerId: 'peer-b', sessionId: 'session-1', generation: 1 });
+
+      expect(pm.getSctpMaxMessageSize('unknown')).toBeUndefined();
+      expect(pm.getSctpMaxMessageSize('peer-b')).toBeUndefined();
+    });
+
+    it('should return correct connection generation via getPeerGeneration', async () => {
+      const signaling = createMockSignaling();
+      const pm = new PeerManager('local', 'session-1', 1, signaling);
+      pm.bindToRoom('room-1');
+      await pm.connect({ peerId: 'peer-b', sessionId: 'session-1', generation: 3 });
+
+      expect(pm.getPeerGeneration('unknown')).toBeUndefined();
+      expect(pm.getPeerGeneration('peer-b')).toBe(3);
+    });
+
+    it('should reject sendSerialized if generation mismatches', async () => {
+      const signaling = createMockSignaling();
+      const pm = new PeerManager('local', 'session-1', 1, signaling);
+      pm.bindToRoom('room-1');
+      await pm.connect({ peerId: 'peer-b', sessionId: 'session-1', generation: 2 });
+
+      // @ts-expect-error accessing private peers map for test simulation
+      const entry = pm.peers.get('peer-b');
+      // @ts-expect-error accessing private transport dc
+      const dc = entry.transport.dc;
+      dc.simulateOpen();
+
+      const result = pm.sendSerialized('peer-b', '{"test":true}', 1); // Stale generation 1 vs 2
+      expect(result.ok).toBe(false);
+      expect(result.error).toBe('Generation mismatch');
+    });
+
+    it('should reject sendSerialized if DataChannel is not open', async () => {
+      const signaling = createMockSignaling();
+      const pm = new PeerManager('local', 'session-1', 1, signaling);
+      pm.bindToRoom('room-1');
+      await pm.connect({ peerId: 'peer-b', sessionId: 'session-1', generation: 2 });
+
+      const result = pm.sendSerialized('peer-b', '{"test":true}', 2);
+      expect(result.ok).toBe(false);
+      expect(result.error).toBe('DataChannel not open');
+    });
+
+    it('should enforce negotiated SCTP limit in sendSerialized', async () => {
+      const signaling = createMockSignaling();
+      const pm = new PeerManager('local', 'session-1', 1, signaling);
+      pm.bindToRoom('room-1');
+      await pm.connect({ peerId: 'peer-b', sessionId: 'session-1', generation: 1 });
+
+      // @ts-expect-error accessing private peers map for test simulation
+      const entry = pm.peers.get('peer-b');
+      // @ts-expect-error accessing private transport pc and dc
+      entry.transport.pc.sctp = { maxMessageSize: 50 }; // Tiny limit: 50 bytes
+      entry.transport.dc.simulateOpen();
+
+      const smallPayload = JSON.stringify({ a: 1 }); // < 50 bytes
+      const bigPayload = JSON.stringify({ a: 'x'.repeat(100) }); // > 50 bytes
+
+      const okResult = pm.sendSerialized('peer-b', smallPayload, 1);
+      expect(okResult.ok).toBe(true);
+
+      const failResult = pm.sendSerialized('peer-b', bigPayload, 1);
+      expect(failResult.ok).toBe(false);
+      expect(failResult.error).toContain('Message exceeds maximum size');
+    });
+
+    it('should enforce 65,536-byte cap when SCTP limit is 0 (unconstrained remote)', async () => {
+      const signaling = createMockSignaling();
+      const pm = new PeerManager('local', 'session-1', 1, signaling);
+      pm.bindToRoom('room-1');
+      await pm.connect({ peerId: 'peer-b', sessionId: 'session-1', generation: 1 });
+
+      // @ts-expect-error accessing private peers map for test simulation
+      const entry = pm.peers.get('peer-b');
+      entry.transport.pc.sctp = { maxMessageSize: 0 }; // RFC 8841: 0 = unconstrained remote
+      entry.transport.dc.simulateOpen();
+
+      const oversizedString = 'x'.repeat(65537);
+      const failResult = pm.sendSerialized('peer-b', oversizedString, 1);
+      expect(failResult.ok).toBe(false);
+      expect(failResult.error).toContain('Message exceeds maximum size');
+    });
+
+    it('should pass exact serialized string directly to DataChannel.send', async () => {
+      const signaling = createMockSignaling();
+      const pm = new PeerManager('local', 'session-1', 1, signaling);
+      pm.bindToRoom('room-1');
+      await pm.connect({ peerId: 'peer-b', sessionId: 'session-1', generation: 1 });
+
+      // @ts-expect-error accessing private peers map for test simulation
+      const entry = pm.peers.get('peer-b');
+      const dc = entry.transport.dc;
+      dc.simulateOpen();
+
+      const exactJson = '{"exact":"bytes","unicode":"🎉"}';
+      const result = pm.sendSerialized('peer-b', exactJson, 1);
+      expect(result.ok).toBe(true);
+
+      const sent = dc.getSentMessages();
+      expect(sent).toContain(exactJson);
+      expect(sent[sent.length - 1]).toBe(exactJson);
+    });
+  });
 });
 

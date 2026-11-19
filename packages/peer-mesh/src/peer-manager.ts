@@ -17,6 +17,7 @@ import {
   type ProtocolMessage,
   MessageType,
   PROTOCOL_VERSION,
+  MAX_MESSAGE_BYTES,
   parseAndValidateMessage,
 } from '@syncplay/protocol';
 
@@ -142,7 +143,67 @@ export class PeerManager implements PeerMesh {
     }
 
     const json = JSON.stringify(message);
-    const sent = entry.transport.send(json);
+    return this.sendSerialized(peerId, json, entry.generation);
+  }
+
+  /**
+   * Returns the negotiated SCTP max message size for a peer connection in bytes,
+   * or undefined if unnegotiated or unavailable.
+   */
+  getSctpMaxMessageSize(peerId: PeerId): number | undefined {
+    const entry = this.peers.get(peerId);
+    if (!entry) return undefined;
+    return entry.transport.sctpMaxMessageSize;
+  }
+
+  /**
+   * Returns the current connection generation for a peer, or undefined if not found.
+   */
+  getPeerGeneration(peerId: PeerId): ConnectionGeneration | undefined {
+    const entry = this.peers.get(peerId);
+    return entry?.generation;
+  }
+
+  /**
+   * Sends a pre-serialized JSON message over the peer's DataChannel, strictly enforcing
+   * generation currency and the effective message size limit before transmission.
+   */
+  sendSerialized(
+    peerId: PeerId,
+    serializedJson: string,
+    expectedGeneration?: ConnectionGeneration,
+  ): SendResult {
+    const entry = this.peers.get(peerId);
+    if (!entry) {
+      return { ok: false, error: 'Peer not found' };
+    }
+
+    if (expectedGeneration !== undefined && entry.generation !== expectedGeneration) {
+      return { ok: false, error: 'Generation mismatch' };
+    }
+
+    if (entry.transport.dataChannelState !== 'open') {
+      return { ok: false, error: 'DataChannel not open' };
+    }
+
+    // Measure exact UTF-8 wire bytes
+    const byteLength = new TextEncoder().encode(serializedJson).byteLength;
+
+    // Determine effective limit (RFC 8841 / W3C WebRTC §6.2)
+    const sctpLimit = entry.transport.sctpMaxMessageSize;
+    const effectiveLimit =
+      sctpLimit !== undefined && sctpLimit > 0
+        ? Math.min(MAX_MESSAGE_BYTES, sctpLimit)
+        : MAX_MESSAGE_BYTES;
+
+    if (byteLength > effectiveLimit) {
+      return {
+        ok: false,
+        error: `Message exceeds maximum size (${byteLength} bytes > ${effectiveLimit} limit)`,
+      };
+    }
+
+    const sent = entry.transport.send(serializedJson);
     return sent
       ? { ok: true }
       : { ok: false, error: 'DataChannel not open' };

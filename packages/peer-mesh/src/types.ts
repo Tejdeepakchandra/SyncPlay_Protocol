@@ -88,6 +88,27 @@ export interface PeerMesh {
   onMessage(handler: (message: InboundMessage) => void): Unsubscribe;
   onPeerStatus(handler: (status: PeerStatus) => void): Unsubscribe;
   dispose(): Promise<void>;
+
+  /**
+   * Returns the negotiated SCTP max message size for a peer connection in bytes,
+   * or undefined if unnegotiated or unavailable.
+   */
+  getSctpMaxMessageSize?(peerId: PeerId): number | undefined;
+
+  /**
+   * Returns the current connection generation for a peer, or undefined if not found.
+   */
+  getPeerGeneration?(peerId: PeerId): ConnectionGeneration | undefined;
+
+  /**
+   * Sends a pre-serialized JSON message over the peer's DataChannel, strictly enforcing
+   * generation currency and the effective message size limit before transmission.
+   */
+  sendSerialized?(
+    peerId: PeerId,
+    serializedJson: string,
+    expectedGeneration?: ConnectionGeneration,
+  ): SendResult;
 }
 
 // ── Signaling events from Bootstrap Server ───────────────────

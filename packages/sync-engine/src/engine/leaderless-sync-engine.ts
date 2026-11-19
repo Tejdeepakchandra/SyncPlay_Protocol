@@ -43,9 +43,14 @@ import {
   type StateSnapshotPayloadV2,
   type StateDigestPayload,
   StateDigestPayloadSchema,
+  PROTOCOL_VERSION,
+  MessageType,
+  SYNC_MESSAGE_TYPES,
+  MAX_MESSAGE_BYTES,
 } from '@syncplay/protocol';
+import type { PeerMesh, InboundMessage, PeerStatus, SendResult } from '@syncplay/peer-mesh';
 import { compareDigests } from '../replication/replication-comparator.js';
-import type { DigestComparisonResult, IAntiEntropyManager } from '../replication/types.js';
+import type { DigestComparisonResult, IAntiEntropyManager, AntiEntropyCallbacks } from '../replication/types.js';
 
 interface MutableStats {
   eventsReceivedCount: number;
@@ -269,12 +274,17 @@ export class TrustedTransportAdapter {
    * immediately before serializing and transmitting over the WebRTC DataChannel.
    * Guarantees that no response from an obsolete membership epoch or obsolete connection
    * generation can be transmitted if a transition intervened.
+   *
+   * Enforces measured UTF-8 byte length of the complete wire message against the effective
+   * transport limit (min(MAX_MESSAGE_BYTES, sctpMaxMessageSize)). Never forces a 1-byte minimum.
+   * Serializes once and passes the exact measured serialized string to sendFn.
    */
   public sendRepairResponse(
     targetPeerId: string,
     response: OperationBatchPayload | RepairRejectedPayload,
     expectedConnectionGeneration: number,
     sendFn: (wireJson: string) => boolean,
+    effectiveTransportLimit?: number,
   ): boolean {
     if ('membershipEpoch' in response && response.membershipEpoch !== this.engine.epoch) {
       return false; // Obsolete epoch transition intervened: drop transmission
@@ -285,7 +295,7 @@ export class TrustedTransportAdapter {
     }
 
     const wireMessage = {
-      protocolVersion: 1,
+      protocolVersion: PROTOCOL_VERSION,
       messageType: 'membershipEpoch' in response ? 'OPERATION_BATCH' : 'REPAIR_REJECTED',
       sessionId: this.engine.sessionId,
       senderPeerId: this.engine.localPeerId,
@@ -297,7 +307,263 @@ export class TrustedTransportAdapter {
     };
 
     const wireJson = JSON.stringify(wireMessage);
+    const limit =
+      effectiveTransportLimit !== undefined && effectiveTransportLimit > 0
+        ? Math.min(MAX_MESSAGE_BYTES, effectiveTransportLimit)
+        : MAX_MESSAGE_BYTES;
+
+    const measuredBytes = new TextEncoder().encode(wireJson).byteLength;
+    if (measuredBytes > limit) {
+      return false; // Complete envelope exceeds effective transport limit
+    }
+
     return sendFn(wireJson);
+  }
+
+  /**
+   * Safe transport-level delivery method that validates epoch and generation currency
+   * immediately before serializing and transmitting a REPAIR_REQUEST over the WebRTC DataChannel.
+   * Guarantees that no request for an obsolete membership epoch or obsolete connection
+   * generation can be transmitted if a transition intervened.
+   *
+   * Enforces measured UTF-8 byte length of the complete wire message against the effective
+   * transport limit (min(MAX_MESSAGE_BYTES, sctpMaxMessageSize)).
+   * Serializes once and passes the exact measured serialized string to sendFn.
+   */
+  public sendRepairRequest(
+    targetPeerId: string,
+    request: RepairRequestPayload,
+    expectedConnectionGeneration: number,
+    sendFn: (wireJson: string) => boolean,
+    effectiveTransportLimit?: number,
+  ): boolean {
+    if (request.membershipEpoch !== this.engine.epoch) {
+      return false; // Obsolete epoch transition intervened: drop transmission
+    }
+    const currentGen = this.engine.getPeerGeneration(targetPeerId);
+    if (currentGen === undefined || currentGen !== expectedConnectionGeneration) {
+      return false; // Obsolete generation: drop transmission
+    }
+
+    const wireMessage = {
+      protocolVersion: PROTOCOL_VERSION,
+      messageType: 'REPAIR_REQUEST',
+      sessionId: this.engine.sessionId,
+      senderPeerId: this.engine.localPeerId,
+      messageId: request.requestId,
+      logicalEventId: request.requestId,
+      originPeerId: request.targetOriginPeerId,
+      membershipEpoch: this.engine.epoch,
+      payload: request,
+    };
+
+    const wireJson = JSON.stringify(wireMessage);
+    const limit =
+      effectiveTransportLimit !== undefined && effectiveTransportLimit > 0
+        ? Math.min(MAX_MESSAGE_BYTES, effectiveTransportLimit)
+        : MAX_MESSAGE_BYTES;
+
+    const measuredBytes = new TextEncoder().encode(wireJson).byteLength;
+    if (measuredBytes > limit) {
+      return false; // Complete envelope exceeds effective transport limit
+    }
+
+    return sendFn(wireJson);
+  }
+
+  public getEngine(): LeaderlessSyncEngine {
+    return this.engine;
+  }
+
+  public get engineSessionId(): string {
+    return this.engine.sessionId;
+  }
+
+  public get engineLocalPeerId(): string {
+    return this.engine.localPeerId;
+  }
+
+  public get engineEpoch(): number {
+    return this.engine.epoch;
+  }
+
+  /**
+   * Binds the TrustedTransportAdapter to a PeerMesh instance, establishing
+   * capability-gated transport routing for anti-entropy repair messages, state digests,
+   * and peer lifecycle events.
+   */
+  public bindPeerMesh(mesh: PeerMesh): Unsubscribe {
+    const unsubMessage = mesh.onMessage((inbound: InboundMessage) => {
+      this.handleInboundDataChannelMessage(mesh, inbound);
+    });
+
+    const unsubPeerStatus = mesh.onPeerStatus((status: PeerStatus) => {
+      this.handlePeerStatusChange(status);
+    });
+
+    // Seed any currently connected peers from mesh
+    for (const peer of mesh.listPeers()) {
+      this.handlePeerStatusChange(peer);
+    }
+
+    return () => {
+      unsubMessage();
+      unsubPeerStatus();
+    };
+  }
+
+  /**
+   * Creates standard AntiEntropyCallbacks wired directly to this adapter and the given PeerMesh.
+   * Enforces measured wire-size limits and currency checks for all outbound repair requests,
+   * responses, and state digests.
+   */
+  public createAntiEntropyCallbacks(mesh: PeerMesh): AntiEntropyCallbacks {
+    return {
+      onBroadcastDigest: (digest: StateDigestPayload) => {
+        const message = {
+          protocolVersion: PROTOCOL_VERSION,
+          messageType: 'STATE_DIGEST',
+          sessionId: this.engine.sessionId,
+          senderPeerId: this.engine.localPeerId,
+          messageId: `digest-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+          membershipEpoch: this.engine.epoch,
+          payload: digest,
+        };
+        for (const peer of mesh.listPeers()) {
+          if (peer.state === 'CONNECTED' && peer.dataChannelState === 'open') {
+            mesh.send(peer.peerId, message as any);
+          }
+        }
+      },
+      onSendRepairRequest: (targetPeerId: string, request: RepairRequestPayload) => {
+        const peerStatus = mesh.getPeerStatus(targetPeerId);
+        if (!peerStatus || peerStatus.state !== 'CONNECTED' || peerStatus.dataChannelState !== 'open') {
+          return;
+        }
+        const sctpLimit = mesh.getSctpMaxMessageSize?.(targetPeerId);
+        this.sendRepairRequest(
+          targetPeerId,
+          request,
+          peerStatus.generation,
+          (wireJson) => {
+            if (mesh.sendSerialized) {
+              return mesh.sendSerialized(targetPeerId, wireJson, peerStatus.generation).ok;
+            }
+            try {
+              return mesh.send(targetPeerId, JSON.parse(wireJson)).ok;
+            } catch {
+              return false;
+            }
+          },
+          sctpLimit,
+        );
+      },
+      onSendRepairResponse: (
+        targetPeerId: string,
+        response: OperationBatchPayload | RepairRejectedPayload,
+      ) => {
+        const peerStatus = mesh.getPeerStatus(targetPeerId);
+        if (!peerStatus || peerStatus.state !== 'CONNECTED' || peerStatus.dataChannelState !== 'open') {
+          return;
+        }
+        const sctpLimit = mesh.getSctpMaxMessageSize?.(targetPeerId);
+        this.sendRepairResponse(
+          targetPeerId,
+          response,
+          peerStatus.generation,
+          (wireJson) => {
+            if (mesh.sendSerialized) {
+              return mesh.sendSerialized(targetPeerId, wireJson, peerStatus.generation).ok;
+            }
+            try {
+              return mesh.send(targetPeerId, JSON.parse(wireJson)).ok;
+            } catch {
+              return false;
+            }
+          },
+          sctpLimit,
+        );
+      },
+    };
+  }
+
+  private handleInboundDataChannelMessage(mesh: PeerMesh, inbound: InboundMessage): void {
+    const msg = inbound.message;
+    if (!msg) return;
+
+    // 1. Session verification: drop messages for other rooms/sessions
+    if (msg.sessionId !== this.engine.sessionId) {
+      return;
+    }
+
+    // 2. Sender spoofing check: claimed sender must match transport identity
+    if (msg.senderPeerId !== inbound.fromPeerId) {
+      return;
+    }
+
+    // 3. Inspect transport connection status
+    const peerStatus = mesh.getPeerStatus(inbound.fromPeerId);
+    if (!peerStatus) {
+      return;
+    }
+
+    const type = msg.messageType;
+
+    // REPAIR_REQUEST (M4 supplier servicing)
+    if (type === 'REPAIR_REQUEST' || type === 'sync:repair-request') {
+      if (msg.membershipEpoch !== this.engine.epoch) {
+        return; // Stale epoch request: drop
+      }
+      this.handleInboundRepairRequest(
+        msg.payload as RepairRequestPayload,
+        inbound.fromPeerId,
+        peerStatus.generation,
+      );
+      return;
+    }
+
+    // OPERATION_BATCH (M3 requester ingestion)
+    if (type === 'OPERATION_BATCH' || type === 'sync:operation-batch') {
+      this.handleInboundRepairBatch(
+        msg.payload as OperationBatchPayload,
+        inbound.fromPeerId,
+        peerStatus.generation,
+      );
+      return;
+    }
+
+    // REPAIR_REJECTED (M3 requester failover)
+    if (type === 'REPAIR_REJECTED' || type === 'sync:repair-rejected') {
+      this.handleInboundRepairRejected(
+        msg.payload as RepairRejectedPayload,
+        inbound.fromPeerId,
+        peerStatus.generation,
+      );
+      return;
+    }
+
+    // STATE_DIGEST (Anti-entropy comparison)
+    if (type === 'STATE_DIGEST' || type === 'sync:state-digest') {
+      this.antiEntropyManager?.processRemoteDigest(msg.payload as StateDigestPayload);
+      return;
+    }
+  }
+
+  private handlePeerStatusChange(status: PeerStatus): void {
+    if (status.state === 'CONNECTED') {
+      this.engine.authorizePeerGeneration(status.peerId, status.generation);
+      this.antiEntropyManager?.onPeerGenerationChanged?.(status.peerId, status.generation);
+      if (status.dataChannelState === 'open') {
+        this.antiEntropyManager?.triggerReactiveDigest?.();
+        this.antiEntropyManager?.reconcileGaps?.();
+      }
+    } else if (
+      status.state === 'DISCONNECTED' ||
+      status.state === 'CLOSED' ||
+      status.state === 'FAILED'
+    ) {
+      this.antiEntropyManager?.onPeerDisconnected(status.peerId);
+    }
   }
 }
 

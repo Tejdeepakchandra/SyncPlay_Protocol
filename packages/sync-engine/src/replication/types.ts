@@ -358,6 +358,9 @@ export interface IAntiEntropyManager {
   /** Schedules targeted repair requests for all currently detected sequence gaps (M3). */
   reconcileGaps(): void;
 
+  /** Triggers a coalesced reactive digest transmission. */
+  triggerReactiveDigest?(): void;
+
   /** Cancels active repair requests to a departing peer. */
   onPeerDisconnected(peerId: string): void;
 
