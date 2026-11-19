@@ -520,9 +520,9 @@ export class TrustedTransportAdapter {
       return;
     }
 
-    // 3. Inspect transport connection status
+    // 3. Inspect transport connection status: strictly reject messages from non-connected peers
     const peerStatus = mesh.getPeerStatus(inbound.fromPeerId);
-    if (!peerStatus) {
+    if (!peerStatus || peerStatus.state !== 'CONNECTED' || peerStatus.dataChannelState !== 'open') {
       return;
     }
 

@@ -59,6 +59,10 @@ export class OrderedOperationLog implements IOrderedOperationLog {
     return this._capacity;
   }
 
+  public get hasPruned(): boolean {
+    return this.hasPrunedOperations;
+  }
+
   public getBaseSnapshot(): PlaybackState | undefined {
     return this.baseSnapshot;
   }

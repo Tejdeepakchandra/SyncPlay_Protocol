@@ -55,6 +55,9 @@ export interface IOrderedOperationLog {
   /** Maximum capacity horizon (K = 256). */
   readonly capacity: number;
 
+  /** Indicates whether any operations have been pruned from the active log. */
+  readonly hasPruned?: boolean;
+
   /** Checks if operation exists by logicalEventId in log. */
   has(logicalEventId: string): boolean;
 

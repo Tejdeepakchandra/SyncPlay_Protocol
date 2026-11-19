@@ -243,6 +243,39 @@ describe('Phase 7.5 M4.0: Prerequisite Infrastructure Corrections', () => {
       expect(engine.getPeerDigests().has(REMOTE_PEER)).toBe(false);
     });
 
+    it('should drop STATE_DIGEST when peer is disconnected or DataChannel is closed', () => {
+      // Simulate peer disconnection on transport
+      mockMesh.simulatePeerStatus({
+        peerId: REMOTE_PEER,
+        state: 'DISCONNECTED',
+        dataChannelState: 'closed',
+        generation: 1,
+      });
+
+      const message: ProtocolMessage<StateDigestPayload> = {
+        protocolVersion: 1,
+        messageType: 'STATE_DIGEST',
+        sessionId: SESSION_ID,
+        senderPeerId: REMOTE_PEER,
+        messageId: 'msg-disconnected-peer',
+        membershipEpoch: 1,
+        payload: makeDigestPayload({
+          sessionId: SESSION_ID,
+          senderPeerId: REMOTE_PEER,
+          connectionGeneration: 1,
+          membershipEpoch: 1,
+        }),
+      };
+
+      mockMesh.simulateInboundMessage({
+        fromPeerId: REMOTE_PEER,
+        message,
+      });
+
+      // Proof: Disconnected peer cannot register digest knowledge
+      expect(engine.getPeerDigests().has(REMOTE_PEER)).toBe(false);
+    });
+
     it('should accept valid current sender STATE_DIGEST and record peer digest knowledge', () => {
       const validPayload = makeDigestPayload({
         sessionId: SESSION_ID,
@@ -552,45 +585,56 @@ describe('Phase 7.5 M4.0: Prerequisite Infrastructure Corrections', () => {
       const baseSnapshotBefore = log.getBaseSnapshot();
       const baseFrontierBefore = log.getBaseSnapshotFrontier();
       const checkpointsBefore = log.getAllCompactedCheckpoints();
+      const opsArrayRefBefore = (log as any).operations;
+      const idIndexRefBefore = (log as any).idIndex;
+      const originSeqIndexRefBefore = (log as any).originSeqIndex;
+      const compactedCheckpointsRefBefore = (log as any).compactedCheckpoints;
+      const originTimestampsRefBefore = (log as any).originFrontierTimestamps;
+      expect(log.hasPruned).toBe(false);
 
       // Attempt compaction that will prune op1 and op2 (throwing on op2)
       expect(() => {
         log.compactAtFrontier({ 'peer-A': 2 });
       }).toThrow('SIMULATED_REDUCER_FAULT');
 
-      // Verify all 8 active components are completely unmodified!
+      // Verify all 8 active components are completely unmodified (both by value and reference identity)!
       // 1. baseSnapshot
       expect(log.getBaseSnapshot()).toEqual(baseSnapshotBefore);
       expect(log.getBaseSnapshot()?.anchorPositionMs).toBe(1000);
       expect(log.getBaseSnapshot()?.stateVersion).toBe(1);
 
-      // 2. operations
+      // 2. operations (array was neither replaced nor mutated)
       expect(log.size).toBe(sizeBefore);
       expect(log.getAllOperations()).toEqual(allOpsBefore);
+      expect((log as any).operations).toBe(opsArrayRefBefore);
 
       // 3. idIndex
+      expect((log as any).idIndex).toBe(idIndexRefBefore);
       expect(log.has('evt-atomic-1')).toBe(true);
       expect(log.has('evt-atomic-2')).toBe(true);
       expect(log.has('evt-atomic-3')).toBe(true);
       expect(log.get('evt-atomic-1')).toBe(op1);
 
       // 4. originSeqIndex
+      expect((log as any).originSeqIndex).toBe(originSeqIndexRefBefore);
       expect(log.getOperationAt('peer-A', 1)).toBe(op1);
       expect(log.getOperationAt('peer-A', 2)).toBe(op2);
       expect(log.getOperationAt('peer-A', 3)).toBe(op3);
 
       // 5. compactedCheckpoints
+      expect((log as any).compactedCheckpoints).toBe(compactedCheckpointsRefBefore);
       expect(log.getAllCompactedCheckpoints()).toEqual(checkpointsBefore);
       expect(log.getCompactedCheckpoint('peer-A', 1)).toBeUndefined();
 
       // 6. originFrontierTimestamps
-      // Exact sequence 1 is still active in log (timestamp 10)
+      expect((log as any).originFrontierTimestamps).toBe(originTimestampsRefBefore);
       expect(log.getOriginFrontierTimestamps({ 'peer-A': 1 })['peer-A']).toBe(10);
 
       // 7. baseSnapshotFrontier
       expect(log.getBaseSnapshotFrontier()).toEqual(baseFrontierBefore);
 
-      // 8. hasPrunedOperations: inserting older event still rejected or accepted based on pre-state
+      // 8. hasPrunedOperations (explicitly tested: remains false on failure)
+      expect(log.hasPruned).toBe(false);
       expect(log.size).toBe(3);
     });
 
@@ -612,6 +656,7 @@ describe('Phase 7.5 M4.0: Prerequisite Infrastructure Corrections', () => {
       });
 
       const log = new OrderedOperationLog(OrderedOperationLog.DEFAULT_CAPACITY, initialSnapshot, pureReducer);
+      expect(log.hasPruned).toBe(false);
 
       const op1: StoredOperation = {
         logicalEventId: 'evt-succ-1',
@@ -642,6 +687,8 @@ describe('Phase 7.5 M4.0: Prerequisite Infrastructure Corrections', () => {
       log.insert(op1);
       log.insert(op2);
 
+      const opsArrayRefBefore = (log as any).operations;
+
       const pruned = log.compactAtFrontier({ 'peer-A': 1 });
       expect(pruned).toBe(1);
 
@@ -649,9 +696,10 @@ describe('Phase 7.5 M4.0: Prerequisite Infrastructure Corrections', () => {
       expect(log.getBaseSnapshot()?.anchorPositionMs).toBe(100);
       expect(log.getBaseSnapshot()?.stateVersion).toBe(1);
 
-      // 2. operations contains only op2
+      // 2. operations contains only op2 and reference was swapped to candidate array
       expect(log.size).toBe(1);
       expect(log.getAllOperations()[0]?.logicalEventId).toBe('evt-succ-2');
+      expect((log as any).operations).not.toBe(opsArrayRefBefore);
 
       // 3. idIndex updated
       expect(log.has('evt-succ-1')).toBe(false);
@@ -666,6 +714,34 @@ describe('Phase 7.5 M4.0: Prerequisite Infrastructure Corrections', () => {
 
       // 6. baseSnapshotFrontier updated
       expect(log.getBaseSnapshotFrontier()['peer-A']).toBe(1);
+
+      // 7. originFrontierTimestamps updated
+      expect(log.getOriginFrontierTimestamps({ 'peer-A': 1 })['peer-A']).toBe(10);
+
+      // 8. hasPrunedOperations is true after successful compaction
+      expect(log.hasPruned).toBe(true);
+    });
+
+    it('should verify deepClone preserves PlaybackState fields identically without prototype pollution', () => {
+      const state: PlaybackState = Object.freeze({
+        status: 'playing',
+        anchorPositionMs: 42500,
+        anchorLocalTimestamp: 12345.67,
+        playbackRate: 1.5,
+        stateVersion: 42,
+      });
+
+      // Test structuredClone path
+      const cloned = structuredClone(state);
+      expect(cloned).toEqual(state);
+      expect(cloned).not.toBe(state);
+      expect(Object.isFrozen(cloned)).toBe(false);
+
+      // Test JSON parse/stringify fallback path
+      const jsonCloned = JSON.parse(JSON.stringify(state));
+      expect(jsonCloned).toEqual(state);
+      expect(jsonCloned).not.toBe(state);
+      expect(Object.isFrozen(jsonCloned)).toBe(false);
     });
   });
 });
