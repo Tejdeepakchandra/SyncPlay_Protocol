@@ -33,8 +33,8 @@ export const MIN_SUPPORTED_SCTP_LIMIT = 2048;
 /** Envelope budget in bytes for SNAPSHOT_CHUNK metadata, UUIDs, and Base64 framing overhead. */
 export const CHUNK_ENVELOPE_BUDGET_BYTES = 768;
 
-/** Guaranteed maximum envelope overhead in bytes for ProtocolMessage wrapping, JSON keys, UUIDs, and signatures. */
-export const MAX_ENVELOPE_OVERHEAD_BYTES = 1024;
+/** Guaranteed maximum envelope overhead in bytes for ProtocolMessage wrapping, JSON keys, UUIDs, and signatures (proven upper bound across maximum schema field lengths). */
+export const MAX_ENVELOPE_OVERHEAD_BYTES = 1600;
 
 /** Hard operational bound on sizing loop attempts per chunk. */
 export const MAX_SIZING_ITERATIONS = 5;
@@ -267,10 +267,29 @@ export function calculateChunkCapacity(effectiveLimit: number): number {
 export function calculateSnapshotAdmission(
   totalSizeBytes: number,
   sctpMaxMessageSize?: number,
-  advertisedTotalChunks?: number
+  advertisedTotalChunks?: number,
+  options?: { allowSctpFallback?: boolean },
 ): SnapshotAdmissionResult {
-  // Resolve effective limit against local framing policy cap of 65,536 bytes
-  const fallbackLimit = 65536; // Conservative local implementation policy cap (NOT RFC 8831 guarantee)
+  // If unnegotiated or unavailable in production, defer or reject
+  if (
+    sctpMaxMessageSize === undefined ||
+    sctpMaxMessageSize <= 0 ||
+    !Number.isFinite(sctpMaxMessageSize)
+  ) {
+    if (!options?.allowSctpFallback) {
+      return {
+        eligible: false,
+        requiredChunks: 0,
+        chunkBinaryCapacity: 0,
+        effectiveLimit: 0,
+        reason: 'TRANSPORT_LIMIT_EXCEEDED',
+        detail: 'SCTP transport is unnegotiated or maxMessageSize is unavailable',
+      };
+    }
+  }
+
+  // Resolve effective limit: clamp valid SCTP limit against local framing policy cap of 65,536 bytes
+  const fallbackLimit = 65536; // Conservative local implementation policy cap (mock/test environments only)
   const effectiveLimit =
     sctpMaxMessageSize !== undefined && sctpMaxMessageSize > 0 && Number.isFinite(sctpMaxMessageSize)
       ? Math.min(fallbackLimit, sctpMaxMessageSize)
@@ -336,9 +355,22 @@ export function calculateSnapshotAdmission(
  * Delegates to calculateChunkCapacity(effectiveLimit).
  *
  * NOTE: The 65,536-byte fallback represents SyncPlay's conservative local framing cap,
- * NOT an RFC 8831 universal minimum guarantee.
+ * used ONLY when allowSctpFallback is explicitly enabled for mock test harnesses.
  */
-export function calculateDynamicChunkSize(sctpMaxMessageSize?: number): number {
+export function calculateDynamicChunkSize(
+  sctpMaxMessageSize?: number,
+  options?: { allowSctpFallback?: boolean },
+): number {
+  if (
+    sctpMaxMessageSize === undefined ||
+    sctpMaxMessageSize <= 0 ||
+    !Number.isFinite(sctpMaxMessageSize)
+  ) {
+    if (!options?.allowSctpFallback) {
+      throw new Error('SCTP transport is unnegotiated or maxMessageSize is unavailable');
+    }
+  }
+
   const fallbackLimit = 65536;
   const effectiveLimit =
     sctpMaxMessageSize !== undefined && sctpMaxMessageSize > 0 && Number.isFinite(sctpMaxMessageSize)
@@ -346,17 +378,6 @@ export function calculateDynamicChunkSize(sctpMaxMessageSize?: number): number {
       : fallbackLimit;
 
   return calculateChunkCapacity(effectiveLimit);
-}
-
-  if (effectiveLimit < MIN_SUPPORTED_SCTP_LIMIT) {
-    throw new Error(
-      `SCTP limit (${effectiveLimit} bytes) is below minimum supported limit (${MIN_SUPPORTED_SCTP_LIMIT} bytes)`
-    );
-  }
-
-  const availableBase64 = Math.max(0, effectiveLimit - CHUNK_ENVELOPE_BUDGET_BYTES);
-  const maxBinaryBytes = Math.floor((availableBase64 * 3) / 4);
-  return Math.min(MAX_CHUNK_BYTES, maxBinaryBytes);
 }
 ```
 
@@ -534,9 +555,12 @@ export interface FrontierTimestampResolutionResult {
 }
 ```
 In `OrderedOperationLog.getOriginFrontierTimestamps(frontier)`:
-- If exact sequence is found in active log or compacted checkpoints: resolve timestamp.
-- If not found: mark origin as unresolvable.
-- **Never substitute a later or earlier sequence timestamp.**
+- If requested `seq <= 0`: resolve timestamp to 0.
+- If exact sequence is found in active log (`originSeqIndex`): resolve to `activeOp.logicalTimestamp`.
+- If exact sequence is found in compacted checkpoints (`compactedCheckpoints`): resolve to `checkpoint.logicalTimestamp`.
+- If exact sequence is evicted from checkpoints or outside retention horizon: origin is unresolvable (timestamp omitted or marked `null`, origin listed in `unresolvableOrigins`, `exact = false`).
+- Fallback to `this.originFrontierTimestamps.get(origin)` is **STRICTLY ELIMINATED**.
+- **Invariant:** Never substitute a later sequence's Lamport timestamp for the exact timestamp of an earlier requested sequence.
 
 ### 5.3 Transactional Staging for Compaction (Limitation C / Milestone M4.0d)
 
@@ -559,7 +583,7 @@ export interface StagedCompactionCandidate {
   readonly candidateOriginSeqIndex: Map<string, StoredOperation>;
   /** Shallow Map clone retaining checkpoints at K=256 intervals up to compaction horizon. */
   readonly candidateCompactedCheckpoints: Map<string, CompactedCheckpointRecord>;
-  /** Shallow Map clone updated with exact sequence timestamps for the compaction frontier. */
+  /** Shallow Map clone updated with latest pruned timestamp per origin (strictly an origin-level tracker, not sequence-indexed). */
   readonly candidateOriginFrontierTimestamps: Map<string, number>;
   /** Shallow Record clone matching candidate base snapshot frontier. */
   readonly candidateBaseSnapshotFrontier: Record<string, number>;

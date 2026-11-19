@@ -45,15 +45,15 @@
 ---
 
 ### R-M4-2: Chunk Framing Starvation on Severely Constrained Links ($< 2\text{ KB}$)
-- **Threat Description:** If a link negotiates an extremely small MTU/SCTP limit ($< 2,048$ bytes), the JSON envelope overhead ($\approx 1024$ bytes) consumes the majority of the message budget, leaving trivial binary payload slices ($< 256$ bytes) that require thousands of chunks, starving the transfer. Furthermore, a 4 MiB snapshot would require $\approx 5,462$ chunks over a 2 KiB link, contradicting the 128-chunk bound.
+- **Threat Description:** If a link negotiates an extremely small MTU/SCTP limit ($< 2,048$ bytes), the JSON envelope overhead ($\approx 1600$ bytes under worst-case schema field lengths) consumes the majority of the message budget, leaving trivial binary payload slices ($< 256$ bytes) that require thousands of chunks, starving the transfer. Furthermore, a 4 MiB snapshot would require thousands of chunks over a 2 KiB link, contradicting the 128-chunk bound.
 - **Root Cause:** Attempting large state snapshot recovery over pathologically constrained network links without evaluating capacity invariants.
 - **Mitigation:**
   1. Exact Upfront Admission Gate: The protocol computes exact required chunks upfront:
-     $$\text{chunkBinaryCapacity} = \min\left(32768, \left\lfloor \frac{\text{effectiveLimit} - 1024}{4} \right\rfloor \times 3\right)$$
+     $$\text{chunkBinaryCapacity} = \min\left(32768, \left\lfloor \frac{\text{effectiveLimit} - 1600}{4} \right\rfloor \times 3\right)$$
      $$\text{calculatedRequiredChunks} = \left\lceil \frac{\text{totalSizeBytes}}{\text{chunkBinaryCapacity}} \right\rceil$$
   2. If $\text{calculatedRequiredChunks} > \text{MAX\_CHUNKS\_PER\_SNAPSHOT}$ (128), the transfer is rejected immediately before allocating reassembly buffer memory (`CHUNK_COUNT_EXCEEDED`).
   3. If $\text{offer.totalChunks} !== \text{calculatedRequiredChunks}$, the offer is rejected upfront with `OFFER_INCONSISTENT`.
-  4. The protocol explicitly **does NOT claim universal 4 MiB snapshot transfer support on 2 KiB transports**; effective capacity on 2 KiB transports is bounded to $\approx 96\text{ KiB}$ for 128 chunks.
+  4. The protocol explicitly **does NOT claim universal 4 MiB snapshot transfer support on 2 KiB transports**; effective capacity on 2 KiB transports is bounded to $\approx 42\text{ KiB}$ (43,008 B) for 128 chunks.
   5. `calculateChunkCapacity` throws if `effectiveLimit < MIN_SUPPORTED_SCTP_LIMIT` (2,048 bytes).
   6. The iterative loop aborts with `TRANSPORT_LIMIT_EXCEEDED` if slice size drops below `MIN_CHUNK_BYTES = 256`.
   7. Transfer terminates cleanly to `DEGRADED`, prompting application intervention rather than hanging.

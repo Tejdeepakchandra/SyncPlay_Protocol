@@ -44,9 +44,10 @@ This document defines the formal, measurable acceptance criteria for Phase 7.5 M
      - `originFrontierTimestamps`: Shallow Map clone `new Map(this.originFrontierTimestamps)` with 64-entry FIFO eviction.
      - `baseSnapshotFrontier`: Shallow Record clone `{ ...this.baseSnapshotFrontier }`.
      - `hasPrunedOperations`: Scalar boolean copy.
-  2. If the reducer throws at any point during candidate reduction, the exception is propagated, all candidate objects are discarded, and `this.baseSnapshot`, `this.operations`, `this.idIndex`, `this.originSeqIndex`, `this.compactedCheckpoints`, `this.originFrontierTimestamps`, `this.baseSnapshotFrontier`, and `this.hasPrunedOperations` remain 100% untouched.
+  2. If the reducer throws at any point during candidate reduction or candidate validation fails, the exception is propagated, all candidate objects are discarded, and `this.baseSnapshot`, `this.operations`, `this.idIndex`, `this.originSeqIndex`, `this.compactedCheckpoints`, `this.originFrontierTimestamps`, `this.baseSnapshotFrontier`, and `this.hasPrunedOperations` remain 100% untouched.
   3. Formal Proof Criterion:
-     $$\mathbf{\text{ReducerFailure}} \implies \mathbf{\text{ActiveStateAfter} \equiv \text{ActiveStateBefore}}$$
+     $$\mathbf{\text{CandidateConstructionFailure}} \implies \mathbf{\text{ActiveStateAfter} \equiv \text{ActiveStateBefore}}$$
+     (Note: Reducer is contracted to be pure; external reducer side effects cannot be rolled back by the runtime.)
 
 ---
 
@@ -81,12 +82,12 @@ This document defines the formal, measurable acceptance criteria for Phase 7.5 M
 ### AC-M4-ADMIT-1: Upfront Admission Calculation & Chunk Ceiling Invariant
 - **Condition:** Inbound `SNAPSHOT_OFFER` received or outbound `SNAPSHOT_REQUEST` handled over any supported transport.
 - **Pass Threshold:**
-  1. `calculateSnapshotAdmission()` executes exact sizing:
-     $$\text{chunkBinaryCapacity} = \min\left(32768, \left\lfloor \frac{\text{effectiveLimit} - 1024}{4} \right\rfloor \times 3\right)$$
+  1. `calculateSnapshotAdmission()` executes exact sizing using the proven 1,600-byte envelope ceiling:
+     $$\text{chunkBinaryCapacity} = \min\left(32768, \left\lfloor \frac{\text{effectiveLimit} - 1600}{4} \right\rfloor \times 3\right)$$
      $$\text{calculatedRequiredChunks} = \left\lceil \frac{\text{totalSizeBytes}}{\text{chunkBinaryCapacity}} \right\rceil$$
   2. Invariant 1 verified: $\text{calculatedRequiredChunks} \le \text{MAX\_CHUNKS\_PER\_SNAPSHOT}$ (128). If exceeded, rejected upfront with `CHUNK_COUNT_EXCEEDED` before allocating reassembly buffer memory.
   3. Invariant 2 verified: $\text{offer.totalChunks} === \text{calculatedRequiredChunks}$. If inconsistent, rejected upfront with `OFFER_INCONSISTENT` before allocating reassembly buffer memory.
-  4. Explicitly verified that universal 4 MiB transfer is **NOT** claimed on a 2 KiB SCTP transport (which admits snapshots up to 96 KiB for 128 chunks).
+  4. Explicitly verified that universal 4 MiB transfer is **NOT** claimed on a 2 KiB SCTP transport (which admits snapshots up to 42 KiB / 43,008 B for 128 chunks).
 
 ### AC-M4-ADMIT-2: Minimum Supported SCTP Limit Floor
 - **Condition:** Transport reporting SCTP limit $< 2,048$ bytes (`MIN_SUPPORTED_SCTP_LIMIT`).
@@ -99,7 +100,8 @@ This document defines the formal, measurable acceptance criteria for Phase 7.5 M
 - **Pass Threshold:**
   1. If `sctpMaxMessageSize` is `undefined` (negotiation underway), transfer initiation is deferred until negotiation completes.
   2. If `sctpMaxMessageSize` is $\le 0$ or non-finite, transfer is deferred or rejected as invalid transport state.
-  3. Fallback of 65,536 bytes on open channels is verified to be a local application cap, not proof of remote capacity.
+  3. In production, unnegotiated or unavailable SCTP limit rejects transfer with `TRANSPORT_LIMIT_EXCEEDED`. Fallback of 65,536 bytes is permitted ONLY when `allowSctpFallback: true` is explicitly configured in mock test harnesses.
+  4. If synchronous `dc.send()` throws or returns `false`, transfer aborts cleanly without corrupting engine state.
 
 ---
 
