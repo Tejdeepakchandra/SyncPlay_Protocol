@@ -17,6 +17,9 @@ export {
   MAX_OPERATIONS_PER_BATCH,
   MAX_VECTOR_ENTRIES,
   MAX_SNAPSHOT_BYTES,
+  ASCII_IDENTIFIER_REGEX,
+  MAX_ENVELOPE_OVERHEAD_BYTES,
+  MIN_TRANSPORT_LIMIT_FULL_CHUNK,
 } from './constants.js';
 
 // ── Identity types ───────────────────────────────────────────

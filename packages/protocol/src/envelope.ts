@@ -14,6 +14,7 @@
  * at the validation layer, not here.
  */
 import { z } from 'zod';
+import { ASCII_IDENTIFIER_REGEX } from './constants.js';
 import type { PeerId, SessionId, MessageId, LogicalEventId } from './identity.js';
 
 /**
@@ -84,18 +85,18 @@ export interface ProtocolMessage<TPayload = unknown> {
 export const ProtocolMessageSchema = z.object({
   protocolVersion: z.number().int().positive(),
   messageType: z.string().min(1).max(64),
-  sessionId: z.string().min(1).max(128),
-  senderPeerId: z.string().min(1).max(128),
-  messageId: z.string().min(1).max(128),
-  logicalEventId: z.string().min(1).max(128).optional(),
-  originPeerId: z.string().min(1).max(128).optional(),
+  sessionId: z.string().min(1).max(128).regex(ASCII_IDENTIFIER_REGEX),
+  senderPeerId: z.string().min(1).max(128).regex(ASCII_IDENTIFIER_REGEX),
+  messageId: z.string().min(1).max(128).regex(ASCII_IDENTIFIER_REGEX),
+  logicalEventId: z.string().min(1).max(128).regex(ASCII_IDENTIFIER_REGEX).optional(),
+  originPeerId: z.string().min(1).max(128).regex(ASCII_IDENTIFIER_REGEX).optional(),
   membershipEpoch: z.number().int().nonnegative().optional(),
   connectionGeneration: z.number().int().positive().max(Number.MAX_SAFE_INTEGER).optional(),
   logicalTimestamp: z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER).optional(),
   originSequenceNumber: z.number().int().positive().max(Number.MAX_SAFE_INTEGER).optional(),
   causalContext: z
     .record(
-      z.string().min(1).max(128),
+      z.string().min(1).max(128).regex(ASCII_IDENTIFIER_REGEX),
       z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER),
     )
     .optional(),

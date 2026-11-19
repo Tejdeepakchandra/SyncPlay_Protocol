@@ -11,6 +11,7 @@ import {
 } from '../compaction/compaction-manager.js';
 import { OrderedOperationLog } from '../log/ordered-operation-log.js';
 import { LeaderlessSyncEngine } from '../engine/leaderless-sync-engine.js';
+import { INTERNAL_DIGEST_ACCESS_TOKEN } from '../engine/custody.js';
 import { validateSnapshotPayloadV2 } from '../snapshot.js';
 import type { StateDigestPayload } from '@syncplay/protocol';
 import type { StoredOperation } from '../log/types.js';
@@ -534,7 +535,7 @@ describe('Phase 7.5 M3 — Compaction Horizon & Membership View', () => {
       membershipEpoch: 1,
       replicationVector: { 'peer-local': 2, 'peer-remote': 5 },
     });
-    engine.recordPeerDigest(remoteDigest);
+    engine.recordPeerDigest(INTERNAL_DIGEST_ACCESS_TOKEN, remoteDigest);
 
     // Export snapshot V2
     const snapshot = engine.exportSnapshotV2('snap-test-engine');

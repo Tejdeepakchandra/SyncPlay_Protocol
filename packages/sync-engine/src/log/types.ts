@@ -90,8 +90,9 @@ export interface IOrderedOperationLog {
 
   /**
    * Resolves the logical timestamp for each origin at the sequence specified by the frontier.
+   * Returns exact Lamport timestamp, or null if historical sequence is evicted or unavailable.
    */
-  getOriginFrontierTimestamps?(frontier: Record<string, number>): Record<string, number>;
+  getOriginFrontierTimestamps?(frontier: Record<string, number>): Record<string, number | null>;
 
   /** Retrieves tail fingerprint for an origin at an optional target sequence. */
   getTailFingerprint?(originPeerId: string, atSequence?: number): string | undefined;

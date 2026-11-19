@@ -20,15 +20,22 @@ import type {
   CompactedCheckpointRecord,
 } from './types.js';
 
+function deepClone<T>(val: T): T {
+  if (typeof structuredClone === 'function') {
+    return structuredClone(val);
+  }
+  return JSON.parse(JSON.stringify(val));
+}
+
 export class OrderedOperationLog implements IOrderedOperationLog {
   public static readonly DEFAULT_CAPACITY = 256;
 
   private readonly _capacity: number;
-  private readonly operations: StoredOperation[] = [];
-  private readonly idIndex = new Map<string, StoredOperation>();
-  private readonly originSeqIndex = new Map<string, StoredOperation>();
-  private readonly compactedCheckpoints = new Map<string, CompactedCheckpointRecord>();
-  private readonly originFrontierTimestamps = new Map<string, number>();
+  private operations: StoredOperation[] = [];
+  private idIndex = new Map<string, StoredOperation>();
+  private originSeqIndex = new Map<string, StoredOperation>();
+  private compactedCheckpoints = new Map<string, CompactedCheckpointRecord>();
+  private originFrontierTimestamps = new Map<string, number>();
   private baseSnapshot?: PlaybackState;
   private baseSnapshotFrontier: Record<string, number> = {};
   private hasPrunedOperations = false;
@@ -134,12 +141,14 @@ export class OrderedOperationLog implements IOrderedOperationLog {
   /**
    * Resolves the logical timestamp for each origin at the sequence specified by the frontier.
    * Checks:
-   * 1. Active log retained operation at (origin, seq)
-   * 2. Compacted checkpoint at (origin, seq)
-   * 3. Internal originFrontierTimestamps tracking map
+   * 1. If seq <= 0: returns 0
+   * 2. Active log retained operation at (origin, seq): returns exact Lamport timestamp
+   * 3. Compacted checkpoint at (origin, seq): returns exact Lamport timestamp
+   * 4. Evicted or unavailable historical sequence: returns null
+   * (Strictly DOES NOT fall back to latest origin-level timestamp)
    */
-  public getOriginFrontierTimestamps(frontier: Record<string, number>): Record<string, number> {
-    const result: Record<string, number> = {};
+  public getOriginFrontierTimestamps(frontier: Record<string, number>): Record<string, number | null> {
+    const result: Record<string, number | null> = {};
     for (const [origin, seq] of Object.entries(frontier)) {
       if (seq <= 0) {
         result[origin] = 0;
@@ -155,12 +164,7 @@ export class OrderedOperationLog implements IOrderedOperationLog {
         result[origin] = cp;
         continue;
       }
-      const tracked = this.originFrontierTimestamps.get(origin);
-      if (tracked !== undefined) {
-        result[origin] = tracked;
-        continue;
-      }
-      result[origin] = 0;
+      result[origin] = null;
     }
     return result;
   }
@@ -279,6 +283,12 @@ export class OrderedOperationLog implements IOrderedOperationLog {
    * Performs deduplication and collision detection.
    */
   public insert(operation: StoredOperation): InsertOperationResult {
+    // Freeze operation and nested causalContext to guarantee runtime immutability
+    Object.freeze(operation);
+    if (operation.causalContext) {
+      Object.freeze(operation.causalContext);
+    }
+
     // 1. Deduplication check by logicalEventId with identity reuse verification
     const existingById = this.idIndex.get(operation.logicalEventId);
     if (existingById) {
@@ -454,49 +464,122 @@ export class OrderedOperationLog implements IOrderedOperationLog {
 
   /**
    * Prunes operations older than stable frontier, updates base snapshot, and preserves checkpoints.
+   * Uses transactional candidate staging across all 8 mutable components:
+   * 1. baseSnapshot (deep cloned before reduction)
+   * 2. operations (candidate retained array)
+   * 3. idIndex (rebuilt from candidate retained operations)
+   * 4. originSeqIndex (rebuilt from candidate retained operations)
+   * 5. compactedCheckpoints (cloned with FIFO bound)
+   * 6. originFrontierTimestamps (cloned with FIFO bound)
+   * 7. baseSnapshotFrontier (cloned and updated)
+   * 8. hasPrunedOperations (candidate boolean)
+   *
+   * Reducer contract: The reducer is expected to be a pure function:
+   * (state: PlaybackState, op: StoredOperation) => PlaybackState
+   * It must not mutate the incoming state or operation objects.
+   *
+   * Invariant: Candidate construction failure (e.g. reducer exception) leaves
+   * all 8 active components unchanged: ActiveStateAfter === ActiveStateBefore.
    */
   public compactAtFrontier(stableFrontier: Record<string, number>): number {
-    const toPrune: StoredOperation[] = [];
-    for (let i = this.operations.length - 1; i >= 0; i--) {
-      const op = this.operations[i]!;
+    const candidateRetainedOperations: StoredOperation[] = [];
+    const candidateToPrune: StoredOperation[] = [];
+
+    for (const op of this.operations) {
       const stableSeq = stableFrontier[op.originPeerId] ?? 0;
       if (op.originSequenceNumber <= stableSeq) {
-        this.operations.splice(i, 1);
-        this.idIndex.delete(op.logicalEventId);
-        this.originSeqIndex.delete(`${op.originPeerId}:${op.originSequenceNumber}`);
-        const opFp = computeOperationFingerprint(op);
-        this.setCompactedCheckpoint(
-          op.originPeerId,
-          op.originSequenceNumber,
-          op.logicalTimestamp,
-          op.logicalEventId,
-          opFp,
-        );
-        toPrune.push(op);
+        candidateToPrune.push(op);
+      } else {
+        candidateRetainedOperations.push(op);
       }
     }
 
-    if (toPrune.length > 0) {
-      // Sort ascending to fold into base snapshot in deterministic total order
-      toPrune.sort((a, b) => compareOperations(a, b));
-      for (const op of toPrune) {
-        if (this.baseSnapshot && this.reducer) {
-          this.baseSnapshot = this.reducer(this.baseSnapshot, op);
-        }
-        this.baseSnapshotFrontier[op.originPeerId] = Math.max(
-          this.baseSnapshotFrontier[op.originPeerId] ?? 0,
-          op.originSequenceNumber,
-        );
-        this.originFrontierTimestamps.set(op.originPeerId, op.logicalTimestamp);
-        if (this.originFrontierTimestamps.size > 64) {
-          const firstKey = this.originFrontierTimestamps.keys().next().value;
-          if (firstKey) this.originFrontierTimestamps.delete(firstKey);
-        }
-      }
-      this.hasPrunedOperations = true;
+    if (candidateToPrune.length === 0) {
+      return 0;
     }
 
-    return toPrune.length;
+    // Sort operations to prune ascending to fold into base snapshot in deterministic total order
+    candidateToPrune.sort((a, b) => compareOperations(a, b));
+
+    // 1. Stage candidate base snapshot (deep cloned before reduction)
+    let candidateBaseSnapshot: PlaybackState | undefined = undefined;
+    if (this.baseSnapshot) {
+      candidateBaseSnapshot = deepClone(this.baseSnapshot);
+    }
+
+    // 2. Stage candidate indexes from candidateRetainedOperations
+    const candidateIdIndex = new Map<string, StoredOperation>();
+    const candidateOriginSeqIndex = new Map<string, StoredOperation>();
+    for (const op of candidateRetainedOperations) {
+      candidateIdIndex.set(op.logicalEventId, op);
+      candidateOriginSeqIndex.set(`${op.originPeerId}:${op.originSequenceNumber}`, op);
+    }
+
+    // 3. Stage candidate compactedCheckpoints (clone existing map)
+    const candidateCompactedCheckpoints = new Map<string, CompactedCheckpointRecord>(
+      this.compactedCheckpoints,
+    );
+
+    // 4. Stage candidate originFrontierTimestamps (clone existing map)
+    const candidateOriginFrontierTimestamps = new Map<string, number>(
+      this.originFrontierTimestamps,
+    );
+
+    // 5. Stage candidate baseSnapshotFrontier (clone existing object)
+    const candidateBaseSnapshotFrontier: Record<string, number> = {
+      ...this.baseSnapshotFrontier,
+    };
+
+    // 6. Update candidate checkpoints, base snapshot, baseSnapshotFrontier, and originFrontierTimestamps
+    for (const op of candidateToPrune) {
+      const opFp = computeOperationFingerprint(op);
+      const seqKey = `${op.originPeerId}:${op.originSequenceNumber}`;
+
+      candidateCompactedCheckpoints.set(seqKey, {
+        logicalTimestamp: op.logicalTimestamp,
+        logicalEventId: op.logicalEventId,
+        fingerprint: opFp,
+      });
+      if (candidateCompactedCheckpoints.size > this._capacity) {
+        const firstKey = candidateCompactedCheckpoints.keys().next().value;
+        if (firstKey) {
+          candidateCompactedCheckpoints.delete(firstKey);
+        }
+      }
+
+      // Fold op into candidate base snapshot using reducer
+      if (candidateBaseSnapshot && this.reducer) {
+        candidateBaseSnapshot = this.reducer(candidateBaseSnapshot, op);
+      }
+
+      candidateBaseSnapshotFrontier[op.originPeerId] = Math.max(
+        candidateBaseSnapshotFrontier[op.originPeerId] ?? 0,
+        op.originSequenceNumber,
+      );
+
+      candidateOriginFrontierTimestamps.set(op.originPeerId, op.logicalTimestamp);
+      if (candidateOriginFrontierTimestamps.size > 64) {
+        const firstKey = candidateOriginFrontierTimestamps.keys().next().value;
+        if (firstKey) candidateOriginFrontierTimestamps.delete(firstKey);
+      }
+    }
+
+    // 7. Stage candidate hasPrunedOperations
+    const candidateHasPrunedOperations = true;
+
+    // --- ALL POTENTIALLY THROWING OPERATIONS ARE COMPLETE ABOVE ---
+    // Perform synchronous reference replacement of all 8 mutable components.
+    // No await, callback, or external observer may execute between these assignments.
+    this.baseSnapshot = candidateBaseSnapshot;
+    this.operations = candidateRetainedOperations;
+    this.idIndex = candidateIdIndex;
+    this.originSeqIndex = candidateOriginSeqIndex;
+    this.compactedCheckpoints = candidateCompactedCheckpoints;
+    this.originFrontierTimestamps = candidateOriginFrontierTimestamps;
+    this.baseSnapshotFrontier = candidateBaseSnapshotFrontier;
+    this.hasPrunedOperations = candidateHasPrunedOperations;
+
+    return candidateToPrune.length;
   }
 
   public reset(baseSnapshot: PlaybackState, frontier?: Record<string, number>): void {

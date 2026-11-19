@@ -28,7 +28,9 @@ export type SyncEngineErrorCode =
   | 'DIGEST_MISMATCH'
   | 'DEGRADED_OUT_OF_SYNC'
   | 'INVALID_VERSION_VECTOR'
-  | 'BATCH_OVERFLOW';
+  | 'BATCH_OVERFLOW'
+  | 'INCOMPLETE_FRONTIER_METADATA'
+  | 'UNAUTHORIZED_FACADE_CALL';
 
 export class SyncEngineError extends Error {
   public readonly code: SyncEngineErrorCode;

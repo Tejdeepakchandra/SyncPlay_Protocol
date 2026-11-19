@@ -67,6 +67,9 @@ import {
 import type { PeerMesh, InboundMessage, PeerStatus, SendResult } from '@syncplay/peer-mesh';
 import { compareDigests } from '../replication/replication-comparator.js';
 import type { DigestComparisonResult, IAntiEntropyManager, AntiEntropyCallbacks } from '../replication/types.js';
+import { INTERNAL_DIGEST_ACCESS_TOKEN, type InternalDigestAccessToken } from './custody.js';
+
+export type { InternalDigestAccessToken };
 
 interface MutableStats {
   eventsReceivedCount: number;
@@ -560,7 +563,45 @@ export class TrustedTransportAdapter {
 
     // STATE_DIGEST (Anti-entropy comparison)
     if (type === 'STATE_DIGEST' || type === 'sync:state-digest') {
-      this.antiEntropyManager?.processRemoteDigest(msg.payload as StateDigestPayload);
+      const digestPayload = msg.payload as Partial<StateDigestPayload> | undefined;
+      if (!digestPayload || typeof digestPayload !== 'object') {
+        return;
+      }
+
+      // M4.0a Verification Rules:
+      // 1. Outer and inner session IDs match the active engine session
+      if (msg.sessionId !== this.engine.sessionId || digestPayload.sessionId !== this.engine.sessionId) {
+        return;
+      }
+
+      // 2. Outer senderPeerId equals actual inbound transport peer ID
+      if (msg.senderPeerId !== inbound.fromPeerId) {
+        return;
+      }
+
+      // 3. Inner payload senderPeerId equals actual inbound transport peer ID
+      if (digestPayload.senderPeerId !== inbound.fromPeerId) {
+        return;
+      }
+
+      // 4. Outer and inner membership epochs match current engine epoch
+      const currentEpoch = this.engine.epoch;
+      if (msg.membershipEpoch !== undefined && msg.membershipEpoch !== currentEpoch) {
+        return;
+      }
+      if (digestPayload.membershipEpoch !== currentEpoch) {
+        return;
+      }
+
+      // 5. Payload connectionGeneration matches current authenticated peer generation
+      if (digestPayload.connectionGeneration !== peerStatus.generation) {
+        return;
+      }
+      if (msg.connectionGeneration !== undefined && msg.connectionGeneration !== peerStatus.generation) {
+        return;
+      }
+
+      this.antiEntropyManager?.processRemoteDigest(digestPayload as StateDigestPayload);
       return;
     }
   }
@@ -1916,14 +1957,25 @@ export class LeaderlessSyncEngine implements SyncEngine {
   }
 
   /**
-   * Phase 7.5 M3: Snapshot creation from current committed engine state.
+   * Phase 7.5 M3/M4.0b: Snapshot creation from current committed engine state.
    * Generates deterministic RFC 8785 JSON SHA-256 digest, exact Lamport timestamps,
-   * and preserves all compacted checkpoints.
+   * and preserves all compacted checkpoints. Throws INCOMPLETE_FRONTIER_METADATA if any
+   * historical origin sequence timestamp is unresolvable.
    */
   public exportSnapshotV2(snapshotId?: string): StateSnapshotPayloadV2 {
-    const originTimestamps = this.operationLog.getOriginFrontierTimestamps
+    const rawOriginTimestamps = this.operationLog.getOriginFrontierTimestamps
       ? this.operationLog.getOriginFrontierTimestamps(this.replicationVector)
       : {};
+    const originTimestamps: Record<string, number> = {};
+    for (const [origin, ts] of Object.entries(rawOriginTimestamps)) {
+      if (ts === null) {
+        throw new SyncEngineError(
+          'INCOMPLETE_FRONTIER_METADATA',
+          `Cannot export snapshot: missing exact historical timestamp for origin ${origin} at sequence ${this.replicationVector[origin]}`,
+        );
+      }
+      originTimestamps[origin] = ts;
+    }
     const checkpoints = this.operationLog.getAllCompactedCheckpoints
       ? this.operationLog.getAllCompactedCheckpoints()
       : [];
@@ -1939,7 +1991,17 @@ export class LeaderlessSyncEngine implements SyncEngine {
     );
   }
 
-  public recordPeerDigest(digest: StateDigestPayload): void {
+  /**
+   * Restricts remote peer digest registration to internal capability token holders (M4.0c).
+   * Unverified callers without INTERNAL_DIGEST_ACCESS_TOKEN are rejected.
+   */
+  public recordPeerDigest(token: InternalDigestAccessToken, digest: StateDigestPayload): void {
+    if (token !== INTERNAL_DIGEST_ACCESS_TOKEN) {
+      throw new SyncEngineError(
+        'UNAUTHORIZED_FACADE_CALL',
+        'Direct registration of peer digests via public facade is unauthorized. Digests must be received through verified transport channels.',
+      );
+    }
     this.compactionManager.recordPeerDigest(digest);
   }
 

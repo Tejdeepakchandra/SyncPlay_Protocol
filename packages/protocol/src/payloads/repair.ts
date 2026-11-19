@@ -8,7 +8,7 @@
  * - PHASE7_4_INTERFACE_SPECIFICATION.md §1
  */
 import { z } from 'zod';
-import { MAX_OPERATIONS_PER_BATCH, MAX_VECTOR_ENTRIES } from '../constants.js';
+import { MAX_OPERATIONS_PER_BATCH, MAX_VECTOR_ENTRIES, ASCII_IDENTIFIER_REGEX } from '../constants.js';
 
 /**
  * Canonical UUID v4 regular expression (RFC 4122 §4.4).
@@ -387,10 +387,10 @@ export const StateDigestPayloadSchema = z.object({
   formatVersion: z.literal(2),
 
   /** Session identifier to ensure messages belong to active room. */
-  sessionId: z.string().min(1).max(128),
+  sessionId: z.string().min(1).max(128).regex(ASCII_IDENTIFIER_REGEX),
 
   /** The peer transmitting this digest. */
-  senderPeerId: z.string().min(1).max(64),
+  senderPeerId: z.string().min(1).max(64).regex(ASCII_IDENTIFIER_REGEX),
 
   /** Active connection generation of the sender at dispatch time. */
   connectionGeneration: z.number().int().positive().max(Number.MAX_SAFE_INTEGER),
@@ -454,7 +454,7 @@ export function isStateDigestV2(payload: unknown): payload is StateDigestPayload
 }
 
 export const CompactedCheckpointItemSchema = z.object({
-  originPeerId: z.string().min(1).max(64),
+  originPeerId: z.string().min(1).max(64).regex(ASCII_IDENTIFIER_REGEX),
   sequenceNumber: z.number().int().positive().max(Number.MAX_SAFE_INTEGER),
   logicalTimestamp: z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER),
 });
@@ -463,17 +463,17 @@ export type CompactedCheckpointItem = z.infer<typeof CompactedCheckpointItemSche
 
 export const StateSnapshotPayloadV2Schema = z.object({
   formatVersion: z.literal(2),
-  snapshotId: z.string().min(1).max(128),
-  sessionId: z.string().min(1).max(128),
+  snapshotId: z.string().min(1).max(128).regex(ASCII_IDENTIFIER_REGEX),
+  sessionId: z.string().min(1).max(128).regex(ASCII_IDENTIFIER_REGEX),
   membershipEpoch: z.number().int().nonnegative(),
-  authorPeerId: z.string().min(1).max(64),
+  authorPeerId: z.string().min(1).max(64).regex(ASCII_IDENTIFIER_REGEX),
   snapshotFrontier: z.record(
-    z.string().min(1).max(64),
+    z.string().min(1).max(64).regex(ASCII_IDENTIFIER_REGEX),
     z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER),
   ),
   maxLogicalTimestamp: z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER),
   originFrontierTimestamps: z.record(
-    z.string().min(1).max(64),
+    z.string().min(1).max(64).regex(ASCII_IDENTIFIER_REGEX),
     z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER),
   ),
   compactedCheckpoints: z.array(CompactedCheckpointItemSchema).max(256),

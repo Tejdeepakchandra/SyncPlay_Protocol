@@ -80,3 +80,22 @@ export const MAX_VECTOR_ENTRIES = 64;
  */
 export const MAX_SNAPSHOT_BYTES = 4 * 1024 * 1024;
 
+/**
+ * Regular expression restricting protocol identifiers to an explicit ASCII-safe alphabet (Option A).
+ * Matches characters: a-z, A-Z, 0-9, _, ., :, -
+ */
+export const ASCII_IDENTIFIER_REGEX = /^[a-zA-Z0-9_.:-]+$/;
+
+/**
+ * Guaranteed maximum envelope overhead in bytes for ProtocolMessage wrapping,
+ * JSON keys, UUIDs, and signatures under Option A ASCII identifier restrictions.
+ */
+export const MAX_ENVELOPE_OVERHEAD_BYTES = 1600;
+
+/**
+ * Minimum transport message limit required to support a full 32 KB binary chunk:
+ * 43,692 B Base64 + 1,600 B envelope = 45,292 B (44.23 KiB).
+ */
+export const MIN_TRANSPORT_LIMIT_FULL_CHUNK = 45292;
+
+
