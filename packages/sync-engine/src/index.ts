@@ -118,3 +118,15 @@ export type { OperationOrderingKey } from './ordering/comparator.js';
 // ── Phase 7.4 State Replication & Anti-Entropy Components ──────
 export * from './replication/index.js';
 
+// ── Phase 7.5 Snapshot Recovery Components ─────────────────────
+export { ChunkAssembler } from './recovery/chunk-assembler.js';
+export type {
+  ChunkAssemblerConfig,
+  InitTransferParams,
+  ChunkEnvelopeContext,
+  IngestChunkResult,
+  AssembledSnapshot,
+  FinalizeResult,
+  TransferProgress,
+} from './recovery/chunk-assembler.js';
+

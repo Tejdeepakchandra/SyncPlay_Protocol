@@ -121,4 +121,50 @@ export const MIN_TRANSPORT_LIMIT_CHUNK_TRANSFER = 2144;
  */
 export const MIN_TRANSPORT_LIMIT_FULL_CHUNK = 45492;
 
+/**
+ * Absolute maximum chunk binary payload size: 32 KB (32,768 bytes).
+ */
+export const MAX_CHUNK_BYTES = 32 * 1024;
+
+/**
+ * Maximum number of chunks allowed per snapshot transfer.
+ */
+export const MAX_CHUNKS_PER_SNAPSHOT = 128;
+
+/**
+ * Maximum concurrent in-flight chunk requests allowed per transfer.
+ */
+export const MAX_CONCURRENT_CHUNK_REQUESTS = 4;
+
+/**
+ * Minimum supported SCTP message limit for chunked snapshot transfer:
+ * 1,800 B envelope + 344 B Base64 (256 B raw) = 2,144 bytes.
+ */
+export const MIN_SUPPORTED_SCTP_LIMIT = 2144;
+
+/**
+ * Timeout in milliseconds before missing chunks in the active window are re-requested.
+ */
+export const CHUNK_REQUEST_TIMEOUT_MS = 5000;
+
+/**
+ * Maximum retransmission attempts allowed for an individual chunk index.
+ */
+export const MAX_CHUNK_RETRIES = 3;
+
+/**
+ * Maximum cumulative chunk retransmission attempts allowed across an entire transfer attempt.
+ */
+export const MAX_TRANSFER_RETRIES = 10;
+
+/**
+ * Hard wall-clock transfer deadline in milliseconds (60 seconds).
+ */
+export const OVERALL_TRANSFER_TIMEOUT_MS = 60000;
+
+/**
+ * Maximum concurrent outbound transfers served by a single supplier.
+ */
+export const MAX_SUPPLIER_CONCURRENT_TRANSFERS = 2;
+
 

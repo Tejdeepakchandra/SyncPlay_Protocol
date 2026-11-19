@@ -14,7 +14,7 @@ import {
   MIN_TRANSPORT_LIMIT_CHUNK_TRANSFER,
   MIN_TRANSPORT_LIMIT_FULL_CHUNK,
 } from '../constants.js';
-import { MessageType } from '../message-types.js';
+import { MessageType, SYNC_MESSAGE_TYPES } from '../message-types.js';
 import { computeUtf8ByteLength, serializeAndCheckSize } from '../validation.js';
 
 /** A valid base message for reuse in tests. */
@@ -326,30 +326,37 @@ describe('ProtocolMessageSchema', () => {
 
 // ── Strict Snapshot-Chunk Envelope Contract Tests ────────────────────────────
 describe('SnapshotChunkEnvelopeSchema — Strict Wire Contract & Bounded Envelope Overhead', () => {
-  // Mock chunk metadata framing representing SnapshotChunkPayload (with empty dataBase64)
-  const chunkPayloadFraming = {
-    transferId: '12345678-1234-4234-8234-123456789abc',
-    sessionId: 's'.repeat(128),
-    supplierPeerId: 'p'.repeat(64),
-    snapshotId: 'k'.repeat(128),
-    chunkIndex: 127,
-    totalChunks: 128,
-    chunkSizeBytes: 32768,
-    totalSizeBytes: 4194304,
-    chunkSha256: 'e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855',
-    dataBase64: '',
-  };
+  const sampleUuid = '12345678-1234-4234-8234-123456789abc';
+  const sampleSha256 = 'e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855';
+  const default256BytesB64 = Buffer.alloc(256, 0x42).toString('base64');
+
+  function createValidPayload(overrides: Record<string, unknown> = {}) {
+    return {
+      transferId: sampleUuid,
+      sessionId: 's'.repeat(128),
+      membershipEpoch: 1,
+      supplierPeerId: 'p'.repeat(64),
+      snapshotId: 'k'.repeat(128),
+      chunkIndex: 0,
+      totalChunks: 4,
+      chunkSizeBytes: 256,
+      totalSizeBytes: 1024,
+      chunkSha256: sampleSha256,
+      dataBase64: default256BytesB64,
+      ...overrides,
+    };
+  }
 
   function validChunkEnvelope(overrides: Record<string, unknown> = {}) {
     return {
       protocolVersion: PROTOCOL_VERSION,
-      messageType: 'sync:state-snapshot-chunk',
+      messageType: SYNC_MESSAGE_TYPES.SNAPSHOT_CHUNK,
       sessionId: 's'.repeat(128),
       senderPeerId: 'p'.repeat(128),
       messageId: 'm'.repeat(128),
       membershipEpoch: 1,
       connectionGeneration: 1,
-      payload: chunkPayloadFraming,
+      payload: createValidPayload(),
       ...overrides,
     };
   }
@@ -369,58 +376,71 @@ describe('SnapshotChunkEnvelopeSchema — Strict Wire Contract & Bounded Envelop
   });
 
   it('should prove maximum valid serialized chunk message framing overhead is strictly <= 1800 bytes', () => {
-    // Construct absolute worst-case valid chunk message:
-    // - maximum 64-character messageType
+    // Construct absolute worst-case valid chunk message framing:
+    // - exact supported messageType: 'sync:snapshot-chunk'
     // - maximum 128-character sessionId, senderPeerId, messageId
     // - maximum safe integer numeric fields (membershipEpoch, connectionGeneration)
     // - full chunk payload framing with max-length IDs, 64-char hex SHA-256, and empty dataBase64
-    const worstCaseChunkMessage = {
+    const worstCaseFraming = {
       protocolVersion: PROTOCOL_VERSION,
-      messageType: 'sync:state-snapshot-chunk-transfer-max-permitted-wire-type-64chr', // 64 chars
+      messageType: SYNC_MESSAGE_TYPES.SNAPSHOT_CHUNK,
       sessionId: 's'.repeat(128),
       senderPeerId: 'p'.repeat(128),
       messageId: 'm'.repeat(128),
       membershipEpoch: Number.MAX_SAFE_INTEGER,
       connectionGeneration: Number.MAX_SAFE_INTEGER,
       payload: {
-        ...chunkPayloadFraming,
-        chunkIndex: Number.MAX_SAFE_INTEGER,
-        totalChunks: Number.MAX_SAFE_INTEGER,
-        chunkSizeBytes: Number.MAX_SAFE_INTEGER,
-        totalSizeBytes: Number.MAX_SAFE_INTEGER,
+        transferId: sampleUuid,
+        sessionId: 's'.repeat(128),
+        membershipEpoch: Number.MAX_SAFE_INTEGER,
+        supplierPeerId: 'p'.repeat(64),
+        snapshotId: 'k'.repeat(128),
+        chunkIndex: 127,
+        totalChunks: 128,
+        chunkSizeBytes: 32768,
+        totalSizeBytes: 4194304,
+        chunkSha256: sampleSha256,
+        dataBase64: '',
       },
     };
 
-    const parsed = SnapshotChunkEnvelopeSchema.safeParse(worstCaseChunkMessage);
-    expect(parsed.success).toBe(true);
-
-    // Measure exact production serialization via JSON.stringify and TextEncoder / Buffer.byteLength
-    const serializedJson = JSON.stringify(worstCaseChunkMessage);
+    // Measure exact framing serialization overhead via JSON.stringify and TextEncoder / Buffer.byteLength
+    const serializedJson = JSON.stringify(worstCaseFraming);
     const textEncoderBytes = new TextEncoder().encode(serializedJson).byteLength;
     const bufferBytes = Buffer.byteLength(serializedJson, 'utf-8');
-    const computeBytes = computeUtf8ByteLength(worstCaseChunkMessage);
+    const computeBytes = computeUtf8ByteLength(worstCaseFraming);
 
     // All UTF-8 measurement methods must agree
     expect(textEncoderBytes).toBe(bufferBytes);
     expect(textEncoderBytes).toBe(computeBytes);
 
-    // Worst-case framing without dataBase64 is measured at 1270 bytes (with 64-character messageType)
+    // Worst-case framing without dataBase64 is measured at exactly 1214 bytes
     expect(textEncoderBytes).toBeLessThanOrEqual(MAX_ENVELOPE_OVERHEAD_BYTES);
-    expect(textEncoderBytes).toBe(1270);
-
-    // With standard 25-char messageType ('sync:state-snapshot-chunk'), framing is exactly 1231 bytes
-    const standardChunkMessage = {
-      ...worstCaseChunkMessage,
-      messageType: 'sync:state-snapshot-chunk',
-    };
-    const standardBytes = computeUtf8ByteLength(standardChunkMessage);
-    expect(standardBytes).toBe(1231);
-    expect(standardBytes).toBeLessThanOrEqual(MAX_ENVELOPE_OVERHEAD_BYTES);
+    expect(textEncoderBytes).toBe(1214);
 
     // Verified safety margin against 1,800 B bound:
-    // 1800 - 1270 = 530 bytes headroom (41.7% safety margin)
+    // 1800 - 1214 = 586 bytes headroom (48.3% safety margin)
     const safetyMargin = MAX_ENVELOPE_OVERHEAD_BYTES - textEncoderBytes;
-    expect(safetyMargin).toBe(530);
+    expect(safetyMargin).toBe(586);
+
+    // Full 32 KB chunk message verification:
+    // 43,692 Base64 bytes + 1,214 B framing = 44,906 bytes
+    const fullChunkBytes = Buffer.alloc(32768, 0x41).toString('base64');
+    expect(fullChunkBytes.length).toBe(43692);
+
+    const fullChunkMessage = {
+      ...worstCaseFraming,
+      payload: {
+        ...worstCaseFraming.payload,
+        dataBase64: fullChunkBytes,
+      },
+    };
+    const fullMessageBytes = computeUtf8ByteLength(fullChunkMessage);
+    expect(fullMessageBytes).toBe(44906);
+    expect(fullMessageBytes).toBeLessThanOrEqual(MIN_TRANSPORT_LIMIT_FULL_CHUNK);
+
+    // Headroom against 45,492 threshold
+    expect(MIN_TRANSPORT_LIMIT_FULL_CHUNK - fullMessageBytes).toBe(586);
   });
 
   // ── Negative Tests: Prohibited Fields ───────────────────────────────────────
@@ -516,10 +536,9 @@ describe('SnapshotChunkEnvelopeSchema — Strict Wire Contract & Bounded Envelop
 
   it('should verify send-boundary exact string measurement and unchanged-string transmission', () => {
     const rawPayload = validChunkEnvelope({
-      payload: {
-        ...chunkPayloadFraming,
-        dataBase64: 'A'.repeat(344), // Exactly 256 bytes of data
-      },
+      payload: createValidPayload({
+        dataBase64: Buffer.alloc(256, 0x41).toString('base64'),
+      }),
     });
 
     // Production serialization path

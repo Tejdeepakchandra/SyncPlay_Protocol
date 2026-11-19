@@ -32,6 +32,13 @@ export const MessageType = {
   OPERATION_BATCH: 'OPERATION_BATCH',
   REPAIR_REQUEST: 'REPAIR_REQUEST',
   REPAIR_REJECTED: 'REPAIR_REJECTED',
+
+  // Snapshot transfer recovery (Phase 7.5 M4)
+  SNAPSHOT_OFFER: 'SNAPSHOT_OFFER',
+  SNAPSHOT_REQUEST: 'SNAPSHOT_REQUEST',
+  SNAPSHOT_CHUNK: 'SNAPSHOT_CHUNK',
+  SNAPSHOT_CHUNK_REQUEST: 'SNAPSHOT_CHUNK_REQUEST',
+  SNAPSHOT_ABORT: 'SNAPSHOT_ABORT',
 } as const;
 
 /** Union of all known message type string values. */
@@ -52,6 +59,13 @@ export const SYNC_MESSAGE_TYPES = {
   REPAIR_REQUEST: 'sync:repair-request',
   // Explicit negative acknowledgement for unfulfillable repair request
   REPAIR_REJECTED: 'sync:repair-rejected',
+
+  // Snapshot transfer recovery (Phase 7.5 M4)
+  SNAPSHOT_OFFER: 'sync:snapshot-offer',
+  SNAPSHOT_REQUEST: 'sync:snapshot-request',
+  SNAPSHOT_CHUNK: 'sync:snapshot-chunk',
+  SNAPSHOT_CHUNK_REQUEST: 'sync:snapshot-chunk-request',
+  SNAPSHOT_ABORT: 'sync:snapshot-abort',
 } as const;
 
 export type SyncMessageType = (typeof SYNC_MESSAGE_TYPES)[keyof typeof SYNC_MESSAGE_TYPES];

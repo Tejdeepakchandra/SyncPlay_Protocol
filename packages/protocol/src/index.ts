@@ -23,6 +23,15 @@ export {
   MIN_BASE64_CHUNK_BYTES,
   MIN_TRANSPORT_LIMIT_CHUNK_TRANSFER,
   MIN_TRANSPORT_LIMIT_FULL_CHUNK,
+  MAX_CHUNK_BYTES,
+  MAX_CHUNKS_PER_SNAPSHOT,
+  MAX_CONCURRENT_CHUNK_REQUESTS,
+  MIN_SUPPORTED_SCTP_LIMIT,
+  CHUNK_REQUEST_TIMEOUT_MS,
+  MAX_CHUNK_RETRIES,
+  MAX_TRANSFER_RETRIES,
+  OVERALL_TRANSFER_TIMEOUT_MS,
+  MAX_SUPPLIER_CONCURRENT_TRANSFERS,
 } from './constants.js';
 
 // ── Identity types ───────────────────────────────────────────
@@ -119,6 +128,31 @@ export {
   REPAIR_REJECTION_REASONS,
   validateContiguousSequenceBatch,
 } from './payloads/repair.js';
+
+// ── Snapshot Recovery Payloads (Phase 7.5 M4) ───────────────
+export type {
+  SnapshotAbortReason,
+  SnapshotOfferPayload,
+  SnapshotRequestPayload,
+  SnapshotChunkPayload,
+  SnapshotChunkRequestPayload,
+  SnapshotAbortPayload,
+} from './payloads/snapshot-recovery.js';
+export {
+  SnapshotAbortReasonSchema,
+  SnapshotOfferPayloadSchema,
+  SnapshotRequestPayloadSchema,
+  SnapshotChunkPayloadSchema,
+  SnapshotChunkRequestPayloadSchema,
+  SnapshotAbortPayloadSchema,
+} from './payloads/snapshot-recovery.js';
+
+// ── Admission and Dynamic Sizing ─────────────────────────────
+export type { SnapshotAdmissionResult } from './admission.js';
+export {
+  calculateChunkCapacity,
+  calculateSnapshotAdmission,
+} from './admission.js';
 
 // ── Payload schema registry ─────────────────────────────────
 export { PAYLOAD_SCHEMAS, StateDigestWireSchema } from './payloads/index.js';

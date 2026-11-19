@@ -38,6 +38,14 @@ import {
   StateSnapshotPayloadV2Schema,
   REPAIR_REJECTION_REASONS,
 } from './repair.js';
+import {
+  SnapshotAbortReasonSchema,
+  SnapshotOfferPayloadSchema,
+  SnapshotRequestPayloadSchema,
+  SnapshotChunkPayloadSchema,
+  SnapshotChunkRequestPayloadSchema,
+  SnapshotAbortPayloadSchema,
+} from './snapshot-recovery.js';
 
 export { PingPayloadSchema, PongPayloadSchema } from './ping-pong.js';
 export {
@@ -94,6 +102,23 @@ export type {
   ContiguousSequenceBatchData,
 } from './repair.js';
 
+export {
+  SnapshotAbortReasonSchema,
+  SnapshotOfferPayloadSchema,
+  SnapshotRequestPayloadSchema,
+  SnapshotChunkPayloadSchema,
+  SnapshotChunkRequestPayloadSchema,
+  SnapshotAbortPayloadSchema,
+} from './snapshot-recovery.js';
+export type {
+  SnapshotAbortReason,
+  SnapshotOfferPayload,
+  SnapshotRequestPayload,
+  SnapshotChunkPayload,
+  SnapshotChunkRequestPayload,
+  SnapshotAbortPayload,
+} from './snapshot-recovery.js';
+
 /**
  * Union schema for STATE_DIGEST message type, accepting either Phase 7.4 V2 multi-vector
  * digest or Phase 2 V1 legacy digest.
@@ -117,11 +142,21 @@ const entries: ReadonlyArray<[string, z.ZodTypeAny]> = [
   [MessageType.OPERATION_BATCH, OperationBatchPayloadSchema],
   [MessageType.REPAIR_REQUEST, RepairRequestPayloadSchema],
   [MessageType.REPAIR_REJECTED, RepairRejectedPayloadSchema],
+  [MessageType.SNAPSHOT_OFFER, SnapshotOfferPayloadSchema],
+  [MessageType.SNAPSHOT_REQUEST, SnapshotRequestPayloadSchema],
+  [MessageType.SNAPSHOT_CHUNK, SnapshotChunkPayloadSchema],
+  [MessageType.SNAPSHOT_CHUNK_REQUEST, SnapshotChunkRequestPayloadSchema],
+  [MessageType.SNAPSHOT_ABORT, SnapshotAbortPayloadSchema],
   [SYNC_MESSAGE_TYPES.CONTROL_EVENT, z.unknown()],
   [SYNC_MESSAGE_TYPES.OPERATION_BATCH, OperationBatchPayloadSchema],
   [SYNC_MESSAGE_TYPES.STATE_DIGEST, StateDigestPayloadSchema],
   [SYNC_MESSAGE_TYPES.REPAIR_REQUEST, RepairRequestPayloadSchema],
   [SYNC_MESSAGE_TYPES.REPAIR_REJECTED, RepairRejectedPayloadSchema],
+  [SYNC_MESSAGE_TYPES.SNAPSHOT_OFFER, SnapshotOfferPayloadSchema],
+  [SYNC_MESSAGE_TYPES.SNAPSHOT_REQUEST, SnapshotRequestPayloadSchema],
+  [SYNC_MESSAGE_TYPES.SNAPSHOT_CHUNK, SnapshotChunkPayloadSchema],
+  [SYNC_MESSAGE_TYPES.SNAPSHOT_CHUNK_REQUEST, SnapshotChunkRequestPayloadSchema],
+  [SYNC_MESSAGE_TYPES.SNAPSHOT_ABORT, SnapshotAbortPayloadSchema],
 ];
 
 export const PAYLOAD_SCHEMAS: ReadonlyMap<string, z.ZodTypeAny> = new Map(entries);

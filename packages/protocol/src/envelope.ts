@@ -14,7 +14,12 @@
  * at the validation layer, not here.
  */
 import { z } from 'zod';
-import { ASCII_IDENTIFIER_REGEX } from './constants.js';
+import { ASCII_IDENTIFIER_REGEX, PROTOCOL_VERSION } from './constants.js';
+import { MessageType, SYNC_MESSAGE_TYPES } from './message-types.js';
+import {
+  SnapshotChunkPayloadSchema,
+  type SnapshotChunkPayload,
+} from './payloads/snapshot-recovery.js';
 import type { PeerId, SessionId, MessageId, LogicalEventId } from './identity.js';
 
 /**
@@ -118,14 +123,17 @@ export const ProtocolMessageSchema = z.object({
  */
 export const SnapshotChunkEnvelopeSchema = z
   .object({
-    protocolVersion: z.number().int().positive(),
-    messageType: z.string().min(1).max(64),
+    protocolVersion: z.literal(PROTOCOL_VERSION),
+    messageType: z.union([
+      z.literal(SYNC_MESSAGE_TYPES.SNAPSHOT_CHUNK),
+      z.literal(MessageType.SNAPSHOT_CHUNK),
+    ]),
     sessionId: z.string().min(1).max(128).regex(ASCII_IDENTIFIER_REGEX),
     senderPeerId: z.string().min(1).max(128).regex(ASCII_IDENTIFIER_REGEX),
     messageId: z.string().min(1).max(128).regex(ASCII_IDENTIFIER_REGEX),
-    membershipEpoch: z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER).optional(),
-    connectionGeneration: z.number().int().positive().max(Number.MAX_SAFE_INTEGER).optional(),
-    payload: z.unknown(),
+    membershipEpoch: z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER),
+    connectionGeneration: z.number().int().positive().max(Number.MAX_SAFE_INTEGER),
+    payload: SnapshotChunkPayloadSchema,
     // Strictly prohibited fields on snapshot chunk wire envelopes
     causalContext: z
       .never({ message: 'Snapshot chunk envelope must not contain causalContext' })
@@ -145,13 +153,13 @@ export const SnapshotChunkEnvelopeSchema = z
   })
   .strict();
 
-export interface SnapshotChunkEnvelope<TPayload = unknown> {
-  readonly protocolVersion: number;
-  readonly messageType: string;
+export interface SnapshotChunkEnvelope {
+  readonly protocolVersion: typeof PROTOCOL_VERSION;
+  readonly messageType: typeof SYNC_MESSAGE_TYPES.SNAPSHOT_CHUNK | typeof MessageType.SNAPSHOT_CHUNK;
   readonly sessionId: SessionId;
   readonly senderPeerId: PeerId;
   readonly messageId: MessageId;
-  readonly membershipEpoch?: number;
-  readonly connectionGeneration?: number;
-  readonly payload: TPayload;
+  readonly membershipEpoch: number;
+  readonly connectionGeneration: number;
+  readonly payload: SnapshotChunkPayload;
 }

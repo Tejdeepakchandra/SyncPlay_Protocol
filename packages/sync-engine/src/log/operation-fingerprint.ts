@@ -106,7 +106,7 @@ export function canonicalizeJson(value: unknown, seen: Set<object> = new Set()):
  * Pure TypeScript synchronous SHA-256 (FIPS 180-4) implementation.
  * Deterministic across all environments (Node.js, Vite/browsers, Web Workers).
  */
-export function sha256(input: string): string {
+export function sha256(input: string | Uint8Array): string {
   function rightRotate(value: number, amount: number): number {
     return (value >>> amount) | (value << (32 - amount));
   }
@@ -126,7 +126,7 @@ export function sha256(input: string): string {
     0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 0x510e527f, 0x9b05688c, 0x1f83d9ab, 0x5be0cd19,
   ];
 
-  const utf8 = new TextEncoder().encode(input);
+  const utf8 = typeof input === 'string' ? new TextEncoder().encode(input) : input;
   const bitLength = utf8.length * 8;
   const wordCount = (((bitLength + 64) >>> 9) << 4) + 16;
   const words = new Int32Array(wordCount);

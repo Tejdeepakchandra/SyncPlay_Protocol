@@ -18,7 +18,7 @@
  * Returns typed Result<T> — no exceptions for expected invalid input.
  */
 import type { z } from 'zod';
-import { ProtocolMessageSchema } from './envelope.js';
+import { ProtocolMessageSchema, SnapshotChunkEnvelopeSchema } from './envelope.js';
 import type { ProtocolMessage } from './envelope.js';
 import {
   PROTOCOL_VERSION,
@@ -172,6 +172,30 @@ export function validatePayload(
  * @returns The validated ProtocolMessage on success.
  */
 export function validateMessage(raw: unknown): Result<ProtocolMessage> {
+  // Strict snapshot-chunk wire contract handling
+  if (
+    raw !== null &&
+    typeof raw === 'object' &&
+    'messageType' in raw &&
+    (raw.messageType === SYNC_MESSAGE_TYPES.SNAPSHOT_CHUNK ||
+      raw.messageType === MessageType.SNAPSHOT_CHUNK)
+  ) {
+    const chunkResult = SnapshotChunkEnvelopeSchema.safeParse(raw);
+    if (!chunkResult.success) {
+      return fail(
+        'INVALID_ENVELOPE',
+        `Invalid snapshot chunk message: ${formatZodError(chunkResult.error)}`,
+        zodErrorPath(chunkResult.error),
+      );
+    }
+    const chunkMessage = chunkResult.data;
+    const payloadSizeResult = checkPayloadSize(chunkMessage.payload, MAX_MESSAGE_BYTES);
+    if (!payloadSizeResult.ok) {
+      return payloadSizeResult as Result<never>;
+    }
+    return { ok: true, value: chunkMessage as unknown as ProtocolMessage };
+  }
+
   // 1. Validate envelope structure
   const envelopeResult = ProtocolMessageSchema.safeParse(raw);
   if (!envelopeResult.success) {

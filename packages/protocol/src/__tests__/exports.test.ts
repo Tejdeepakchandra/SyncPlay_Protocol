@@ -22,6 +22,15 @@ import {
   MIN_BASE64_CHUNK_BYTES,
   MIN_TRANSPORT_LIMIT_CHUNK_TRANSFER,
   MIN_TRANSPORT_LIMIT_FULL_CHUNK,
+  MAX_CHUNK_BYTES,
+  MAX_CHUNKS_PER_SNAPSHOT,
+  MAX_CONCURRENT_CHUNK_REQUESTS,
+  MIN_SUPPORTED_SCTP_LIMIT,
+  CHUNK_REQUEST_TIMEOUT_MS,
+  MAX_CHUNK_RETRIES,
+  MAX_TRANSFER_RETRIES,
+  OVERALL_TRANSFER_TIMEOUT_MS,
+  MAX_SUPPLIER_CONCURRENT_TRANSFERS,
 
   // Message type registry
   MessageType,
@@ -58,6 +67,16 @@ import {
   REPAIR_REJECTION_REASONS,
   PAYLOAD_SCHEMAS,
   StateDigestWireSchema,
+  SnapshotAbortReasonSchema,
+  SnapshotOfferPayloadSchema,
+  SnapshotRequestPayloadSchema,
+  SnapshotChunkPayloadSchema,
+  SnapshotChunkRequestPayloadSchema,
+  SnapshotAbortPayloadSchema,
+
+  // Admission
+  calculateChunkCapacity,
+  calculateSnapshotAdmission,
 
   // Helpers
   UUID_V4_REGEX,
@@ -124,6 +143,15 @@ describe('Public exports', () => {
     expect(MIN_BASE64_CHUNK_BYTES).toBe(344);
     expect(MIN_TRANSPORT_LIMIT_CHUNK_TRANSFER).toBe(2144);
     expect(MIN_TRANSPORT_LIMIT_FULL_CHUNK).toBe(45492);
+    expect(MAX_CHUNK_BYTES).toBe(32768);
+    expect(MAX_CHUNKS_PER_SNAPSHOT).toBe(128);
+    expect(MAX_CONCURRENT_CHUNK_REQUESTS).toBe(4);
+    expect(MIN_SUPPORTED_SCTP_LIMIT).toBe(2144);
+    expect(CHUNK_REQUEST_TIMEOUT_MS).toBe(5000);
+    expect(MAX_CHUNK_RETRIES).toBe(3);
+    expect(MAX_TRANSFER_RETRIES).toBe(10);
+    expect(OVERALL_TRANSFER_TIMEOUT_MS).toBe(60000);
+    expect(MAX_SUPPLIER_CONCURRENT_TRANSFERS).toBe(2);
   });
 
   it('should export ProtocolMessageSchema and SnapshotChunkEnvelopeSchema', () => {
@@ -133,8 +161,8 @@ describe('Public exports', () => {
     expect(typeof SnapshotChunkEnvelopeSchema.safeParse).toBe('function');
   });
 
-  it('should export all known message types including Phase 7.4 anti-entropy', () => {
-    expect(KNOWN_MESSAGE_TYPES.size).toBe(17);
+  it('should export all known message types including Phase 7.4 anti-entropy and Phase 7.5 snapshot recovery', () => {
+    expect(KNOWN_MESSAGE_TYPES.size).toBe(27);
     expect(KNOWN_MESSAGE_TYPES.has(MessageType.PING)).toBe(true);
     expect(KNOWN_MESSAGE_TYPES.has(MessageType.PONG)).toBe(true);
     expect(KNOWN_MESSAGE_TYPES.has(MessageType.PLAY)).toBe(true);
@@ -147,6 +175,11 @@ describe('Public exports', () => {
     expect(KNOWN_MESSAGE_TYPES.has(MessageType.OPERATION_BATCH)).toBe(true);
     expect(KNOWN_MESSAGE_TYPES.has(MessageType.REPAIR_REQUEST)).toBe(true);
     expect(KNOWN_MESSAGE_TYPES.has(MessageType.REPAIR_REJECTED)).toBe(true);
+    expect(KNOWN_MESSAGE_TYPES.has(MessageType.SNAPSHOT_OFFER)).toBe(true);
+    expect(KNOWN_MESSAGE_TYPES.has(MessageType.SNAPSHOT_REQUEST)).toBe(true);
+    expect(KNOWN_MESSAGE_TYPES.has(MessageType.SNAPSHOT_CHUNK)).toBe(true);
+    expect(KNOWN_MESSAGE_TYPES.has(MessageType.SNAPSHOT_CHUNK_REQUEST)).toBe(true);
+    expect(KNOWN_MESSAGE_TYPES.has(MessageType.SNAPSHOT_ABORT)).toBe(true);
 
     // Wire subprotocol constants
     expect(KNOWN_MESSAGE_TYPES.has(SYNC_MESSAGE_TYPES.CONTROL_EVENT)).toBe(true);
@@ -154,6 +187,11 @@ describe('Public exports', () => {
     expect(KNOWN_MESSAGE_TYPES.has(SYNC_MESSAGE_TYPES.STATE_DIGEST)).toBe(true);
     expect(KNOWN_MESSAGE_TYPES.has(SYNC_MESSAGE_TYPES.REPAIR_REQUEST)).toBe(true);
     expect(KNOWN_MESSAGE_TYPES.has(SYNC_MESSAGE_TYPES.REPAIR_REJECTED)).toBe(true);
+    expect(KNOWN_MESSAGE_TYPES.has(SYNC_MESSAGE_TYPES.SNAPSHOT_OFFER)).toBe(true);
+    expect(KNOWN_MESSAGE_TYPES.has(SYNC_MESSAGE_TYPES.SNAPSHOT_REQUEST)).toBe(true);
+    expect(KNOWN_MESSAGE_TYPES.has(SYNC_MESSAGE_TYPES.SNAPSHOT_CHUNK)).toBe(true);
+    expect(KNOWN_MESSAGE_TYPES.has(SYNC_MESSAGE_TYPES.SNAPSHOT_CHUNK_REQUEST)).toBe(true);
+    expect(KNOWN_MESSAGE_TYPES.has(SYNC_MESSAGE_TYPES.SNAPSHOT_ABORT)).toBe(true);
   });
 
   it('should export REQUIRES_LOGICAL_EVENT_ID with 4 control types', () => {
@@ -197,11 +235,17 @@ describe('Public exports', () => {
     expect(typeof CompactedCheckpointItemSchema.safeParse).toBe('function');
     expect(typeof StateSnapshotPayloadV2Schema.safeParse).toBe('function');
     expect(typeof StateDigestWireSchema.safeParse).toBe('function');
+    expect(typeof SnapshotAbortReasonSchema.safeParse).toBe('function');
+    expect(typeof SnapshotOfferPayloadSchema.safeParse).toBe('function');
+    expect(typeof SnapshotRequestPayloadSchema.safeParse).toBe('function');
+    expect(typeof SnapshotChunkPayloadSchema.safeParse).toBe('function');
+    expect(typeof SnapshotChunkRequestPayloadSchema.safeParse).toBe('function');
+    expect(typeof SnapshotAbortPayloadSchema.safeParse).toBe('function');
     expect(typeof UUIDv4Schema.safeParse).toBe('function');
     expect(UUID_V4_REGEX instanceof RegExp).toBe(true);
   });
 
-  it('should export validation and size helper functions', () => {
+  it('should export validation, size helper, and admission functions', () => {
     expect(typeof validateMessage).toBe('function');
     expect(typeof validatePayload).toBe('function');
     expect(typeof checkMessageSize).toBe('function');
@@ -212,6 +256,8 @@ describe('Public exports', () => {
     expect(typeof isLegacyStateDigest).toBe('function');
     expect(typeof isStateDigestV2).toBe('function');
     expect(typeof validateContiguousSequenceBatch).toBe('function');
+    expect(typeof calculateChunkCapacity).toBe('function');
+    expect(typeof calculateSnapshotAdmission).toBe('function');
   });
 
   it('should export PAYLOAD_SCHEMAS map with entry for each message type', () => {
