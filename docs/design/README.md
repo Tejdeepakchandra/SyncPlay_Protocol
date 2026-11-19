@@ -69,4 +69,12 @@ The master planning suite for Phase 7 is located at the root of the `docs/` dire
 - `docs/PHASE7_4_ACCEPTANCE_CRITERIA.md`: Seven levels of state agreement, 10 mandatory acceptance criteria (AC-1–AC-10), performance thresholds, and test verification matrix.
 - `docs/PHASE7_4_RISK_REGISTER.md`: Risk inventory (amplification storms, silent forks, stale replay, memory bloat, churn, buffer starvation), trigger conditions, automated mitigations, and telemetry counters.
 
+### Milestone P7.5 Fault Tolerance & State Recovery (Planning & Specification)
+- `docs/PHASE7_5_RESEARCH_AND_PROBLEM_DEFINITION.md`: Deep research, failure mode analysis, theoretical foundations, and comprehensive answers to the 18 core recovery research questions.
+- `docs/PHASE7_5_ARCHITECTURE.md`: High-level and low-level architecture for snapshot generation, compaction horizon, 4-state recovery machine (`ACTIVE`, `RECOVERING`, `RECONCILING`, `DEGRADED`), chunked DataChannel transport, and atomic staging/installation.
+- `docs/PHASE7_5_INTERFACE_SPECIFICATION.md`: Wire protocol contracts (`SNAPSHOT_OFFER`, `SNAPSHOT_REQUEST`, `SNAPSHOT_CHUNK`, `SNAPSHOT_CHUNK_REQUEST`, `SNAPSHOT_ABORT`), Zod schemas, subsystem interfaces (`ISnapshotTransferManager`, `IRecoveryCoordinator`, `ISnapshotInstaller`), and error taxonomy.
+- `docs/PHASE7_5_IMPLEMENTATION_ROADMAP.md`: Six-stage staged delivery plan (M1–M6), affected files, dependency gating, invariants, verification plans, and prohibited work per milestone.
+- `docs/PHASE7_5_ACCEPTANCE_CRITERIA.md`: Granular, testable pass/fail acceptance criteria (AC-COMPACT, AC-ELIGIBLE, AC-XFER, AC-INSTALL, AC-CLOCK, AC-REGRESSION).
+- `docs/PHASE7_5_RISK_REGISTER.md`: Comprehensive risk inventory (memory exhaustion, split-brain divergence, quarantine overflow, SCTP overflow, clock inflation), severity ratings, triggers, automated mitigations, and test plans.
+
 Use the consistency review and interface contracts as cross-module references; module LLDs provide task-specific detail.
