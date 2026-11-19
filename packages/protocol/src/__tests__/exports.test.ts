@@ -78,6 +78,10 @@ import {
   calculateChunkCapacity,
   calculateSnapshotAdmission,
 
+  // Base64 helpers
+  decodeBase64,
+  encodeBase64,
+
   // Helpers
   UUID_V4_REGEX,
   UUIDv4Schema,
@@ -258,6 +262,8 @@ describe('Public exports', () => {
     expect(typeof validateContiguousSequenceBatch).toBe('function');
     expect(typeof calculateChunkCapacity).toBe('function');
     expect(typeof calculateSnapshotAdmission).toBe('function');
+    expect(typeof decodeBase64).toBe('function');
+    expect(typeof encodeBase64).toBe('function');
   });
 
   it('should export PAYLOAD_SCHEMAS map with entry for each message type', () => {

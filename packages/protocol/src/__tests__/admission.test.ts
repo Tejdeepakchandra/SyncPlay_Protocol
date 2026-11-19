@@ -104,6 +104,7 @@ describe('Phase 7.5 M4.1 — Transport-Dependent Admission and Sizing', () => {
       const result = calculateSnapshotAdmission(500, 2144);
       expect(result.eligible).toBe(true);
       expect(result.chunkBinaryCapacity).toBe(258);
+      expect(result.nominalChunkSizeBytes).toBe(258);
       expect(result.requiredChunks).toBe(2);
       expect(result.effectiveLimit).toBe(2144);
     });
@@ -154,6 +155,25 @@ describe('Phase 7.5 M4.1 — Transport-Dependent Admission and Sizing', () => {
       const result = calculateSnapshotAdmission(10000, 65536, 1);
       expect(result.eligible).toBe(true);
       expect(result.requiredChunks).toBe(1);
+    });
+
+    it('should reject when advertisedNominalChunkSizeBytes differs from calculated chunkCapacity (OFFER_INCONSISTENT)', () => {
+      // For 65,536 B transport, capacity is 32,768.
+      // If offer advertises nominalChunkSizeBytes = 16384, reject as OFFER_INCONSISTENT.
+      const result = calculateSnapshotAdmission(10000, 65536, 1, {
+        advertisedNominalChunkSizeBytes: 16384,
+      });
+      expect(result.eligible).toBe(false);
+      expect(result.reason).toBe('OFFER_INCONSISTENT');
+      expect(result.detail).toContain('differ');
+    });
+
+    it('should accept when advertisedNominalChunkSizeBytes matches calculated chunkCapacity', () => {
+      const result = calculateSnapshotAdmission(10000, 65536, 1, {
+        advertisedNominalChunkSizeBytes: MAX_CHUNK_BYTES,
+      });
+      expect(result.eligible).toBe(true);
+      expect(result.nominalChunkSizeBytes).toBe(MAX_CHUNK_BYTES);
     });
 
     it('should reject snapshot size exceeding MAX_SNAPSHOT_BYTES (4 MiB)', () => {

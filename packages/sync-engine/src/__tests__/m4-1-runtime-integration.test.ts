@@ -97,6 +97,7 @@ describe('Phase 7.5 M4.1 Runtime Integration — Network Boundary & Chunk Assemb
       snapshotId: sampleSnapshotId,
       totalChunks: 2,
       totalSizeBytes: 512,
+      nominalChunkSizeBytes: 256,
       expectedSha256Digest: overallSha,
       supplierPeerId: sampleSupplier,
       membershipEpoch: sampleEpoch,
@@ -241,6 +242,77 @@ describe('Phase 7.5 M4.1 Runtime Integration — Network Boundary & Chunk Assemb
     expect(parseResult.ok).toBe(false);
     if (!parseResult.ok) {
       expect(parseResult.error.code).toBe('INVALID_ENVELOPE');
+    }
+  });
+
+  it('should reject snapshot chunk with envelope vs payload identity mismatch at boundary', () => {
+    const rawData = new Uint8Array(256);
+    const validBasePayload = {
+      transferId: sampleUuid,
+      sessionId: sampleSessionId,
+      membershipEpoch: sampleEpoch,
+      supplierPeerId: sampleSupplier,
+      snapshotId: sampleSnapshotId,
+      chunkIndex: 0,
+      totalChunks: 1,
+      chunkSizeBytes: 256,
+      totalSizeBytes: 256,
+      chunkSha256: sha256(rawData),
+      dataBase64: Buffer.from(rawData).toString('base64'),
+    };
+
+    // 1. SessionId mismatch
+    const wireSessionMismatch = JSON.stringify({
+      protocolVersion: PROTOCOL_VERSION,
+      messageType: SYNC_MESSAGE_TYPES.SNAPSHOT_CHUNK,
+      sessionId: 'wrong-session',
+      senderPeerId: sampleSupplier,
+      messageId: 'msg-mismatch-1',
+      membershipEpoch: sampleEpoch,
+      connectionGeneration: sampleGeneration,
+      payload: validBasePayload,
+    });
+    const res1 = parseAndValidateMessage(wireSessionMismatch);
+    expect(res1.ok).toBe(false);
+    if (!res1.ok) {
+      expect(res1.error.code).toBe('INVALID_ENVELOPE');
+      expect(res1.error.message).toMatch(/sessionId/i);
+    }
+
+    // 2. Epoch mismatch
+    const wireEpochMismatch = JSON.stringify({
+      protocolVersion: PROTOCOL_VERSION,
+      messageType: SYNC_MESSAGE_TYPES.SNAPSHOT_CHUNK,
+      sessionId: sampleSessionId,
+      senderPeerId: sampleSupplier,
+      messageId: 'msg-mismatch-2',
+      membershipEpoch: sampleEpoch + 1,
+      connectionGeneration: sampleGeneration,
+      payload: validBasePayload,
+    });
+    const res2 = parseAndValidateMessage(wireEpochMismatch);
+    expect(res2.ok).toBe(false);
+    if (!res2.ok) {
+      expect(res2.error.code).toBe('INVALID_ENVELOPE');
+      expect(res2.error.message).toMatch(/membershipEpoch/i);
+    }
+
+    // 3. Sender peer ID mismatch with supplierPeerId
+    const wireSenderMismatch = JSON.stringify({
+      protocolVersion: PROTOCOL_VERSION,
+      messageType: SYNC_MESSAGE_TYPES.SNAPSHOT_CHUNK,
+      sessionId: sampleSessionId,
+      senderPeerId: 'other-peer',
+      messageId: 'msg-mismatch-3',
+      membershipEpoch: sampleEpoch,
+      connectionGeneration: sampleGeneration,
+      payload: validBasePayload,
+    });
+    const res3 = parseAndValidateMessage(wireSenderMismatch);
+    expect(res3.ok).toBe(false);
+    if (!res3.ok) {
+      expect(res3.error.code).toBe('INVALID_ENVELOPE');
+      expect(res3.error.message).toMatch(/senderPeerId/i);
     }
   });
 });

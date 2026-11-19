@@ -83,10 +83,10 @@ describe('ChunkAssembler (Phase 7.5 M4.1)', () => {
 
   describe('Single-chunk assembly', () => {
     it('should assemble a valid single-chunk snapshot', () => {
-      const rawData = new Uint8Array([1, 2, 3, 4, 5, 6, 7, 8]);
+      const rawData = new Uint8Array(256).fill(42);
       const { totalChunks, totalSizeBytes, overallSha256, chunks } = createChunksFromBuffer(
         rawData,
-        rawData.byteLength
+        256
       );
 
       assembler.initTransfer({
@@ -95,6 +95,7 @@ describe('ChunkAssembler (Phase 7.5 M4.1)', () => {
         snapshotId: sampleSnapshotId,
         totalChunks,
         totalSizeBytes,
+        nominalChunkSizeBytes: 256,
         expectedSha256Digest: overallSha256,
         supplierPeerId: sampleSupplier,
         membershipEpoch: sampleEpoch,
@@ -145,6 +146,7 @@ describe('ChunkAssembler (Phase 7.5 M4.1)', () => {
         snapshotId: sampleSnapshotId,
         totalChunks,
         totalSizeBytes,
+        nominalChunkSizeBytes: 256,
         expectedSha256Digest: overallSha256,
         supplierPeerId: sampleSupplier,
         membershipEpoch: sampleEpoch,
@@ -188,6 +190,7 @@ describe('ChunkAssembler (Phase 7.5 M4.1)', () => {
         snapshotId: sampleSnapshotId,
         totalChunks,
         totalSizeBytes,
+        nominalChunkSizeBytes: 256,
         expectedSha256Digest: overallSha256,
         supplierPeerId: sampleSupplier,
         membershipEpoch: sampleEpoch,
@@ -231,6 +234,7 @@ describe('ChunkAssembler (Phase 7.5 M4.1)', () => {
         snapshotId: sampleSnapshotId,
         totalChunks,
         totalSizeBytes,
+        nominalChunkSizeBytes: 256,
         expectedSha256Digest: overallSha256,
         supplierPeerId: sampleSupplier,
         membershipEpoch: sampleEpoch,
@@ -270,6 +274,7 @@ describe('ChunkAssembler (Phase 7.5 M4.1)', () => {
         snapshotId: sampleSnapshotId,
         totalChunks,
         totalSizeBytes,
+        nominalChunkSizeBytes: 256,
         expectedSha256Digest: overallSha256,
         supplierPeerId: sampleSupplier,
         membershipEpoch: sampleEpoch,
@@ -309,6 +314,7 @@ describe('ChunkAssembler (Phase 7.5 M4.1)', () => {
         snapshotId: sampleSnapshotId,
         totalChunks,
         totalSizeBytes,
+        nominalChunkSizeBytes: 256,
         expectedSha256Digest: overallSha256,
         supplierPeerId: sampleSupplier,
         membershipEpoch: sampleEpoch,
@@ -342,6 +348,7 @@ describe('ChunkAssembler (Phase 7.5 M4.1)', () => {
         snapshotId: sampleSnapshotId,
         totalChunks,
         totalSizeBytes,
+        nominalChunkSizeBytes: 256,
         expectedSha256Digest: fakeOverallHash,
         supplierPeerId: sampleSupplier,
         membershipEpoch: sampleEpoch,
@@ -371,6 +378,7 @@ describe('ChunkAssembler (Phase 7.5 M4.1)', () => {
         snapshotId: sampleSnapshotId,
         totalChunks,
         totalSizeBytes,
+        nominalChunkSizeBytes: 256,
         expectedSha256Digest: overallSha256,
         supplierPeerId: sampleSupplier,
         membershipEpoch: sampleEpoch,
@@ -403,6 +411,7 @@ describe('ChunkAssembler (Phase 7.5 M4.1)', () => {
         snapshotId: sampleSnapshotId,
         totalChunks,
         totalSizeBytes,
+        nominalChunkSizeBytes: 256,
         expectedSha256Digest: overallSha256,
         supplierPeerId: sampleSupplier,
         membershipEpoch: sampleEpoch,
@@ -433,6 +442,7 @@ describe('ChunkAssembler (Phase 7.5 M4.1)', () => {
         snapshotId: sampleSnapshotId,
         totalChunks,
         totalSizeBytes,
+        nominalChunkSizeBytes: 256,
         expectedSha256Digest: overallSha256,
         supplierPeerId: sampleSupplier,
         membershipEpoch: sampleEpoch,
@@ -463,6 +473,7 @@ describe('ChunkAssembler (Phase 7.5 M4.1)', () => {
         snapshotId: sampleSnapshotId,
         totalChunks,
         totalSizeBytes,
+        nominalChunkSizeBytes: 256,
         expectedSha256Digest: overallSha256,
         supplierPeerId: sampleSupplier,
         membershipEpoch: sampleEpoch,
@@ -506,6 +517,7 @@ describe('ChunkAssembler (Phase 7.5 M4.1)', () => {
         snapshotId: sampleSnapshotId,
         totalChunks,
         totalSizeBytes,
+        nominalChunkSizeBytes: 256,
         expectedSha256Digest: overallSha256,
         supplierPeerId: sampleSupplier,
         membershipEpoch: sampleEpoch,
@@ -529,6 +541,7 @@ describe('ChunkAssembler (Phase 7.5 M4.1)', () => {
         expectedSha256Digest: overallSha256,
         totalChunks,
         totalSizeBytes,
+        nominalChunkSizeBytes: 256,
       });
 
       expect(failoverResult.retainedChunks).toBe(2);
@@ -573,6 +586,7 @@ describe('ChunkAssembler (Phase 7.5 M4.1)', () => {
         snapshotId: sampleSnapshotId,
         totalChunks,
         totalSizeBytes,
+        nominalChunkSizeBytes: 256,
         expectedSha256Digest: overallSha256,
         supplierPeerId: sampleSupplier,
         membershipEpoch: sampleEpoch,
@@ -590,6 +604,7 @@ describe('ChunkAssembler (Phase 7.5 M4.1)', () => {
         expectedSha256Digest: 'f'.repeat(64),
         totalChunks: 2,
         totalSizeBytes: 512,
+        nominalChunkSizeBytes: 256,
       });
 
       expect(failoverResult.retainedChunks).toBe(0);
@@ -612,6 +627,7 @@ describe('ChunkAssembler (Phase 7.5 M4.1)', () => {
         snapshotId: sampleSnapshotId,
         totalChunks,
         totalSizeBytes,
+        nominalChunkSizeBytes: 256,
         expectedSha256Digest: overallSha256,
         supplierPeerId: sampleSupplier,
         membershipEpoch: sampleEpoch,
@@ -643,6 +659,7 @@ describe('ChunkAssembler (Phase 7.5 M4.1)', () => {
         snapshotId: sampleSnapshotId,
         totalChunks,
         totalSizeBytes,
+        nominalChunkSizeBytes: 256,
         expectedSha256Digest: overallSha256,
         supplierPeerId: sampleSupplier,
         membershipEpoch: sampleEpoch,
@@ -664,6 +681,418 @@ describe('ChunkAssembler (Phase 7.5 M4.1)', () => {
       if (!finalizeResult.ok) {
         expect(finalizeResult.reason).toBe('LOCAL_ABORT');
       }
+    });
+  });
+
+  describe('F-1: Canonical Chunk Partition Verification & Adversarial Ingestion', () => {
+    it('should reject adversarial transfer with irregular chunks [3000, 1000, 2000, 4000] (S=10000, N=4, C=2500)', () => {
+      assembler.initTransfer({
+        transferId: sampleTransferId,
+        sessionId: sampleSessionId,
+        snapshotId: sampleSnapshotId,
+        totalChunks: 4,
+        totalSizeBytes: 10000,
+        nominalChunkSizeBytes: 2500,
+        expectedSha256Digest: 'a'.repeat(64),
+        supplierPeerId: sampleSupplier,
+        membershipEpoch: sampleEpoch,
+      });
+
+      // Chunk 0 claims chunkSizeBytes = 3000 (expected canonical: 2500)
+      const chunk0Bytes = new Uint8Array(3000).fill(1);
+      const chunk0: SnapshotChunkPayload = {
+        transferId: sampleTransferId,
+        sessionId: sampleSessionId,
+        membershipEpoch: sampleEpoch,
+        supplierPeerId: sampleSupplier,
+        snapshotId: sampleSnapshotId,
+        chunkIndex: 0,
+        totalChunks: 4,
+        chunkSizeBytes: 3000,
+        totalSizeBytes: 10000,
+        chunkSha256: sha256(chunk0Bytes),
+        dataBase64: Buffer.from(chunk0Bytes).toString('base64'),
+      };
+
+      const res0 = assembler.ingestChunk(chunk0);
+      expect(res0.ok).toBe(false);
+      if (!res0.ok) {
+        expect(res0.reason).toBe('CHUNK_CORRUPTED');
+        expect(res0.detail).toContain('expected canonical partition size (2500)');
+      }
+    });
+
+    it('should reject adversarial transfer with irregular chunks [3000, 2000, 3000, 2000] (S=10000, N=4, C=2500)', () => {
+      assembler.initTransfer({
+        transferId: sampleTransferId,
+        sessionId: sampleSessionId,
+        snapshotId: sampleSnapshotId,
+        totalChunks: 4,
+        totalSizeBytes: 10000,
+        nominalChunkSizeBytes: 2500,
+        expectedSha256Digest: 'b'.repeat(64),
+        supplierPeerId: sampleSupplier,
+        membershipEpoch: sampleEpoch,
+      });
+
+      const chunk0Bytes = new Uint8Array(3000).fill(2);
+      const chunk0: SnapshotChunkPayload = {
+        transferId: sampleTransferId,
+        sessionId: sampleSessionId,
+        membershipEpoch: sampleEpoch,
+        supplierPeerId: sampleSupplier,
+        snapshotId: sampleSnapshotId,
+        chunkIndex: 0,
+        totalChunks: 4,
+        chunkSizeBytes: 3000,
+        totalSizeBytes: 10000,
+        chunkSha256: sha256(chunk0Bytes),
+        dataBase64: Buffer.from(chunk0Bytes).toString('base64'),
+      };
+
+      const res0 = assembler.ingestChunk(chunk0);
+      expect(res0.ok).toBe(false);
+      if (!res0.ok) {
+        expect(res0.reason).toBe('CHUNK_CORRUPTED');
+        expect(res0.detail).toContain('expected canonical partition size (2500)');
+      }
+    });
+
+    it('should reject non-uniform middle chunk (size !== nominalChunkSizeBytes)', () => {
+      // S=1000, C=256, N=4. Expected: [256, 256, 256, 232]
+      assembler.initTransfer({
+        transferId: sampleTransferId,
+        sessionId: sampleSessionId,
+        snapshotId: sampleSnapshotId,
+        totalChunks: 4,
+        totalSizeBytes: 1000,
+        nominalChunkSizeBytes: 256,
+        expectedSha256Digest: 'c'.repeat(64),
+        supplierPeerId: sampleSupplier,
+        membershipEpoch: sampleEpoch,
+      });
+
+      // Chunk 1 claims 200 instead of 256
+      const bytes = new Uint8Array(200);
+      const chunk1: SnapshotChunkPayload = {
+        transferId: sampleTransferId,
+        sessionId: sampleSessionId,
+        membershipEpoch: sampleEpoch,
+        supplierPeerId: sampleSupplier,
+        snapshotId: sampleSnapshotId,
+        chunkIndex: 1,
+        totalChunks: 4,
+        chunkSizeBytes: 200,
+        totalSizeBytes: 1000,
+        chunkSha256: sha256(bytes),
+        dataBase64: Buffer.from(bytes).toString('base64'),
+      };
+
+      const res = assembler.ingestChunk(chunk1);
+      expect(res.ok).toBe(false);
+      if (!res.ok) {
+        expect(res.reason).toBe('CHUNK_CORRUPTED');
+        expect(res.detail).toContain('expected canonical partition size (256)');
+      }
+    });
+
+    it('should reject non-uniform final chunk (size !== expectedFinalChunkSize)', () => {
+      // S=1000, C=256, N=4. Final chunk must be 1000 - 3*256 = 232
+      assembler.initTransfer({
+        transferId: sampleTransferId,
+        sessionId: sampleSessionId,
+        snapshotId: sampleSnapshotId,
+        totalChunks: 4,
+        totalSizeBytes: 1000,
+        nominalChunkSizeBytes: 256,
+        expectedSha256Digest: 'd'.repeat(64),
+        supplierPeerId: sampleSupplier,
+        membershipEpoch: sampleEpoch,
+      });
+
+      // Chunk 3 claims 256 instead of 232
+      const bytes = new Uint8Array(256);
+      const chunk3: SnapshotChunkPayload = {
+        transferId: sampleTransferId,
+        sessionId: sampleSessionId,
+        membershipEpoch: sampleEpoch,
+        supplierPeerId: sampleSupplier,
+        snapshotId: sampleSnapshotId,
+        chunkIndex: 3,
+        totalChunks: 4,
+        chunkSizeBytes: 256,
+        totalSizeBytes: 1000,
+        chunkSha256: sha256(bytes),
+        dataBase64: Buffer.from(bytes).toString('base64'),
+      };
+
+      const res = assembler.ingestChunk(chunk3);
+      expect(res.ok).toBe(false);
+      if (!res.ok) {
+        expect(res.reason).toBe('CHUNK_CORRUPTED');
+        expect(res.detail).toContain('expected canonical partition size (232)');
+      }
+    });
+
+    it('should reject out-of-order chunk violating canonical partition even before chunk 0 arrives', () => {
+      assembler.initTransfer({
+        transferId: sampleTransferId,
+        sessionId: sampleSessionId,
+        snapshotId: sampleSnapshotId,
+        totalChunks: 4,
+        totalSizeBytes: 1000,
+        nominalChunkSizeBytes: 256,
+        expectedSha256Digest: 'e'.repeat(64),
+        supplierPeerId: sampleSupplier,
+        membershipEpoch: sampleEpoch,
+      });
+
+      // Ingest chunk 2 first, but with size 250 instead of 256
+      const bytes = new Uint8Array(250);
+      const chunk2: SnapshotChunkPayload = {
+        transferId: sampleTransferId,
+        sessionId: sampleSessionId,
+        membershipEpoch: sampleEpoch,
+        supplierPeerId: sampleSupplier,
+        snapshotId: sampleSnapshotId,
+        chunkIndex: 2,
+        totalChunks: 4,
+        chunkSizeBytes: 250,
+        totalSizeBytes: 1000,
+        chunkSha256: sha256(bytes),
+        dataBase64: Buffer.from(bytes).toString('base64'),
+      };
+
+      const res = assembler.ingestChunk(chunk2);
+      expect(res.ok).toBe(false);
+      if (!res.ok) {
+        expect(res.reason).toBe('CHUNK_CORRUPTED');
+        expect(res.detail).toContain('expected canonical partition size (256)');
+      }
+    });
+
+    it('should reject invalid initTransfer parameters violating canonical partition equations before allocating storage', () => {
+      // 1. totalChunks != ceil(S / C)
+      expect(() =>
+        assembler.initTransfer({
+          transferId: sampleTransferId,
+          sessionId: sampleSessionId,
+          snapshotId: sampleSnapshotId,
+          totalChunks: 5, // ceil(1000 / 256) is 4, not 5
+          totalSizeBytes: 1000,
+          nominalChunkSizeBytes: 256,
+          expectedSha256Digest: 'f'.repeat(64),
+          supplierPeerId: sampleSupplier,
+          membershipEpoch: sampleEpoch,
+        })
+      ).toThrow(/canonical partition count/i);
+
+      // 2. nominalChunkSizeBytes < minRawChunkBytes (256)
+      expect(() =>
+        assembler.initTransfer({
+          transferId: sampleTransferId,
+          sessionId: sampleSessionId,
+          snapshotId: sampleSnapshotId,
+          totalChunks: 10,
+          totalSizeBytes: 1000,
+          nominalChunkSizeBytes: 100,
+          expectedSha256Digest: 'f'.repeat(64),
+          supplierPeerId: sampleSupplier,
+          membershipEpoch: sampleEpoch,
+        })
+      ).toThrow(/nominalChunkSizeBytes/i);
+
+      // 3. totalSizeBytes <= 0
+      expect(() =>
+        assembler.initTransfer({
+          transferId: sampleTransferId,
+          sessionId: sampleSessionId,
+          snapshotId: sampleSnapshotId,
+          totalChunks: 1,
+          totalSizeBytes: 0,
+          nominalChunkSizeBytes: 256,
+          expectedSha256Digest: 'f'.repeat(64),
+          supplierPeerId: sampleSupplier,
+          membershipEpoch: sampleEpoch,
+        })
+      ).toThrow(/totalSizeBytes.*positive/i);
+    });
+
+    it('should purge all chunks when failover nominalChunkSizeBytes differs from active transfer', () => {
+      const rawData = new Uint8Array(1024);
+      const { totalChunks, totalSizeBytes, overallSha256, chunks } = createChunksFromBuffer(
+        rawData,
+        256
+      );
+
+      assembler.initTransfer({
+        transferId: sampleTransferId,
+        sessionId: sampleSessionId,
+        snapshotId: sampleSnapshotId,
+        totalChunks,
+        totalSizeBytes,
+        nominalChunkSizeBytes: 256,
+        expectedSha256Digest: overallSha256,
+        supplierPeerId: sampleSupplier,
+        membershipEpoch: sampleEpoch,
+      });
+
+      // Ingest chunk 0
+      assembler.ingestChunk(chunks[0]!);
+      expect(assembler.getReceivedChunkIndices()).toEqual([0]);
+
+      // Failover with different nominalChunkSizeBytes (e.g. 512)
+      const failoverResult = assembler.prepareForFailover({
+        transferId: 'cccccccc-dddd-4eee-8fff-000000000000',
+        supplierPeerId: 'peer-supplier-4',
+        membershipEpoch: sampleEpoch + 1,
+        snapshotId: sampleSnapshotId,
+        expectedSha256Digest: overallSha256,
+        totalChunks: 2,
+        totalSizeBytes: 1024,
+        nominalChunkSizeBytes: 512, // Different partition!
+      });
+
+      // All chunks must be purged due to partition mismatch
+      expect(failoverResult.retainedChunks).toBe(0);
+      expect(assembler.getReceivedChunkIndices()).toEqual([]);
+      expect(assembler.getMissingChunkIndices()).toEqual([0, 1]);
+    });
+  });
+
+  describe('F-4: ChunkAssembler Lifecycle & Transfer Reset Invariants', () => {
+    it('should allow immediate initTransfer for next transfer without reset() after successful finalizeAssembly()', () => {
+      const transferId1 = '11111111-1111-4111-8111-111111111111';
+      const snapshotId1 = 'snap-1';
+      const rawData1 = new Uint8Array(256).fill(11);
+      const transfer1 = createChunksFromBuffer(
+        rawData1,
+        256,
+        transferId1,
+        sampleSessionId,
+        snapshotId1,
+        sampleSupplier,
+        sampleEpoch
+      );
+
+      assembler.initTransfer({
+        transferId: transferId1,
+        sessionId: sampleSessionId,
+        snapshotId: snapshotId1,
+        totalChunks: 1,
+        totalSizeBytes: 256,
+        nominalChunkSizeBytes: 256,
+        expectedSha256Digest: transfer1.overallSha256,
+        supplierPeerId: sampleSupplier,
+        membershipEpoch: sampleEpoch,
+      });
+
+      assembler.ingestChunk(transfer1.chunks[0]!);
+      const finalResult1 = assembler.finalizeAssembly();
+      expect(finalResult1.ok).toBe(true);
+
+      // Verify that a second transfer can immediately be initialized without calling reset()
+      const transferId2 = '22222222-2222-4222-8222-222222222222';
+      const snapshotId2 = 'snap-2';
+      const rawData2 = new Uint8Array(256).fill(22);
+      const transfer2 = createChunksFromBuffer(
+        rawData2,
+        256,
+        transferId2,
+        sampleSessionId,
+        snapshotId2,
+        sampleSupplier,
+        sampleEpoch
+      );
+
+      expect(() => {
+        assembler.initTransfer({
+          transferId: transferId2,
+          sessionId: sampleSessionId,
+          snapshotId: snapshotId2,
+          totalChunks: 1,
+          totalSizeBytes: 256,
+          nominalChunkSizeBytes: 256,
+          expectedSha256Digest: transfer2.overallSha256,
+          supplierPeerId: sampleSupplier,
+          membershipEpoch: sampleEpoch,
+        });
+      }).not.toThrow();
+
+      expect(assembler.getMissingChunkIndices()).toEqual([0]);
+      assembler.ingestChunk(transfer2.chunks[0]!);
+      const finalResult2 = assembler.finalizeAssembly();
+      expect(finalResult2.ok).toBe(true);
+      if (finalResult2.ok) {
+        expect(finalResult2.snapshot.snapshotId).toBe('snap-2');
+      }
+    });
+
+    it('should reject ingestChunk after successful finalizeAssembly() with IDENTITY_MISMATCH', () => {
+      const rawData = new Uint8Array(256).fill(33);
+      const { chunks, overallSha256 } = createChunksFromBuffer(rawData, 256);
+
+      assembler.initTransfer({
+        transferId: sampleTransferId,
+        sessionId: sampleSessionId,
+        snapshotId: sampleSnapshotId,
+        totalChunks: 1,
+        totalSizeBytes: 256,
+        nominalChunkSizeBytes: 256,
+        expectedSha256Digest: overallSha256,
+        supplierPeerId: sampleSupplier,
+        membershipEpoch: sampleEpoch,
+      });
+
+      assembler.ingestChunk(chunks[0]!);
+      const finalizeRes = assembler.finalizeAssembly();
+      expect(finalizeRes.ok).toBe(true);
+
+      // Ingesting again should fail with IDENTITY_MISMATCH because no transfer is active
+      const lateIngest = assembler.ingestChunk(chunks[0]!);
+      expect(lateIngest.ok).toBe(false);
+      if (!lateIngest.ok) {
+        expect(lateIngest.reason).toBe('IDENTITY_MISMATCH');
+      }
+    });
+
+    it('should reset transfer state upon hash mismatch during finalizeAssembly(), allowing immediate initTransfer()', () => {
+      const rawData = new Uint8Array(256).fill(44);
+      const { chunks } = createChunksFromBuffer(rawData, 256);
+
+      assembler.initTransfer({
+        transferId: sampleTransferId,
+        sessionId: sampleSessionId,
+        snapshotId: sampleSnapshotId,
+        totalChunks: 1,
+        totalSizeBytes: 256,
+        nominalChunkSizeBytes: 256,
+        expectedSha256Digest: '0'.repeat(64), // deliberately wrong hash
+        supplierPeerId: sampleSupplier,
+        membershipEpoch: sampleEpoch,
+      });
+
+      assembler.ingestChunk(chunks[0]!);
+      const finalizeRes = assembler.finalizeAssembly();
+      expect(finalizeRes.ok).toBe(false);
+      if (!finalizeRes.ok) {
+        expect(finalizeRes.reason).toBe('HASH_MISMATCH');
+      }
+
+      // Proves transfer was aborted and reset: immediate initTransfer for new transfer succeeds
+      expect(() => {
+        assembler.initTransfer({
+          transferId: '33333333-3333-4333-8333-333333333333',
+          sessionId: sampleSessionId,
+          snapshotId: 'snap-3',
+          totalChunks: 1,
+          totalSizeBytes: 256,
+          nominalChunkSizeBytes: 256,
+          expectedSha256Digest: 'a'.repeat(64),
+          supplierPeerId: sampleSupplier,
+          membershipEpoch: sampleEpoch,
+        });
+      }).not.toThrow();
     });
   });
 });

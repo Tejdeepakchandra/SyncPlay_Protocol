@@ -16,6 +16,7 @@ import {
   MAX_SNAPSHOT_BYTES,
   MAX_CHUNKS_PER_SNAPSHOT,
   MAX_CHUNK_BYTES,
+  MIN_RAW_CHUNK_BYTES,
   type SnapshotAbortReason,
   type SnapshotChunkPayload,
 } from '@syncplay/protocol';
@@ -25,6 +26,7 @@ export interface ChunkAssemblerConfig {
   maxSnapshotBytes?: number;
   maxChunks?: number;
   maxChunkBytes?: number;
+  minRawChunkBytes?: number;
 }
 
 export interface InitTransferParams {
@@ -33,6 +35,7 @@ export interface InitTransferParams {
   snapshotId: string;
   totalChunks: number;
   totalSizeBytes: number;
+  nominalChunkSizeBytes: number;
   expectedSha256Digest: string;
   supplierPeerId: string;
   membershipEpoch: number;
@@ -72,6 +75,7 @@ export class ChunkAssembler {
   private readonly maxSnapshotBytes: number;
   private readonly maxChunks: number;
   private readonly maxChunkBytes: number;
+  private readonly minRawChunkBytes: number;
 
   private transferParams: InitTransferParams | null = null;
   private chunks: Array<Uint8Array | null> | null = null;
@@ -84,11 +88,13 @@ export class ChunkAssembler {
     this.maxSnapshotBytes = config.maxSnapshotBytes ?? MAX_SNAPSHOT_BYTES;
     this.maxChunks = config.maxChunks ?? MAX_CHUNKS_PER_SNAPSHOT;
     this.maxChunkBytes = config.maxChunkBytes ?? MAX_CHUNK_BYTES;
+    this.minRawChunkBytes = config.minRawChunkBytes ?? MIN_RAW_CHUNK_BYTES;
   }
 
   /**
    * Initializes a new recovery transfer session.
    * Throws if an existing transfer is active (must be aborted or reset first).
+   * Validates exact canonical partition invariants before allocating storage.
    */
   public initTransfer(params: InitTransferParams): void {
     if (this.disposed) {
@@ -97,14 +103,35 @@ export class ChunkAssembler {
     if (this.transferParams !== null) {
       throw new Error('Transfer already active. Call reset() or prepareForFailover() first.');
     }
-    if (params.totalSizeBytes > this.maxSnapshotBytes) {
+    if (params.totalSizeBytes <= 0 || params.totalSizeBytes > this.maxSnapshotBytes) {
       throw new Error(
-        `totalSizeBytes (${params.totalSizeBytes}) exceeds maxSnapshotBytes (${this.maxSnapshotBytes})`
+        `totalSizeBytes (${params.totalSizeBytes}) must be positive and not exceed maxSnapshotBytes (${this.maxSnapshotBytes})`
+      );
+    }
+    if (
+      params.nominalChunkSizeBytes < this.minRawChunkBytes ||
+      params.nominalChunkSizeBytes > this.maxChunkBytes
+    ) {
+      throw new Error(
+        `nominalChunkSizeBytes (${params.nominalChunkSizeBytes}) must be between ${this.minRawChunkBytes} and ${this.maxChunkBytes}`
+      );
+    }
+    const expectedTotalChunks = Math.ceil(params.totalSizeBytes / params.nominalChunkSizeBytes);
+    if (params.totalChunks !== expectedTotalChunks) {
+      throw new Error(
+        `totalChunks (${params.totalChunks}) does not match expected canonical partition count (${expectedTotalChunks}) for totalSizeBytes (${params.totalSizeBytes}) and nominalChunkSizeBytes (${params.nominalChunkSizeBytes})`
       );
     }
     if (params.totalChunks < 1 || params.totalChunks > this.maxChunks) {
       throw new Error(
         `totalChunks (${params.totalChunks}) must be between 1 and ${this.maxChunks}`
+      );
+    }
+    const expectedFinalChunkSize =
+      params.totalSizeBytes - (params.totalChunks - 1) * params.nominalChunkSizeBytes;
+    if (expectedFinalChunkSize < 1 || expectedFinalChunkSize > params.nominalChunkSizeBytes) {
+      throw new Error(
+        `Final chunk size (${expectedFinalChunkSize}) must be at least 1 and not exceed nominalChunkSizeBytes (${params.nominalChunkSizeBytes})`
       );
     }
 
@@ -227,6 +254,21 @@ export class ChunkAssembler {
       };
     }
 
+    // F-1: Canonical partition expected size verification for chunkIndex
+    const expectedChunkSize =
+      payload.chunkIndex < this.transferParams.totalChunks - 1
+        ? this.transferParams.nominalChunkSizeBytes
+        : this.transferParams.totalSizeBytes -
+          (this.transferParams.totalChunks - 1) * this.transferParams.nominalChunkSizeBytes;
+
+    if (payload.chunkSizeBytes !== expectedChunkSize) {
+      return {
+        ok: false,
+        reason: 'CHUNK_CORRUPTED',
+        detail: `Chunk at index ${payload.chunkIndex} declared chunkSizeBytes (${payload.chunkSizeBytes}), expected canonical partition size (${expectedChunkSize})`,
+      };
+    }
+
     // Decode Base64 data
     let rawBytes: Uint8Array;
     try {
@@ -311,6 +353,7 @@ export class ChunkAssembler {
     expectedSha256Digest: string;
     totalChunks: number;
     totalSizeBytes: number;
+    nominalChunkSizeBytes: number;
   }): { retainedChunks: number } {
     if (this.disposed) {
       throw new Error('ChunkAssembler is disposed');
@@ -324,7 +367,8 @@ export class ChunkAssembler {
       this.transferParams.expectedSha256Digest.toLowerCase() ===
         params.expectedSha256Digest.toLowerCase() &&
       this.transferParams.totalChunks === params.totalChunks &&
-      this.transferParams.totalSizeBytes === params.totalSizeBytes;
+      this.transferParams.totalSizeBytes === params.totalSizeBytes &&
+      this.transferParams.nominalChunkSizeBytes === params.nominalChunkSizeBytes;
 
     if (isExactMatch) {
       // Retain verified chunks and update context
@@ -453,10 +497,12 @@ export class ChunkAssembler {
     // Verify overall SHA-256 digest
     const overallHash = sha256(assembled).toLowerCase();
     if (overallHash !== this.transferParams.expectedSha256Digest.toLowerCase()) {
+      const expected = this.transferParams.expectedSha256Digest;
+      this.abortTransfer();
       return {
         ok: false,
         reason: 'HASH_MISMATCH',
-        detail: `Overall snapshot SHA-256 digest mismatch: expected ${this.transferParams.expectedSha256Digest}, computed ${overallHash}`,
+        detail: `Overall snapshot SHA-256 digest mismatch: expected ${expected}, computed ${overallHash}`,
       };
     }
 
@@ -466,6 +512,11 @@ export class ChunkAssembler {
       sha256Digest: overallHash,
       totalSizeBytes: this.transferParams.totalSizeBytes,
     };
+
+    // F-4: Reset transfer state on successful finalization so new transfers can initialize cleanly
+    this.transferParams = null;
+    this.receivedChunksCount = 0;
+    this.receivedBytesCount = 0;
 
     return { ok: true, snapshot };
   }

@@ -29,6 +29,8 @@ import {
   SnapshotRequestPayloadSchema,
   SnapshotChunkRequestPayloadSchema,
   SnapshotAbortPayloadSchema,
+  decodeBase64,
+  encodeBase64,
   validateMessage,
   parseAndValidateMessage,
   computeUtf8ByteLength,
@@ -85,7 +87,7 @@ describe('Phase 7.5 M4.1 — Snapshot Recovery Wire Schemas', () => {
         protocolVersion: PROTOCOL_VERSION,
         messageType: SYNC_MESSAGE_TYPES.SNAPSHOT_CHUNK,
         sessionId: 's'.repeat(128),
-        senderPeerId: 'p'.repeat(128),
+        senderPeerId: 'p'.repeat(64),
         messageId: 'm'.repeat(128),
         membershipEpoch: Number.MAX_SAFE_INTEGER,
         connectionGeneration: Number.MAX_SAFE_INTEGER,
@@ -110,7 +112,7 @@ describe('Phase 7.5 M4.1 — Snapshot Recovery Wire Schemas', () => {
       // Verify exact framing overhead and full serialized message
       const json = JSON.stringify(maxEnvelope);
       const byteLength = Buffer.byteLength(json, 'utf-8');
-      expect(byteLength).toBe(44906); // 1,214 B framing + 43,692 B base64
+      expect(byteLength).toBe(44842); // 1,150 B framing + 43,692 B base64
       expect(byteLength).toBeLessThanOrEqual(MIN_TRANSPORT_LIMIT_FULL_CHUNK);
     });
 
@@ -341,6 +343,33 @@ describe('Phase 7.5 M4.1 — Snapshot Recovery Wire Schemas', () => {
       };
       const result = SnapshotOfferPayloadSchema.safeParse(validOffer);
       expect(result.success).toBe(true);
+
+      // With valid nominalChunkSizeBytes
+      const offerWithNominal = {
+        ...validOffer,
+        nominalChunkSizeBytes: 256,
+      };
+      expect(SnapshotOfferPayloadSchema.safeParse(offerWithNominal).success).toBe(true);
+
+      const offerWithMaxNominal = {
+        ...validOffer,
+        nominalChunkSizeBytes: MAX_CHUNK_BYTES,
+      };
+      expect(SnapshotOfferPayloadSchema.safeParse(offerWithMaxNominal).success).toBe(true);
+
+      // With invalid nominalChunkSizeBytes
+      expect(
+        SnapshotOfferPayloadSchema.safeParse({ ...validOffer, nominalChunkSizeBytes: 255 }).success,
+      ).toBe(false);
+      expect(
+        SnapshotOfferPayloadSchema.safeParse({
+          ...validOffer,
+          nominalChunkSizeBytes: MAX_CHUNK_BYTES + 1,
+        }).success,
+      ).toBe(false);
+      expect(
+        SnapshotOfferPayloadSchema.safeParse({ ...validOffer, nominalChunkSizeBytes: 256.5 }).success,
+      ).toBe(false);
     });
 
     it('should validate SnapshotRequestPayloadSchema', () => {
@@ -384,6 +413,56 @@ describe('Phase 7.5 M4.1 — Snapshot Recovery Wire Schemas', () => {
       };
       const result = SnapshotAbortPayloadSchema.safeParse(validAbort);
       expect(result.success).toBe(true);
+    });
+  });
+
+  // ── F-2: Isomorphic Browser Base64 Decoding & Encoding ──────────────────────
+  describe('F-2: Browser runtime environment without Node Buffer', () => {
+    it('should encode and decode base64 correctly in the absence of global Buffer', () => {
+      const originalBuffer = (globalThis as any).Buffer;
+      try {
+        // Temporarily delete Buffer to simulate pure browser environment
+        delete (globalThis as any).Buffer;
+
+        const testBytes = new Uint8Array([0, 1, 2, 255, 128, 64, 32, 16, 8, 4, 2, 1]);
+        const encoded = encodeBase64(testBytes);
+        expect(typeof encoded).toBe('string');
+
+        const decoded = decodeBase64(encoded);
+        expect(decoded).toEqual(testBytes);
+
+        // Test with empty array
+        expect(decodeBase64(encodeBase64(new Uint8Array(0)))).toEqual(new Uint8Array(0));
+
+        // Test with 32 KB chunk (cross slice boundary of 8192)
+        const largeBytes = new Uint8Array(32768);
+        for (let i = 0; i < largeBytes.length; i++) {
+          largeBytes[i] = i % 256;
+        }
+        const largeEncoded = encodeBase64(largeBytes);
+        const largeDecoded = decodeBase64(largeEncoded);
+        expect(largeDecoded.byteLength).toBe(32768);
+        expect(largeDecoded).toEqual(largeBytes);
+
+        // SnapshotChunkPayloadSchema should successfully validate and decode without global Buffer
+        const rawPayload = {
+          transferId: sampleUuid,
+          sessionId: 'session-001',
+          membershipEpoch: 1,
+          supplierPeerId: 'peer-supplier-1',
+          snapshotId: 'snap-001',
+          chunkIndex: 0,
+          totalChunks: 1,
+          chunkSizeBytes: testBytes.byteLength,
+          totalSizeBytes: testBytes.byteLength,
+          chunkSha256: sampleSha256,
+          dataBase64: encoded,
+        };
+        const parseResult = SnapshotChunkPayloadSchema.safeParse(rawPayload);
+        expect(parseResult.success).toBe(true);
+      } finally {
+        (globalThis as any).Buffer = originalBuffer;
+      }
     });
   });
 });

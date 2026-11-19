@@ -145,6 +145,8 @@ export {
   SnapshotChunkPayloadSchema,
   SnapshotChunkRequestPayloadSchema,
   SnapshotAbortPayloadSchema,
+  decodeBase64,
+  encodeBase64,
 } from './payloads/snapshot-recovery.js';
 
 // ── Admission and Dynamic Sizing ─────────────────────────────

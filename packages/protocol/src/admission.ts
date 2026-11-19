@@ -20,6 +20,7 @@ export interface SnapshotAdmissionResult {
   readonly eligible: boolean;
   readonly requiredChunks: number;
   readonly chunkBinaryCapacity: number;
+  readonly nominalChunkSizeBytes: number;
   readonly effectiveLimit: number;
   readonly reason?: SnapshotAbortReason;
   readonly detail?: string;
@@ -31,6 +32,12 @@ export interface SnapshotAdmissionResult {
  * chunk indices, UUIDs, type strings, timestamps, signatures, and hash hex strings.
  *
  * Guaranteed to never underestimate the required chunk count or overshoot wire limits.
+ *
+ * Note on 2,144 B transport floor (F-5):
+ * At MIN_TRANSPORT_LIMIT_CHUNK_TRANSFER (2,144 B), available Base64 characters = 2,144 - 1,800 = 344 B.
+ * Math.floor(344 / 4) * 3 = 86 * 3 = 258 B.
+ * 258 B is the exact calculated capacity at the 2,144 B transport floor, satisfying
+ * MIN_RAW_CHUNK_BYTES (256 B) since 258 >= 256, with ceil(258 / 3) * 4 = 344 B Base64 framing.
  */
 export function calculateChunkCapacity(effectiveLimit: number): number {
   if (effectiveLimit < MIN_TRANSPORT_LIMIT_CHUNK_TRANSFER) {
@@ -60,7 +67,7 @@ export function calculateSnapshotAdmission(
   totalSizeBytes: number,
   sctpMaxMessageSize?: number,
   advertisedTotalChunks?: number,
-  options?: { allowSctpFallback?: boolean },
+  options?: { allowSctpFallback?: boolean; advertisedNominalChunkSizeBytes?: number },
 ): SnapshotAdmissionResult {
   // If unnegotiated or unavailable in production, defer or reject
   if (
@@ -73,6 +80,7 @@ export function calculateSnapshotAdmission(
         eligible: false,
         requiredChunks: 0,
         chunkBinaryCapacity: 0,
+        nominalChunkSizeBytes: 0,
         effectiveLimit: 0,
         reason: 'TRANSPORT_LIMIT_EXCEEDED',
         detail: 'SCTP transport is unnegotiated or maxMessageSize is unavailable',
@@ -92,6 +100,7 @@ export function calculateSnapshotAdmission(
       eligible: false,
       requiredChunks: 0,
       chunkBinaryCapacity: 0,
+      nominalChunkSizeBytes: 0,
       effectiveLimit,
       reason: 'TRANSPORT_LIMIT_EXCEEDED',
       detail: `Effective limit (${effectiveLimit} B) is below minimum supported limit (${MIN_TRANSPORT_LIMIT_CHUNK_TRANSFER} B)`,
@@ -103,6 +112,7 @@ export function calculateSnapshotAdmission(
       eligible: false,
       requiredChunks: 0,
       chunkBinaryCapacity: 0,
+      nominalChunkSizeBytes: 0,
       effectiveLimit,
       reason: 'LOCAL_ABORT',
       detail: `Total size (${totalSizeBytes} B) is non-positive or exceeds maximum permitted (${MAX_SNAPSHOT_BYTES} B)`,
@@ -115,6 +125,7 @@ export function calculateSnapshotAdmission(
       eligible: false,
       requiredChunks: 0,
       chunkBinaryCapacity: chunkCapacity,
+      nominalChunkSizeBytes: chunkCapacity,
       effectiveLimit,
       reason: 'TRANSPORT_LIMIT_EXCEEDED',
       detail: `Chunk binary capacity (${chunkCapacity} B) is below minimum raw chunk size (${MIN_RAW_CHUNK_BYTES} B)`,
@@ -128,6 +139,7 @@ export function calculateSnapshotAdmission(
       eligible: false,
       requiredChunks: calculatedRequiredChunks,
       chunkBinaryCapacity: chunkCapacity,
+      nominalChunkSizeBytes: chunkCapacity,
       effectiveLimit,
       reason: 'CHUNK_COUNT_EXCEEDED',
       detail: `Required chunks (${calculatedRequiredChunks}) exceeds maximum allowed (${MAX_CHUNKS_PER_SNAPSHOT}) on ${effectiveLimit} B transport`,
@@ -139,9 +151,25 @@ export function calculateSnapshotAdmission(
       eligible: false,
       requiredChunks: calculatedRequiredChunks,
       chunkBinaryCapacity: chunkCapacity,
+      nominalChunkSizeBytes: chunkCapacity,
       effectiveLimit,
       reason: 'OFFER_INCONSISTENT',
       detail: `Advertised totalChunks (${advertisedTotalChunks}) differs from calculatedRequiredChunks (${calculatedRequiredChunks})`,
+    };
+  }
+
+  if (
+    options?.advertisedNominalChunkSizeBytes !== undefined &&
+    options.advertisedNominalChunkSizeBytes !== chunkCapacity
+  ) {
+    return {
+      eligible: false,
+      requiredChunks: calculatedRequiredChunks,
+      chunkBinaryCapacity: chunkCapacity,
+      nominalChunkSizeBytes: chunkCapacity,
+      effectiveLimit,
+      reason: 'OFFER_INCONSISTENT',
+      detail: `Advertised nominalChunkSizeBytes (${options.advertisedNominalChunkSizeBytes}) differs from calculated chunkBinaryCapacity (${chunkCapacity})`,
     };
   }
 
@@ -149,6 +177,7 @@ export function calculateSnapshotAdmission(
     eligible: true,
     requiredChunks: calculatedRequiredChunks,
     chunkBinaryCapacity: chunkCapacity,
+    nominalChunkSizeBytes: chunkCapacity,
     effectiveLimit,
   };
 }

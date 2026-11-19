@@ -7,10 +7,47 @@ import {
   ASCII_IDENTIFIER_REGEX,
   MAX_SNAPSHOT_BYTES,
   MAX_CHUNK_BYTES,
+  MIN_RAW_CHUNK_BYTES,
   MAX_CHUNKS_PER_SNAPSHOT,
   MAX_CONCURRENT_CHUNK_REQUESTS,
 } from '../constants.js';
 import { UUIDv4Schema } from './repair.js';
+
+/**
+ * Portable, isomorphic Base64 decoding safe for browser and Node.js runtimes.
+ * Does not depend unconditionally on Node.js Buffer global.
+ */
+export function decodeBase64(base64: string): Uint8Array {
+  const maybeBuffer = (globalThis as unknown as { Buffer?: { from: (str: string, enc: string) => Uint8Array } }).Buffer;
+  if (typeof maybeBuffer !== 'undefined' && typeof maybeBuffer.from === 'function') {
+    const buf = maybeBuffer.from(base64, 'base64');
+    return new Uint8Array(buf.buffer, buf.byteOffset, buf.byteLength);
+  }
+  const binaryString = atob(base64);
+  const len = binaryString.length;
+  const bytes = new Uint8Array(len);
+  for (let i = 0; i < len; i++) {
+    bytes[i] = binaryString.charCodeAt(i);
+  }
+  return bytes;
+}
+
+/**
+ * Portable, isomorphic Base64 encoding safe for browser and Node.js runtimes.
+ * Does not depend unconditionally on Node.js Buffer global.
+ */
+export function encodeBase64(bytes: Uint8Array): string {
+  const maybeBuffer = (globalThis as unknown as { Buffer?: { from: (arr: Uint8Array) => { toString: (enc: string) => string } } }).Buffer;
+  if (typeof maybeBuffer !== 'undefined' && typeof maybeBuffer.from === 'function') {
+    return maybeBuffer.from(bytes).toString('base64');
+  }
+  let binary = '';
+  const CHUNK_SIZE = 8192;
+  for (let i = 0; i < bytes.length; i += CHUNK_SIZE) {
+    binary += String.fromCharCode(...bytes.subarray(i, i + CHUNK_SIZE));
+  }
+  return btoa(binary);
+}
 
 // ── Abort Reason Taxonomy ──────────────────────────────────────────────
 
@@ -51,6 +88,12 @@ export const SnapshotOfferPayloadSchema = z
     maxLogicalTimestamp: z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER),
     totalSizeBytes: z.number().int().positive().max(MAX_SNAPSHOT_BYTES),
     totalChunks: z.number().int().positive().max(MAX_CHUNKS_PER_SNAPSHOT),
+    nominalChunkSizeBytes: z
+      .number()
+      .int()
+      .min(MIN_RAW_CHUNK_BYTES)
+      .max(MAX_CHUNK_BYTES)
+      .optional(),
     sha256Digest: z.string().regex(/^[0-9a-f]{64}$/i, {
       message: 'Must be canonical 64-character hex SHA-256 digest',
     }),
@@ -136,9 +179,9 @@ export const SnapshotChunkPayloadSchema = z
     }
 
     // 4. Decoded byte length and canonical roundtrip check
-    let decoded: Buffer;
+    let decoded: Uint8Array;
     try {
-      decoded = Buffer.from(data.dataBase64, 'base64');
+      decoded = decodeBase64(data.dataBase64);
     } catch (e) {
       ctx.addIssue({
         code: z.ZodIssueCode.custom,
@@ -156,7 +199,19 @@ export const SnapshotChunkPayloadSchema = z
       });
     }
 
-    if (decoded.toString('base64') !== data.dataBase64) {
+    let reencoded: string;
+    try {
+      reencoded = encodeBase64(decoded);
+    } catch (e) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        message: `Failed to re-encode dataBase64: ${e instanceof Error ? e.message : String(e)}`,
+        path: ['dataBase64'],
+      });
+      return;
+    }
+
+    if (reencoded !== data.dataBase64) {
       ctx.addIssue({
         code: z.ZodIssueCode.custom,
         message: 'dataBase64 is non-canonical (invalid padding or non-zero unused trailing bits)',

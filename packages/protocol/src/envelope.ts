@@ -151,7 +151,30 @@ export const SnapshotChunkEnvelopeSchema = z
       .never({ message: 'Snapshot chunk envelope must not contain originSequenceNumber' })
       .optional(),
   })
-  .strict();
+  .strict()
+  .superRefine((data, ctx) => {
+    if (data.sessionId !== data.payload.sessionId) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        message: `Envelope sessionId '${data.sessionId}' must match payload sessionId '${data.payload.sessionId}'`,
+        path: ['sessionId'],
+      });
+    }
+    if (data.membershipEpoch !== data.payload.membershipEpoch) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        message: `Envelope membershipEpoch (${data.membershipEpoch}) must match payload membershipEpoch (${data.payload.membershipEpoch})`,
+        path: ['membershipEpoch'],
+      });
+    }
+    if (data.senderPeerId !== data.payload.supplierPeerId) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        message: `Envelope senderPeerId '${data.senderPeerId}' must match payload supplierPeerId '${data.payload.supplierPeerId}'`,
+        path: ['senderPeerId'],
+      });
+    }
+  });
 
 export interface SnapshotChunkEnvelope {
   readonly protocolVersion: typeof PROTOCOL_VERSION;

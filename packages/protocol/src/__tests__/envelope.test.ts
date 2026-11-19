@@ -352,7 +352,7 @@ describe('SnapshotChunkEnvelopeSchema — Strict Wire Contract & Bounded Envelop
       protocolVersion: PROTOCOL_VERSION,
       messageType: SYNC_MESSAGE_TYPES.SNAPSHOT_CHUNK,
       sessionId: 's'.repeat(128),
-      senderPeerId: 'p'.repeat(128),
+      senderPeerId: 'p'.repeat(64),
       messageId: 'm'.repeat(128),
       membershipEpoch: 1,
       connectionGeneration: 1,
@@ -368,7 +368,7 @@ describe('SnapshotChunkEnvelopeSchema — Strict Wire Contract & Bounded Envelop
     if (result.success) {
       expect(result.data.protocolVersion).toBe(PROTOCOL_VERSION);
       expect(result.data.sessionId).toBe('s'.repeat(128));
-      expect(result.data.senderPeerId).toBe('p'.repeat(128));
+      expect(result.data.senderPeerId).toBe('p'.repeat(64));
       expect(result.data.messageId).toBe('m'.repeat(128));
       expect(result.data.membershipEpoch).toBe(1);
       expect(result.data.connectionGeneration).toBe(1);
@@ -378,14 +378,15 @@ describe('SnapshotChunkEnvelopeSchema — Strict Wire Contract & Bounded Envelop
   it('should prove maximum valid serialized chunk message framing overhead is strictly <= 1800 bytes', () => {
     // Construct absolute worst-case valid chunk message framing:
     // - exact supported messageType: 'sync:snapshot-chunk'
-    // - maximum 128-character sessionId, senderPeerId, messageId
+    // - maximum 128-character sessionId, messageId, snapshotId
+    // - maximum 64-character senderPeerId and supplierPeerId (must match)
     // - maximum safe integer numeric fields (membershipEpoch, connectionGeneration)
     // - full chunk payload framing with max-length IDs, 64-char hex SHA-256, and empty dataBase64
     const worstCaseFraming = {
       protocolVersion: PROTOCOL_VERSION,
       messageType: SYNC_MESSAGE_TYPES.SNAPSHOT_CHUNK,
       sessionId: 's'.repeat(128),
-      senderPeerId: 'p'.repeat(128),
+      senderPeerId: 'p'.repeat(64),
       messageId: 'm'.repeat(128),
       membershipEpoch: Number.MAX_SAFE_INTEGER,
       connectionGeneration: Number.MAX_SAFE_INTEGER,
@@ -414,17 +415,17 @@ describe('SnapshotChunkEnvelopeSchema — Strict Wire Contract & Bounded Envelop
     expect(textEncoderBytes).toBe(bufferBytes);
     expect(textEncoderBytes).toBe(computeBytes);
 
-    // Worst-case framing without dataBase64 is measured at exactly 1214 bytes
+    // Worst-case framing without dataBase64 is measured at exactly 1150 bytes
     expect(textEncoderBytes).toBeLessThanOrEqual(MAX_ENVELOPE_OVERHEAD_BYTES);
-    expect(textEncoderBytes).toBe(1214);
+    expect(textEncoderBytes).toBe(1150);
 
     // Verified safety margin against 1,800 B bound:
-    // 1800 - 1214 = 586 bytes headroom (48.3% safety margin)
+    // 1800 - 1150 = 650 bytes headroom (56.5% safety margin)
     const safetyMargin = MAX_ENVELOPE_OVERHEAD_BYTES - textEncoderBytes;
-    expect(safetyMargin).toBe(586);
+    expect(safetyMargin).toBe(650);
 
     // Full 32 KB chunk message verification:
-    // 43,692 Base64 bytes + 1,214 B framing = 44,906 bytes
+    // 43,692 Base64 bytes + 1,150 B framing = 44,842 bytes
     const fullChunkBytes = Buffer.alloc(32768, 0x41).toString('base64');
     expect(fullChunkBytes.length).toBe(43692);
 
@@ -435,12 +436,17 @@ describe('SnapshotChunkEnvelopeSchema — Strict Wire Contract & Bounded Envelop
         dataBase64: fullChunkBytes,
       },
     };
+
+    // Full chunk message validates against strict SnapshotChunkEnvelopeSchema
+    const parseResult = SnapshotChunkEnvelopeSchema.safeParse(fullChunkMessage);
+    expect(parseResult.success).toBe(true);
+
     const fullMessageBytes = computeUtf8ByteLength(fullChunkMessage);
-    expect(fullMessageBytes).toBe(44906);
+    expect(fullMessageBytes).toBe(44842);
     expect(fullMessageBytes).toBeLessThanOrEqual(MIN_TRANSPORT_LIMIT_FULL_CHUNK);
 
-    // Headroom against 45,492 threshold
-    expect(MIN_TRANSPORT_LIMIT_FULL_CHUNK - fullMessageBytes).toBe(586);
+    // Headroom against 45,492 threshold: 45,492 - 44,842 = 650 bytes
+    expect(MIN_TRANSPORT_LIMIT_FULL_CHUNK - fullMessageBytes).toBe(650);
   });
 
   // ── Negative Tests: Prohibited Fields ───────────────────────────────────────
@@ -559,5 +565,44 @@ describe('SnapshotChunkEnvelopeSchema — Strict Wire Contract & Bounded Envelop
       const verifyLength = computeUtf8ByteLength(json);
       expect(verifyLength).toBe(byteLength);
     }
+  });
+
+  // ── F-3: Cross-validation of envelope and payload identities ────────────────
+  describe('F-3: Envelope vs. payload consistency enforcement', () => {
+    it('should reject snapshot-chunk envelope when sessionId does not match payload.sessionId', () => {
+      const msg = validChunkEnvelope({
+        sessionId: 'session-outer-123',
+        payload: createValidPayload({ sessionId: 'session-inner-456' }),
+      });
+      const result = SnapshotChunkEnvelopeSchema.safeParse(msg);
+      expect(result.success).toBe(false);
+      if (!result.success) {
+        expect(result.error.issues[0]?.message).toMatch(/sessionId 'session-outer-123' must match payload sessionId 'session-inner-456'/i);
+      }
+    });
+
+    it('should reject snapshot-chunk envelope when membershipEpoch does not match payload.membershipEpoch', () => {
+      const msg = validChunkEnvelope({
+        membershipEpoch: 2,
+        payload: createValidPayload({ membershipEpoch: 1 }),
+      });
+      const result = SnapshotChunkEnvelopeSchema.safeParse(msg);
+      expect(result.success).toBe(false);
+      if (!result.success) {
+        expect(result.error.issues[0]?.message).toMatch(/membershipEpoch \(2\) must match payload membershipEpoch \(1\)/i);
+      }
+    });
+
+    it('should reject snapshot-chunk envelope when senderPeerId does not match payload.supplierPeerId', () => {
+      const msg = validChunkEnvelope({
+        senderPeerId: 'peer-sender-abc',
+        payload: createValidPayload({ supplierPeerId: 'peer-supplier-xyz' }),
+      });
+      const result = SnapshotChunkEnvelopeSchema.safeParse(msg);
+      expect(result.success).toBe(false);
+      if (!result.success) {
+        expect(result.error.issues[0]?.message).toMatch(/senderPeerId 'peer-sender-abc' must match payload supplierPeerId 'peer-supplier-xyz'/i);
+      }
+    });
   });
 });

@@ -109,6 +109,8 @@ export {
   SnapshotChunkPayloadSchema,
   SnapshotChunkRequestPayloadSchema,
   SnapshotAbortPayloadSchema,
+  decodeBase64,
+  encodeBase64,
 } from './snapshot-recovery.js';
 export type {
   SnapshotAbortReason,
