@@ -25,7 +25,7 @@ The complete anti-entropy repair protocol (`REPAIR_REQUEST`, `OPERATION_BATCH`, 
 | **Branch** | `main` |
 | **Parent Baseline (M4 Freeze)** | `ba96c56` |
 | **M5 Implementation Commit** | `dbd5217` |
-| **M5 Docs Commit** | (Pending documentation commit) |
+| **M5 Docs Commit** | `6c138c0` (initial report) / reconciled in current documentation commit |
 | **Working Tree Status** | Clean |
 | **Monorepo Build** | 0 TypeScript errors, 0 warnings across all workspaces |
 
@@ -167,7 +167,7 @@ The full P2P repair lifecycle has been validated through comprehensive integrati
    - Peer A validates supplier context, admits operations into the Phase 7.3 engine, and advances its replication frontier to 3.
 2. **Unfulfillable Range Rejection (Test 4.2):**
    - Peer A requests operations outside Peer B's log.
-   - Peer B responds with `REPAIR_REJECTED` (`reason: 'HISTORY_NOT_FOUND'`).
+   - Peer B responds with `REPAIR_REJECTED` (`reason: 'ORIGIN_UNKNOWN'`).
    - Peer A verifies rejection context and marks the repair attempt failed.
 3. **Causal Dependency Unblocking (Test 4.3):**
    - Peer A receives forward operation seq 2 (dependent on seq 1) via live broadcast; operation is buffered in pending dependency queue (`BUFFERED_PENDING_DEPENDENCY`).
