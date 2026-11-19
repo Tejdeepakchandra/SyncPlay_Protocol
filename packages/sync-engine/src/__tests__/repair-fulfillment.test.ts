@@ -1513,5 +1513,255 @@ describe('Phase 7.4 Milestone M4: Supplier Range Servicing (RepairSupplierServic
       const res = supplierService.serveRepairRequest(req, requesterContext);
       expect('operations' in res).toBe(true);
     });
+
+    it('5.13 Envelope overhead accounts for complete wire message and forces batch slicing', () => {
+      // Negotiated transport limit: 2000 bytes
+      // Envelope overhead: 256 bytes -> maxPayloadBytes: 1744 bytes
+      const service = new RepairSupplierService(
+        supplierEngine,
+        supplierCallbacks,
+        {
+          negotiatedSctpMaxMessageSizeProvider: () => 2000,
+          envelopeOverheadBytes: 256,
+        },
+        clock,
+      );
+
+      // Seed 5 operations of ~500 bytes each
+      for (let s = 1; s <= 5; s++) {
+        supplierEngine.getOperationLog().insert(
+          createStoredOperation('peer-A', s, 1, { data: 'M'.repeat(500) }),
+        );
+      }
+
+      const req: RepairRequestPayload = {
+        requestId: 'cda74a9a-f4ef-4b9e-b2d3-18ef557163ef',
+        sessionId: SESSION_ID,
+        requesterPeerId: 'peer-requester',
+        targetOriginPeerId: 'peer-A',
+        fromSequence: 1,
+        toSequence: 5,
+        membershipEpoch: 1,
+      };
+
+      const res = service.serveRepairRequest(req, requesterContext);
+      expect('operations' in res).toBe(true);
+      const batch = res as OperationBatchPayload;
+
+      // Sliced to fit within 1744 bytes payload limit so payload + 256 bytes <= 2000 bytes
+      const payloadBytes = new TextEncoder().encode(JSON.stringify(batch)).byteLength;
+      expect(payloadBytes).toBeLessThanOrEqual(1744);
+      expect(payloadBytes + 256).toBeLessThanOrEqual(2000);
+      expect(batch.operations.length).toBeLessThan(5);
+    });
+
+    it('5.14 Epoch transition during servicing triggers pre-delivery rejection with EPOCH_MISMATCH', () => {
+      for (let s = 1; s <= 5; s++) {
+        supplierEngine.getOperationLog().insert(createStoredOperation('peer-A', s));
+      }
+
+      const sendResponseSpy = vi.fn();
+      const customCallbacks: AntiEntropyCallbacks = {
+        onBroadcastDigest: vi.fn(),
+        onSendRepairResponse: sendResponseSpy,
+      };
+
+      const service = new RepairSupplierService(
+        supplierEngine,
+        customCallbacks,
+        {},
+        clock,
+      );
+
+      // Intercept getOperationLog().getOperationAt to simulate epoch transition during history querying
+      const originalGetOp = supplierEngine.getOperationLog().getOperationAt.bind(supplierEngine.getOperationLog());
+      vi.spyOn(supplierEngine.getOperationLog(), 'getOperationAt').mockImplementation((origin, seq) => {
+        if (supplierEngine.epoch < 2) {
+          supplierEngine.transitionEpoch(2, supplierEpochCap);
+        }
+        return originalGetOp(origin, seq);
+      });
+
+      const req: RepairRequestPayload = {
+        requestId: 'cea74a9a-f4ef-4b9e-b2d3-18ef557163ef',
+        sessionId: SESSION_ID,
+        requesterPeerId: 'peer-requester',
+        targetOriginPeerId: 'peer-A',
+        fromSequence: 1,
+        toSequence: 5,
+        membershipEpoch: 1,
+      };
+
+      const res = service.serveRepairRequest(req, requesterContext);
+      expect('reason' in res).toBe(true);
+      expect((res as RepairRejectedPayload).reason).toBe('EPOCH_MISMATCH');
+
+      // Obsolete epoch response was never delivered via callback
+      expect(sendResponseSpy).not.toHaveBeenCalled();
+    });
+
+    it('5.15 Connection generation change during servicing triggers pre-delivery rejection with UNAUTHORIZED', () => {
+      for (let s = 1; s <= 5; s++) {
+        supplierEngine.getOperationLog().insert(createStoredOperation('peer-A', s));
+      }
+
+      const sendResponseSpy = vi.fn();
+      const customCallbacks: AntiEntropyCallbacks = {
+        onBroadcastDigest: vi.fn(),
+        onSendRepairResponse: sendResponseSpy,
+      };
+
+      const service = new RepairSupplierService(
+        supplierEngine,
+        customCallbacks,
+        {},
+        clock,
+      );
+
+      // Intercept getOperationLog().getOperationAt to simulate connection reconnect during history querying
+      const originalGetOp = supplierEngine.getOperationLog().getOperationAt.bind(supplierEngine.getOperationLog());
+      vi.spyOn(supplierEngine.getOperationLog(), 'getOperationAt').mockImplementation((origin, seq) => {
+        supplierEngine.authorizePeerGeneration('peer-requester', 2);
+        return originalGetOp(origin, seq);
+      });
+
+      const req: RepairRequestPayload = {
+        requestId: 'cfa74a9a-f4ef-4b9e-b2d3-18ef557163ef',
+        sessionId: SESSION_ID,
+        requesterPeerId: 'peer-requester',
+        targetOriginPeerId: 'peer-A',
+        fromSequence: 1,
+        toSequence: 5,
+        membershipEpoch: 1,
+      };
+
+      expect(() => service.serveRepairRequest(req, requesterContext)).toThrow(SyncEngineError);
+      expect(() => service.serveRepairRequest(req, requesterContext)).toThrow(
+        /Requester connection generation 1 does not match active engine generation 2/,
+      );
+      expect(sendResponseSpy).not.toHaveBeenCalled();
+    });
+
+    it('5.16 Re-entrant callback triggering epoch transition preserves non-negative concurrency counters', () => {
+      for (let s = 1; s <= 5; s++) {
+        supplierEngine.getOperationLog().insert(createStoredOperation('peer-A', s));
+      }
+
+      let serviceRef: RepairSupplierService;
+      const customCallbacks: AntiEntropyCallbacks = {
+        onBroadcastDigest: vi.fn(),
+        onSendRepairResponse: () => {
+          // Re-entrant epoch transition inside callback
+          if (supplierEngine.epoch < 2) {
+            supplierEngine.transitionEpoch(2, supplierEpochCap);
+            serviceRef.onEpochTransition(2);
+          }
+        },
+      };
+
+      serviceRef = new RepairSupplierService(
+        supplierEngine,
+        customCallbacks,
+        {},
+        clock,
+      );
+
+      const req: RepairRequestPayload = {
+        requestId: 'd0a74a9a-f4ef-4b9e-b2d3-18ef557163ef',
+        sessionId: SESSION_ID,
+        requesterPeerId: 'peer-requester',
+        targetOriginPeerId: 'peer-A',
+        fromSequence: 1,
+        toSequence: 5,
+        membershipEpoch: 1,
+      };
+
+      const res = serviceRef.serveRepairRequest(req, requesterContext);
+      expect('operations' in res).toBe(true);
+
+      // Subsequent request in epoch 2 should succeed cleanly without negative counter corruption
+      const reqEpoch2: RepairRequestPayload = {
+        ...req,
+        requestId: 'd1a74a9a-f4ef-4b9e-b2d3-18ef557163ef',
+        membershipEpoch: 2,
+      };
+
+      // Add op for epoch 2
+      supplierEngine.getOperationLog().insert(createStoredOperation('peer-A', 6, 2));
+      const resEpoch2 = serviceRef.serveRepairRequest({ ...reqEpoch2, fromSequence: 6, toSequence: 6 }, requesterContext);
+      expect('operations' in resEpoch2).toBe(true);
+    });
+
+    it('5.17 Re-entrant callback triggering peer disconnect preserves non-negative concurrency counters', () => {
+      for (let s = 1; s <= 5; s++) {
+        supplierEngine.getOperationLog().insert(createStoredOperation('peer-A', s));
+      }
+
+      let serviceRef: RepairSupplierService;
+      const customCallbacks: AntiEntropyCallbacks = {
+        onBroadcastDigest: vi.fn(),
+        onSendRepairResponse: () => {
+          // Re-entrant peer disconnect inside callback
+          serviceRef.onPeerDisconnected('peer-requester');
+        },
+      };
+
+      serviceRef = new RepairSupplierService(
+        supplierEngine,
+        customCallbacks,
+        {},
+        clock,
+      );
+
+      const req: RepairRequestPayload = {
+        requestId: 'd2a74a9a-f4ef-4b9e-b2d3-18ef557163ef',
+        sessionId: SESSION_ID,
+        requesterPeerId: 'peer-requester',
+        targetOriginPeerId: 'peer-A',
+        fromSequence: 1,
+        toSequence: 5,
+        membershipEpoch: 1,
+      };
+
+      const res = serviceRef.serveRepairRequest(req, requesterContext);
+      expect('operations' in res).toBe(true);
+    });
+
+    it('5.18 Permanent vs temporary gap distinction: compacted history returns OUTSIDE_HORIZON, beyond frontier returns BUSY', () => {
+      // Base snapshot frontier at sequence 5
+      supplierEngine.getOperationLog().setBaseSnapshotFrontier?.({ 'peer-A': 5 });
+      for (let s = 6; s <= 10; s++) {
+        supplierEngine.getOperationLog().insert(createStoredOperation('peer-A', s));
+      }
+
+      // 1. Permanent gap (compacted to base snapshot) -> OUTSIDE_HORIZON with retainedHorizonSequence
+      const reqCompacted: RepairRequestPayload = {
+        requestId: 'd3a74a9a-f4ef-4b9e-b2d3-18ef557163ef',
+        sessionId: SESSION_ID,
+        requesterPeerId: 'peer-requester',
+        targetOriginPeerId: 'peer-A',
+        fromSequence: 3,
+        toSequence: 5,
+        membershipEpoch: 1,
+      };
+      const resCompacted = supplierService.serveRepairRequest(reqCompacted, requesterContext);
+      expect('reason' in resCompacted).toBe(true);
+      expect((resCompacted as RepairRejectedPayload).reason).toBe('OUTSIDE_HORIZON');
+      expect((resCompacted as RepairRejectedPayload).retainedHorizonSequence).toBe(6);
+
+      // 2. Temporary gap (requested sequence 11..15 extends beyond frontier 10) -> BUSY
+      const reqBeyond: RepairRequestPayload = {
+        requestId: 'd4a74a9a-f4ef-4b9e-b2d3-18ef557163ef',
+        sessionId: SESSION_ID,
+        requesterPeerId: 'peer-requester',
+        targetOriginPeerId: 'peer-A',
+        fromSequence: 8,
+        toSequence: 12,
+        membershipEpoch: 1,
+      };
+      const resBeyond = supplierService.serveRepairRequest(reqBeyond, requesterContext);
+      expect('reason' in resBeyond).toBe(true);
+      expect((resBeyond as RepairRejectedPayload).reason).toBe('BUSY');
+    });
   });
 });

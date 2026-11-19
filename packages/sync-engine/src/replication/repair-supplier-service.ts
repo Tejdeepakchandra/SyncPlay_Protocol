@@ -280,6 +280,33 @@ export class RepairSupplierService {
 
     try {
       const response = this.queryRetainedHistoryAndBuildResponse(request, context, targetOrigin);
+
+      // Re-verify epoch and connection generation currency before caching and delivery
+      if (request.membershipEpoch !== this.engine.epoch) {
+        const rejection: RepairRejectedPayload = {
+          requestId: request.requestId,
+          sessionId: request.sessionId,
+          supplierPeerId: this.engine.localPeerId,
+          targetOriginPeerId: targetOrigin,
+          fromSequence: request.fromSequence,
+          toSequence: request.toSequence,
+          reason: 'EPOCH_MISMATCH',
+        };
+        return RepairRejectedPayloadSchema.parse(rejection);
+      }
+
+      const currentGen = this.engine.getPeerGeneration(context.requesterPeerId);
+      if (
+        context.connectionGeneration === undefined ||
+        currentGen === undefined ||
+        context.connectionGeneration !== currentGen
+      ) {
+        throw new SyncEngineError(
+          'UNAUTHORIZED',
+          `Requester connection generation changed during servicing`,
+        );
+      }
+
       this.cacheResponse(context.requesterPeerId, request, response);
       this.callbacks.onSendRepairResponse?.(context.requesterPeerId, response);
       return response;
