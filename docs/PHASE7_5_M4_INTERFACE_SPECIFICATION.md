@@ -21,6 +21,12 @@ export const MAX_CHUNK_BYTES = 32 * 1024; // 32,768 bytes
 /** Minimum allowable chunk binary payload size before aborting transfer: 256 bytes. */
 export const MIN_CHUNK_BYTES = 256;
 
+/** Regular expression restricting protocol identifiers to an explicit ASCII-safe alphabet (Option A). */
+export const ASCII_IDENTIFIER_REGEX = /^[a-zA-Z0-9_.:-]+$/;
+
+/** Minimum transport message limit required to support a full 32 KB binary chunk: 43,692 B Base64 + 1,600 B envelope = 45,292 B. */
+export const MIN_TRANSPORT_LIMIT_FULL_CHUNK = 45292; // 45,292 bytes (44.23 KiB)
+
 /** Maximum number of chunks allowed per snapshot transfer. */
 export const MAX_CHUNKS_PER_SNAPSHOT = 128;
 
@@ -33,7 +39,7 @@ export const MIN_SUPPORTED_SCTP_LIMIT = 2048;
 /** Envelope budget in bytes for SNAPSHOT_CHUNK metadata, UUIDs, and Base64 framing overhead. */
 export const CHUNK_ENVELOPE_BUDGET_BYTES = 768;
 
-/** Guaranteed maximum envelope overhead in bytes for ProtocolMessage wrapping, JSON keys, UUIDs, and signatures (proven upper bound across maximum schema field lengths). */
+/** Guaranteed maximum envelope overhead in bytes for ProtocolMessage wrapping, JSON keys, UUIDs, and signatures (proven upper bound across maximum schema field lengths under Option A). */
 export const MAX_ENVELOPE_OVERHEAD_BYTES = 1600;
 
 /** Hard operational bound on sizing loop attempts per chunk. */
@@ -151,10 +157,10 @@ Transfers a single chunk from supplier to requester.
 ```typescript
 export const SnapshotChunkPayloadSchema = z.object({
   transferId: UUIDv4Schema,
-  sessionId: z.string().min(1).max(128),
+  sessionId: z.string().min(1).max(128).regex(ASCII_IDENTIFIER_REGEX),
   membershipEpoch: z.number().int().nonnegative(),
-  supplierPeerId: z.string().min(1).max(64),
-  snapshotId: z.string().min(1).max(128),
+  supplierPeerId: z.string().min(1).max(64).regex(ASCII_IDENTIFIER_REGEX),
+  snapshotId: z.string().min(1).max(128).regex(ASCII_IDENTIFIER_REGEX),
   chunkIndex: z.number().int().nonnegative().max(MAX_CHUNKS_PER_SNAPSHOT - 1),
   totalChunks: z.number().int().positive().max(MAX_CHUNKS_PER_SNAPSHOT),
   chunkSizeBytes: z.number().int().positive().max(MAX_CHUNK_BYTES),
@@ -608,7 +614,30 @@ In `OrderedOperationLog.compactAtFrontier(stableFrontier)`:
   6. Clone `this.originFrontierTimestamps` into a new Map, updating frontier timestamps with 64-entry FIFO eviction.
   7. Copy `this.baseSnapshotFrontier` into a new record, updating sequence maxima.
 - **Phase 2 (Atomic Swap):**
-  - **Only if candidate reduction and validation complete without error**, perform atomic reference swap across all 8 mutable fields in a single synchronous block.
-- **Formal Rollback Proof:**
-  $$\mathbf{\text{ReducerFailure}} \implies \mathbf{\text{ActiveStateAfter} \equiv \text{ActiveStateBefore}}$$
-  If `this.reducer` throws or candidate construction fails, candidate objects are discarded, the exception is re-thrown, and active engine state remains 100% untouched.
+  - **Only if candidate reduction and validation complete without error**, perform atomic reference swap across all 8 mutable fields in a single synchronous block via direct reference assignment:
+    ```typescript
+    this.baseSnapshot = candidate.candidateBaseSnapshot;
+    this.operations = candidate.candidateOperations; // complete reference replacement
+    this.idIndex = candidate.candidateIdIndex;
+    this.originSeqIndex = candidate.candidateOriginSeqIndex;
+    this.compactedCheckpoints = candidate.candidateCompactedCheckpoints;
+    this.originFrontierTimestamps = candidate.candidateOriginFrontierTimestamps;
+    this.baseSnapshotFrontier = candidate.candidateBaseSnapshotFrontier;
+    this.hasPrunedOperations = candidate.candidateHasPrunedOperations;
+    ```
+- **Formal Failure Invariant:**
+  $$\mathbf{\text{CandidateConstructionFailure}} \implies \mathbf{\text{ActiveStateAfter} \equiv \text{ActiveStateBefore}}$$
+  If `this.reducer` throws during candidate folding, or candidate construction fails, candidate objects are discarded, the exception is re-thrown, and active engine state remains 100% untouched. (Note: Reducer is contracted to be pure; external reducer side effects cannot be rolled back by the runtime.)
+
+### 5.4 Facade Capability Boundary (Milestone M4.0c)
+
+```typescript
+/** In-process capability token for internal digest registration (API custody boundary). */
+export const INTERNAL_DIGEST_ACCESS_TOKEN: unique symbol = Symbol('INTERNAL_DIGEST_ACCESS_TOKEN');
+
+export interface IInternalDigestRegistrar {
+  recordPeerDigest(token: typeof INTERNAL_DIGEST_ACCESS_TOKEN, digest: StateDigestPayload): void;
+}
+```
+- Restricts `recordPeerDigest()` to internal callers (`TrustedTransportAdapter`, `AntiEntropyManager`).
+- **Custody Boundary Scope:** Classified explicitly as an in-process API custody boundary, not a security sandbox.

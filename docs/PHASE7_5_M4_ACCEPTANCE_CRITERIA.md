@@ -17,22 +17,28 @@ This document defines the formal, measurable acceptance criteria for Phase 7.5 M
 
 ## 2. Pre-M4 Security, Metadata & Compaction Criteria (AC-M4-PRE)
 
-### AC-M4-PRE-1: `STATE_DIGEST` Transport Sender Identity Binding
-- **Condition:** Inbound `STATE_DIGEST` message received via `TrustedTransportAdapter`.
+### AC-M4-PRE-1: `STATE_DIGEST` Transport Sender Identity Binding (M4.0a)
+- **Condition:** Inbound `STATE_DIGEST` message received via `TrustedTransportAdapter` (`handleInboundDataChannelMessage`).
 - **Pass Threshold:**
   1. `msg.payload.senderPeerId === inbound.fromPeerId` is verified.
   2. `msg.payload.connectionGeneration === peerStatus.generation` is verified.
-  3. If either field differs, the message is immediately dropped with zero mutations to `CompactionManager` or `AntiEntropyManager`.
-  4. Unit test confirms that forged digests from Peer X claiming `senderPeerId: 'peer-y'` are completely discarded.
+  3. `msg.payload.membershipEpoch === this.engine.epoch` and `msg.membershipEpoch === this.engine.epoch` are verified.
+  4. `msg.sessionId === this.engine.sessionId` and `msg.payload.sessionId === this.engine.sessionId` are verified.
+  5. If any check fails, the message is immediately dropped with zero mutations to `CompactionManager` or `AntiEntropyManager`.
+  6. Unit test suite verifies 4 required scenarios:
+     - *Mismatched Inner Sender:* `payload.senderPeerId: 'peer-y'` over channel from `peer-x` is dropped.
+     - *Stale Connection Generation:* `payload.connectionGeneration: 1` when `peerStatus.generation === 2` is dropped.
+     - *Stale Membership Epoch:* `payload.membershipEpoch: 0` when `engine.epoch === 1` is dropped.
+     - *Valid Current Sender:* Matching sender, current generation, and current epoch is accepted and registered.
 
-### AC-M4-PRE-2: Strict Sequence-Specific Timestamp Resolution
+### AC-M4-PRE-2: Strict Sequence-Specific Timestamp Resolution (M4.0b)
 - **Condition:** `getOriginFrontierTimestamps(frontier)` is called with origin sequences that have been pruned and whose checkpoints were evicted from the 256-entry FIFO cache.
 - **Pass Threshold:**
   1. If an exact sequence timestamp is not present in active log or retained checkpoints, it is reported as unresolvable / unavailable (`null`).
   2. The function **NEVER** returns a timestamp belonging to a different sequence number.
   3. Snapshot creation fails if required frontier timestamps cannot be established exactly.
 
-### AC-M4-PRE-3: Compaction Exception Atomicity (8-Component Mutation Inventory)
+### AC-M4-PRE-3: Compaction Exception Atomicity & Reference Replacement (M4.0d)
 - **Condition:** `compactAtFrontier()` is invoked with a throwing reducer callback.
 - **Pass Threshold:**
   1. Candidate mutation set across all 8 mutable fields is staged out-of-band:
@@ -44,10 +50,19 @@ This document defines the formal, measurable acceptance criteria for Phase 7.5 M
      - `originFrontierTimestamps`: Shallow Map clone `new Map(this.originFrontierTimestamps)` with 64-entry FIFO eviction.
      - `baseSnapshotFrontier`: Shallow Record clone `{ ...this.baseSnapshotFrontier }`.
      - `hasPrunedOperations`: Scalar boolean copy.
-  2. If the reducer throws at any point during candidate reduction or candidate validation fails, the exception is propagated, all candidate objects are discarded, and `this.baseSnapshot`, `this.operations`, `this.idIndex`, `this.originSeqIndex`, `this.compactedCheckpoints`, `this.originFrontierTimestamps`, `this.baseSnapshotFrontier`, and `this.hasPrunedOperations` remain 100% untouched.
-  3. Formal Proof Criterion:
+  2. Complete candidate-reference replacement: `this.operations = candidateOperations;` is executed directly; in-place array mutation (`.length = 0; .push(...)`) is strictly prohibited.
+  3. If the reducer throws at any point during candidate reduction or candidate validation fails, the exception is propagated, all candidate objects are discarded, and all 8 active structures remain 100% untouched.
+  4. Formal Proof Criterion:
      $$\mathbf{\text{CandidateConstructionFailure}} \implies \mathbf{\text{ActiveStateAfter} \equiv \text{ActiveStateBefore}}$$
      (Note: Reducer is contracted to be pure; external reducer side effects cannot be rolled back by the runtime.)
+
+### AC-M4-PRE-4: Facade Capability Custody Boundary (M4.0c)
+- **Condition:** Direct external invocation of `LeaderlessSyncEngine.recordPeerDigest()`.
+- **Pass Threshold:**
+  1. Internal registration requires `INTERNAL_DIGEST_ACCESS_TOKEN` capability token or is routed via internal coordinator interface.
+  2. Public engine facade cannot be used by ordinary consumers to bypass `TrustedTransportAdapter`.
+  3. Verified as an in-process API custody boundary, not a security sandbox.
+  4. Internal composition and existing tests remain functional.
 
 ---
 
@@ -87,7 +102,8 @@ This document defines the formal, measurable acceptance criteria for Phase 7.5 M
      $$\text{calculatedRequiredChunks} = \left\lceil \frac{\text{totalSizeBytes}}{\text{chunkBinaryCapacity}} \right\rceil$$
   2. Invariant 1 verified: $\text{calculatedRequiredChunks} \le \text{MAX\_CHUNKS\_PER\_SNAPSHOT}$ (128). If exceeded, rejected upfront with `CHUNK_COUNT_EXCEEDED` before allocating reassembly buffer memory.
   3. Invariant 2 verified: $\text{offer.totalChunks} === \text{calculatedRequiredChunks}$. If inconsistent, rejected upfront with `OFFER_INCONSISTENT` before allocating reassembly buffer memory.
-  4. Explicitly verified that universal 4 MiB transfer is **NOT** claimed on a 2 KiB SCTP transport (which admits snapshots up to 42 KiB / 43,008 B for 128 chunks).
+  4. Explicitly verified that universal 4 MiB transfer is **NOT** claimed on a 2 KiB SCTP transport (which admits snapshots up to 42.0 KiB / 43,008 B for 128 chunks), and that full 32 KB binary chunks require an effective transport limit $\ge 45,292$ bytes (43,692 B Base64 + 1,600 B envelope).
+  5. Option A ASCII identifier alphabet (`/^[a-zA-Z0-9_.:-]+$/`) verified: no JSON escaping can expand identifiers beyond their character lengths.
 
 ### AC-M4-ADMIT-2: Minimum Supported SCTP Limit Floor
 - **Condition:** Transport reporting SCTP limit $< 2,048$ bytes (`MIN_SUPPORTED_SCTP_LIMIT`).

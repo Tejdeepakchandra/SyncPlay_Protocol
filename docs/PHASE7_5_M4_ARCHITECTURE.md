@@ -67,20 +67,38 @@ flowchart TD
 
 A fundamental physical and protocol reality governs state recovery over WebRTC: individual snapshot capacity is fundamentally bound by the negotiated SCTP maximum message size of the transport link and the fixed maximum chunk count.
 
-#### 1.2.1 Exact Sizing Contract and Envelope Budget
+#### 1.2.1 Exact Sizing Contract, Option A Alphabet Restriction, and Envelope Ceiling Proof
 The admission calculation must be completely conservative and consistent with the actual wire serialization executed by the outbound transfer pipeline. It accounts for:
-1. **Complete ProtocolMessage Envelope Overhead:** The outer framing (`protocolVersion`, `sessionId`, `type`, `senderPeerId`, `timestamp`, `signature`), payload object keys, UUIDs, epoch numbers, chunk indices, total chunks, byte counts, and the 64-character hex `chunkSha256` string.
-2. **Guaranteed Maximum Envelope Budget:** Defined as $\text{MAX\_ENVELOPE\_OVERHEAD\_BYTES} = 1600$ bytes, mathematically proven as an airtight upper bound across all schema-permitted worst-case field lengths (including maximum 128-char `sessionId`, `senderPeerId`, `messageId`, `logicalEventId`, `originPeerId`, `snapshotId`, 64-char `supplierPeerId`, 64-char `chunkSha256`, 36-char `transferId`, maximum 64-bit safe integers, JSON keys, quotes, colons, and delimiters).
-3. **Base64 Expansion:** Every 3 binary bytes expand to 4 Base64 characters ($4 \times \lceil B / 3 \rceil$). To guarantee that the encoded data plus envelope fits within `effectiveLimit`:
+1. **Complete ProtocolMessage Envelope Overhead:** The outer framing (`protocolVersion`, `sessionId`, `type`, `senderPeerId`, `timestamp`, `signature`), optional envelope fields (`logicalEventId`, `originPeerId`, `membershipEpoch`, `connectionGeneration`, `logicalTimestamp`, `originSequenceNumber`), payload object keys, UUIDs, epoch numbers, chunk indices, total chunks, byte counts, and the 64-character hex `chunkSha256` string.
+2. **Schema Character Set Strategy: Option A (Adopted):**
+   - In distributed protocol implementations, identifier strings (`sessionId`, `senderPeerId`, `supplierPeerId`, `snapshotId`, `messageId`, `logicalEventId`, `originPeerId`) are restricted in schemas to an explicit ASCII-safe alphabet:
+     $$\text{ASCII\_IDENTIFIER\_REGEX} = \text{/}\hat{\ }[a-zA-Z0-9\_.:-]+\$\text{/}$$
+   - *Why Option A is Adopted:* Under this character set, every character is an ASCII printable character between `0x20` and `0x7E` (excluding quotes and backslashes). No JSON control character escaping (`\u0000` to `\u001f`) is possible, and UTF-8 byte length is strictly identical to character count ($1\text{ char} = 1\text{ byte}$).
+   - *Worst-Case Mathematical Serialization Proof:*
+     - Outer envelope: `protocolVersion` (20 B) + `messageType` "SNAPSHOT_CHUNK" (32 B) + `sessionId` 128 B + `senderPeerId` 128 B + `messageId` 128 B + optional `logicalEventId` 128 B + optional `originPeerId` 128 B + 4 numeric fields at `Number.MAX_SAFE_INTEGER` (110 B)
+     - Inner payload: `transferId` (UUIDv4 36 B) + `sessionId` (128 B) + `supplierPeerId` (64 B) + `snapshotId` (128 B) + `chunkSha256` (64 B) + 4 numeric fields (100 B)
+     - Structural JSON syntax (keys, quotes, colons, braces, `"dataBase64":""`): ~92 B
+     - **Exact maximum serialized UTF-8 bytes (excluding Base64 payload):** **1,554 bytes**.
+     - Since $1,554 \le 1,600$, $\text{MAX\_ENVELOPE\_OVERHEAD\_BYTES} = 1600$ bytes is an airtight, mathematically proven upper bound.
+   - *Option B (Unrestricted Character Set Evaluation):* If arbitrary Unicode and control characters were permitted in schema strings, JSON escaping could produce up to 6 bytes per code point (`\u0000`), driving envelope overhead $> 5,500$ bytes. Such an overhead would starve transfers on links $\le 8\text{ KB}$ and make transfers impossible on 2 KiB links. Option A avoids this pathological inflation while fully supporting all UUIDs, nanoIDs, and standard SyncPlay identifiers.
+3. **Base64 Expansion and Exact Sizing Formulation:**
+   Every 3 binary bytes expand to 4 Base64 characters ($4 \times \lceil B / 3 \rceil$). To guarantee that the encoded data plus envelope fits within `effectiveLimit`:
    $$\text{maxBase64Bytes} = \text{effectiveLimit} - \text{MAX\_ENVELOPE\_OVERHEAD\_BYTES}$$
    $$\text{chunkBinaryCapacity} = \min\left(\text{MAX\_CHUNK\_BYTES}, \left\lfloor \frac{\text{maxBase64Bytes}}{4} \right\rfloor \times 3\right)$$
    (where $\text{MAX\_CHUNK\_BYTES} = 32,768$ bytes).
 
-#### 1.2.2 Exact Mathematical Formulation of Admission
+#### 1.2.2 Minimum Transport Size for Full 32 KB Binary Chunks
+For a maximum binary chunk of $B = 32,768$ bytes:
+- Base64 payload size: $\lceil 32,768 / 3 \rceil \times 4 = 10,923 \times 4 = \mathbf{43,692\text{ bytes}}$.
+- Plus proven maximum envelope budget ($1,600$ bytes):
+  $$\text{Minimum Transport Limit for 32 KB Chunk} = 43,692 + 1,600 = \mathbf{45,292\text{ bytes}} \ (44.23\text{ KiB})$$
+  *(Note: Any transport with an effective limit strictly below 45,292 bytes cannot transmit 32,768-byte binary chunks and will dynamically size down).*
+
+#### 1.2.3 Exact Mathematical Formulation of Admission
 Before allocating reassembly memory or accepting an incoming transfer offer, both supplier and requester evaluate:
 $$\text{calculatedRequiredChunks} = \left\lceil \frac{\text{totalSizeBytes}}{\text{chunkBinaryCapacity}} \right\rceil$$
 
-#### 1.2.3 Mandatory Capacity and Consistency Invariants
+#### 1.2.4 Mandatory Capacity and Consistency Invariants
 $$\mathbf{\text{Invariant 1 (Ceiling):}} \quad \text{calculatedRequiredChunks} \le \text{MAX\_CHUNKS\_PER\_SNAPSHOT} \ (128)$$
 $$\mathbf{\text{Invariant 2 (Consistency):}} \quad \text{offer.totalChunks} === \text{calculatedRequiredChunks}$$
 
@@ -88,16 +106,18 @@ $$\mathbf{\text{Invariant 2 (Consistency):}} \quad \text{offer.totalChunks} === 
 - **Inconsistent Offer Rejection:** If $\text{offer.totalChunks} !== \text{calculatedRequiredChunks}$, the offer is rejected immediately with `OFFER_INCONSISTENT` before allocating any assembler or reassembly buffer memory. An inconsistent offer indicates a malformed or incompatible supplier slicing contract.
 - **Variable Final-Chunk Guarantee:** Chunks $0 \dots N-2$ carry exactly $\text{chunkBinaryCapacity}$ bytes. The final chunk $N-1$ carries $B_{\text{final}} = \text{totalSizeBytes} - (N-1) \times \text{chunkBinaryCapacity} \le \text{chunkBinaryCapacity}$ bytes. Because $B_{\text{final}} \le \text{chunkBinaryCapacity}$, its Base64 encoding is strictly $\le$ preceding chunks, guaranteed to fit within `effectiveLimit`.
 
-#### 1.2.4 Transport-Dependent Snapshot Capacity Matrix
+#### 1.2.5 Transport-Dependent Snapshot Capacity Matrix
 The protocol **does NOT claim universal 4 MiB snapshot transfer support over severely constrained 2 KiB SCTP transports**. On a 2,048-byte link, transferring a 4 MiB snapshot would require thousands of tiny chunks, vastly exceeding the 128-chunk bound. Instead, effective snapshot capacity scales with transport limits:
 
 | Transport SCTP Limit | Envelope Overhead | Available Base64 | Chunk Binary Capacity | Max Transferable Snapshot (128 chunks) | Operational Recovery Scope |
 |:---|:---:|:---:|:---:|:---:|:---|
 | **65,536 B (Standard / Fallback)** | 1,600 B | 63,936 B | 32,768 B (Capped) | **4,194,304 B (4.00 MiB)** | Full 4 MiB Engine Snapshot |
+| **$\ge$ 45,292 B (Full Chunk Ceiling)** | 1,600 B | $\ge$ 43,692 B | 32,768 B (Capped) | **4,194,304 B (4.00 MiB)** | Full 4 MiB Engine Snapshot |
 | **32,768 B** | 1,600 B | 31,168 B | 23,376 B | **2,992,128 B (2.85 MiB)** | Admitted if $\le 2.85\text{ MiB}$; rejected otherwise |
 | **16,384 B** | 1,600 B | 14,784 B | 11,088 B | **1,419,264 B (1.35 MiB)** | Admitted if $\le 1.35\text{ MiB}$; rejected otherwise |
 | **8,192 B** | 1,600 B | 6,592 B | 4,944 B | **632,832 B (618 KiB)** | Admitted if $\le 618\text{ KiB}$; rejected otherwise |
-| **2,048 B (Minimum Floor)** | 1,600 B | 448 B | 336 B | **43,008 B (42 KiB)** | Small snapshot / test case support only |
+| **2,048 B (Minimum Floor)** | 1,600 B | 448 B | 336 B | **43,008 B (42.0 KiB)** | Small snapshot / test case support only |
+| **< 1,944 B** | N/A | < 344 B | < 256 B | **0 B (Rejected Upfront)** | Below minimum chunk threshold; immediate abort |
 | **< 2,048 B** | N/A | N/A | < 256 B | **0 B (Rejected Upfront)** | Unsupported link; immediate abort |
 
 By evaluating the admission invariant upfront, the engine never enters a deadlocked or memory-exhausted transfer state on constrained transports.
@@ -377,8 +397,32 @@ To maintain memory consumption well below the theoretical ceiling:
 
 ## 8. Resolution of Mandatory M3 Audit Limitations
 
-### 8.1 Limitation A: `STATE_DIGEST` Transport Identity Binding
-- **Correction:** In `TrustedTransportAdapter`, verify `msg.payload.senderPeerId === inbound.fromPeerId` and `msg.payload.connectionGeneration === peerStatus.generation`. Mismatches are dropped.
+### 8.1 Limitation A: `STATE_DIGEST` Transport Identity & Generation Binding (Milestone M4.0a)
+- **M3 Implementation Inspection Findings:**
+  In `packages/sync-engine/src/engine/leaderless-sync-engine.ts` (`handleInboundDataChannelMessage`), while outer envelope `msg.senderPeerId === inbound.fromPeerId` and `msg.sessionId === this.engine.sessionId` are validated, the inner payload `msg.payload as StateDigestPayload` is passed directly to `this.antiEntropyManager?.processRemoteDigest()` without validating:
+  1. `payload.senderPeerId === inbound.fromPeerId` (inner sender spoofing).
+  2. `payload.connectionGeneration === peerStatus.generation` (stale connection generation).
+  3. `payload.membershipEpoch === this.engine.epoch` (stale membership epoch).
+  4. `payload.sessionId === this.engine.sessionId` (session matching).
+  If an unvalidated digest payload is processed, `AntiEntropyManager.processRemoteDigest()` records peer knowledge in `RepairRequestPipeline`, and `LeaderlessSyncEngine.compareRemoteDigest()` records the digest into `CompactionManager.recordPeerDigest()`. A stale or spoofed sender could distort the local compaction frontier or trigger spurious repair requests.
+- **M4.0a Normative Inbound Pipeline:**
+  In `handleInboundDataChannelMessage`, before invoking `processRemoteDigest()`:
+  ```typescript
+  // 1. Session verification
+  if (msg.sessionId !== this.engine.sessionId || payload.sessionId !== this.engine.sessionId) return;
+  // 2. Sender transport verification (outer envelope & inner payload)
+  if (msg.senderPeerId !== inbound.fromPeerId || payload.senderPeerId !== inbound.fromPeerId) return;
+  // 3. Epoch fencing
+  if (msg.membershipEpoch !== this.engine.epoch || payload.membershipEpoch !== this.engine.epoch) return;
+  // 4. Connection generation currency
+  if (payload.connectionGeneration !== peerStatus.generation) return;
+  ```
+  Any violation drops the message immediately with zero anti-entropy knowledge recording, zero compaction manager recording, and zero state mutation.
+- **Required Unit Test Matrix for M4.0a:**
+  1. *Test M4.0a-1 (Inner Sender Spoofing):* Inbound `STATE_DIGEST` with `payload.senderPeerId !== inbound.fromPeerId` is dropped; verifies zero knowledge recorded in `RepairRequestPipeline` and zero digest in `CompactionManager`.
+  2. *Test M4.0a-2 (Stale Connection Generation):* Inbound `STATE_DIGEST` with `payload.connectionGeneration < peerStatus.generation` is dropped; verifies zero recording.
+  3. *Test M4.0a-3 (Stale Membership Epoch):* Inbound `STATE_DIGEST` with `payload.membershipEpoch < currentEpoch` is dropped; verifies zero recording.
+  4. *Test M4.0a-4 (Valid Current Sender):* Inbound `STATE_DIGEST` with matching sender, current generation, and current epoch is successfully processed and recorded.
 - **Implementation Milestone:** **M4.0a (Prerequisite)**.
 
 ### 8.2 Limitation B: Exact Historical Timestamp Lookup and Representation Audit
@@ -404,7 +448,7 @@ To maintain memory consumption well below the theoretical ceiling:
      Eliminate the Step 4 fallback to `this.originFrontierTimestamps.get(origin)` entirely from `getOriginFrontierTimestamps()`. If a requested frontier sequence cannot be resolved from `originSeqIndex` or `compactedCheckpoints`, the method returns `null` for that origin. Snapshot creation (`exportSnapshotV2`) must fail or explicitly report incomplete metadata if any required frontier timestamp cannot be verified, rather than substituting a later Lamport timestamp.
 - **Implementation Milestone:** **M4.0b (Prerequisite)**.
 
-### 8.3 Limitation C: Compaction Exception Atomicity (M4.0d Staged Mutation Inventory)
+### 8.3 Limitation C: Compaction Exception Atomicity & Reference Replacement (Milestone M4.0d)
 A documented non-throwing contract is insufficient to ensure transactional safety during log compaction. If the state reducer throws while compacting operations forward into the base snapshot, any partially updated data structures would leave the sync engine in a permanently corrupt state.
 
 #### 8.3.1 Complete Eight-Component Staged Mutation Inventory & Reconstruction Strategies
@@ -416,7 +460,8 @@ In `OrderedOperationLog.compactAtFrontier(stableFrontier)`, all mutations are pe
    - In-place mutation of the active `baseSnapshot` reference is strictly prohibited.
 2. **`this.operations` (`StoredOperation[]`):**
    - **Cloning Strategy: SHALLOW ARRAY CLONE / FILTERED ARRAY** containing only the retained `StoredOperation` references strictly newer than `stableFrontier`.
-   - `StoredOperation` objects are treated as immutable runtime records (TypeScript-readonly, no properties mutated in place).
+   - `StoredOperation` objects are treated as immutable runtime records (TypeScript-readonly; neither their fields nor their nested `causalContext` records are mutated after instantiation).
+   - In `OrderedOperationLog`, the property declaration is changed from `private readonly operations` to `private operations: StoredOperation[] = [];`, permitting complete atomic reference replacement.
 3. **`this.idIndex` (`Map<string, StoredOperation>`):**
    - **Cloning Strategy: RECONSTRUCTED MAP**.
    - A new `Map<string, StoredOperation>()` is instantiated and populated solely with `op.logicalEventId -> op` for retained candidate operations, avoiding deletion on the active map.
@@ -436,9 +481,13 @@ In `OrderedOperationLog.compactAtFrontier(stableFrontier)`, all mutations are pe
    - **Cloning Strategy: SCALAR BOOLEAN VALUE**.
    - Set to `true` if `toPrune.length > 0`, otherwise preserves previous value.
 
-#### 8.3.2 Atomicity Invariant, Atomic Swap, and Formal Rollback Proof
-- **Atomic Reference Swap:**
-  Only when every operation in the pruned range has been folded into `candidateBaseSnapshot` without throwing, and all candidate indexes and maps are fully constructed and validated, are the references swapped in a single synchronous block:
+#### 8.3.2 Complete Candidate-Reference Replacement and Formal Failure Invariant
+- **Why In-Place Array Mutation is Prohibited:**
+  Mutating the existing array via `this.operations.length = 0; this.operations.push(...candidateOperations)` is unsafe: if `candidateOperations` is large, spreading arguments into `.push()` can exceed the V8 call stack argument limit and throw a `RangeError`, corrupting active state after `length = 0` already wiped retained operations.
+- **Atomic Reference Assignment:**
+  Because `this.operations` is private and never exposed directly (all public methods `getAllOperations()` and `getRange()` return fresh copies or slices), `this.operations` is replaced via direct reference assignment.
+  In JavaScript, simple property reference assignments (`this.x = candidate.x`) **cannot throw**.
+  Therefore, the final commit step executes synchronously and atomically:
   ```typescript
   this.baseSnapshot = candidateBaseSnapshot;
   this.operations = candidateOperations;
@@ -451,11 +500,26 @@ In `OrderedOperationLog.compactAtFrontier(stableFrontier)`, all mutations are pe
   ```
 - **Formal Failure Invariant:**
   $$\mathbf{\text{CandidateConstructionFailure}} \implies \mathbf{\text{ActiveStateAfter} \equiv \text{ActiveStateBefore}}$$
-  If `this.reducer` throws at any point (e.g. during operation $k$ of $N$), or if memory allocation fails during candidate staging:
+  If `this.reducer` throws during candidate folding, or if memory allocation fails during candidate staging:
   The candidate objects are discarded, the exception propagates to the caller, and **all 8 active structures remain 100% untouched** (identical references and identical content). Zero intermediate state is observable across the single-threaded event loop.
 - **Reducer Purity Scope:**
   The state reducer is contracted to be a deterministic pure function with no external side effects. The sync engine cannot roll back external side effects performed by user-supplied reducers (e.g. external I/O or global variable mutation); the rollback guarantee applies strictly to `OrderedOperationLog` internal state via candidate staging.
 - **Implementation Milestone:** **M4.0d (Prerequisite)**.
+
+### 8.4 Limitation D: Facade Capability Restriction (Milestone M4.0c)
+- **M3 Implementation Inspection Findings:**
+  In `LeaderlessSyncEngine`:
+  ```typescript
+  public recordPeerDigest(digest: StateDigestPayload): void {
+    this.compactionManager.recordPeerDigest(digest);
+  }
+  ```
+  This method is currently exposed as an unguarded public API on `LeaderlessSyncEngine`. Any external consumer or script holding a reference to the engine can invoke `recordPeerDigest()` directly with arbitrary unverified payloads, bypassing the `TrustedTransportAdapter`, session verification, and transport sender validation.
+- **M4.0c Custody Boundary Specification:**
+  1. *API Custody Boundary Definition:* The internal registration path is restricted by requiring an internal capability token/symbol (`INTERNAL_DIGEST_ACCESS_TOKEN = Symbol('INTERNAL_DIGEST_ACCESS_TOKEN')`) or by extracting `recordPeerDigest` into an internal coordinator interface passed exclusively to `TrustedTransportAdapter` and `AntiEntropyManager`.
+  2. *Not a Security Sandbox:* As this capability operates within the same JavaScript memory space, it is explicitly classified as an **in-process API custody boundary** (preventing accidental consumer misuse or architectural boundary violations), **NOT** an OS-level or hardware security sandbox.
+  3. *Public Engine Facade Protection:* The public facade method on `LeaderlessSyncEngine` is either deprecated/removed or requires the internal capability token, preventing external callers from injecting unauthenticated digests. Existing internal composition and unit tests remain fully functional.
+- **Implementation Milestone:** **M4.0c (Prerequisite)**.
 
 ---
 

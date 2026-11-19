@@ -53,10 +53,11 @@
      $$\text{calculatedRequiredChunks} = \left\lceil \frac{\text{totalSizeBytes}}{\text{chunkBinaryCapacity}} \right\rceil$$
   2. If $\text{calculatedRequiredChunks} > \text{MAX\_CHUNKS\_PER\_SNAPSHOT}$ (128), the transfer is rejected immediately before allocating reassembly buffer memory (`CHUNK_COUNT_EXCEEDED`).
   3. If $\text{offer.totalChunks} !== \text{calculatedRequiredChunks}$, the offer is rejected upfront with `OFFER_INCONSISTENT`.
-  4. The protocol explicitly **does NOT claim universal 4 MiB snapshot transfer support on 2 KiB transports**; effective capacity on 2 KiB transports is bounded to $\approx 42\text{ KiB}$ (43,008 B) for 128 chunks.
-  5. `calculateChunkCapacity` throws if `effectiveLimit < MIN_SUPPORTED_SCTP_LIMIT` (2,048 bytes).
-  6. The iterative loop aborts with `TRANSPORT_LIMIT_EXCEEDED` if slice size drops below `MIN_CHUNK_BYTES = 256`.
-  7. Transfer terminates cleanly to `DEGRADED`, prompting application intervention rather than hanging.
+  4. The protocol explicitly **does NOT claim universal 4 MiB snapshot transfer support on 2 KiB transports**; effective capacity on 2 KiB transports is bounded to $\approx 42.0\text{ KiB}$ (43,008 B) for 128 chunks. Full 32 KB binary chunks require an effective transport limit $\ge 45,292$ bytes (43,692 B Base64 + 1,600 B envelope).
+  5. Option A ASCII identifier restriction (`/^[a-zA-Z0-9_.:-]+$/`) guarantees no JSON escaping overhead expands identifier fields beyond their character lengths.
+  6. `calculateChunkCapacity` throws if `effectiveLimit < MIN_SUPPORTED_SCTP_LIMIT` (2,048 bytes).
+  7. The iterative loop aborts with `TRANSPORT_LIMIT_EXCEEDED` if slice size drops below `MIN_CHUNK_BYTES = 256`.
+  8. Transfer terminates cleanly to `DEGRADED`, prompting application intervention rather than hanging.
 - **Verification Plan:** Test case with SCTP limit set to 1,024 bytes confirms immediate, clean rejection; test case with 4 MiB snapshot on 2,048-byte SCTP limit confirms upfront admission rejection without buffer allocation; test case with inconsistent `totalChunks` confirms rejection before buffer allocation.
 
 ---
@@ -181,3 +182,14 @@
   3. Fallback of 65,536 bytes on open channels is strictly documented as a conservative local implementation cap, not proof of remote capacity.
   4. Synchronous `RTCDataChannel.send()` failures preserve chunk retry state and transfer counters without marking unsent frames as complete.
 - **Verification Plan:** Unit tests verifying transfer deferral on `undefined` SCTP limits, immediate rejection on zero/negative limits, and accurate retry accounting on synchronous send exceptions.
+
+---
+
+### R-M4-13: Facade Capability Custody Bypass (Milestone M4.0c)
+- **Threat Description:** Ordinary application consumers invoke `LeaderlessSyncEngine.recordPeerDigest()` directly, bypassing `TrustedTransportAdapter` session, sender, and epoch validations to inject unverified digests into `CompactionManager`.
+- **Root Cause:** Publicly exposed registration entry point without in-process capability gating.
+- **Mitigation:**
+  1. Designated as **Milestone M4.0c (Prerequisite)**.
+  2. Restrict `recordPeerDigest()` via in-process capability token `INTERNAL_DIGEST_ACCESS_TOKEN` or internal coordinator interface.
+  3. Classify explicitly as an in-process API custody boundary, not a security sandbox.
+- **Verification Plan:** Unit test verifying that external invocation without internal token is rejected at compile/run time while internal composition remains functional.
