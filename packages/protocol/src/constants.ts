@@ -73,3 +73,10 @@ export const MAX_OPERATIONS_PER_BATCH = 32;
  * - Caps serialized StateDigest size to ~7 KB, preserving ample headroom within MAX_PAYLOAD_BYTES (32 KB).
  */
 export const MAX_VECTOR_ENTRIES = 64;
+
+/**
+ * Maximum snapshot payload size: 4 MB (4,194,304 bytes).
+ * Phase 7.5 state recovery snapshot limit (128 chunks of up to 32 KB each).
+ */
+export const MAX_SNAPSHOT_BYTES = 4 * 1024 * 1024;
+

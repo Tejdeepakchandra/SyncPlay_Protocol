@@ -43,8 +43,32 @@ export {
   EngineSnapshotDataSchema,
   exportEngineSnapshot,
   validateSnapshotPayload,
+  computeSnapshotDigestV2,
+  exportEngineSnapshotV2,
+  validateSnapshotPayloadV2,
 } from './snapshot.js';
-export type { EngineSnapshotData, ValidatedSnapshotResult } from './snapshot.js';
+export type {
+  EngineSnapshotData,
+  ValidatedSnapshotResult,
+  ValidatedSnapshotV2Result,
+} from './snapshot.js';
+
+export {
+  captureMembershipView,
+  calculateMembershipSafeFrontier,
+  calculateLocalPressureFrontier,
+  executeCompaction,
+  CompactionManager,
+} from './compaction/compaction-manager.js';
+export type {
+  PeerConnectionDescriptor,
+  CapturedMembershipView,
+  CompactionHoldReason,
+  CompactionAbortReason,
+  CompactionFrontierCandidate,
+  CompactionExecutionResult,
+  CompactionExecutionContext,
+} from './compaction/compaction-manager.js';
 
 // ── Implementation ───────────────────────────────────────────
 export { BaselineSyncEngine } from './baseline-sync-engine.js';

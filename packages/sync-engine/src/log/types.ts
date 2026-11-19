@@ -6,6 +6,7 @@
  * - PHASE7_2_LLD.md §3
  */
 
+import type { CompactedCheckpointItem } from '@syncplay/protocol';
 import type { PlaybackState } from '../types.js';
 
 export interface StoredOperation {
@@ -83,6 +84,14 @@ export interface IOrderedOperationLog {
     originPeerId: string,
     sequenceNumber: number,
   ): CompactedCheckpointRecord | undefined;
+
+  /** Retrieves all retained compacted checkpoints across origins. */
+  getAllCompactedCheckpoints?(): ReadonlyArray<CompactedCheckpointItem>;
+
+  /**
+   * Resolves the logical timestamp for each origin at the sequence specified by the frontier.
+   */
+  getOriginFrontierTimestamps?(frontier: Record<string, number>): Record<string, number>;
 
   /** Retrieves tail fingerprint for an origin at an optional target sequence. */
   getTailFingerprint?(originPeerId: string, atSequence?: number): string | undefined;

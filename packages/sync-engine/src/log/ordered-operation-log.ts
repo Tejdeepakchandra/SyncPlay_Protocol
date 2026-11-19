@@ -11,6 +11,7 @@
 import { SyncEngineError } from '../errors.js';
 import { compareOperations } from '../ordering/comparator.js';
 import { computeOperationFingerprint } from './operation-fingerprint.js';
+import type { CompactedCheckpointItem } from '@syncplay/protocol';
 import type { PlaybackState } from '../types.js';
 import type {
   StoredOperation,
@@ -101,6 +102,67 @@ export class OrderedOperationLog implements IOrderedOperationLog {
     sequenceNumber: number,
   ): CompactedCheckpointRecord | undefined {
     return this.compactedCheckpoints.get(`${originPeerId}:${sequenceNumber}`);
+  }
+
+  /**
+   * Returns all retained compacted checkpoints across origins, sorted deterministically
+   * by originPeerId ascending, then sequenceNumber ascending.
+   */
+  public getAllCompactedCheckpoints(): ReadonlyArray<CompactedCheckpointItem> {
+    const items: CompactedCheckpointItem[] = [];
+    for (const [key, record] of this.compactedCheckpoints.entries()) {
+      const idx = key.indexOf(':');
+      if (idx !== -1) {
+        const originPeerId = key.substring(0, idx);
+        const sequenceNumber = parseInt(key.substring(idx + 1), 10);
+        if (!isNaN(sequenceNumber)) {
+          items.push({
+            originPeerId,
+            sequenceNumber,
+            logicalTimestamp: record.logicalTimestamp,
+          });
+        }
+      }
+    }
+    return items.sort((a, b) => {
+      const cmp = a.originPeerId.localeCompare(b.originPeerId);
+      if (cmp !== 0) return cmp;
+      return a.sequenceNumber - b.sequenceNumber;
+    });
+  }
+
+  /**
+   * Resolves the logical timestamp for each origin at the sequence specified by the frontier.
+   * Checks:
+   * 1. Active log retained operation at (origin, seq)
+   * 2. Compacted checkpoint at (origin, seq)
+   * 3. Internal originFrontierTimestamps tracking map
+   */
+  public getOriginFrontierTimestamps(frontier: Record<string, number>): Record<string, number> {
+    const result: Record<string, number> = {};
+    for (const [origin, seq] of Object.entries(frontier)) {
+      if (seq <= 0) {
+        result[origin] = 0;
+        continue;
+      }
+      const activeOp = this.getOperationAt(origin, seq);
+      if (activeOp) {
+        result[origin] = activeOp.logicalTimestamp;
+        continue;
+      }
+      const cp = this.getCompactedCheckpoint(origin, seq);
+      if (cp !== undefined) {
+        result[origin] = cp;
+        continue;
+      }
+      const tracked = this.originFrontierTimestamps.get(origin);
+      if (tracked !== undefined) {
+        result[origin] = tracked;
+        continue;
+      }
+      result[origin] = 0;
+    }
+    return result;
   }
 
   public setCompactedCheckpoint(

@@ -16,6 +16,7 @@ export {
   MAX_BATCH_PAYLOAD_BYTES,
   MAX_OPERATIONS_PER_BATCH,
   MAX_VECTOR_ENTRIES,
+  MAX_SNAPSHOT_BYTES,
 } from './constants.js';
 
 // ── Identity types ───────────────────────────────────────────

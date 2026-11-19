@@ -28,7 +28,23 @@ import type {
 import { SyncEngineError } from '../errors.js';
 import { validateSyncEngineConfig, type ResolvedSyncEngineConfig } from '../config.js';
 import { calculateExtrapolatedPosition } from '../reducer.js';
-import { exportEngineSnapshot, validateSnapshotPayload } from '../snapshot.js';
+import {
+  exportEngineSnapshot,
+  validateSnapshotPayload,
+  exportEngineSnapshotV2,
+  validateSnapshotPayloadV2,
+} from '../snapshot.js';
+import {
+  CompactionManager,
+  captureMembershipView,
+  calculateMembershipSafeFrontier,
+  calculateLocalPressureFrontier,
+  executeCompaction,
+  type PeerConnectionDescriptor,
+  type CapturedMembershipView,
+  type CompactionFrontierCandidate,
+  type CompactionExecutionResult,
+} from '../compaction/compaction-manager.js';
 import { LogicalClockManager } from '../clock/logical-clock-manager.js';
 import { OrderedOperationLog } from '../log/ordered-operation-log.js';
 import { PendingDependencyQueue, type MissingSequenceRange } from '../log/pending-dependency-queue.js';
@@ -563,6 +579,7 @@ export class TrustedTransportAdapter {
       status.state === 'FAILED'
     ) {
       this.antiEntropyManager?.onPeerDisconnected(status.peerId);
+      this.engine.removePeerDigest(status.peerId);
     }
   }
 }
@@ -594,6 +611,7 @@ export class LeaderlessSyncEngine implements SyncEngine {
   private readonly localCausalContext: Record<string, number> = {};
   private readonly replicationVector: Record<string, number> = {};
   private readonly peerGenerations = new Map<string, number>();
+  private readonly compactionManager = new CompactionManager();
   private readonly authorizedEpochCapability?: EpochTransitionCapability;
   private readonly authorizedTransportCapability?: TransportRegistrationCapability;
   private readonly validSupplierContexts = new WeakSet<AuthenticatedSupplierContext>();
@@ -753,6 +771,8 @@ export class LeaderlessSyncEngine implements SyncEngine {
     this.currentEpoch = newEpoch;
     // Purge obsolete-epoch operations from pending dependency queue
     this.pendingQueue.pruneObsoleteEpoch(newEpoch);
+    // Clear peer digests from previous epoch
+    this.compactionManager.clearDigests();
   }
 
   /**
@@ -778,6 +798,9 @@ export class LeaderlessSyncEngine implements SyncEngine {
     const oldGen = this.peerGenerations.get(peerId);
     this.peerGenerations.set(peerId, generation);
     if (oldGen !== generation) {
+      if (oldGen !== undefined) {
+        this.compactionManager.removePeerDigest(peerId);
+      }
       for (const listener of this.peerGenerationListeners) {
         try {
           listener(peerId, generation, oldGen);
@@ -1892,6 +1915,90 @@ export class LeaderlessSyncEngine implements SyncEngine {
     return exportEngineSnapshot(this.state, this.config.sessionId, snapshotId);
   }
 
+  /**
+   * Phase 7.5 M3: Snapshot creation from current committed engine state.
+   * Generates deterministic RFC 8785 JSON SHA-256 digest, exact Lamport timestamps,
+   * and preserves all compacted checkpoints.
+   */
+  public exportSnapshotV2(snapshotId?: string): StateSnapshotPayloadV2 {
+    const originTimestamps = this.operationLog.getOriginFrontierTimestamps
+      ? this.operationLog.getOriginFrontierTimestamps(this.replicationVector)
+      : {};
+    const checkpoints = this.operationLog.getAllCompactedCheckpoints
+      ? this.operationLog.getAllCompactedCheckpoints()
+      : [];
+    return exportEngineSnapshotV2(
+      this.state,
+      this.config.sessionId,
+      this.currentEpoch,
+      this.config.localPeerId,
+      this.replicationVector,
+      originTimestamps,
+      checkpoints,
+      snapshotId,
+    );
+  }
+
+  public recordPeerDigest(digest: StateDigestPayload): void {
+    this.compactionManager.recordPeerDigest(digest);
+  }
+
+  public removePeerDigest(peerId: string): void {
+    this.compactionManager.removePeerDigest(peerId);
+  }
+
+  public getPeerDigests(): ReadonlyMap<string, StateDigestPayload> {
+    return this.compactionManager.getPeerDigests();
+  }
+
+  public getConnectedPeerDescriptors(): PeerConnectionDescriptor[] {
+    const descriptors: PeerConnectionDescriptor[] = [];
+    for (const [peerId, gen] of this.peerGenerations.entries()) {
+      if (peerId !== this.config.localPeerId) {
+        descriptors.push({ peerId, generation: gen });
+      }
+    }
+    return descriptors.sort((a, b) => a.peerId.localeCompare(b.peerId));
+  }
+
+  public captureMembershipView(
+    connectedPeers?: ReadonlyArray<PeerConnectionDescriptor>,
+  ): CapturedMembershipView {
+    const peers = connectedPeers ?? this.getConnectedPeerDescriptors();
+    return this.compactionManager.captureView(this.currentEpoch, this.replicationVector, peers);
+  }
+
+  public calculateCompactionFrontier(
+    type: 'MEMBERSHIP_SAFE' | 'LOCAL_PRESSURE',
+    view?: CapturedMembershipView,
+  ): CompactionFrontierCandidate {
+    if (type === 'MEMBERSHIP_SAFE') {
+      const capturedView = view ?? this.captureMembershipView();
+      return this.compactionManager.calculateSafeFrontier(capturedView);
+    } else {
+      const frontier = this.compactionManager.calculatePressureFrontier(
+        this.replicationVector,
+        this.operationLog,
+      );
+      return { eligible: true, frontier };
+    }
+  }
+
+  public executeCompaction(
+    candidate: CompactionFrontierCandidate,
+    connectedPeers?: ReadonlyArray<PeerConnectionDescriptor>,
+  ): CompactionExecutionResult {
+    const context = {
+      getCurrentEpoch: () => this.currentEpoch,
+      getConnectedPeers: () => connectedPeers ?? this.getConnectedPeerDescriptors(),
+      getLocalReplicationVector: () => ({ ...this.replicationVector }),
+      getPeerDigests: () => this.compactionManager.getPeerDigests(),
+      isRecoveryActive: () => false,
+      compactLog: (frontier: Record<string, number>) => this.operationLog.compactAtFrontier(frontier),
+    };
+    return this.compactionManager.execute(candidate, context);
+  }
+
   public importSnapshot(payload: StateSnapshotPayload): EngineDecision {
     const now = this.clock.now();
     if (this.disposed) {
@@ -2209,6 +2316,7 @@ export class LeaderlessSyncEngine implements SyncEngine {
     }
 
     // 4. Pure deterministic comparison
+    this.compactionManager.recordPeerDigest(parsed.data);
     const localDigest = this.createLocalDigest();
     return compareDigests(localDigest, parsed.data);
   }
