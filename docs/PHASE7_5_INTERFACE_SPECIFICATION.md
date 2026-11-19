@@ -1,8 +1,8 @@
 # Phase 7.5 — Fault Tolerance & State Recovery: Interface Specification
 
-**Status:** APPROVED ARCHITECTURAL DESIGN (RE-AUDITED)  
+**Status:** APPROVED ARCHITECTURAL DESIGN (FINAL CLOSURE)  
 **Date:** 2026-11-19  
-**Branch Baseline:** `main` at `3a3d9e5`  
+**Branch Baseline:** `main` at `30b8e5f`  
 **Frozen Baselines:** Phase 7.3 (`e49b81a`), Phase 7.4 M1–M5 (`dbd5217`, `3a3d9e5`)  
 
 ---
@@ -14,9 +14,11 @@ Phase 7.5 specifies the recovery mechanisms required when a peer experiences con
 ### 1.1 Non-Negotiable Invariants
 1. **Preservation of Frozen Boundaries:** Existing interfaces established in Phase 7.3 (core engine, ordered operation log, logical clock) and Phase 7.4 (anti-entropy manager, repair pipeline, supplier service, transport adapter) are frozen and MUST NOT be broken or altered.
 2. **Capability-Gated Transport Provenance:** Outbound and inbound snapshot operations must route through `TrustedTransportAdapter` using unforgeable token capabilities (`EpochTransitionCapability`, `TransportRegistrationCapability`, `AuthenticatedSupplierContext`, `AuthenticatedRequesterContext`).
-3. **Dynamic SCTP Wire Sizing:** Chunk payload sizes are dynamically derived per peer based on `PeerManager.getSctpMaxMessageSize(peerId)`. No message exceeds $\min(\text{sctpLimit}, 65536)$ bytes.
-4. **Pure Leaderless Equivalence:** No peer acts as an authoritative snapshot arbitrator. All snapshot validity decisions are derived deterministically from causal frontiers, checkpoint fingerprints, and canonical SHA-256 hashes.
-5. **Multi-Stage Atomic Installation:** Candidate snapshots undergo out-of-engine pre-validation (`validateCandidate`) before synchronous atomic commitment (`installSnapshotAtomic`) with full rollback protection.
+3. **Iterative SCTP Wire Measurement:** Initial chunk size estimation uses `calculateDynamicChunkSize()`, but the normative send boundary requires exact UTF-8 serialization measurement and iterative binary reduction before calling `RTCDataChannel.send()`.
+4. **Historical Prefix Compatibility:** Single-operation fingerprints at sequence $k$ do not commit to historical chains. Compatibility requires verifying all common retained checkpoints across the prefix $[1, k]$; any unverified gaps trigger `REQUIRES_HISTORY_REPAIR` and fail to `DEGRADED`.
+5. **Exact Phase 7.2 Lamport Invariant Reinstated:**
+   $$S.\text{maxLogicalTimestamp} \equiv \max_{p \in \text{origins}(V_S)} S.\text{originFrontierTimestamps}[p]$$
+6. **Staged Immutable State Replacement:** Snapshot installation constructs new engine instances out-of-band and performs a single synchronous reference swap. External listeners are notified only post-swap and post-reconciliation.
 
 ---
 
@@ -24,7 +26,7 @@ Phase 7.5 specifies the recovery mechanisms required when a peer experiences con
 
 All recovery wire messages extend or conform to `@syncplay/protocol`.
 
-### 2.1 Identifiers, Constants, and Dynamic Sizing
+### 2.1 Identifiers, Constants, and Dynamic Sizing Heuristic
 
 ```typescript
 import { z } from 'zod';
@@ -35,6 +37,9 @@ export const MAX_SNAPSHOT_BYTES = 4 * 1024 * 1024; // 4,194,304 bytes
 
 /** Absolute maximum chunk payload size: 32 KB. */
 export const MAX_CHUNK_BYTES = 32 * 1024; // 32,768 bytes
+
+/** Minimum allowable chunk binary payload size before aborting transfer: 256 bytes. */
+export const MIN_CHUNK_BYTES = 256;
 
 /** Maximum number of chunks per snapshot transfer: 128. */
 export const MAX_CHUNKS_PER_SNAPSHOT = 128;
@@ -71,7 +76,8 @@ export const SnapshotAbortReasonSchema = z.enum([
 export type SnapshotAbortReason = z.infer<typeof SnapshotAbortReasonSchema>;
 
 /**
- * Calculates dynamic maximum chunk payload size based on negotiated SCTP limit.
+ * Heuristic initial estimate for chunk payload size based on negotiated SCTP limit.
+ * Normative send boundary MUST iteratively verify exact serialized UTF-8 bytes.
  */
 export function calculateDynamicChunkSize(sctpMaxMessageSize?: number): number {
   const effectiveLimit =
@@ -92,8 +98,6 @@ export function calculateDynamicChunkSize(sctpMaxMessageSize?: number): number {
 ---
 
 ### 2.2 `SNAPSHOT_OFFER` Payload
-
-Broadcast or targeted notification sent by a potential supplier advertising its current snapshot frontier and availability.
 
 ```typescript
 export const SnapshotOfferPayloadSchema = z.object({
@@ -121,8 +125,6 @@ export type SnapshotOfferPayload = z.infer<typeof SnapshotOfferPayloadSchema>;
 
 ### 2.3 `SNAPSHOT_REQUEST` Payload
 
-Sent by a recovering peer to a specific supplier to initiate chunked transfer of an offered snapshot.
-
 ```typescript
 export const SnapshotRequestPayloadSchema = z.object({
   transferId: UUIDv4Schema,
@@ -141,8 +143,6 @@ export type SnapshotRequestPayload = z.infer<typeof SnapshotRequestPayloadSchema
 ---
 
 ### 2.4 `SNAPSHOT_CHUNK` Payload
-
-Carries a single binary-safe Base64-encoded chunk of the serialized canonical snapshot.
 
 ```typescript
 export const SnapshotChunkPayloadSchema = z.object({
@@ -173,8 +173,6 @@ export type SnapshotChunkPayload = z.infer<typeof SnapshotChunkPayloadSchema>;
 
 ### 2.5 `SNAPSHOT_CHUNK_REQUEST` Payload
 
-Used for selective pipelined retransmission of missing or corrupted chunks.
-
 ```typescript
 export const SnapshotChunkRequestPayloadSchema = z.object({
   transferId: UUIDv4Schema,
@@ -195,8 +193,6 @@ export type SnapshotChunkRequestPayload = z.infer<typeof SnapshotChunkRequestPay
 
 ### 2.6 `SNAPSHOT_ABORT` Payload
 
-Sent by either party to immediately terminate a snapshot transfer and release resources.
-
 ```typescript
 export const SnapshotAbortPayloadSchema = z.object({
   transferId: UUIDv4Schema,
@@ -215,9 +211,23 @@ export type SnapshotAbortPayload = z.infer<typeof SnapshotAbortPayloadSchema>;
 
 ## 3. Core Component Interfaces
 
-### 3.1 Recovery State Machine (`IRecoveryStateMachine`)
+### 3.1 Membership View & Compaction Types
 
-Formal interface governing recovery lifecycle transitions.
+```typescript
+export interface PeerConnectionDescriptor {
+  readonly peerId: string;
+  readonly generation: number;
+}
+
+export interface CapturedMembershipView {
+  readonly epoch: number;
+  readonly connectedPeers: ReadonlyArray<PeerConnectionDescriptor>;
+}
+```
+
+---
+
+### 3.2 Recovery State Machine (`IRecoveryStateMachine`)
 
 ```typescript
 export type RecoveryState = 'ACTIVE' | 'RECOVERING' | 'RECONCILING' | 'DEGRADED';
@@ -246,9 +256,7 @@ export interface IRecoveryStateMachine {
 
 ---
 
-### 3.2 Snapshot Transfer Manager (`ISnapshotTransferManager`)
-
-Manages chunked transmission, sliding window acknowledgments, and reassembly.
+### 3.3 Snapshot Transfer Manager (`ISnapshotTransferManager`)
 
 ```typescript
 export interface TransferProgress {
@@ -264,7 +272,7 @@ export interface TransferProgress {
 
 export interface ISnapshotTransferManager {
   /**
-   * Initiates an outbound transfer as a supplier responding to a SNAPSHOT_REQUEST.
+   * Outbound transfer with iterative send boundary measurement.
    */
   startOutboundTransfer(
     request: SnapshotRequestPayload,
@@ -273,52 +281,32 @@ export interface ISnapshotTransferManager {
   ): void;
 
   /**
-   * Initiates an inbound transfer as a requester targeting a specific supplier offer.
-   * Enforces single active transfer invariant.
+   * Inbound transfer under strict single-transfer invariant.
    */
   startInboundTransfer(
     offer: SnapshotOfferPayload,
     context: AuthenticatedRequesterContext
   ): Promise<Uint8Array>;
 
-  /**
-   * Ingests an incoming chunk.
-   */
   handleIncomingChunk(
     chunk: SnapshotChunkPayload,
     context: AuthenticatedSupplierContext | AuthenticatedRequesterContext
   ): void;
 
-  /**
-   * Ingests a chunk retransmission request.
-   */
   handleChunkRequest(
     request: SnapshotChunkRequestPayload,
     context: AuthenticatedSupplierContext
   ): void;
 
-  /**
-   * Handles explicit transfer abort.
-   */
   handleAbort(abort: SnapshotAbortPayload): void;
-
-  /**
-   * Active transfer query.
-   */
   getProgress(transferId: string): TransferProgress | null;
-
-  /**
-   * Cancel and cleanup active transfer.
-   */
   abortActiveTransfer(transferId: string, reason: SnapshotAbortReason): void;
 }
 ```
 
 ---
 
-### 3.3 Atomic Snapshot Installer (`ISnapshotInstaller`)
-
-Handles multi-stage validation, dry-run parsing, staging, and atomic execution.
+### 3.4 Atomic Snapshot Installer (`ISnapshotInstaller`)
 
 ```typescript
 export type SnapshotEligibilityResult =
@@ -339,8 +327,8 @@ export interface SnapshotInstallResult {
 export interface ISnapshotInstaller {
   /**
    * STAGE 1: Pure dry-run pre-commit validation out-of-engine.
-   * Checks schema validity, canonical SHA-256 match, vector domination,
-   * epoch currency, and checkpoint fingerprint equivalence.
+   * Verifies schema, canonical SHA-256, epoch currency, vector domination,
+   * and complete common checkpoint prefix.
    * ZERO engine state is modified.
    */
   validateCandidate(
@@ -350,9 +338,9 @@ export interface ISnapshotInstaller {
   ): Promise<SnapshotEligibilityResult>;
 
   /**
-   * STAGE 2: Atomically installs the validated snapshot payload into the engine.
-   * Executes in a single synchronous run-to-completion step with state backup
-   * and rollback on exception.
+   * STAGE 2 & 3: Constructs staged instances and executes atomic reference swap.
+   * Synchronously swaps engine references in a single run-to-completion step.
+   * External listeners are deferred until reconciliation completes.
    */
   installSnapshotAtomic(
     snapshot: StateSnapshotPayloadV2,
@@ -363,97 +351,24 @@ export interface ISnapshotInstaller {
 
 ---
 
-### 3.4 Recovery Coordinator (`IRecoveryCoordinator`)
-
-Central orchestration service bridging transport, engine, and anti-entropy.
+### 3.5 Recovery Coordinator (`IRecoveryCoordinator`)
 
 ```typescript
 export interface IRecoveryCoordinator {
   readonly state: RecoveryState;
 
-  /**
-   * Called when anti-entropy reports history exhaustion.
-   */
   handleHistoryExhausted(originPeerId: string, fromSequence: number): void;
-
-  /**
-   * Handles incoming SNAPSHOT_OFFER from peer mesh.
-   */
-  handleSnapshotOffer(
-    offer: SnapshotOfferPayload,
-    context: AuthenticatedRequesterContext
-  ): void;
-
-  /**
-   * Quarantines a live broadcast control operation arriving during RECOVERING or RECONCILING.
-   * Returns false if buffer capacity (1000) is exceeded.
-   */
+  handleSnapshotOffer(offer: SnapshotOfferPayload, context: AuthenticatedRequesterContext): void;
   quarantineLiveOperation(operation: SerializedControlOperation): boolean;
-
-  /**
-   * Drains quarantined operations into the engine once snapshot installation finishes.
-   */
   drainQuarantineQueue(): Promise<void>;
-
-  /**
-   * Aborts active recovery and transitions to DEGRADED or restarts.
-   */
   abortRecovery(reason: SnapshotAbortReason): void;
-
-  /**
-   * Cleanup resources on engine destruction.
-   */
   dispose(): void;
 }
 ```
 
 ---
 
-## 4. Error Taxonomy and Diagnostics
-
-```typescript
-export type RecoveryErrorCode =
-  | 'SNAPSHOT_CORRUPTED'
-  | 'INCOMPARABLE_SNAPSHOT'
-  | 'TRANSFER_TIMEOUT'
-  | 'QUARANTINE_OVERFLOW'
-  | 'EPOCH_ABORTED'
-  | 'SUPPLIER_DISCONNECTED'
-  | 'CHUNK_INDEX_OUT_OF_BOUNDS'
-  | 'TRANSFER_LIMIT_EXCEEDED'
-  | 'RECOVERY_ALREADY_IN_PROGRESS'
-  | 'CHECKPOINT_DIVERGENCE'
-  | 'RECONCILIATION_TIMEOUT';
-
-export class RecoveryError extends Error {
-  public readonly code: RecoveryErrorCode;
-  public readonly transferId?: string;
-  public readonly supplierPeerId?: string;
-
-  constructor(
-    message: string,
-    code: RecoveryErrorCode,
-    options?: { transferId?: string; supplierPeerId?: string; cause?: unknown }
-  ) {
-    super(message, { cause: options?.cause });
-    this.name = 'RecoveryError';
-    this.code = code;
-    this.transferId = options?.transferId;
-    this.supplierPeerId = options?.supplierPeerId;
-  }
-}
-```
-
----
-
-## 5. Formal Open Decisions Register
-
-For every architectural decision evaluated during planning, the register records:
-1. The question
-2. Why it matters
-3. Available alternatives
-4. Recommended choice
-5. Whether implementation can safely proceed without deciding it
+## 4. Open Decisions Register
 
 | ID | 1. Question | 2. Why It Matters | 3. Available Alternatives | 4. Recommended Choice | 5. Can Proceed to M3? |
 | :--- | :--- | :--- | :--- | :--- | :---: |
@@ -461,3 +376,4 @@ For every architectural decision evaluated during planning, the register records
 | **OD-7.5-2** | How should `SNAPSHOT_OFFER` messages be advertised? | Flooding offers on every timer tick wastes WebRTC bandwidth on mobile/constrained clients. | **Alt A:** Periodic broadcast.<br/>**Alt B:** Request-driven / targeted responses to `onHistoryExhausted`. | **Alt B (Request-driven):** Eliminates unneeded signaling overhead; offers are published only when missing history is declared. | **YES** (Decided: Alt B) |
 | **OD-7.5-3** | How should Explicit Manual Reset be exposed to applications when in `DEGRADED` state? | When two partitions have incomparable histories, users need a way to force convergence without causing silent causal overwrites. | **Alt A:** Automatic tie-breaking (e.g. lowest peerId).<br/>**Alt B:** Provide explicit `resetSession({ newSessionId })` API with UI prompt.<br/>**Alt C:** Defer Manual Reset to Phase 8. | **Alt C (Defer to Phase 8):** Phase 7.5 provides the mathematical safety, fencing, and `DEGRADED` state. Application-level session recreation is a Phase 8 SDK concern. | **YES** (Decided: Alt C) |
 | **OD-7.5-4** | What is the minimum supported SCTP max message size? | If a WebRTC link negotiates an extremely small MTU ($< 2\text{ KB}$), chunk framing overhead exceeds data payload. | **Alt A:** Reject connections with SCTP limit $< 64\text{ KB}$.<br/>**Alt B:** Support down to 2,048 bytes; abort if $< 2048$ bytes. | **Alt B:** Supports standard constrained networks (e.g. 16 KB) while protecting against pathologically tiny MTUs. | **YES** (Decided: Alt B) |
+| **OD-7.5-5** | How should unverified intermediate sequence gaps below compaction horizon be resolved? | Since checkpoints do not chain previous operations, missing checkpoints mean history cannot be verified. | **Alt A:** Assume equality if vector dominates.<br/>**Alt B:** Declare `REQUIRES_HISTORY_REPAIR` and fail to `DEGRADED` if unrepairable. | **Alt B (Require repair / fail to DEGRADED):** Prevents silent branch overwriting when intermediate divergence exists. | **YES** (Decided: Alt B) |

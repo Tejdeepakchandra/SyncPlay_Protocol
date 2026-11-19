@@ -1,8 +1,8 @@
 # Phase 7.5 — Fault Tolerance & State Recovery: Architecture Specification
 
-**Status:** APPROVED ARCHITECTURAL DESIGN (RE-AUDITED)  
+**Status:** APPROVED ARCHITECTURAL DESIGN (FINAL CLOSURE)  
 **Date:** 2026-11-19  
-**Branch Baseline:** `main` at `3a3d9e5`  
+**Branch Baseline:** `main` at `30b8e5f`  
 **Frozen Baselines:** Phase 7.3 (`e49b81a`), Phase 7.4 M1–M5 (`dbd5217`, `3a3d9e5`)  
 
 ---
@@ -17,7 +17,7 @@
 |  |                                  APPLICATION / SDK LAYER                                     |  |
 |  |  PlaybackControls, HTML5 Media Adapter, UI State Listeners, EngineHealthCallbacks             |  |
 |  +-----------------------------------------------^----------------------------------------------+  |
-|                                                  | State / Health Notifications                    |
+|                                                  | State / Health Notifications (Deferred post-swap)
 |  +-----------------------------------------------v----------------------------------------------+  |
 |  |                                     SYNC ENGINE LAYER                                        |  |
 |  |                                                                                              |  |
@@ -25,10 +25,10 @@
 |  |  |   RecoveryCoordinator (Phase 7.5)   |      |        AntiEntropyManager (Phase 7.4)      |  |  |
 |  |  |  - RecoveryStateMachine            |      |  - RepairRequestPipeline (Requester M3)    |  |  |
 |  |  |  - SnapshotTransferManager         |<---->|  - RepairSupplierService (Supplier M4)     |  |  |
-|  |  |  - SnapshotInstaller (Stage/Commit)|      |  - ReplicationComparator                   |  |  |
+|  |  |  - SnapshotInstaller (Staged Swap) |      |  - ReplicationComparator                   |  |  |
 |  |  |  - QuarantineBuffer (Cap: 1000)    |      +----------------------^---------------------+  |  |
 |  |  +------------------^-----------------+                             |                         |  |
-|  |                     |                                               |                         |  |
+|  |                     | Staged Instance Replacement                   |                         |  |
 |  |  +------------------v-----------------------------------------------v---------------------+  |  |
 |  |  |                           LeaderlessSyncEngine (Phase 7.3 Core)                        |  |  |
 |  |  |  - OrderedOperationLog (Compacted checkpoints, history pruning, base snapshot)         |  |  |
@@ -40,7 +40,7 @@
 |  +---------------------------------------------v------------------------------------------------+  |
 |  |                            TRUSTED TRANSPORT ADAPTER (Phase 7.4 M5)                          |  |
 |  |  - Capability-gated inbound context creation (AuthenticatedSupplierContext / RequesterContext) |
-|  |  - Exact UTF-8 wire size measurement (min(64KB, sctpLimit))                                 |  |
+|  |  - Iterative UTF-8 wire size measurement & send boundary (min(64KB, sctpLimit))              |  |
 |  |  - Epoch & generation currency validation immediately before serialization                   |  |
 |  +---------------------------------------------^------------------------------------------------+  |
 |                                                | Unchanged Serialized Wire Bytes                   |
@@ -53,22 +53,23 @@
 
 ---
 
-## 2. Core Architectural Principles & Re-Evaluated Invariants
+## 2. Core Architectural Principles & Invariants
 
 1. **Absence of Globally Agreed Stable Frontier:**
-   In a leaderless WebRTC mesh, a globally agreed consensus frontier does NOT exist. Peers autonomously prune operation logs bounded by the membership-scoped safe frontier ($V_{\text{epoch\_safe}}$) or by local memory bounds ($K=256$). Snapshot recovery is therefore a **first-class protocol requirement** to service reconnecting peers who fall outside supplier log horizons.
-2. **Strict Vector Domination & Historical Compatibility:**
-   A snapshot is eligible for installation if and only if $V_S[p] \ge V_L[p]$ for all known origins AND checkpoint fingerprints match at all common sequences. Vector domination without checkpoint verification is strictly insufficient.
+   In a leaderless WebRTC mesh, a globally agreed consensus frontier does NOT exist. Peers autonomously prune operation logs bounded by the membership-scoped safe frontier ($V_{\text{epoch\_safe}}$) over a verified view $\mathcal{V}$, or by local memory bounds ($K=256$). Snapshot recovery is a **first-class protocol requirement** to service reconnecting peers outside supplier log horizons.
+2. **Historical Compatibility via Prefix Verification:**
+   Because single-operation fingerprints do not hash historical chains, a snapshot is eligible if and only if $V_S[p] \ge V_L[p]$ AND all common retained sequence checkpoints in the prefix $[1, \min(V_L[p], V_S[p])]$ match bit-exact. Any unverified sequence gaps trigger `REQUIRES_HISTORY_REPAIR` and fail to `DEGRADED`.
 3. **No Arbitrary Tie-Breaking:**
    If two snapshots have incomparable frontiers, the engine transitions to `DEGRADED` state and notifies the application. Arbitrary tie-breaking (by peer ID or wall clock) is mathematically forbidden.
-4. **Dynamic Chunk Sizing for WebRTC DataChannels:**
-   Chunk payload sizes are dynamically calculated per peer based on `PeerManager.getSctpMaxMessageSize(peerId)`. The complete JSON wire message is serialized once, measured, and verified before being sent over `RTCDataChannel.send()`.
-5. **Exact Lamport Reseed:**
-   Lamport clocks are reseeded strictly as $L_{\text{local}} = \max(L_{\text{local}}, S.\text{maxLogicalTimestamp})$ **without $+1$**, preventing clock runaway.
-6. **Isolated Staging and Atomic Commit:**
-   Snapshot validation executes in a pre-commit phase (`validateCandidate`). Installation is synchronous and atomic, with state backup and rollback on error.
+4. **Normative Iterative Transport Sizing:**
+   `calculateDynamicChunkSize` serves solely as an initial estimation. Outbound chunks undergo a normative 7-step iterative send-boundary loop that serializes, measures exact UTF-8 bytes, and reduces binary payload until fitting within the negotiated SCTP limit before calling `RTCDataChannel.send()`.
+5. **Exact Phase 7.2 Lamport Invariant Reinstated:**
+   $$S.\text{maxLogicalTimestamp} \equiv \max_{p \in \text{origins}(V_S)} S.\text{originFrontierTimestamps}[p]$$
+   Reseeding executes strictly as $L_{\text{local}} = \max(L_{\text{local}}, S.\text{maxLogicalTimestamp})$ **without $+1$**.
+6. **Staged Immutable Engine-State Replacement:**
+   Installation constructs a new `OrderedOperationLog`, state, and replication vectors out-of-band. Once validated, an atomic reference swap executes in a single synchronous run-to-completion step. External listeners are notified only post-swap and post-reconciliation.
 7. **Quarantine Buffer & Local Input Fencing:**
-   Local control operations are blocked while recovering. Incoming live operations are quarantined (capped at 1,000 operations). Exceeding capacity synchronously aborts transfer to `DEGRADED`.
+   Local control operations are blocked while recovering. Incoming live operations are quarantined (capacity: 1,000 operations). Exceeding capacity synchronously aborts transfer to `DEGRADED`.
 
 ---
 
@@ -86,7 +87,7 @@ stateDiagram-v2
         ValidatingSnapshot --> TransferringChunks : Retransmit missing/corrupt chunk
     }
 
-    RECOVERING --> RECONCILING : validateCandidate() OK & installSnapshotAtomic() OK
+    RECOVERING --> RECONCILING : validateCandidate() OK & stagedReferenceSwap() OK
     RECOVERING --> DEGRADED : Incomparable snapshot / Retries exhausted / Quarantine overflow
     RECOVERING --> ACTIVE : Transfer aborted (revert to local state)
 
@@ -96,7 +97,7 @@ stateDiagram-v2
         EvaluatingRemainingGaps --> [*] : Frontiers aligned
     }
 
-    RECONCILING --> ACTIVE : All live events applied
+    RECONCILING --> ACTIVE : All live events applied & listeners notified
     RECONCILING --> DEGRADED : Reconciliation timeout / Unresolvable gap
     DEGRADED --> RECOVERING : New dominating snapshot offer received
     DEGRADED --> [*]
@@ -108,91 +109,103 @@ stateDiagram-v2
 | :--- | :--- | :--- | :--- | :--- |
 | **`ACTIVE`** | Allowed (processed immediately) | Processed via standard Phase 7.3 causal ordering | None | Normal playback synchronization. |
 | **`RECOVERING`** | **Blocked** (rejects or queues locally) | **Quarantined** in `QuarantineBuffer` (cap: 1000) | Exactly 1 active transfer | Inbound snapshot chunk transfer and pre-validation. |
-| **`RECONCILING`** | **Blocked** | **Quarantined** until buffer drains | None | Snapshot installed; draining quarantine buffer in causal order. |
+| **`RECONCILING`** | **Blocked** | **Quarantined** until buffer drains | None | Staged reference swap complete; draining quarantine in causal order. |
 | **`DEGRADED`** | **Blocked** | Discarded or held; state frozen | None | Causal divergence detected or retries exhausted; requires application intervention. |
 
 ---
 
-## 4. Chunked Transfer and Transport Boundary Integration
+## 4. Compaction Frontier Procedure & Revalidation
 
-### 4.1 Dynamic Chunk Sizing Derivation
-To ensure messages never exceed negotiated SCTP limits (RFC 8841):
+### 4.1 Membership View $\mathcal{V}$ Capture
+The local peer captures:
+$$\mathcal{V} = \Big( E_{\text{local}}, \mathcal{P} = \{ (p, gen_p) \mid \text{dataChannelState}(p) === \text{'open'} \} \Big)$$
 
-$$\text{effectiveLimit} = \min(65536, \text{sctpLimit} \text{ if defined and } > 0 \text{ else } 65536)$$
-$$\text{envelopeBudget} = 768 \text{ bytes (JSON keys, UUIDs, chunkSha256, session metadata)}$$
-$$\text{availableBase64Bytes} = \max(0, \text{effectiveLimit} - \text{envelopeBudget})$$
-$$\text{dynamicChunkBytes} = \min(32768, \lfloor \text{availableBase64Bytes} \times \frac{3}{4} \rfloor)$$
+### 4.2 Current Digest Requirement
+For every peer in $\mathcal{P}$, the local engine must hold an authenticated `STATE_DIGEST` $D_p$ matching $(p, gen_p, E_{\text{local}})$.
+- If any peer has not supplied a current digest, the view is incomplete. Compaction at $V_{\text{epoch\_safe}}$ is held.
+- If memory requires pruning ($K=256$), the engine prunes locally under $V_{\text{local\_cand}}$ without peer safety guarantees.
 
-- **Standard 64 KB SCTP limit:** `dynamicChunkBytes = 32,768` bytes (32 KB).
-- **Constrained 16 KB SCTP limit:** `dynamicChunkBytes = 11,712` bytes.
-- **Unfeasible Limit ($< 2048$ bytes):** Aborts with `TRANSPORT_LIMIT_EXCEEDED` $\to$ `DEGRADED`.
-
-### 4.2 WebRTC Send Boundary Trace
-1. Outbound chunk message is formatted as `ProtocolMessage<'SNAPSHOT_CHUNK'>`.
-2. `wireJson = JSON.stringify(wireMessage)` is generated once.
-3. UTF-8 byte length is measured: `new TextEncoder().encode(wireJson).byteLength`.
-4. `PeerManager.sendSerialized(peerId, wireJson, generation)` verifies:
-   - Target peer exists in connection table.
-   - Active generation matches expected generation.
-   - DataChannel state is `open`.
-   - `byteLength <= effectiveLimit`.
-5. The exact string is passed to `RTCDataChannel.send(wireJson)`.
+### 4.3 Pre-Commit Revalidation
+Immediately prior to invoking `compactAtFrontier(V_epoch_safe)`:
+1. Verify `engine.epoch === V.epoch`.
+2. Verify active connected peer set in `PeerManager` matches $\mathcal{P}$ exactly.
+3. If any peer disconnected, generation changed, or epoch incremented: **abort compaction immediately**.
 
 ---
 
-## 5. Multi-Stage Atomic Installation & Quarantine Processing
+## 5. Chunked Transfer and Transport Boundary Integration
 
-### 5.1 Architecture of `SnapshotInstaller`
-Unlike the legacy `importSnapshotV2()` which mutates engine state directly without checks, Phase 7.5 enforces a 2-stage commit pattern:
+### 5.1 Iterative Sizing and Send Procedure
+1. Initial estimation: `calculateDynamicChunkSize(sctpMaxMessageSize)` provides starting slice size.
+2. Binary payload is sliced and formatted into `ProtocolMessage<'SNAPSHOT_CHUNK'>`.
+3. `wireJson = JSON.stringify(msg)` is generated.
+4. Exact UTF-8 byte length is measured: `new TextEncoder().encode(wireJson).byteLength`.
+5. If `byteLength <= effectiveLimit`:
+   - Pass `wireJson` unchanged to `PeerManager.sendSerialized()`.
+   - `PeerManager` checks generation and DataChannel state immediately prior to `RTCDataChannel.send()`.
+6. If `byteLength > effectiveLimit`:
+   - Calculate overshoot $\Delta = \lceil (\text{byteLength} - \text{effectiveLimit}) \times 0.75 \rceil + 32$.
+   - Reduce chunk binary slice and repeat from Step 2.
+   - If chunk binary size drops below 256 bytes without fitting: abort with `TRANSPORT_LIMIT_EXCEEDED` $\to$ `DEGRADED`.
 
+---
+
+## 6. Staged Immutable Engine-State Replacement
+
+### 6.1 Replacement Workflow
 ```
 +----------------------------------------------------------------------------------------------------+
-| STAGE 1: Pre-Commit Validation (validateCandidate)                                                 |
-| - Pure dry-run execution out-of-engine.                                                            |
-| - Validates StateSnapshotPayloadV2Schema.                                                          |
-| - Calculates and compares canonical SHA-256 digest against snapshot.sha256Digest.                 |
-| - Checks epoch currency: S.membershipEpoch <= currentEpoch.                                        |
-| - Checks vector domination: for all known origins p, V_S[p] >= V_local[p].                         |
-| - Checks checkpoint fingerprint equivalence for all common sequences min(V_S[p], V_local[p]).       |
-| - Verifies Lamport clock reasonableness: maxLogicalTimestamp <= MAX_SAFE_INTEGER.                  |
-| - GUARANTEE: Zero engine state is modified. Throws immediately on failure.                         |
+| STAGE 1: Pure Dry-Run Validation (validateCandidate)                                               |
+| - Validates StateSnapshotPayloadV2Schema, canonical SHA-256 digest, epoch, vector domination, and  |
+|   complete common checkpoint prefix. ZERO engine state is touched.                                 |
 +----------------------------------------------------------------------------------------------------+
                                                  │
                                                  ▼ Validation Passed
 +----------------------------------------------------------------------------------------------------+
-| STAGE 2: Synchronous Atomic Commit (installSnapshotAtomic)                                         |
-| - Captures backup of current PlaybackState, clock, replicationVector, logs, and queues.             |
-| - Invokes engine.importSnapshotV2(validatedSnapshot).                                              |
-| - Clock reseeded: L_local = max(L_local, S.maxLogicalTimestamp) (WITHOUT +1).                      |
-| - Vectors wiped and reset to V_S.                                                                  |
-| - Logs cleared and checkpoints ingested.                                                           |
-| - Local stateVersion incremented by +1.                                                            |
-| - If any error is thrown: synchronously restores backup state (atomic rollback).                   |
+| STAGE 2: Out-of-Band Staged Instance Construction                                                  |
+| - Construct StagedPlaybackState with stateVersion = localVersion + 1.                              |
+| - Construct new OrderedOperationLog pre-loaded with snapshot base and checkpoints.                 |
+| - Construct new replicationVector, localCausalContext, and empty pendingQueue.                     |
+| - If any constructor throws: discard staged instances. Old engine state remains 100% active.       |
 +----------------------------------------------------------------------------------------------------+
                                                  │
-                                                 ▼ Commit Successful
+                                                 ▼ Staging Succeeded
 +----------------------------------------------------------------------------------------------------+
-| STAGE 3: Post-Commit Quarantine Drain (RecoveryCoordinator)                                        |
-| - Transitions engine to RECONCILING state.                                                         |
-| - Drains QuarantineBuffer:                                                                         |
-|   - Operations with sequence <= V_S[origin] are discarded as already subsumed.                     |
-|   - Operations with sequence > V_S[origin] are validated causally and applied.                     |
-| - Once queue is empty and gaps are resolved, transitions to ACTIVE state.                          |
+| STAGE 3: Atomic Reference Swap (installSnapshotAtomic)                                             |
+| - Synchronous run-to-completion property swap:                                                    |
+|     this.state = stagedState;                                                                      |
+|     this.baseSnapshot = stagedState;                                                               |
+|     this.operationLog = stagedLog;                                                                 |
+|     this.replicationVector = stagedVector;                                                         |
+|     this.localCausalContext = stagedCausalContext;                                                 |
+|     this.clockManager.reseed(snapshot.maxLogicalTimestamp);                                        |
+|     this.pendingQueue = stagedQueue;                                                               |
+| - Transition state to RECONCILING.                                                                 |
++----------------------------------------------------------------------------------------------------+
+                                                 │
+                                                 ▼ Post-Swap
++----------------------------------------------------------------------------------------------------+
+| STAGE 4: Quarantine Drain & Deferred Listener Notification                                         |
+| - Drain QuarantineBuffer in causal order.                                                          |
+| - Upon successful drain and transition to ACTIVE:                                                  |
+|     Notify registered stateChangeListeners(this.state).                                            |
+| - Listeners NEVER observe intermediate recovery states.                                            |
 +----------------------------------------------------------------------------------------------------+
 ```
 
-### 5.2 Quarantine Buffer Capacity and Overflow Policy
-- **Capacity:** Fixed at 1,000 operations (`maxQuarantinedOperations = 1000`).
-- **Overflow Policy:** If active mesh broadcast generates more than 1,000 operations before a snapshot transfer completes:
-  1. Transfer is aborted synchronously with reason `QUARANTINE_OVERFLOW`.
-  2. Quarantine buffer is purged.
-  3. Engine transitions to `DEGRADED` state.
-  4. Application callback `onRecoveryDegraded` is dispatched.
-  5. State remains uncorrupted; no partial snapshot is ever committed.
+### 6.2 Enumeration of Swapped State
+- Playback State (`PlaybackState`) & incremented `stateVersion`
+- Logical Clock (`clockManager` reseeded to exact $S.\text{maxLogicalTimestamp}$ without $+1$)
+- Replication Vector (`Record<string, number>`)
+- Local Causal Context (`Record<string, number>`)
+- Operation Log (`OrderedOperationLog` with reset base and checkpoints)
+- Pending Dependency Queue (`PendingOperationQueue` cleared/reset)
+- Base Snapshot Frontier (`baseSnapshotFrontier`)
+- Deduplication and replay filters
 
 ---
 
-## 6. Boundary Between Ordinary Recovery and Manual Reset
+## 7. Boundary Between Ordinary Recovery and Manual Reset
 
 - **Ordinary Recovery:** Fully automated and mathematically constrained by causal consistency. Any incomparable snapshot, fork, or unresolvable gap halts recovery and enters `DEGRADED`.
 - **Manual Reset:** An out-of-band administrative intervention where a user intentionally discards incompatible history and generates a new session identity (`newSessionId`) with an epoch fence barrier ($E_{\text{reset}} = E + 1000$).

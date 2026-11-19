@@ -1,8 +1,8 @@
 # Phase 7.5 — Fault Tolerance & State Recovery: Implementation Roadmap
 
-**Status:** APPROVED ARCHITECTURAL DESIGN (RE-AUDITED)  
+**Status:** APPROVED ARCHITECTURAL DESIGN (FINAL CLOSURE)  
 **Date:** 2026-11-19  
-**Branch Baseline:** `main` at `3a3d9e5`  
+**Branch Baseline:** `main` at `30b8e5f`  
 **Frozen Baselines:** Phase 7.3 (`e49b81a`), Phase 7.4 M1–M5 (`dbd5217`, `3a3d9e5`)  
 
 ---
@@ -13,10 +13,10 @@ Phase 7.5 provides state recovery and fault tolerance when operation logs are co
 
 ```mermaid
 flowchart TD
-    M1["Milestone M1: Research & Problem Definition<br/>(Complete & Re-Audited)"] --> M2["Milestone M2: Architecture & Interfaces<br/>(Complete & Re-Audited)"]
+    M1["Milestone M1: Research & Problem Definition<br/>(Complete & Final Closure)"] --> M2["Milestone M2: Architecture & Interfaces<br/>(Complete & Final Closure)"]
     M2 --> M3["Milestone M3: Snapshot Creation & Compaction Horizon<br/>(Runtime Authorization Required)"]
-    M3 --> M4["Milestone M4: Dynamic Chunked Transfer Protocol<br/>(Runtime Authorization Required)"]
-    M4 --> M5["Milestone M5: Atomic Installation & Quarantine<br/>(Runtime Authorization Required)"]
+    M3 --> M4["Milestone M4: Iterative Chunked Transfer Protocol<br/>(Runtime Authorization Required)"]
+    M4 --> M5["Milestone M5: Staged Atomic Installation & Quarantine<br/>(Runtime Authorization Required)"]
     M5 --> M6["Milestone M6: Full Recovery Integration & Verification<br/>(System Integration)"]
 ```
 
@@ -25,29 +25,30 @@ flowchart TD
 ## 2. Milestone Breakdown (M1 to M6)
 
 ### Milestone M1: Research, Problem Definition, and Threat Model
-- **Status:** COMPLETE & RE-AUDITED (Planning Phase)
+- **Status:** COMPLETE & FINAL CLOSURE (Planning Phase)
 - **Objective:** Establish the theoretical foundations, failure scenarios, and boundaries of state recovery.
 - **Scope:**
-  - Exhaustive answers to the 18 research questions.
-  - Critical re-evaluation of compaction frontiers: distinction between Local candidate, Membership-scoped safe frontier ($V_{\text{epoch\_safe}}$), and acknowledgment of the absence of a Globally agreed stable consensus frontier.
-  - Refutation of anti-patterns (downloading highest state version, hash-only matching, arbitrary tie-breaking).
-  - Formal specification of snapshot eligibility and historical compatibility across Cases A through E.
+  - Complete answers to the 18 research questions.
+  - Compaction frontier re-evaluation: formal captured membership view $\mathcal{V} = (E, \mathcal{P})$, current digest requirement, pre-commit revalidation, and acknowledgment that a globally agreed stable frontier does not exist.
+  - Historical compatibility proof: single-operation fingerprints do not chain history; prefix verification across all common retained sequences $[1, k]$ is mandatory.
   - Formal boundary between ordinary recovery and manual reset (deferred to Phase 8).
+  - Snapshot epoch revalidation rules.
 - **Deliverables:** `docs/PHASE7_5_RESEARCH_AND_PROBLEM_DEFINITION.md`
 - **Exit Conditions:** Architectural sign-off on research answers and invariants.
 
 ---
 
 ### Milestone M2: Architecture, Chunk Protocol, and Interface Specification
-- **Status:** COMPLETE & RE-AUDITED (Planning Phase)
+- **Status:** COMPLETE & FINAL CLOSURE (Planning Phase)
 - **Objective:** Specify all wire contracts, schemas, component interfaces, state machines, and integration hooks.
 - **Scope:**
   - System context and block diagrams.
   - Formal 4-state recovery state machine (`ACTIVE`, `RECOVERING`, `RECONCILING`, `DEGRADED`).
   - Wire schemas: `SNAPSHOT_OFFER`, `SNAPSHOT_REQUEST`, `SNAPSHOT_CHUNK`, `SNAPSHOT_CHUNK_REQUEST`, `SNAPSHOT_ABORT`.
   - Component interfaces: `ISnapshotTransferManager`, `IRecoveryCoordinator`, `ISnapshotInstaller`, `IRecoveryStateMachine`.
-  - Dynamic chunk sizing formula (`calculateDynamicChunkSize`) integrating with `PeerManager.getSctpMaxMessageSize()`.
-  - Error codes, diagnostics taxonomy, and Open Decisions register.
+  - Normative 7-step iterative send-boundary loop.
+  - Staged Immutable Engine-State Replacement pattern.
+  - Error codes, diagnostics taxonomy, and Open Decisions register (OD-7.5-1 to OD-7.5-5).
 - **Deliverables:**
   - `docs/PHASE7_5_ARCHITECTURE.md`
   - `docs/PHASE7_5_INTERFACE_SPECIFICATION.md`
@@ -65,15 +66,17 @@ flowchart TD
   - Integrate `StateSnapshotPayloadV2Schema` wire definitions into `@syncplay/protocol`.
   - Enhance `OrderedOperationLog` compaction to retain origin checkpoints up to the frontier.
   - Implement deterministic canonical RFC 8785 JSON serialization and SHA-256 digest computation.
-  - Support memory-bounded snapshot generation from active playback state and checkpoint tables.
+  - Implement captured view revalidation for `V_epoch_safe`.
+  - Enforce exact Phase 7.2 invariant: `maxLogicalTimestamp === max(originFrontierTimestamps.values())`.
 - **Affected Packages and Files:**
   - `packages/protocol/src/payloads/recovery.ts` (new schemas)
   - `packages/protocol/src/payloads/index.ts` (exports)
   - `packages/sync-engine/src/snapshot/snapshot-generator.ts` (canonical serialization)
-  - `packages/sync-engine/src/log/ordered-operation-log.ts` (checkpoint compaction retention)
+  - `packages/sync-engine/src/log/ordered-operation-log.ts` (checkpoint retention & view revalidation)
 - **Invariants Enforced:**
-  - Compaction operates autonomously bounded by $V_{\text{epoch\_safe}}$ or $K=256$, never discarding checkpoints.
+  - Compaction never discards checkpoints.
   - Canonical JSON key ordering ensures identical SHA-256 digests across all platforms and V8 versions.
+  - Compaction revalidation aborts if view $\mathcal{V}$ changed.
   - Snapshot size strictly capped at 4 MB.
 - **Verification and Tests:**
   - Unit tests for canonical serialization determinism under varied key insertion orders.
@@ -88,12 +91,12 @@ flowchart TD
 
 ---
 
-### Milestone M4: Dynamic Chunked Snapshot Transfer Protocol and WebRTC Multiplexing
+### Milestone M4: Iterative Chunked Snapshot Transfer Protocol and WebRTC Multiplexing
 - **Status:** PENDING AUTHORIZATION (Runtime Implementation)
 - **Objective:** Implement reliable, dynamic chunked snapshot transfer over WebRTC DataChannels within strict SCTP limits.
 - **Scope:**
   - Implement `SnapshotTransferManager` for outbound chunking and inbound reassembly.
-  - Enforce dynamic chunk payload sizing via `calculateDynamicChunkSize(sctpMaxMessageSize)`.
+  - Implement normative 7-step iterative send-boundary loop.
   - Enforce strictly **1 active transfer** per recovering peer.
   - Implement sliding-window flow control with pipelined chunk requests (window of 4).
   - Implement chunk retransmission requests (`SNAPSHOT_CHUNK_REQUEST`) via missing-index arrays.
@@ -123,11 +126,13 @@ flowchart TD
 
 ---
 
-### Milestone M5: Atomic Snapshot Installation, Causal Restoration, and Event Quarantine
+### Milestone M5: Staged Atomic Snapshot Installation, Causal Restoration, and Event Quarantine
 - **Status:** PENDING AUTHORIZATION (Runtime Implementation)
-- **Objective:** Atomically install verified snapshots, restore causal vectors, and drain quarantined live events.
+- **Objective:** Atomically install verified snapshots via staged instance replacement, restore causal vectors, and drain quarantined live events.
 - **Scope:**
-  - Implement `SnapshotInstaller` providing Stage 1 out-of-engine pre-validation (`validateCandidate`) and Stage 2 atomic commit (`installSnapshotAtomic`) with rollback protection.
+  - Implement `SnapshotInstaller` providing Stage 1 out-of-engine pre-validation (`validateCandidate`) with full prefix checkpoint verification.
+  - Implement Stage 2 out-of-band staged instance construction and Stage 3 synchronous atomic reference swap.
+  - Defer listener notifications until Stage 4 (post-reconciliation).
   - Implement `QuarantineBuffer` in `RecoveryCoordinator` for incoming live events (capacity: 1,000 operations).
   - Block local control inputs while in `RECOVERING` and `RECONCILING` states.
   - Implement exact Lamport clock reseed: $L_{\text{local}} = \max(L_{\text{local}}, L_{\text{snapshot}})$ without $+1$.
@@ -138,14 +143,14 @@ flowchart TD
   - `packages/sync-engine/src/recovery/quarantine-buffer.ts` (new)
   - `packages/sync-engine/src/engine/leaderless-sync-engine.ts` (quarantine hooks & atomic install)
 - **Invariants Enforced:**
-  - Atomic commit: either complete installation succeeds or state remains completely untouched.
+  - Atomic commit via staged reference swap: either complete installation succeeds or state remains completely untouched.
   - Local state version is strictly incremented: $V_{\text{local}} = V_{\text{local}} + 1$.
   - Quarantined operations older than snapshot frontier are safely discarded without re-execution.
   - Local inputs are blocked while in `RECOVERING` and `RECONCILING` states.
 - **Verification and Tests:**
-  - Atomic rollback verification under simulated install failure.
+  - Staged rollback verification under simulated install failure.
   - Lamport clock monotonicity before and after recovery across all peers.
-  - Correct ordering and application of live operations quarantined during snapshot transfer.
+  - Full prefix checkpoint divergence detection (counterexample test).
   - Quarantine queue 1,000-operation overflow abortion and transition to `DEGRADED`.
 - **Acceptance Criteria:**
   - Recovered peer converges to identical playback state with zero state corruption.
@@ -176,7 +181,7 @@ flowchart TD
   - Memory usage strictly bounded under repeated disconnect/reconnect loops.
 - **Verification and Tests:**
   - End-to-end multi-peer recovery tests across simulated WebRTC DataChannels.
-  - Verification of Cases A, B, C, D, E with exact expected results (Eligible, DEGRADED, Rejected, Requires history repair).
+  - Verification of Cases A, B, C, D, E with exact expected results.
   - Peer crash and failover during active snapshot transfer.
   - Deterministic property-based test of causal frontier monotonicity.
 - **Acceptance Criteria:**

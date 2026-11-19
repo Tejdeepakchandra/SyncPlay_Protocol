@@ -1,8 +1,8 @@
 # Phase 7.5 — Fault Tolerance & State Recovery: Research and Problem Definition
 
-**Status:** APPROVED ARCHITECTURAL DESIGN (RE-AUDITED)  
+**Status:** APPROVED ARCHITECTURAL DESIGN (FINAL CLOSURE)  
 **Date:** 2026-11-19  
-**Branch Baseline:** `main` at `3a3d9e5`  
+**Branch Baseline:** `main` at `30b8e5f`  
 **Frozen Baselines:** Phase 7.3 (`e49b81a`), Phase 7.4 M1–M5 (`dbd5217`, `3a3d9e5`)  
 
 ---
@@ -13,7 +13,7 @@ In Phase 7.4, the SyncPlay protocol established a request-driven, peer-to-peer a
 
 In real-world distributed media playback across unstable WebRTC peer meshes, peers routinely experience conditions that exceed the bounded history retention horizon of active logs:
 1. **Extended Disconnections / Late Joiners:** A peer joins or rejoins after being disconnected for minutes or hours, during which hundreds or thousands of playback operations occurred and were compacted.
-2. **Log Compaction Horizon:** To prevent unbounded memory consumption, operation logs are pruned up to a stable consensus frontier ($V_{\text{snap}}$). Operations older than $V_{\text{snap}}$ are collapsed into a base playback snapshot and permanently discarded from memory.
+2. **Log Compaction Horizon:** To prevent unbounded memory consumption, operation logs are pruned up to a safe frontier ($V_{\text{epoch\_safe}}$). Operations older than the compaction horizon are collapsed into a base playback snapshot and permanently discarded from memory.
 3. **No Supplier Retains History:** When an anti-entropy request triggers `onHistoryExhausted` (due to `OUTSIDE_HORIZON` or `NO_ELIGIBLE_REPAIR_SUPPLIER`), operation repair is mathematically impossible.
 4. **Network Partitions and Divergent Snapshots:** Multiple network partitions may independently compact different subsets of history or operate at different frontiers.
 5. **Epoch Transitions During Recovery:** Membership changes trigger epoch increments while a recovery handshake is in-flight.
@@ -52,12 +52,13 @@ A snapshot $S$ is eligible for atomic installation if and only if all eight cond
 2. **Bit-Exact SHA-256 Digest:** Canonical RFC 8785 JSON representation of $S$ produces a SHA-256 digest identical to $S.\text{sha256Digest}$.
 3. **Strict Vector Domination:** For every origin $p$ known locally:
    $$V_S[p] \ge V_{\text{local}}[p]$$
-4. **Historical Checkpoint Compatibility:** For every common sequence $k = \min(V_S[p], V_{\text{local}}[p])$, checkpoint fingerprints match:
-   $$\text{digest}_S(p, k) == \text{digest}_{\text{local}}(p, k)$$
-5. **Lamport Clock Monotonicity:** $S.\text{maxLogicalTimestamp} \ge \max_p S.\text{originFrontierTimestamps}[p]$ and is within valid integer bounds ($\le \text{Number.MAX\_SAFE\_INTEGER}$).
-6. **Epoch Compatibility:** $S.\text{membershipEpoch} \le \text{currentEpoch}$.
+4. **Historical Checkpoint Compatibility Across Prefix:** For every common sequence $i \in [1, \min(V_S[p], V_{\text{local}}[p])]$ retained by either party, checkpoint fingerprints match bit-exact (Section 5).
+5. **Exact Lamport Invariant Reinstated:**
+   $$S.\text{maxLogicalTimestamp} \equiv \max_{p \in \text{origins}(V_S)} S.\text{originFrontierTimestamps}[p]$$
+   and is within integer bounds ($\le \text{Number.MAX\_SAFE\_INTEGER}$).
+6. **Epoch Compatibility & Revalidation:** $S.\text{membershipEpoch} \le \text{currentEpoch}$ adhering to formal epoch revalidation rules (Section 6).
 7. **Identity Authorization:** $S.\text{authorPeerId}$ is a recognized participant in the session.
-8. **Generation Currency:** Arrives over an authenticated DataChannel whose connection generation matches current active generation.
+8. **Generation Currency:** Arrives over an authenticated DataChannel whose connection generation matches the active generation.
 
 ### Q2: How does a peer detect that log repair is impossible?
 Log repair is declared impossible when:
@@ -66,7 +67,7 @@ Log repair is declared impossible when:
 - `RepairRequestPipeline` exhausts retries and invokes `callbacks.onHistoryExhausted`.
 
 ### Q3: How is the compaction horizon safely determined?
-See Section 4 for detailed re-evaluation of compaction frontiers. Compaction is bounded by the membership-scoped safe frontier ($V_{\text{epoch\_safe}}$), representing the component-wise minimum of connected peers' acknowledged vectors in the active epoch.
+See Section 4. Compaction is bounded by the membership-scoped safe frontier ($V_{\text{epoch\_safe}}$) over a verified, unmutated membership view $\mathcal{V}$, or bounded by local ring buffer capacity ($K=256$).
 
 ### Q4: What prevents snapshot corruption during transmission?
 - Multi-tier validation: each chunk carries its own SHA-256 hash (`chunkSha256`).
@@ -75,7 +76,7 @@ See Section 4 for detailed re-evaluation of compaction frontiers. Compaction is 
 
 ### Q5: How is snapshot chunking bounded for WebRTC?
 - WebRTC DataChannel hard ceiling: 65,536 bytes.
-- Dynamic chunk sizing (Section 7) bounds payload to $\le 32,768$ bytes, ensuring Base64 plus JSON overhead stays well below negotiated SCTP limits.
+- Dynamic chunk sizing (Section 7) uses `calculateDynamicChunkSize` as an initial estimate, with an iterative normative send-boundary loop measuring exact serialized UTF-8 bytes against negotiated SCTP limits.
 - Total snapshot size hard-capped at 4,194,304 bytes (4 MB = 128 chunks).
 
 ### Q6: How does Lamport clock reseeding avoid clock runaway?
@@ -90,10 +91,10 @@ Incoming broadcast operations are diverted to an in-memory `QuarantineBuffer` (c
 Neither snapshot causally dominates. Arbitrary tie-breaking is strictly prohibited. The engine enters `DEGRADED` state and notifies the application via `onRecoveryDegraded`.
 
 ### Q9: How is atomic installation guaranteed?
-Staged validation (`validateCandidate`) performs dry-run schema and digest checks. The engine commit runs in a single synchronous run-to-completion step with state backup and rollback on exception.
+Staged validation (`validateCandidate`) executes purely out-of-engine. Installation uses a **Staged Immutable Engine-State Replacement** pattern, atomically swapping engine references only after all structures and checkpoints are validated (Section 9). Listeners are notified only post-swap.
 
 ### Q10: How does a peer verify historical continuity below the compaction horizon?
-Via `compactedCheckpoints` tables stored in `StateSnapshotPayloadV2`. Each origin stores checkpoints with `originSequenceNumber`, `logicalTimestamp`, and SHA-256 `fingerprint`.
+Via `compactedCheckpoints` tables stored in `StateSnapshotPayloadV2`. Checkpoints across the common sequence prefix are cross-checked (Section 5).
 
 ### Q11: How are membership epochs handled during transfer?
 If the room epoch increments during an active transfer, the transfer is synchronously aborted (`EPOCH_MISMATCH`) and all intermediate chunk buffers are discarded.
@@ -122,273 +123,250 @@ Ordinary recovery is strictly causally consistent. Manual reset abandons causali
 
 ---
 
-## 4. Compaction Horizon & Membership Dynamics: Re-Evaluation
+## 4. Compaction Frontier Procedure & Membership Dynamics
 
 The computation of the compaction horizon must be grounded in the concrete realities of SyncPlay's leaderless architecture.
 
-### 4.1 Answers to the 10 Membership & Compaction Audit Questions
+### 4.1 Formal Captured Membership View $\mathcal{V}$
+A local peer captures a formal membership view:
+$$\mathcal{V} = \Big(\text{epoch}: E_{\text{local}}, \mathcal{P}: \{ (p, gen_p) \mid p \in \text{connectedPeers}, \text{dataChannelState}(p) === \text{'open'} \} \Big)$$
 
-1. **What precisely defines the acknowledgement membership set?**
-   In SyncPlay's peer-to-peer mesh, there is NO centralized membership registry. The acknowledgement membership set $\mathcal{M}_{\text{local}}$ is strictly the set of peers currently connected to the local peer via open WebRTC DataChannels in `PeerManager.listPeers()`.
-2. **Is that set fixed for one membership epoch?**
-   No. While an epoch transition occurs when peers join or leave via signaling, WebRTC DataChannels can open, close, or reset independently within an epoch due to network drops, ICE renegotiations, or browser tab freezes before signaling catches up.
-3. **What exactly does an acknowledgement certify?**
-   When a peer broadcasts a `STATE_DIGEST` containing `replicationVector[origin] = seq`, it certifies **local causal admission and application**—meaning that peer has verified, applied, and incorporated all operations up to sequence `seq` into its local playback state and log. It does **NOT** certify that other peers have received it, nor that a snapshot has been generated.
-4. **Does it certify receipt, structural validation, causal admission, or committed incorporation into a snapshot?**
-   It certifies structural validation and causal admission into the local engine. It does not certify committed incorporation into a snapshot.
-5. **How is an acknowledgement bound to peer identity, generation, and membership epoch?**
-   The `STATE_DIGEST` carries `senderPeerId`, `connectionGeneration`, and `membershipEpoch`. `TrustedTransportAdapter` verifies that `senderPeerId` matches the WebRTC peer, `connectionGeneration` matches `peerGenerations.get(senderPeerId)`, and `membershipEpoch` matches `this.currentEpoch`.
-6. **What happens if a peer disconnects while the GLB is being calculated?**
-   If a peer disconnects, its vector is omitted from subsequent calculations. If compaction executes based on an in-flight calculation that included the disconnected peer, the resulting frontier may be further advanced than what an offline peer retains.
-7. **Can an excluded peer later rejoin with stale history?**
-   **YES.** A peer that disconnected at sequence 20 may rejoin minutes later when the remaining peers have advanced to sequence 500 and compacted up to 450.
-8. **Can two peers independently calculate different compaction frontiers?**
-   **YES.** Because there is no consensus leader or atomic distributed barrier, Peer A (observing digests from {P1, P2}) and Peer B (observing digests from {P2, P3}, or observing P1 with network delay) will independently calculate different GLB frontiers.
-9. **What prevents a peer from claiming an acknowledgement it never actually completed under the cooperative trust model?**
-   Under Cooperative Non-Byzantine Model (Phase 7.2-R4 Option C), peers are honest and follow the protocol without malicious manipulation. Premature advancement is prevented by advancing `replicationVector` only within `applyOperation()`.
-10. **What happens when membership changes before compaction completes?**
-    An epoch transition increments `currentEpoch`. In-flight digests from the prior epoch are immediately stale and discarded.
+### 4.2 Current Digest Requirement
+For every peer $(p, gen_p) \in \mathcal{P}$:
+The local engine must possess an active, authenticated `STATE_DIGEST` $D_p$ satisfying:
+1. $D_p.\text{senderPeerId} === p$
+2. $D_p.\text{connectionGeneration} === gen_p$
+3. $D_p.\text{membershipEpoch} === E_{\text{local}}$
 
-### 4.2 Three Levels of Compaction Frontiers
+**Behavior when a connected peer has not supplied a current digest:**
+- If ANY peer in $\mathcal{P}$ lacks a current digest for view $\mathcal{V}$, the membership view is **INCOMPLETE**.
+- `V_epoch_safe` **CANNOT** be computed over $\mathcal{P}$.
+- Compaction at `V_epoch_safe` is **HELD** until all connected peers report.
+- The engine does not stall indefinitely: if local memory pressure requires log pruning ($K=256$), the engine may prune oldest operations locally under `V_local_cand`, which explicitly provides **ZERO safety guarantees for remote peers**.
 
-To prevent unsafe assumptions, the architecture strictly distinguishes three concepts:
+### 4.3 Pre-Commit Revalidation
+Immediately prior to committing `compactAtFrontier(V_epoch_safe)`:
+1. Re-read active epoch: `assert(engine.epoch === V.epoch)`.
+2. Re-read connected peer table from `PeerManager`:
+   $$\text{currentConnected} = \{ (p, gen_p) \mid \text{dataChannelState}(p) === \text{'open'} \}$$
+   `assert(currentConnected === V.P)`
+3. If ANY peer in $\mathcal{P}$ disconnected, closed its channel, incremented its generation, or if an epoch increment occurred:
+   - **ABORT the compaction attempt immediately.**
+   - Do NOT prune operations based on the invalidated view.
+   - Wait for a new view $\mathcal{V}'$ and new digests.
 
+### 4.4 The Three Compaction Frontiers
 ```
 +----------------------------------------------------------------------------------------------------+
 | 1. Local Compaction Candidate (V_local_cand):                                                      |
-|    Operations older than capacity K=256 that the local peer wishes to prune for memory reasons.     |
-|    SAFETY: None for other peers. Only ensures local memory boundedness.                            |
+|    Operations older than capacity K=256 that the local peer prunes for local memory bounds.        |
+|    SAFETY: Purely local. Provides zero safety guarantees for remote peers.                         |
 +----------------------------------------------------------------------------------------------------+
                                                  │
                                                  ▼
 +----------------------------------------------------------------------------------------------------+
 | 2. Membership-Scoped Safe Frontier (V_epoch_safe):                                                 |
-|    Component-wise GLB of replication vectors received from all currently connected peers:           |
-|    V_epoch_safe[p] = min_{m in M_connected} V_m[p]                                                 |
-|    SAFETY: Safe for currently connected peers in the active epoch.                                 |
+|    Component-wise GLB of replication vectors received from all currently connected peers in V:     |
+|    V_epoch_safe[p] = min_{m in P union {local}} D_m.replicationVector[p]                           |
+|    SAFETY: Safe ONLY for peers actively connected in P during epoch E_local.                       |
 |    LIMITATION: Does NOT protect disconnected, partitioned, or newly joining peers.                |
 +----------------------------------------------------------------------------------------------------+
                                                  │
                                                  ▼
 +----------------------------------------------------------------------------------------------------+
 | 3. Globally Agreed Stable Frontier (V_stable):                                                     |
-|    A frontier certified by a 100% atomic consensus round or total-order commit across all peers.  |
+|    A frontier certified by an atomic consensus round or total-order commit across all peers.       |
 |    STATUS IN SYNCPLAY: DOES NOT EXIST. SyncPlay is leaderless without Raft/Paxos rounds.          |
 +----------------------------------------------------------------------------------------------------+
 ```
 
-### 4.3 Architectural Consequence: Snapshot Recovery as a First-Class Necessity
-Because a **Globally Agreed Stable Frontier does not exist**, peers will inevitably compact history that some disconnected or partitioned peer later needs.
-
-**Conservative Architectural Decision:**
-1. A peer is permitted to compact operations up to $V_{\text{epoch\_safe}}$ (or up to its local ring buffer capacity $K=256$ when memory limits require).
-2. Compacting peers **must retain compacted checkpoints** for all pruned origins.
-3. The protocol formally embraces that a supplier will return `REPAIR_REJECTED (OUTSIDE_HORIZON)` when a reconnecting peer requests compacted history.
-4. **Snapshot recovery is not an exceptional failure mode; it is the fundamental, expected recovery mechanism for leaderless operation under churn.**
-
 ---
 
-## 5. Formal Snapshot Eligibility & Historical Compatibility Procedure
+## 5. Historical Compatibility Proof: The Checkpoint Commitment Reality
 
-Vector domination ($V_S \ge V_L$) is a necessary condition, but **does not guarantee historical compatibility**.
-
-### 5.1 Formal Compatibility Algorithm
-
-Given local state $(V_L, CP_L, E_L)$ and candidate snapshot $S = (V_S, FT_S, CP_S, E_S, H_S)$:
-
-```
-function evaluateSnapshotEligibility(S, local):
-    // 1. Schema & Integrity Validation
-    if not StateSnapshotPayloadV2Schema.safeParse(S).success:
-        return REJECTED("Schema validation failed")
-    if sha256(canonicalJson(S.payload)) != S.sha256Digest:
-        return REJECTED("SHA-256 digest mismatch")
-
-    // 2. Epoch Currency Check
-    if S.membershipEpoch > local.currentEpoch:
-        return REJECTED("Snapshot from future epoch")
-
-    // 3. Vector Domination Check
-    for each origin p in keys(local.V_L):
-        if S.V_S[p] === undefined or S.V_S[p] < local.V_L[p]:
-            if exists q where S.V_S[q] > local.V_L[q]:
-                return DEGRADED("Incomparable snapshots: partial divergence")
-            else:
-                return REJECTED("Stale snapshot: local state is newer")
-
-    // 4. Metadata Completeness Check
-    for each origin p in keys(S.V_S):
-        if S.V_S[p] > 0 and S.originFrontierTimestamps[p] === undefined:
-            return REJECTED("Missing origin frontier timestamp for " + p)
-    if S.maxLogicalTimestamp < max_p(S.originFrontierTimestamps[p]):
-        return REJECTED("Inconsistent maxLogicalTimestamp")
-
-    // 5. Historical Checkpoint Compatibility Check
-    for each origin p in keys(local.V_L):
-        commonSeq = min(local.V_L[p], S.V_S[p])
-        if commonSeq == 0:
-            continue
-            
-        localCP = local.getCheckpoint(p, commonSeq)
-        remoteCP = S.getCheckpoint(p, commonSeq)
-        
-        if localCP is defined and remoteCP is defined:
-            if localCP.fingerprint != remoteCP.fingerprint or 
-               localCP.logicalTimestamp != remoteCP.logicalTimestamp:
-                return REJECTED("Checkpoint divergence: history fork on " + p)
-        else:
-            // Checkpoint missing at exact common sequence
-            if local.hasRetainedOperation(p, commonSeq):
-                localFp = computeFingerprint(local.getOperation(p, commonSeq))
-                if remoteCP is defined and remoteCP.fingerprint != localFp:
-                    return REJECTED("History fork detected against stored operation")
-            else:
-                // Neither side retains proof of common history at sequence commonSeq
-                return REQUIRES_HISTORY_REPAIR("Common checkpoint unavailable")
-
-    return ELIGIBLE
+### 5.1 What Does a Phase 7.3 Operation Fingerprint Actually Commit To?
+Inspection of `packages/sync-engine/src/log/operation-fingerprint.ts` shows:
+```typescript
+const preimage = {
+  originPeerId: op.originPeerId,
+  originSequenceNumber: op.originSequenceNumber,
+  logicalEventId: op.logicalEventId,
+  logicalTimestamp: op.logicalTimestamp,
+  causalContext: op.causalContext,
+  messageType: op.messageType,
+  payload: op.payload,
+  membershipEpoch: op.membershipEpoch ?? 1,
+};
+return sha256(canonicalizeJson(preimage));
 ```
 
-### 5.2 Concrete Verification Examples
+**Critical Architectural Insight:**
+- `op.causalContext` records only sequence integers: `{ [peerId]: sequenceNumber }`.
+- `computeOperationFingerprint` **does NOT chain previous operation hashes** ($H_k \ne \text{hash}(H_{k-1}, op_k)$).
+- A fingerprint at sequence $k$ commits strictly to the identity of **that single operation at sequence $k$** and the sequence watermarks in its causal context.
+- **Equality of one operation fingerprint at sequence $k$ DOES NOT prove equality of preceding operations $i < k$.**
 
-| Case | Local State ($V_L, CP_L$) | Candidate Snapshot ($V_S, CP_S$) | Causal / Checkpoint Evaluation | Exact Result |
-| :--- | :--- | :--- | :--- | :---: |
-| **A: Valid Dominating Snapshot** | $V_L = \{ A: 10, B: 5 \}$<br/>$CP_L(A,10) = \text{fp}_1$<br/>$CP_L(B,5) = \text{fp}_2$ | $V_S = \{ A: 15, B: 8, C: 2 \}$<br/>$CP_S(A,10) = \text{fp}_1$<br/>$CP_S(B,5) = \text{fp}_2$ | $\forall p: V_S[p] \ge V_L[p]$. Common checkpoints match bit-exact. C causal extension. | **ELIGIBLE** |
-| **B: Incomparable Snapshots** | $V_L = \{ A: 12, B: 4 \}$ | $V_S = \{ A: 8, B: 10 \}$ | $V_S[A] < V_L[A]$ while $V_S[B] > V_L[B]$. Neither dominates. | **DEGRADED** |
-| **C: Conflicting Checkpoint** | $V_L = \{ A: 10 \}$<br/>$CP_L(A,10) = \text{fp}_{\text{alpha}}$ | $V_S = \{ A: 15 \}$<br/>$CP_S(A,10) = \text{fp}_{\text{beta}}$ | $V_S \ge V_L$, but fingerprints at common sequence 10 conflict ($\text{fp}_{\alpha} \ne \text{fp}_{\beta}$). History fork! | **REJECTED** |
-| **D: Unavailable Checkpoint** | $V_L = \{ A: 10 \}$<br/>$CP_L(A,10) = \text{fp}_1$ | $V_S = \{ A: 100 \}$<br/>$CP_S$ only has sequences $\ge 80$ | $V_S \ge V_L$, but no common checkpoint exists between sequence 10 and 80. Continuity unproven. | **REQUIRES_HISTORY_REPAIR** |
-| **E: Missing Frontier Timestamp** | $V_L = \{ A: 5 \}$ | $V_S = \{ A: 20, B: 10 \}$<br/>$FT_S = \{ A: 50 \}$ (B missing) | Malformed snapshot metadata: origin $B$ has sequence 10 but missing frontier timestamp. | **REJECTED** |
+### 5.2 Concrete Counterexample: Concealed Intermediate Divergence
+Consider origin $P$ authoring three operations in two divergent network partitions:
+- **Partition 1:**
+  - $op_1$: `PAUSE`
+  - $op_2$: `PLAY`
+  - $op_3$: `SEEK(100)` with `causalContext: { P: 2 }`
+- **Partition 2:**
+  - $op_1$: `RATE_CHANGE(2.0)`  *(Divergent operation!)*
+  - $op_2$: `PLAY`
+  - $op_3$: `SEEK(100)` with `causalContext: { P: 2 }`
 
----
+Notice that at sequence 3, both partitions produced an operation $op_3$ with identical fields:
+`{ originPeerId: 'P', originSequenceNumber: 3, logicalEventId: 'seek-100', logicalTimestamp: 10, causalContext: { P: 2 }, messageType: 'SEEK', payload: { positionMs: 100 }, membershipEpoch: 1 }`.
 
-## 6. Manual Recovery Versus Causal Convergence
+If the compatibility check evaluates **only** $k = \min(V_1[P], V_2[P]) = 3$:
+$$\text{fingerprint}_1(P, 3) === \text{fingerprint}_2(P, 3)$$
+The fingerprints at sequence 3 match bit-for-bit, yet at sequence 1 the partitions executed conflicting operations (`PAUSE` vs `RATE_CHANGE`). Evaluating only sequence $k$ would falsely claim causal compatibility!
 
-A strict boundary is drawn between autonomous distributed recovery and administrative intervention.
+### 5.3 Formally Defensible Compatibility Strategy
+Because Phase 7.3 checkpoints are not a Merkle chain, full historical compatibility must be proven through **comprehensive prefix verification**:
 
-### 6.1 Ordinary Recovery (Causally Consistent)
-- **Scope:** Automated, algorithmic state reconciliation.
-- **Guarantee:** Never adopts a snapshot that cannot be proven to causally dominate local history.
-- **Behavior on Incomparable Snapshots:** The engine halts automated reconciliation, transitions to `DEGRADED`, and dispatches `onRecoveryDegraded`. It **NEVER** silently guesses or forces one branch over another.
-
-### 6.2 Explicit Manual Reset (Administrative Intervention)
-If an application or user decides to recover from a `DEGRADED` state by forcibly choosing one peer's playback position, this is an **intentional abandonment of causal history**, NOT causal reconciliation.
-
-**Formal Specification for Manual Reset:**
-1. **New Session Identity:** The initiator must generate a fresh `sessionId = UUIDv4()`.
-2. **Epoch Fence:** Membership epoch is reset or incremented by a fence barrier ($E_{\text{reset}} = E + 1000$).
-3. **Fencing Stale History:** `TrustedTransportAdapter` and `PeerManager` immediately drop and reject any message or snapshot carrying the old `sessionId` or an epoch $< E_{\text{reset}}$.
-4. **Application Notification:** The engine fires `onHistoryAbandoned({ previousSessionId, newSessionId, authorPeerId })` to explicitly alert the UI layer.
-5. **Phase Scope:** Implementing administrative manual reset workflows involves UI prompts and signaling session renegotiation. **Manual Reset is explicitly DEFERRED to Phase 8 / Application Layer.** Phase 7.5 provides the detection, safety fences, and `DEGRADED` state triggers.
-
----
-
-## 7. Actual Transport Limits & Dynamic Chunk Sizing
-
-Phase 7.5 snapshot transfers run over WebRTC DataChannels and must strictly comply with Phase 7.4 M5's transport architecture.
-
-### 7.1 Re-evaluation of Static 32 KB Chunking
-In the initial proposal, chunks were fixed at 32 KB (`MAX_CHUNK_BYTES = 32768`).
-- 32 KB raw binary $\xrightarrow{\text{Base64}}$ $\approx 43,692$ bytes.
-- JSON envelope overhead $\approx 500$ bytes.
-- Total message size $\approx 44.2$ KB.
-
-**Defect Identified:** RFC 8841 permits WebRTC implementations to negotiate SCTP maximum message sizes smaller than 64 KB (e.g., 16,384 bytes, 8,192 bytes, or 1,280 bytes). If a peer's `sctpMaxMessageSize` is 16 KB, a fixed 32 KB chunk will fail `PeerManager.sendSerialized()` every time with:
-`Message exceeds maximum size (45250 bytes > 16384 limit)`.
-
-### 7.2 Dynamic Chunk Sizing Formula
-Phase 7.5 reuses `PeerManager.getSctpMaxMessageSize(peerId)` to dynamically calculate the maximum chunk payload size per supplier:
-
-$$\text{effectiveLimit} = \min(65536, \text{sctpLimit} \text{ if defined and } > 0 \text{ else } 65536)$$
-$$\text{envelopeBudget} = 768 \text{ bytes (JSON keys, UUIDs, chunkSha256, session metadata)}$$
-$$\text{availableBase64Bytes} = \max(0, \text{effectiveLimit} - \text{envelopeBudget})$$
-$$\text{dynamicChunkBytes} = \min(32768, \lfloor \text{availableBase64Bytes} \times \frac{3}{4} \rfloor)$$
-
-- Under standard 64 KB limit: $\text{dynamicChunkBytes} = \min(32768, \lfloor 64768 \times 0.75 \rfloor) = 32,768$ bytes (32 KB).
-- Under 16 KB SCTP limit: $\text{dynamicChunkBytes} = \lfloor (16384 - 768) \times 0.75 \rfloor = 11,712$ bytes.
-- Minimum threshold: If $\text{effectiveLimit} < 2048$ bytes, chunk transfer over DataChannel is unfeasible. The transfer aborts with `TRANSPORT_LIMIT_EXCEEDED` and enters `DEGRADED`.
-
-### 7.3 Reuse of M5 Send Boundary
-1. The serialized JSON message is constructed and measured once:
-   $$\text{byteLength} = \text{new TextEncoder}().\text{encode}(\text{wireJson}).\text{byteLength}$$
-2. The exact string is passed unchanged to `PeerManager.sendSerialized()`.
-3. `PeerManager.sendSerialized()` performs the final currency checks:
-   - Target peer exists in `peers` map.
-   - Target connection generation matches `entry.generation`.
-   - DataChannel `readyState === 'open'`.
-   - Byte length does not exceed `effectiveLimit`.
-4. The exact string is passed directly to `RTCDataChannel.send()`.
+1. **Prefix Checkpoint Scan:**
+   For every origin $p \in \text{origins}(V_L) \cap \text{origins}(V_S)$, evaluate the common sequence prefix $[1, k]$ where $k = \min(V_L[p], V_S[p])$:
+   - For every sequence $i \in [1, k]$ where a checkpoint or stored operation is retained by both sides:
+     $$\text{fingerprint}_S(p, i) == \text{fingerprint}_L(p, i)$$
+     If any pair differs $\implies$ **REJECTED (History Fork Detected)**.
+2. **Completeness of Retained Coverage:**
+   - If BOTH parties retain checkpoints or stored operations for all sequences in $[1, k]$, historical compatibility is proven.
+   - If an intermediate sequence $j \in [1, k]$ has been pruned on either side without a retained checkpoint or stored operation to compare against:
+     The local engine **cannot prove** that sequence $j$ was identical.
+     Result: **REQUIRES_HISTORY_REPAIR** (attempt to fetch missing checkpoints/operations from connected peers via anti-entropy).
+     If missing proof cannot be retrieved $\implies$ transition to **DEGRADED**.
+3. **Strict Non-Assumption Invariant:**
+   The protocol NEVER assumes unverified historical prefixes are identical based on vector domination or single-sequence checkpoint matches.
 
 ---
 
-## 8. Snapshot Identity, Provenance, and Transfer Concurrency
+## 6. Snapshot Epoch Compatibility & Fencing
 
-### 8.1 Snapshot Identity: Creation-Unique vs Content-Addressed
-- **`snapshotId`:** A creation-unique UUIDv4 generated by the authoring peer. It identifies the snapshot instance across transfer requests.
-- **`sha256Digest`:** The content-addressed hash computed over the canonical RFC 8785 JSON representation of the payload. It guarantees payload immutability and byte-exact integrity.
+### 6.1 Reconciling Epoch Fencing with Historical Snapshots
+In Phase 7.3-R3, live operation broadcasts are strictly epoch-fenced: an operation authored in epoch $E_1$ is discarded by peers in epoch $E_2 > E_1$.
 
-### 8.2 Author vs Supplier
-- **`authorPeerId`:** The peer that originally created the snapshot and computed its state.
-- **`supplierPeerId`:** The currently connected peer transmitting the snapshot over WebRTC. A supplier may serve a snapshot authored by another peer (or itself).
+However, state snapshots represent compacted historical bases. A room that has been idle in epoch 1 may transition to epoch 2 due to a member leaving. Discarding the epoch 1 snapshot would discard the only record of historical state.
 
-### 8.3 Supplier Retention & Offer Invalidation
-- A supplier advertises a snapshot via `SNAPSHOT_OFFER`.
-- Offers are invalidated immediately upon:
-  1. Peer disconnection.
-  2. Room epoch increment (`membershipEpoch`).
-  3. Supplier local compaction superseding the base snapshot.
-- If a supplier fails to serve chunks, chunk timeouts trigger retry failover to another supplier.
+### 6.2 Formal Epoch Revalidation Rules
+A snapshot $S$ is valid for installation across epochs if and only if all four conditions hold:
 
-### 8.4 Multiple Suppliers
-- **Identical Snapshots:** If two suppliers advertise the same `sha256Digest`, they hold identical data. The requester can download chunks from either, or failover seamlessly mid-transfer.
-- **Identical Frontiers with Different Digests:** If two suppliers advertise identical $V_S$ but different `sha256Digest`, their histories diverge (different checkpoints or state). The requester flags this as divergent and rejects both offers.
-
-### 8.5 Concurrency Model Clarification
-- **Concurrent Transfers:** Strictly **1 active transfer** per recovering peer (`activeTransfer = null | transferId`). A recovering peer never downloads multiple snapshots simultaneously.
-- **In-Flight Chunks:** Within the single active transfer, the requester pipelines up to **4 concurrent chunk requests** (`MAX_CONCURRENT_CHUNK_REQUESTS = 4`) to maximize WebRTC throughput.
+1. **Strict Session Identity Binding:**
+   $$S.\text{sessionId} === \text{engine.sessionId}$$
+   Cross-session snapshots are unconditionally rejected.
+2. **Current Transport Envelope Currency:**
+   The snapshot must be served inside recovery wire envelopes (`SNAPSHOT_OFFER`, `SNAPSHOT_REQUEST`, `SNAPSHOT_CHUNK`) that carry the **CURRENT active epoch** ($E_{\text{local}}$) and current connection generation. Stale transport messages carrying epoch $< E_{\text{local}}$ are dropped at the transport boundary.
+3. **Current Supplier Certification:**
+   The supplier must certify in its current-epoch `SNAPSHOT_OFFER` (signed and sent at $E_{\text{local}}$) that $S$ represents its active, committed base snapshot.
+4. **Epoch Monotonicity & Superseded Branch Fencing:**
+   - If $S.\text{membershipEpoch} === E_{\text{local}}$: Standard current-epoch validation.
+   - If $S.\text{membershipEpoch} < E_{\text{local}}$:
+     The snapshot is eligible ONLY IF the local engine has committed **ZERO** operations in epoch $E_{\text{local}}$ that conflict with or supersede $S$. If any local operation exists with `membershipEpoch > S.membershipEpoch` whose sequence is not subsumed by $S$, $S$ is strictly **REJECTED** as an obsolete historical branch.
 
 ---
 
-## 9. Quarantine Mechanics & Atomic Installation Analysis
+## 7. Exact Transport Sizing & Iterative Send Boundary
 
-### 9.1 Inspection of `LeaderlessSyncEngine.importSnapshotV2()`
-Inspection of `packages/sync-engine/src/engine/leaderless-sync-engine.ts:1981` reveals:
-1. **Validation Deficiencies:** `importSnapshotV2()` performs **zero pre-validation**. It does not check schema, digest, epoch, vector domination, or checkpoint compatibility.
-2. **Lack of Atomicity:** It directly mutates engine properties step-by-step:
-   - Reseeds clock (`this.clockManager.reseed`).
-   - Wipes and overwrites `localCausalContext` and `replicationVector`.
-   - Replaces `this.state` with `stateVersion + 1`.
-   - Resets `operationLog` and clears `pendingQueue`.
-   - Ingests checkpoints.
-   If any checkpoint insertion throws or a listener fails, the engine is left partially mutated with no rollback.
+### 7.1 Initial Heuristic vs Normative Send Loop
+`calculateDynamicChunkSize(sctpMaxMessageSize)` is an **initial estimation heuristic** used to slice binary buffers.
 
-### 9.2 Architecture of `SnapshotInstaller`
-Phase 7.5 introduces `SnapshotInstaller` to wrap and isolate installation:
-1. **Stage 1 (Pre-Commit Dry Run):** `validateCandidate()` executes all checks in Section 5. Zero engine state is touched.
-2. **Stage 2 (Synchronous Atomic Commit):** Captures previous state, replication vector, clock, and queues. Executes `importSnapshotV2()`. On any thrown exception, synchronously restores backup state.
-3. **Stage 3 (Post-Commit Reconcile):** Quarantined operations are drained and revalidated against the newly installed frontier.
+The **normative transport requirement** reuses Phase 7.4 M5's send boundary via an exact 7-step iterative loop:
 
-### 9.3 Precise State Machine Transitions
-```
-                onHistoryExhausted / REQUIRES_SNAPSHOT_RECOVERY
-       [ACTIVE] ──────────────────────────────────────────────> [RECOVERING]
-          ▲                                                          │
-          │                                                          │ validateCandidate() OK
-          │                                                          │ & installAtomic() OK
-          │                                                          ▼
-          │         Quarantine drained & gaps closed            [RECONCILING]
-          └──────────────────────────────────────────────────────────┘
-                                      │
-                                      │ Failure / Timeout / Overflow / Fork
-                                      ▼
-                                 [DEGRADED]
+```mermaid
+flowchart TD
+    Step1["1. Slice chunk payload (size <= estimatedChunkSize)"] --> Step2["2. Construct ProtocolMessage<'SNAPSHOT_CHUNK'>"]
+    Step2 --> Step3["3. Serialize via JSON.stringify() to wireJson"]
+    Step3 --> Step4["4. Measure exact UTF-8 byte length via TextEncoder"]
+    Step4 --> Step5{"5. byteLength <= effectiveLimit?"}
+    Step5 -- Yes --> Step6["6. Send exact wireJson unchanged via PeerManager.sendSerialized()"]
+    Step5 -- No --> Step7{"Chunk binary size > MIN_CHUNK_BYTES (256)?"}
+    Step7 -- Yes --> Step8["Reduce chunk binary size by delta and repeat"]
+    Step8 --> Step1
+    Step7 -- No --> Step9["Abort transfer with TRANSPORT_LIMIT_EXCEEDED -> DEGRADED"]
 ```
 
-- **`ACTIVE` $\to$ `RECOVERING`:** Triggered when anti-entropy reports `onHistoryExhausted` or digest comparison requires snapshot recovery.
-- **`RECOVERING` $\to$ `RECONCILING`:** Triggered when all chunks are assembled, pre-validation succeeds, and atomic installation commits.
-- **`RECONCILING` $\to$ `ACTIVE`:** Triggered when the quarantine buffer drains and any remaining causal gaps are resolved.
-- **Transitions to `DEGRADED`:**
-  - `INCOMPARABLE_SNAPSHOT`: Incomparable frontiers detected.
-  - `RETRIES_EXHAUSTED`: 3 failed transfer attempts.
-  - `QUARANTINE_OVERFLOW`: Quarantined events exceed 1,000.
-  - `CHECKPOINT_DIVERGENCE`: Checkpoint hash mismatch (history fork).
-  - `RECONCILIATION_TIMEOUT`: Quarantine drain exceeds 10 seconds.
+### 7.2 Transport Invariants
+1. `PeerManager.sendSerialized()` verifies `entry.generation === expectedGeneration` and `entry.transport.dataChannelState === 'open'` immediately before `RTCDataChannel.send()`.
+2. The exact string measured is the exact string passed to `RTCDataChannel.send()`.
+3. If negotiated SCTP limit $< 2048$ bytes, transfer aborts safely without attempting transmission.
+
+---
+
+## 8. Metadata and Lifecycle Consistency
+
+### 8.1 Reinstatement of Exact Phase 7.2 Invariant
+The exact Phase 7.2-R7 / R9 Lamport snapshot invariant is reinstated:
+$$S.\text{maxLogicalTimestamp} \equiv \max_{p \in \text{origins}(V_S)} S.\text{originFrontierTimestamps}[p]$$
+*(For empty frontiers, $\text{maxLogicalTimestamp} = 0$.)*
+
+### 8.2 Cross-Metadata Consistency Checks
+Candidate snapshot $S$ must pass all cross-metadata consistency rules:
+1. $\text{origins}(V_S) == \text{origins}(FT_S)$ for all origins where $V_S[p] > 0$.
+2. $\forall p: FT_S[p] \le S.\text{maxLogicalTimestamp}$, with at least one origin attaining the maximum.
+3. $\forall (p, s) \in CP_S: s \le V_S[p]$ and $CP_S(p, s).\text{logicalTimestamp} \le FT_S[p]$.
+4. Upon installation, local $V_L$ and `localCausalContext` are both updated to $V_S$.
+
+### 8.3 Authorship vs Supplier Identity
+- **`authorPeerId`:** Immutable author of base snapshot.
+- **`supplierPeerId`:** Active connected peer transmitting chunks. A supplier may serve its own snapshot or forward a snapshot authored by another peer.
+
+### 8.4 Transition from `RECONCILING` to `ACTIVE`
+The engine transitions from `RECONCILING` to `ACTIVE` if and only if:
+1. `QuarantineBuffer` is completely drained ($0$ pending operations).
+2. All drained operations have been causally applied or filtered.
+3. Any sequence gaps between $V_S$ and live events have been resolved via Phase 7.4 anti-entropy.
+4. Engine replication vector is contiguous with zero unfulfilled dependencies.
+
+---
+
+## 9. Atomic Snapshot Installation: Staged Immutable Instance Replacement
+
+### 9.1 Why `try/catch` Rollback is Insufficient
+`importSnapshotV2()` mutates multiple internal state maps and arrays in place (`operationLog`, `pendingQueue`, `localCausalContext`, `clockManager`). If a failure occurs midway (e.g. checkpoint insertion failure or memory limit breach), rolling back mutated in-memory state via `catch` blocks is error-prone, fragile, and risks leaving corrupted references.
+
+### 9.2 Staged Immutable Engine-State Replacement Pattern
+Phase 7.5 adopts a true atomic replacement pattern:
+
+```
++----------------------------------------------------------------------------------------------------+
+| STAGE 1: Pure Dry-Run Validation (validateCandidate)                                               |
+| - Validates StateSnapshotPayloadV2Schema, canonical SHA-256, epoch, vector domination, and         |
+|   complete common checkpoint prefix.                                                               |
+| - ZERO engine state is touched.                                                                    |
++----------------------------------------------------------------------------------------------------+
+                                                 │
+                                                 ▼ Validation Passed
++----------------------------------------------------------------------------------------------------+
+| STAGE 2: Staged Instance Construction                                                              |
+| - Construct new StagedPlaybackState with stateVersion = localVersion + 1.                          |
+| - Construct new OrderedOperationLog instance, pre-populated with snapshot base and checkpoints.    |
+| - Construct new replicationVector, localCausalContext, and empty pendingQueue.                     |
+| - If any constructor or ingestion step fails, the staged instances are discarded.                 |
+| - Engine remains 100% active and untouched on previous state.                                      |
++----------------------------------------------------------------------------------------------------+
+                                                 │
+                                                 ▼ Staging Succeeded
++----------------------------------------------------------------------------------------------------+
+| STAGE 3: Atomic Reference Swap (installSnapshotAtomic)                                             |
+| - In a single synchronous run-to-completion step without microtask interleaving:                  |
+|     this.state = stagedState;                                                                      |
+|     this.baseSnapshot = stagedState;                                                               |
+|     this.operationLog = stagedLog;                                                                 |
+|     this.replicationVector = stagedVector;                                                         |
+|     this.localCausalContext = stagedCausalContext;                                                 |
+|     this.clockManager.reseed(snapshot.maxLogicalTimestamp);                                        |
+|     this.pendingQueue = stagedQueue;                                                               |
+| - Transition state to RECONCILING.                                                                 |
++----------------------------------------------------------------------------------------------------+
+                                                 │
+                                                 ▼ Post-Swap
++----------------------------------------------------------------------------------------------------+
+| STAGE 4: Quarantine Drain & Deferred Listener Notification                                         |
+| - Drain QuarantineBuffer in causal order.                                                          |
+| - Upon successful drain and transition to ACTIVE:                                                  |
+|     Notify registered stateChangeListeners(this.state).                                            |
+| - Listeners NEVER observe intermediate recovery states.                                            |
++----------------------------------------------------------------------------------------------------+
+```
