@@ -9,7 +9,8 @@
 **Milestone M2 Baseline:** `2d5e9f3` (docs: `4926c52`)  
 **Milestone M3 Baseline:** `c143972` (docs: `a42c0e7`)  
 **Initial M4 Implementation Baseline:** `5001199` (docs: `a40852e`)  
-**Audited M4 Implementation Baseline:** `dd94004`  
+**M4 First Audit Baseline:** `dd94004`  
+**M4 Hardening Audit Baseline:** `a85598c`  
 **Branch:** `main`  
 **Working Tree Status:** Clean  
 **Date:** 2026-11-19  
@@ -28,6 +29,7 @@ Following the initial implementation, a comprehensive safety and transport-bound
 3. **Actual transport message-size accounting, envelope overhead margins, and RFC 8841 SCTP semantics.**
 4. **Synchronous servicing safety, concurrency tracking resilience, pre-delivery currency checks, and epoch transition guarantees.**
 5. **Rejection semantics, permanent vs temporary failure handling, and contiguous range verification.**
+6. **Transport boundary currency checks and commit baseline reconciliation.**
 
 ---
 
@@ -62,17 +64,19 @@ Following the initial implementation, a comprehensive safety and transport-bound
 
 ### Audit 3: Actual Transport Message-Size Accounting and Envelope Overhead
 - **Transport Framing & Envelope Overhead:**  
-  Wire messages are transmitted as framed JSON envelopes (`MessageEnvelope`), adding roughly 100–250 bytes of JSON framing over the payload.  
-  *Fix Implemented:* Added `envelopeOverheadBytes` option (default: `DEFAULT_SUPPLIER_ENVELOPE_OVERHEAD_BYTES = 256` bytes). The effective payload ceiling is computed as:
-  $$\text{effectiveTransportLimit} = \min(\text{maxPayloadBytes}, \text{negotiatedSctpSize} > 0 ? \text{negotiatedSctpSize} : \text{maxPayloadBytes})$$
-  $$\text{maxBytes} = \max(1, \text{effectiveTransportLimit} - \text{envelopeOverhead})$$
+  Wire messages are transmitted as framed JSON envelopes (`MessageEnvelope`), adding framing overhead over the payload.  
+  *Fix Implemented:* 
+  1. `measureEnvelopeOverhead(origin, requestId)` calculates the exact baseline framing overhead for this supplier and session.
+  2. `envelopeOverheadEstimator` option allows callers/transport adapters to provide dynamic, exact envelope overhead measurements for variable metadata.
+  3. `maxPayloadBytes` is computed as $\text{effectiveTransportLimit} - \text{envelopeOverhead}$.
+  4. **Elimination of forced 1-byte minimum:** If $\text{effectiveTransportLimit} \le \text{envelopeOverhead}$ (transport limit too small to accommodate even the envelope), `maxPayloadBytes \le 0` and the supplier immediately rejects safely with `REPAIR_REJECTED` (`reason: 'BUSY'`).
 - **Negotiated SCTP Limit Semantics (RFC 8841 / W3C WebRTC §6.2):**  
   - `undefined`: falls back to the application cap of $65,536$ bytes, reserving envelope overhead ($65,280$ bytes max payload).
   - `0`: RFC 8841 defines 0 as "remote endpoint can handle messages of any size" (unconstrained). This is clamped to the local application cap of $65,536$ bytes, reserving envelope overhead.
   - Finite value $< 65,536$ (e.g. 2,000 bytes): clamped to 2,000 bytes, reserving envelope overhead ($1,744$ bytes max payload).
   - Finite value $> 65,536$ (e.g. 100,000 bytes): clamped to local application cap of $65,536$ bytes, reserving envelope overhead.
 - **Exact Boundary Enforcement & Batch Slicing:**  
-  Unit tests verify that a single operation whose serialized batch length equals `maxBytes` is admitted into an `OperationBatchPayload`, while an operation with serialized batch length of `maxBytes + 1` is immediately rejected with `REPAIR_REJECTED` (`reason: 'BUSY'`). A multi-operation batch exceeding `maxBytes` is sliced down to $[fromSequence, fromSequence + M - 1]$ to fit within the transport limit, ensuring that `payload + envelopeOverhead <= negotiatedSctpSize`.
+  Unit tests verify that a single operation whose serialized batch length equals `maxPayloadBytes` is admitted into an `OperationBatchPayload`, while an operation with serialized batch length of `maxPayloadBytes + 1` is immediately rejected with `REPAIR_REJECTED` (`reason: 'BUSY'`). Multi-operation batches are sliced down to $[fromSequence, fromSequence + M - 1]$ to fit within the transport limit, ensuring that `payload + envelopeOverhead <= negotiatedSctpSize`.
 
 ### Audit 4: Epoch Transition, Pre-Delivery Checks, and Synchronous Servicing Safety
 - **Servicing Synchrony:**  
@@ -81,6 +85,8 @@ Following the initial implementation, a comprehensive safety and transport-bound
   Immediately prior to inserting into `responseCache` and calling `onSendRepairResponse`, `serveRepairRequest()` re-validates:
   1. `request.membershipEpoch === this.engine.epoch`: if the epoch changed, rejects immediately with `EPOCH_MISMATCH`.
   2. `context.connectionGeneration === this.engine.getPeerGeneration(context.requesterPeerId)`: if the peer reconnected/transitioned generation, throws `SyncEngineError('UNAUTHORIZED')`.
+- **Outbound Delivery Boundary Validation:**  
+  Added `TrustedTransportAdapter.sendRepairResponse()` to validate epoch and generation currency immediately before serializing and handing wire JSON to the WebRTC transport `send` function. If a transition intervened, transmission is aborted.
 - **Proof of No Old-Epoch Delivery:**  
   Because execution is synchronous and pre-delivery checks guard caching and dispatch:
   - An epoch transition cannot occur undetected during servicing.
@@ -107,23 +113,25 @@ Following the initial implementation, a comprehensive safety and transport-bound
 
 ### Added:
 1. `packages/sync-engine/src/replication/repair-supplier-service.ts`:
-   - Full M4 supplier service with request validation, rate limiting, concurrency bounds, duplicate response cache, retained log queries, batch slicing, envelope overhead reserve, pre-delivery currency checks, and rejection creation.
+   - Full M4 supplier service with request validation, rate limiting, concurrency bounds, duplicate response cache, retained log queries, batch slicing, envelope overhead reserve, pre-delivery currency checks, exact envelope measurement, and rejection creation.
 2. `packages/sync-engine/src/__tests__/repair-fulfillment.test.ts`:
-   - 56 unit and adversarial tests covering validation, history verification, sizing, lifecycle, and all audit conditions.
+   - 62 unit and adversarial tests covering validation, history verification, sizing, lifecycle, and all audit conditions.
 
 ### Modified:
 1. `packages/sync-engine/src/replication/types.ts`:
-   - Added `envelopeOverheadBytes?: number` to `RepairSupplierOptions`.
+   - Added `envelopeOverheadBytes?: number` and `envelopeOverheadEstimator?: (payload: OperationBatchPayload, requesterPeerId: string) => number` to `RepairSupplierOptions`.
 2. `packages/sync-engine/src/replication/index.ts`:
    - Exported `DEFAULT_SUPPLIER_ENVELOPE_OVERHEAD_BYTES = 256`.
 3. `packages/sync-engine/src/replication/repair-supplier-service.ts`:
    - Added conflicting request parameter detection on cache hits.
    - Added rate limit token consumption on cache hits.
    - Added retransmission via `onSendRepairResponse` on cache hits.
-   - Added `envelopeOverheadBytes` accounting and RFC 8841 SCTP limit parsing.
+   - Added `envelopeOverheadBytes`, `envelopeOverheadEstimator`, and `measureEnvelopeOverhead()` accounting.
+   - Eliminated forced 1-byte minimum: rejects safely with `BUSY` when transport limit $\le$ envelope overhead.
    - Added pre-delivery epoch and generation currency checks.
 4. `packages/sync-engine/src/engine/leaderless-sync-engine.ts`:
    - Integrated `AuthenticatedRequesterContext`, `registerInboundRequesterContext`, and `serveRepairRequest`.
+   - Added `sendRepairResponse()` with final outbound delivery boundary currency validation.
 5. `packages/sync-engine/src/log/ordered-operation-log.ts` & `log/types.ts`:
    - Added `getOldestRetainedSequence()`.
 6. `packages/sync-engine/src/replication/anti-entropy-manager.ts`:
@@ -137,9 +145,9 @@ Following the initial implementation, a comprehensive safety and transport-bound
 - `@syncplay/control-events`: **49 passed** (6 test files)
 - `@syncplay/peer-mesh`: **101 passed** (6 test files)
 - `@syncplay/protocol`: **273 passed** (4 test files)
-- `@syncplay/sync-engine`: **412 passed** (24 test files) — includes all 56 tests in `repair-fulfillment.test.ts`
+- `@syncplay/sync-engine`: **418 passed** (24 test files) — includes all 62 tests in `repair-fulfillment.test.ts`
 - `@syncplay/bootstrap-server`: **91 passed** (3 test files)
-- **Monorepo Total:** **926 passed across 43 test files with 0 failures, 0 skipped**.
+- **Monorepo Total:** **932 passed across 43 test files with 0 failures, 0 skipped**.
 - **Monorepo Build (`npm run build`):** Clean compilation across all packages with zero TypeScript or Vite errors.
 
 ---
@@ -153,19 +161,19 @@ Following the initial implementation, a comprehensive safety and transport-bound
 3. **Can ordinary SDK consumers obtain the trusted capability or register arbitrary requester contexts?**  
    **NO.** The capability is private to `LeaderlessSyncEngine` and `TrustedTransportAdapter`. Valid contexts are stored in an engine-private `WeakSet`. Attempting to pass forged or cross-engine contexts fails reference equality and throws `SyncEngineError('UNAUTHORIZED')`.
 4. **Does byte accounting preserve the 65,536-byte application cap and the actual negotiated transport limit?**  
-   **YES.** The supplier clamps payload size to $\min(65536, \text{negotiatedSctpSize})$, reserving an envelope overhead margin (default: 256 bytes) to guarantee the framed message over the wire never exceeds the transport limit.
+   **YES.** The supplier clamps payload size to $\min(65536, \text{negotiatedSctpSize}) - \text{envelopeOverhead}$, ensuring the complete message passed to `RTCDataChannel.send()` fits the transport limit.
 5. **Are unavailable and zero-valued negotiated SCTP limits handled correctly?**  
    **YES.** `undefined` falls back to the 64 KB cap ($65,536$). `0` is interpreted per RFC 8841 as unconstrained remote peer and clamped to the 64 KB local cap ($65,536$).
 6. **Can old-epoch or old-generation work deliver a response after a transition?**  
-   **NO.** Supplier servicing is strictly synchronous within a single turn and includes pre-delivery currency validation. Epoch transitions purge the response cache and reset concurrency counters. Requests from older epochs or stale connection generations are immediately rejected with `EPOCH_MISMATCH` or `UNAUTHORIZED`.
+   **NO.** Supplier servicing is strictly synchronous within a single turn and includes pre-delivery currency validation. `TrustedTransportAdapter.sendRepairResponse()` provides final delivery boundary validation immediately prior to transport transmission.
 7. **Can a permanent history gap trigger unbounded retries?**  
    **NO.** Permanent gaps return `OUTSIDE_HORIZON` (with `retainedHorizonSequence`) or `ORIGIN_UNKNOWN`. M3 treats these as non-retryable for that supplier, terminating retries and triggering `onHistoryExhausted` when no suppliers retain the history.
 8. **Are all caches, counters, and queues bounded?**  
    **YES.** Response cache is bounded to 64 entries (FIFO/LRU). Active requests are bounded room-wide ($\le 16$) and per-peer ($\le 4$). Rate limiters are bounded by token bucket burst (20 tokens).
 9. **Are all frozen regression suites passing?**  
-   **YES.** All 926 tests across all 5 monorepo packages pass with zero regressions.
+   **YES.** All 932 tests across all 5 monorepo packages pass with zero regressions.
 10. **Is the final audited M4 baseline committed with a clean working tree?**  
-    **YES.** Committed with a clean working tree.
+    **YES.** Ready to be committed with a clean working tree.
 
 ---
 

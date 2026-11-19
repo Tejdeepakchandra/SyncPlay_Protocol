@@ -473,14 +473,28 @@ export class RepairSupplierService {
         ? Math.min(applicationCap, negotiatedSize)
         : applicationCap;
 
+    const baselineEnvelopeOverhead = this.measureEnvelopeOverhead(targetOrigin, request.requestId);
     const envelopeOverhead =
       this.options.envelopeOverheadBytes !== undefined
         ? this.options.envelopeOverheadBytes
-        : (effectiveTransportLimit > DEFAULT_SUPPLIER_ENVELOPE_OVERHEAD_BYTES
-            ? DEFAULT_SUPPLIER_ENVELOPE_OVERHEAD_BYTES
-            : 0);
+        : Math.max(DEFAULT_SUPPLIER_ENVELOPE_OVERHEAD_BYTES, baselineEnvelopeOverhead);
 
-    const maxBytes = Math.max(1, effectiveTransportLimit - envelopeOverhead);
+    const maxPayloadBytes = effectiveTransportLimit - envelopeOverhead;
+
+    if (maxPayloadBytes <= 0) {
+      // The negotiated transport limit is smaller than or equal to the envelope overhead itself!
+      // Cannot fit even one operation and its envelope into the transport limit.
+      // Safely reject with BUSY. Never force a one-byte minimum.
+      return RepairRejectedPayloadSchema.parse({
+        requestId: request.requestId,
+        sessionId: request.sessionId,
+        supplierPeerId: this.engine.localPeerId,
+        targetOriginPeerId: targetOrigin,
+        fromSequence: request.fromSequence,
+        toSequence: request.toSequence,
+        reason: 'BUSY',
+      });
+    }
 
     let currentOps = serializedOps;
     let currentToSeq = request.toSequence;
@@ -499,9 +513,18 @@ export class RepairSupplierService {
     let serializedJson = JSON.stringify(candidateBatch);
     let byteLength = new TextEncoder().encode(serializedJson).byteLength;
 
-    if (byteLength > maxBytes) {
+    const computeTotalWireBytes = (batchPayload: OperationBatchPayload, payloadByteLen: number): number => {
+      if (this.options.envelopeOverheadEstimator) {
+        return payloadByteLen + this.options.envelopeOverheadEstimator(batchPayload, context.requesterPeerId);
+      }
+      return payloadByteLen + envelopeOverhead;
+    };
+
+    let totalWireBytes = computeTotalWireBytes(candidateBatch, byteLength);
+
+    if (byteLength > maxPayloadBytes || totalWireBytes > effectiveTransportLimit) {
       // Slicing: Slice batch into smaller contiguous sub-range [fromSequence, fromSequence + M - 1]
-      while (currentOps.length > 1 && byteLength > maxBytes) {
+      while (currentOps.length > 1 && (byteLength > maxPayloadBytes || totalWireBytes > effectiveTransportLimit)) {
         currentOps = currentOps.slice(0, currentOps.length - 1);
         currentToSeq = currentOps[currentOps.length - 1]!.originSequenceNumber;
         candidateBatch = {
@@ -511,12 +534,13 @@ export class RepairSupplierService {
         };
         serializedJson = JSON.stringify(candidateBatch);
         byteLength = new TextEncoder().encode(serializedJson).byteLength;
+        totalWireBytes = computeTotalWireBytes(candidateBatch, byteLength);
       }
     }
 
-    if (byteLength > maxBytes) {
-      // Even 1 operation exceeds the max frame size! Cannot fit into permitted payload size.
-      // Follow approved architecture's bounded rejection behavior.
+    if (byteLength > maxPayloadBytes || totalWireBytes > effectiveTransportLimit) {
+      // Even 1 operation exceeds the max frame size! Cannot fit into permitted payload size or complete wire envelope.
+      // Follow approved architecture's bounded rejection behavior. Never force a one-byte minimum and never silently truncate.
       return RepairRejectedPayloadSchema.parse({
         requestId: request.requestId,
         sessionId: request.sessionId,
@@ -530,6 +554,26 @@ export class RepairSupplierService {
 
     // Guarantee that wire contracts and contiguous sequence refinements are 100% satisfied
     return OperationBatchPayloadSchema.parse(candidateBatch);
+  }
+
+  /**
+   * Computes the exact byte overhead of the serialized protocol message envelope
+   * wrapping an OperationBatchPayload for this session and supplier.
+   */
+  public measureEnvelopeOverhead(targetOrigin: string, requestId: string): number {
+    const sampleEnvelope = {
+      protocolVersion: 1,
+      messageType: 'OPERATION_BATCH',
+      sessionId: this.engine.sessionId,
+      senderPeerId: this.engine.localPeerId,
+      messageId: requestId,
+      logicalEventId: requestId,
+      originPeerId: targetOrigin,
+      membershipEpoch: this.engine.epoch,
+      payload: null,
+    };
+    const sampleJson = JSON.stringify(sampleEnvelope);
+    return new TextEncoder().encode(sampleJson).byteLength - 4; // Subtract "null" (4 bytes)
   }
 
   /**

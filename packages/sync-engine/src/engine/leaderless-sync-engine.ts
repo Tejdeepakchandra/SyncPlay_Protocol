@@ -263,6 +263,42 @@ export class TrustedTransportAdapter {
   ): EngineDecision[] {
     return this.handleInboundRepairBatch(batch, supplierPeerId, connectionGeneration);
   }
+
+  /**
+   * Safe transport-level delivery method that validates epoch and generation currency
+   * immediately before serializing and transmitting over the WebRTC DataChannel.
+   * Guarantees that no response from an obsolete membership epoch or obsolete connection
+   * generation can be transmitted if a transition intervened.
+   */
+  public sendRepairResponse(
+    targetPeerId: string,
+    response: OperationBatchPayload | RepairRejectedPayload,
+    expectedConnectionGeneration: number,
+    sendFn: (wireJson: string) => boolean,
+  ): boolean {
+    if ('membershipEpoch' in response && response.membershipEpoch !== this.engine.epoch) {
+      return false; // Obsolete epoch transition intervened: drop transmission
+    }
+    const currentGen = this.engine.getPeerGeneration(targetPeerId);
+    if (currentGen === undefined || currentGen !== expectedConnectionGeneration) {
+      return false; // Obsolete generation: drop transmission
+    }
+
+    const wireMessage = {
+      protocolVersion: 1,
+      messageType: 'membershipEpoch' in response ? 'OPERATION_BATCH' : 'REPAIR_REJECTED',
+      sessionId: this.engine.sessionId,
+      senderPeerId: this.engine.localPeerId,
+      messageId: response.requestId,
+      logicalEventId: response.requestId,
+      originPeerId: 'originPeerId' in response ? response.originPeerId : response.targetOriginPeerId,
+      membershipEpoch: this.engine.epoch,
+      payload: response,
+    };
+
+    const wireJson = JSON.stringify(wireMessage);
+    return sendFn(wireJson);
+  }
 }
 
 export interface LeaderlessSyncEngineConfig extends SyncEngineConfig {

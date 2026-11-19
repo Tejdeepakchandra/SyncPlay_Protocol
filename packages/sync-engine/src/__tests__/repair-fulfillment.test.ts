@@ -1763,5 +1763,200 @@ describe('Phase 7.4 Milestone M4: Supplier Range Servicing (RepairSupplierServic
       expect('reason' in resBeyond).toBe(true);
       expect((resBeyond as RepairRejectedPayload).reason).toBe('BUSY');
     });
+
+    it('5.19 Negotiated maximum smaller than envelope overhead safely rejects with BUSY without forcing 1-byte min', () => {
+      supplierEngine.getOperationLog().insert(createStoredOperation('peer-A', 1));
+
+      // Negotiated limit is 150 bytes, smaller than 256-byte envelope overhead
+      const service = new RepairSupplierService(
+        supplierEngine,
+        supplierCallbacks,
+        {
+          negotiatedSctpMaxMessageSizeProvider: () => 150,
+          envelopeOverheadBytes: 256,
+        },
+        clock,
+      );
+
+      const req: RepairRequestPayload = {
+        requestId: 'd5a74a9a-f4ef-4b9e-b2d3-18ef557163ef',
+        sessionId: SESSION_ID,
+        requesterPeerId: 'peer-requester',
+        targetOriginPeerId: 'peer-A',
+        fromSequence: 1,
+        toSequence: 1,
+        membershipEpoch: 1,
+      };
+
+      const res = service.serveRepairRequest(req, requesterContext);
+      expect('reason' in res).toBe(true);
+      expect((res as RepairRejectedPayload).reason).toBe('BUSY');
+    });
+
+    it('5.20 Negotiated maximum equal to envelope overhead safely rejects with BUSY', () => {
+      supplierEngine.getOperationLog().insert(createStoredOperation('peer-A', 1));
+
+      // Negotiated limit is exactly 256 bytes, equal to envelope overhead -> 0 payload budget
+      const service = new RepairSupplierService(
+        supplierEngine,
+        supplierCallbacks,
+        {
+          negotiatedSctpMaxMessageSizeProvider: () => 256,
+          envelopeOverheadBytes: 256,
+        },
+        clock,
+      );
+
+      const req: RepairRequestPayload = {
+        requestId: 'd6a74a9a-f4ef-4b9e-b2d3-18ef557163ef',
+        sessionId: SESSION_ID,
+        requesterPeerId: 'peer-requester',
+        targetOriginPeerId: 'peer-A',
+        fromSequence: 1,
+        toSequence: 1,
+        membershipEpoch: 1,
+      };
+
+      const res = service.serveRepairRequest(req, requesterContext);
+      expect('reason' in res).toBe(true);
+      expect((res as RepairRejectedPayload).reason).toBe('BUSY');
+    });
+
+    it('5.21 Variable envelope metadata via envelopeOverheadEstimator measures complete message and slices batch', () => {
+      for (let s = 1; s <= 5; s++) {
+        supplierEngine.getOperationLog().insert(
+          createStoredOperation('peer-A', s, 1, { data: 'V'.repeat(400) }),
+        );
+      }
+
+      // Estimator that computes variable envelope overhead with extra metadata fields (350 bytes)
+      const service = new RepairSupplierService(
+        supplierEngine,
+        supplierCallbacks,
+        {
+          negotiatedSctpMaxMessageSizeProvider: () => 2000,
+          envelopeOverheadEstimator: (_payload, _peerId) => 350,
+        },
+        clock,
+      );
+
+      const req: RepairRequestPayload = {
+        requestId: 'd7a74a9a-f4ef-4b9e-b2d3-18ef557163ef',
+        sessionId: SESSION_ID,
+        requesterPeerId: 'peer-requester',
+        targetOriginPeerId: 'peer-A',
+        fromSequence: 1,
+        toSequence: 5,
+        membershipEpoch: 1,
+      };
+
+      const res = service.serveRepairRequest(req, requesterContext);
+      expect('operations' in res).toBe(true);
+      const batch = res as OperationBatchPayload;
+      const payloadBytes = new TextEncoder().encode(JSON.stringify(batch)).byteLength;
+
+      // Complete wire message (payload + 350) must not exceed 2000
+      expect(payloadBytes + 350).toBeLessThanOrEqual(2000);
+      expect(batch.operations.length).toBeLessThan(5);
+    });
+
+    it('5.22 TrustedTransportAdapter.sendRepairResponse drops transmission if epoch transitioned before send', () => {
+      const adapter = new TrustedTransportAdapter(supplierEngine, supplierTransportCap);
+      const sendSpy = vi.fn().mockReturnValue(true);
+
+      const batch: OperationBatchPayload = {
+        requestId: 'd8a74a9a-f4ef-4b9e-b2d3-18ef557163ef',
+        sessionId: SESSION_ID,
+        supplierPeerId: 'peer-supplier',
+        originPeerId: 'peer-A',
+        fromSequence: 1,
+        toSequence: 2,
+        membershipEpoch: 1,
+        operations: [],
+      };
+
+      // Engine transitions to epoch 2
+      supplierEngine.transitionEpoch(2, supplierEpochCap);
+
+      const sent = adapter.sendRepairResponse('peer-requester', batch, 1, sendSpy);
+      expect(sent).toBe(false);
+      expect(sendSpy).not.toHaveBeenCalled();
+    });
+
+    it('5.23 TrustedTransportAdapter.sendRepairResponse drops transmission if generation changed before send', () => {
+      const adapter = new TrustedTransportAdapter(supplierEngine, supplierTransportCap);
+      const sendSpy = vi.fn().mockReturnValue(true);
+
+      const batch: OperationBatchPayload = {
+        requestId: 'd9a74a9a-f4ef-4b9e-b2d3-18ef557163ef',
+        sessionId: SESSION_ID,
+        supplierPeerId: 'peer-supplier',
+        originPeerId: 'peer-A',
+        fromSequence: 1,
+        toSequence: 2,
+        membershipEpoch: 1,
+        operations: [],
+      };
+
+      // Peer generation changes to 2
+      supplierEngine.authorizePeerGeneration('peer-requester', 2);
+
+      // Attempting to send with stale expected generation 1
+      const sent = adapter.sendRepairResponse('peer-requester', batch, 1, sendSpy);
+      expect(sent).toBe(false);
+      expect(sendSpy).not.toHaveBeenCalled();
+    });
+
+    it('5.24 Failed send retains retryable response in cache, safely rejecting stale delivery on epoch change', () => {
+      for (let s = 1; s <= 5; s++) {
+        supplierEngine.getOperationLog().insert(createStoredOperation('peer-A', s));
+      }
+
+      let shouldFailSend = true;
+      const sendSpy = vi.fn(() => {
+        if (shouldFailSend) {
+          throw new Error('Transport send error');
+        }
+      });
+
+      const service = new RepairSupplierService(
+        supplierEngine,
+        {
+          onBroadcastDigest: vi.fn(),
+          onSendRepairResponse: sendSpy,
+        },
+        {},
+        clock,
+      );
+
+      const req: RepairRequestPayload = {
+        requestId: 'daa74a9a-f4ef-4b9e-b2d3-18ef557163ef',
+        sessionId: SESSION_ID,
+        requesterPeerId: 'peer-requester',
+        targetOriginPeerId: 'peer-A',
+        fromSequence: 1,
+        toSequence: 5,
+        membershipEpoch: 1,
+      };
+
+      // Send throws network error
+      expect(() => service.serveRepairRequest(req, requesterContext)).toThrow('Transport send error');
+
+      // Response is cached in supplier cache despite send failure.
+      // Next attempt succeeds without re-reading log when transport recovers.
+      shouldFailSend = false;
+      const spyLog = vi.spyOn(supplierEngine.getOperationLog(), 'getOperationAt');
+      const resRetry = service.serveRepairRequest(req, requesterContext);
+      expect('operations' in resRetry).toBe(true);
+      expect(spyLog).not.toHaveBeenCalled();
+
+      // Now if epoch transitions to 2, retry under epoch 1 must reject with EPOCH_MISMATCH
+      supplierEngine.transitionEpoch(2, supplierEpochCap);
+      service.onEpochTransition(2);
+
+      const resStale = service.serveRepairRequest(req, requesterContext);
+      expect('reason' in resStale).toBe(true);
+      expect((resStale as RepairRejectedPayload).reason).toBe('EPOCH_MISMATCH');
+    });
   });
 });

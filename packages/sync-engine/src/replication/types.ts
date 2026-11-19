@@ -271,6 +271,13 @@ export interface RepairSupplierOptions {
   /** Estimated envelope overhead in bytes reserved for transport framing (default: 256). */
   readonly envelopeOverheadBytes?: number;
 
+  /**
+   * Optional custom envelope overhead estimator returning the exact envelope byte overhead
+   * for a candidate OperationBatchPayload. If provided, the supplier measures the actual
+   * complete wire message size (payload + envelope) at each slicing step.
+   */
+  readonly envelopeOverheadEstimator?: (payload: OperationBatchPayload, requesterPeerId: string) => number;
+
   /** Optional provider for negotiated DataChannel / SCTP max message size per peer. */
   readonly negotiatedSctpMaxMessageSizeProvider?: (peerId: string) => number | undefined;
 }
