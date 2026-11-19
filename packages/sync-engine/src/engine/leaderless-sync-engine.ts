@@ -584,12 +584,9 @@ export class TrustedTransportAdapter {
         return;
       }
 
-      // 4. Outer and inner membership epochs match current engine epoch
+      // 4. Outer and inner membership epochs match current engine epoch (strictly required for STATE_DIGEST)
       const currentEpoch = this.engine.epoch;
-      if (msg.membershipEpoch !== undefined && msg.membershipEpoch !== currentEpoch) {
-        return;
-      }
-      if (digestPayload.membershipEpoch !== currentEpoch) {
+      if (msg.membershipEpoch !== currentEpoch || digestPayload.membershipEpoch !== currentEpoch) {
         return;
       }
 

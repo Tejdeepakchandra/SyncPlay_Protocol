@@ -15,6 +15,13 @@ import {
   MAX_BATCH_PAYLOAD_BYTES,
   MAX_OPERATIONS_PER_BATCH,
   MAX_VECTOR_ENTRIES,
+  MAX_SNAPSHOT_BYTES,
+  ASCII_IDENTIFIER_REGEX,
+  MAX_ENVELOPE_OVERHEAD_BYTES,
+  MIN_RAW_CHUNK_BYTES,
+  MIN_BASE64_CHUNK_BYTES,
+  MIN_TRANSPORT_LIMIT_CHUNK_TRANSFER,
+  MIN_TRANSPORT_LIMIT_FULL_CHUNK,
 
   // Message type registry
   MessageType,
@@ -24,6 +31,7 @@ import {
 
   // Envelope
   ProtocolMessageSchema,
+  SnapshotChunkEnvelopeSchema,
 
   // Payload schemas
   PingPayloadSchema,
@@ -109,6 +117,20 @@ describe('Public exports', () => {
     expect(MAX_MESSAGE_BYTES).toBeGreaterThanOrEqual(MAX_PAYLOAD_BYTES);
     expect(MAX_OPERATIONS_PER_BATCH).toBe(32);
     expect(MAX_VECTOR_ENTRIES).toBe(64);
+    expect(MAX_SNAPSHOT_BYTES).toBe(4 * 1024 * 1024);
+    expect(ASCII_IDENTIFIER_REGEX instanceof RegExp).toBe(true);
+    expect(MAX_ENVELOPE_OVERHEAD_BYTES).toBe(1800);
+    expect(MIN_RAW_CHUNK_BYTES).toBe(256);
+    expect(MIN_BASE64_CHUNK_BYTES).toBe(344);
+    expect(MIN_TRANSPORT_LIMIT_CHUNK_TRANSFER).toBe(2144);
+    expect(MIN_TRANSPORT_LIMIT_FULL_CHUNK).toBe(45492);
+  });
+
+  it('should export ProtocolMessageSchema and SnapshotChunkEnvelopeSchema', () => {
+    expect(ProtocolMessageSchema).toBeDefined();
+    expect(typeof ProtocolMessageSchema.safeParse).toBe('function');
+    expect(SnapshotChunkEnvelopeSchema).toBeDefined();
+    expect(typeof SnapshotChunkEnvelopeSchema.safeParse).toBe('function');
   });
 
   it('should export all known message types including Phase 7.4 anti-entropy', () => {

@@ -191,12 +191,13 @@ describe('Phase 7.5 M4.0: Prerequisite Infrastructure Corrections', () => {
       expect(engine.getPeerDigests().has(REMOTE_PEER)).toBe(false);
     });
 
-    it('should drop STATE_DIGEST with stale membership epoch', () => {
-      const staleEpochPayload = makeDigestPayload({
+    // ── Strict Membership Epoch Verification (Audit Regression Suite) ───────
+    it('1. should reject STATE_DIGEST when outer membershipEpoch is missing but inner is current', () => {
+      const validInner = makeDigestPayload({
         sessionId: SESSION_ID,
         senderPeerId: REMOTE_PEER,
         connectionGeneration: 1,
-        membershipEpoch: 99, // Stale epoch != current engine epoch (1)
+        membershipEpoch: 1, // Current engine epoch
       });
 
       const message: ProtocolMessage<StateDigestPayload> = {
@@ -204,9 +205,9 @@ describe('Phase 7.5 M4.0: Prerequisite Infrastructure Corrections', () => {
         messageType: 'STATE_DIGEST',
         sessionId: SESSION_ID,
         senderPeerId: REMOTE_PEER,
-        messageId: 'msg-stale-epoch',
-        membershipEpoch: 99,
-        payload: staleEpochPayload,
+        messageId: 'msg-missing-outer-epoch',
+        // outer membershipEpoch is omitted (undefined)
+        payload: validInner,
       };
 
       mockMesh.simulateInboundMessage({
@@ -214,6 +215,145 @@ describe('Phase 7.5 M4.0: Prerequisite Infrastructure Corrections', () => {
         message,
       });
 
+      // Proof: Dropped at trust boundary, not registered
+      expect(engine.getPeerDigests().has(REMOTE_PEER)).toBe(false);
+    });
+
+    it('2. should reject STATE_DIGEST when outer membershipEpoch is current but inner is missing or mismatched', () => {
+      const invalidInner = makeDigestPayload({
+        sessionId: SESSION_ID,
+        senderPeerId: REMOTE_PEER,
+        connectionGeneration: 1,
+        membershipEpoch: undefined as unknown as number, // Missing inner epoch!
+      });
+
+      const message: ProtocolMessage<StateDigestPayload> = {
+        protocolVersion: 1,
+        messageType: 'STATE_DIGEST',
+        sessionId: SESSION_ID,
+        senderPeerId: REMOTE_PEER,
+        messageId: 'msg-missing-inner-epoch',
+        membershipEpoch: 1, // Outer is current
+        payload: invalidInner,
+      };
+
+      mockMesh.simulateInboundMessage({
+        fromPeerId: REMOTE_PEER,
+        message,
+      });
+
+      expect(engine.getPeerDigests().has(REMOTE_PEER)).toBe(false);
+    });
+
+    it('3. should reject STATE_DIGEST when outer membershipEpoch is stale even if inner is current', () => {
+      const currentInner = makeDigestPayload({
+        sessionId: SESSION_ID,
+        senderPeerId: REMOTE_PEER,
+        connectionGeneration: 1,
+        membershipEpoch: 1, // Current
+      });
+
+      const message: ProtocolMessage<StateDigestPayload> = {
+        protocolVersion: 1,
+        messageType: 'STATE_DIGEST',
+        sessionId: SESSION_ID,
+        senderPeerId: REMOTE_PEER,
+        messageId: 'msg-stale-outer-epoch',
+        membershipEpoch: 99, // Stale outer epoch
+        payload: currentInner,
+      };
+
+      mockMesh.simulateInboundMessage({
+        fromPeerId: REMOTE_PEER,
+        message,
+      });
+
+      expect(engine.getPeerDigests().has(REMOTE_PEER)).toBe(false);
+    });
+
+    it('4. should reject STATE_DIGEST when outer membershipEpoch is current but inner is stale', () => {
+      const staleInner = makeDigestPayload({
+        sessionId: SESSION_ID,
+        senderPeerId: REMOTE_PEER,
+        connectionGeneration: 1,
+        membershipEpoch: 99, // Stale inner epoch
+      });
+
+      const message: ProtocolMessage<StateDigestPayload> = {
+        protocolVersion: 1,
+        messageType: 'STATE_DIGEST',
+        sessionId: SESSION_ID,
+        senderPeerId: REMOTE_PEER,
+        messageId: 'msg-stale-inner-epoch',
+        membershipEpoch: 1, // Current outer
+        payload: staleInner,
+      };
+
+      mockMesh.simulateInboundMessage({
+        fromPeerId: REMOTE_PEER,
+        message,
+      });
+
+      expect(engine.getPeerDigests().has(REMOTE_PEER)).toBe(false);
+    });
+
+    it('5. should accept STATE_DIGEST when both outer and inner epochs match the current engine epoch', () => {
+      const validPayload = makeDigestPayload({
+        sessionId: SESSION_ID,
+        senderPeerId: REMOTE_PEER,
+        connectionGeneration: 1,
+        membershipEpoch: 1, // Current
+        replicationVector: { [REMOTE_PEER]: 12 },
+      });
+
+      const message: ProtocolMessage<StateDigestPayload> = {
+        protocolVersion: 1,
+        messageType: 'STATE_DIGEST',
+        sessionId: SESSION_ID,
+        senderPeerId: REMOTE_PEER,
+        messageId: 'msg-both-current-epochs',
+        membershipEpoch: 1, // Current
+        payload: validPayload,
+      };
+
+      mockMesh.simulateInboundMessage({
+        fromPeerId: REMOTE_PEER,
+        message,
+      });
+
+      // Proof: Accepted into compactionManager peer digests
+      const recorded = engine.getPeerDigests().get(REMOTE_PEER);
+      expect(recorded).toBeDefined();
+      expect(recorded?.senderPeerId).toBe(REMOTE_PEER);
+      expect(recorded?.membershipEpoch).toBe(1);
+      expect(recorded?.replicationVector[REMOTE_PEER]).toBe(12);
+    });
+
+    it('6. should guarantee side-effect immunity for rejected epoch messages (no anti-entropy, no compaction update)', () => {
+      // Spy on engine digest registration
+      const recordSpy = vi.spyOn(engine, 'recordPeerDigest');
+
+      // Send message with missing outer epoch
+      mockMesh.simulateInboundMessage({
+        fromPeerId: REMOTE_PEER,
+        message: {
+          protocolVersion: 1,
+          messageType: 'STATE_DIGEST',
+          sessionId: SESSION_ID,
+          senderPeerId: REMOTE_PEER,
+          messageId: 'msg-epoch-immunity-test',
+          // Omitted outer epoch
+          payload: makeDigestPayload({
+            sessionId: SESSION_ID,
+            senderPeerId: REMOTE_PEER,
+            connectionGeneration: 1,
+            membershipEpoch: 1,
+          }),
+        },
+      });
+
+      // Assert zero calls to recordPeerDigest and empty peer digests map
+      expect(recordSpy).not.toHaveBeenCalled();
       expect(engine.getPeerDigests().has(REMOTE_PEER)).toBe(false);
     });
 

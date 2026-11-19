@@ -5,9 +5,17 @@
  * valid, invalid, and edge-case inputs.
  */
 import { describe, it, expect } from 'vitest';
-import { ProtocolMessageSchema } from '../envelope.js';
-import { PROTOCOL_VERSION } from '../constants.js';
+import { ProtocolMessageSchema, SnapshotChunkEnvelopeSchema } from '../envelope.js';
+import {
+  PROTOCOL_VERSION,
+  MAX_ENVELOPE_OVERHEAD_BYTES,
+  MIN_RAW_CHUNK_BYTES,
+  MIN_BASE64_CHUNK_BYTES,
+  MIN_TRANSPORT_LIMIT_CHUNK_TRANSFER,
+  MIN_TRANSPORT_LIMIT_FULL_CHUNK,
+} from '../constants.js';
 import { MessageType } from '../message-types.js';
+import { computeUtf8ByteLength, serializeAndCheckSize } from '../validation.js';
 
 /** A valid base message for reuse in tests. */
 function validMessage(overrides: Record<string, unknown> = {}) {
@@ -286,74 +294,251 @@ describe('ProtocolMessageSchema', () => {
       expect(result.success).toBe(true);
     });
 
-    it('should mathematically bound worst-case valid envelope serialization to <= 1600 bytes', () => {
-      // Build a worst-case valid envelope: all optional fields present, maximum length strings
-      // Note: MAX_VECTOR_ENTRIES for causalContext is 64 entries in protocol constraints
-      const maxCausalContext: Record<string, number> = {};
-      for (let i = 0; i < 8; i++) {
-        // e.g. 8 origin entries of maximum key length 128 chars
-        const originKey = `origin_${i}_` + 'x'.repeat(128 - `origin_${i}_`.length);
-        maxCausalContext[originKey] = Number.MAX_SAFE_INTEGER;
-      }
-
-      const worstCaseEnvelope = {
-        protocolVersion: 1,
-        messageType: 'sync:state-snapshot-chunk-transfer', // maximum message type string
-        sessionId: 's'.repeat(128),
-        senderPeerId: 'p'.repeat(128),
-        messageId: 'm'.repeat(128),
-        logicalEventId: 'e'.repeat(128),
-        originPeerId: 'o'.repeat(128),
-        membershipEpoch: Number.MAX_SAFE_INTEGER,
-        connectionGeneration: Number.MAX_SAFE_INTEGER,
-        logicalTimestamp: Number.MAX_SAFE_INTEGER,
-        originSequenceNumber: Number.MAX_SAFE_INTEGER,
-        causalContext: maxCausalContext,
-        payload: '',
-      };
-
-      const parsed = ProtocolMessageSchema.safeParse(worstCaseEnvelope);
-      expect(parsed.success).toBe(true);
-
-      const serialized = JSON.stringify(worstCaseEnvelope);
-      const byteLength = Buffer.byteLength(serialized, 'utf-8');
-
-      // Assert envelope overhead without payload is strictly <= 1600 bytes when using standard 1-2 causal peers
-      // For standard envelopes without excessive causalContext (e.g. 1 causal peer):
-      const standardWorstCase = {
-        protocolVersion: 1,
-        messageType: 'sync:state-snapshot-chunk-transfer',
-        sessionId: 's'.repeat(128),
-        senderPeerId: 'p'.repeat(128),
-        messageId: 'm'.repeat(128),
-        logicalEventId: 'e'.repeat(128),
-        originPeerId: 'o'.repeat(128),
-        membershipEpoch: Number.MAX_SAFE_INTEGER,
-        connectionGeneration: Number.MAX_SAFE_INTEGER,
-        logicalTimestamp: Number.MAX_SAFE_INTEGER,
-        originSequenceNumber: Number.MAX_SAFE_INTEGER,
-        causalContext: { ['c'.repeat(128)]: Number.MAX_SAFE_INTEGER },
-        payload: '',
-      };
-      const standardSerialized = JSON.stringify(standardWorstCase);
-      const standardBytes = Buffer.byteLength(standardSerialized, 'utf-8');
-
-      // Standard worst case with 1 max-length causal entry is 1128 bytes, well within 1600 bytes
-      expect(standardBytes).toBeLessThanOrEqual(1600);
-      expect(standardBytes).toBe(1128);
-
-      // Even with up to 3 max-length causal entries (each ~150B), it remains <= 1600 bytes
+    it('should demonstrate that generic ProtocolMessage allows causalContext while bounded by MAX_VECTOR_ENTRIES', () => {
+      // Build a generic control envelope with 3 causal peers
       const threePeerCausal: Record<string, number> = {};
       for (let i = 0; i < 3; i++) {
         threePeerCausal[`peer_${i}_` + 'k'.repeat(128 - `peer_${i}_`.length)] = Number.MAX_SAFE_INTEGER;
       }
-      const threePeerWorstCase = {
-        ...standardWorstCase,
+      const genericMsg = {
+        protocolVersion: 1,
+        messageType: 'control:event',
+        sessionId: 's'.repeat(128),
+        senderPeerId: 'p'.repeat(128),
+        messageId: 'm'.repeat(128),
+        logicalEventId: 'e'.repeat(128),
+        originPeerId: 'o'.repeat(128),
+        membershipEpoch: Number.MAX_SAFE_INTEGER,
+        connectionGeneration: Number.MAX_SAFE_INTEGER,
+        logicalTimestamp: Number.MAX_SAFE_INTEGER,
+        originSequenceNumber: Number.MAX_SAFE_INTEGER,
         causalContext: threePeerCausal,
+        payload: '',
       };
-      const threePeerBytes = Buffer.byteLength(JSON.stringify(threePeerWorstCase), 'utf-8');
-      expect(threePeerBytes).toBeLessThanOrEqual(1600);
-      expect(threePeerBytes).toBe(1424);
+      const parsed = ProtocolMessageSchema.safeParse(genericMsg);
+      expect(parsed.success).toBe(true);
+
+      const byteLength = Buffer.byteLength(JSON.stringify(genericMsg), 'utf-8');
+      expect(byteLength).toBe(1403);
     });
+  });
+});
+
+// ── Strict Snapshot-Chunk Envelope Contract Tests ────────────────────────────
+describe('SnapshotChunkEnvelopeSchema — Strict Wire Contract & Bounded Envelope Overhead', () => {
+  // Mock chunk metadata framing representing SnapshotChunkPayload (with empty dataBase64)
+  const chunkPayloadFraming = {
+    transferId: '12345678-1234-4234-8234-123456789abc',
+    sessionId: 's'.repeat(128),
+    supplierPeerId: 'p'.repeat(64),
+    snapshotId: 'k'.repeat(128),
+    chunkIndex: 127,
+    totalChunks: 128,
+    chunkSizeBytes: 32768,
+    totalSizeBytes: 4194304,
+    chunkSha256: 'e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855',
+    dataBase64: '',
+  };
+
+  function validChunkEnvelope(overrides: Record<string, unknown> = {}) {
+    return {
+      protocolVersion: PROTOCOL_VERSION,
+      messageType: 'sync:state-snapshot-chunk',
+      sessionId: 's'.repeat(128),
+      senderPeerId: 'p'.repeat(128),
+      messageId: 'm'.repeat(128),
+      membershipEpoch: 1,
+      connectionGeneration: 1,
+      payload: chunkPayloadFraming,
+      ...overrides,
+    };
+  }
+
+  it('should accept valid snapshot-chunk envelope with maximum-length valid identifiers', () => {
+    const msg = validChunkEnvelope();
+    const result = SnapshotChunkEnvelopeSchema.safeParse(msg);
+    expect(result.success).toBe(true);
+    if (result.success) {
+      expect(result.data.protocolVersion).toBe(PROTOCOL_VERSION);
+      expect(result.data.sessionId).toBe('s'.repeat(128));
+      expect(result.data.senderPeerId).toBe('p'.repeat(128));
+      expect(result.data.messageId).toBe('m'.repeat(128));
+      expect(result.data.membershipEpoch).toBe(1);
+      expect(result.data.connectionGeneration).toBe(1);
+    }
+  });
+
+  it('should prove maximum valid serialized chunk message framing overhead is strictly <= 1800 bytes', () => {
+    // Construct absolute worst-case valid chunk message:
+    // - maximum 64-character messageType
+    // - maximum 128-character sessionId, senderPeerId, messageId
+    // - maximum safe integer numeric fields (membershipEpoch, connectionGeneration)
+    // - full chunk payload framing with max-length IDs, 64-char hex SHA-256, and empty dataBase64
+    const worstCaseChunkMessage = {
+      protocolVersion: PROTOCOL_VERSION,
+      messageType: 'sync:state-snapshot-chunk-transfer-max-permitted-wire-type-64chr', // 64 chars
+      sessionId: 's'.repeat(128),
+      senderPeerId: 'p'.repeat(128),
+      messageId: 'm'.repeat(128),
+      membershipEpoch: Number.MAX_SAFE_INTEGER,
+      connectionGeneration: Number.MAX_SAFE_INTEGER,
+      payload: {
+        ...chunkPayloadFraming,
+        chunkIndex: Number.MAX_SAFE_INTEGER,
+        totalChunks: Number.MAX_SAFE_INTEGER,
+        chunkSizeBytes: Number.MAX_SAFE_INTEGER,
+        totalSizeBytes: Number.MAX_SAFE_INTEGER,
+      },
+    };
+
+    const parsed = SnapshotChunkEnvelopeSchema.safeParse(worstCaseChunkMessage);
+    expect(parsed.success).toBe(true);
+
+    // Measure exact production serialization via JSON.stringify and TextEncoder / Buffer.byteLength
+    const serializedJson = JSON.stringify(worstCaseChunkMessage);
+    const textEncoderBytes = new TextEncoder().encode(serializedJson).byteLength;
+    const bufferBytes = Buffer.byteLength(serializedJson, 'utf-8');
+    const computeBytes = computeUtf8ByteLength(worstCaseChunkMessage);
+
+    // All UTF-8 measurement methods must agree
+    expect(textEncoderBytes).toBe(bufferBytes);
+    expect(textEncoderBytes).toBe(computeBytes);
+
+    // Worst-case framing without dataBase64 is measured at 1270 bytes (with 64-character messageType)
+    expect(textEncoderBytes).toBeLessThanOrEqual(MAX_ENVELOPE_OVERHEAD_BYTES);
+    expect(textEncoderBytes).toBe(1270);
+
+    // With standard 25-char messageType ('sync:state-snapshot-chunk'), framing is exactly 1231 bytes
+    const standardChunkMessage = {
+      ...worstCaseChunkMessage,
+      messageType: 'sync:state-snapshot-chunk',
+    };
+    const standardBytes = computeUtf8ByteLength(standardChunkMessage);
+    expect(standardBytes).toBe(1231);
+    expect(standardBytes).toBeLessThanOrEqual(MAX_ENVELOPE_OVERHEAD_BYTES);
+
+    // Verified safety margin against 1,800 B bound:
+    // 1800 - 1270 = 530 bytes headroom (41.7% safety margin)
+    const safetyMargin = MAX_ENVELOPE_OVERHEAD_BYTES - textEncoderBytes;
+    expect(safetyMargin).toBe(530);
+  });
+
+  // ── Negative Tests: Prohibited Fields ───────────────────────────────────────
+  it('should strictly reject snapshot-chunk envelope containing causalContext', () => {
+    const withCausal = validChunkEnvelope({
+      causalContext: { 'peer-remote': 5 },
+    });
+    const result = SnapshotChunkEnvelopeSchema.safeParse(withCausal);
+    expect(result.success).toBe(false);
+    if (!result.success) {
+      expect(result.error.issues[0]?.message).toMatch(/must not contain causalContext/i);
+    }
+  });
+
+  it('should strictly reject snapshot-chunk envelope containing logicalEventId', () => {
+    const withLogicalEvent = validChunkEnvelope({
+      logicalEventId: 'op-event-12345',
+    });
+    const result = SnapshotChunkEnvelopeSchema.safeParse(withLogicalEvent);
+    expect(result.success).toBe(false);
+    if (!result.success) {
+      expect(result.error.issues[0]?.message).toMatch(/must not contain logicalEventId/i);
+    }
+  });
+
+  it('should strictly reject snapshot-chunk envelope containing originPeerId', () => {
+    const withOriginPeer = validChunkEnvelope({
+      originPeerId: 'peer-author-origin',
+    });
+    const result = SnapshotChunkEnvelopeSchema.safeParse(withOriginPeer);
+    expect(result.success).toBe(false);
+    if (!result.success) {
+      expect(result.error.issues[0]?.message).toMatch(/must not contain originPeerId/i);
+    }
+  });
+
+  it('should strictly reject snapshot-chunk envelope containing logicalTimestamp', () => {
+    const withLogicalTimestamp = validChunkEnvelope({
+      logicalTimestamp: 100,
+    });
+    const result = SnapshotChunkEnvelopeSchema.safeParse(withLogicalTimestamp);
+    expect(result.success).toBe(false);
+    if (!result.success) {
+      expect(result.error.issues[0]?.message).toMatch(/must not contain logicalTimestamp/i);
+    }
+  });
+
+  it('should strictly reject snapshot-chunk envelope containing originSequenceNumber', () => {
+    const withOriginSeq = validChunkEnvelope({
+      originSequenceNumber: 42,
+    });
+    const result = SnapshotChunkEnvelopeSchema.safeParse(withOriginSeq);
+    expect(result.success).toBe(false);
+    if (!result.success) {
+      expect(result.error.issues[0]?.message).toMatch(/must not contain originSequenceNumber/i);
+    }
+  });
+
+  it('should strictly reject snapshot-chunk envelope with unrecognized extra fields (.strict())', () => {
+    const withExtra = validChunkEnvelope({
+      unrecognizedField: 'malicious-data',
+    });
+    const result = SnapshotChunkEnvelopeSchema.safeParse(withExtra);
+    expect(result.success).toBe(false);
+    if (!result.success) {
+      expect(result.error.issues[0]?.code).toBe('unrecognized_keys');
+    }
+  });
+
+  // ── Correct Constants & Minimum Transport Capacity Arithmetic ───────────────
+  it('should satisfy all transport and chunk capacity arithmetic invariants', () => {
+    // 1. Minimum raw chunk is 256 bytes
+    expect(MIN_RAW_CHUNK_BYTES).toBe(256);
+
+    // 2. Base64 encoding of 256 bytes is Math.ceil(256 / 3) * 4 = 86 * 4 = 344 bytes
+    const base64BytesFor256 = Math.ceil(MIN_RAW_CHUNK_BYTES / 3) * 4;
+    expect(base64BytesFor256).toBe(344);
+    expect(MIN_BASE64_CHUNK_BYTES).toBe(344);
+
+    // 3. Guaranteed envelope bound is 1,800 bytes
+    expect(MAX_ENVELOPE_OVERHEAD_BYTES).toBe(1800);
+
+    // 4. Minimum transport limit is 1,800 + 344 = 2,144 bytes
+    expect(MIN_TRANSPORT_LIMIT_CHUNK_TRANSFER).toBe(MAX_ENVELOPE_OVERHEAD_BYTES + MIN_BASE64_CHUNK_BYTES);
+    expect(MIN_TRANSPORT_LIMIT_CHUNK_TRANSFER).toBe(2144);
+
+    // 5. Full 32 KB chunk transport limit: 43,692 Base64 bytes + 1,800 envelope = 45,492 bytes
+    const base64BytesFor32K = Math.ceil(32768 / 3) * 4;
+    expect(base64BytesFor32K).toBe(43692);
+    expect(MIN_TRANSPORT_LIMIT_FULL_CHUNK).toBe(MAX_ENVELOPE_OVERHEAD_BYTES + base64BytesFor32K);
+    expect(MIN_TRANSPORT_LIMIT_FULL_CHUNK).toBe(45492);
+  });
+
+  it('should verify send-boundary exact string measurement and unchanged-string transmission', () => {
+    const rawPayload = validChunkEnvelope({
+      payload: {
+        ...chunkPayloadFraming,
+        dataBase64: 'A'.repeat(344), // Exactly 256 bytes of data
+      },
+    });
+
+    // Production serialization path
+    const serializeResult = serializeAndCheckSize(rawPayload, MIN_TRANSPORT_LIMIT_CHUNK_TRANSFER);
+    expect(serializeResult.ok).toBe(true);
+
+    if (serializeResult.ok) {
+      const { json, byteLength } = serializeResult.value;
+
+      // The exact string measured must equal the serialized JSON
+      expect(typeof json).toBe('string');
+      expect(byteLength).toBe(new TextEncoder().encode(json).byteLength);
+
+      // Total message with 344 B Base64 is ~1,538 bytes, well within 2,144 B transport limit
+      expect(byteLength).toBeLessThanOrEqual(MIN_TRANSPORT_LIMIT_CHUNK_TRANSFER);
+
+      // Verify that the exact string passes through unchanged and matches re-measurement
+      const verifyLength = computeUtf8ByteLength(json);
+      expect(verifyLength).toBe(byteLength);
+    }
   });
 });

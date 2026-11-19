@@ -24,8 +24,8 @@ export const MIN_CHUNK_BYTES = 256;
 /** Regular expression restricting protocol identifiers to an explicit ASCII-safe alphabet (Option A). */
 export const ASCII_IDENTIFIER_REGEX = /^[a-zA-Z0-9_.:-]+$/;
 
-/** Minimum transport message limit required to support a full 32 KB binary chunk: 43,692 B Base64 + 1,600 B envelope = 45,292 B. */
-export const MIN_TRANSPORT_LIMIT_FULL_CHUNK = 45292; // 45,292 bytes (44.23 KiB)
+/** Minimum transport message limit required to support a full 32 KB binary chunk: 43,692 B Base64 + 1,800 B envelope = 45,492 B. */
+export const MIN_TRANSPORT_LIMIT_FULL_CHUNK = 45492; // 45,492 bytes (44.43 KiB)
 
 /** Maximum number of chunks allowed per snapshot transfer. */
 export const MAX_CHUNKS_PER_SNAPSHOT = 128;
@@ -33,14 +33,14 @@ export const MAX_CHUNKS_PER_SNAPSHOT = 128;
 /** Maximum concurrent in-flight chunk requests allowed per transfer. */
 export const MAX_CONCURRENT_CHUNK_REQUESTS = 4;
 
-/** Minimum supported SCTP message limit for chunked snapshot transfer. */
-export const MIN_SUPPORTED_SCTP_LIMIT = 2048;
+/** Minimum supported SCTP message limit for chunked snapshot transfer: 1,800 B envelope + 344 B Base64 (256 B raw) = 2,144 bytes. */
+export const MIN_SUPPORTED_SCTP_LIMIT = 2144;
 
 /** Envelope budget in bytes for SNAPSHOT_CHUNK metadata, UUIDs, and Base64 framing overhead. */
 export const CHUNK_ENVELOPE_BUDGET_BYTES = 768;
 
-/** Guaranteed maximum envelope overhead in bytes for ProtocolMessage wrapping, JSON keys, UUIDs, and signatures (proven upper bound across maximum schema field lengths under Option A). */
-export const MAX_ENVELOPE_OVERHEAD_BYTES = 1600;
+/** Guaranteed maximum envelope overhead in bytes for snapshot chunk wire messages (proven upper bound across maximum permitted schema field lengths under Option A). */
+export const MAX_ENVELOPE_OVERHEAD_BYTES = 1800;
 
 /** Hard operational bound on sizing loop attempts per chunk. */
 export const MAX_SIZING_ITERATIONS = 5;
@@ -263,7 +263,7 @@ export function calculateChunkCapacity(effectiveLimit: number): number {
 /**
  * Exact, conservative admission evaluation for snapshot transfers.
  * Validates:
- * 1. effectiveLimit >= MIN_SUPPORTED_SCTP_LIMIT (2048) -> TRANSPORT_LIMIT_EXCEEDED
+ * 1. effectiveLimit >= MIN_SUPPORTED_SCTP_LIMIT (2144) -> TRANSPORT_LIMIT_EXCEEDED
  * 2. totalSizeBytes <= MAX_SNAPSHOT_BYTES (4,194,304) -> LOCAL_ABORT
  * 3. calculatedRequiredChunks <= MAX_CHUNKS_PER_SNAPSHOT (128) -> CHUNK_COUNT_EXCEEDED
  * 4. If advertisedTotalChunks provided: advertisedTotalChunks === calculatedRequiredChunks -> OFFER_INCONSISTENT

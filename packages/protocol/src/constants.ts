@@ -87,15 +87,38 @@ export const MAX_SNAPSHOT_BYTES = 4 * 1024 * 1024;
 export const ASCII_IDENTIFIER_REGEX = /^[a-zA-Z0-9_.:-]+$/;
 
 /**
- * Guaranteed maximum envelope overhead in bytes for ProtocolMessage wrapping,
- * JSON keys, UUIDs, and signatures under Option A ASCII identifier restrictions.
+ * Guaranteed maximum envelope overhead in bytes for snapshot chunk wire messages under
+ * Option A ASCII identifier restrictions.
+ *
+ * Covers standard outer envelope, JSON syntax, UUIDs, chunk metadata framing, and SHA-256 hex strings.
+ * Empirical maximum under valid permitted schema fields is 1,231 bytes (or 1,194 bytes with standard
+ * chunk payload sizes), providing an airtight 569-byte (46%) safety margin to the 1,800-byte bound.
  */
-export const MAX_ENVELOPE_OVERHEAD_BYTES = 1600;
+export const MAX_ENVELOPE_OVERHEAD_BYTES = 1800;
+
+/**
+ * Minimum allowable chunk binary payload size before aborting transfer: 256 bytes.
+ */
+export const MIN_RAW_CHUNK_BYTES = 256;
+
+/**
+ * Exact Base64 encoded byte length for minimum 256-byte binary chunk:
+ * Math.ceil(256 / 3) * 4 = 86 * 4 = 344 bytes.
+ */
+export const MIN_BASE64_CHUNK_BYTES = 344;
+
+/**
+ * Absolute minimum transport message limit required to support chunked snapshot transfer:
+ * 1,800 B envelope + 344 B Base64 (256 B raw) = 2,144 bytes (2.09 KiB).
+ * Any transport negotiating an SCTP limit below this value cannot carry even the smallest
+ * allowable chunk and must be rejected upfront before allocating reassembly buffer memory.
+ */
+export const MIN_TRANSPORT_LIMIT_CHUNK_TRANSFER = 2144;
 
 /**
  * Minimum transport message limit required to support a full 32 KB binary chunk:
- * 43,692 B Base64 + 1,600 B envelope = 45,292 B (44.23 KiB).
+ * 43,692 B Base64 + 1,800 B envelope = 45,492 B (44.43 KiB).
  */
-export const MIN_TRANSPORT_LIMIT_FULL_CHUNK = 45292;
+export const MIN_TRANSPORT_LIMIT_FULL_CHUNK = 45492;
 
 

@@ -97,16 +97,19 @@ This document defines the formal, measurable acceptance criteria for Phase 7.5 M
 ### AC-M4-ADMIT-1: Upfront Admission Calculation & Chunk Ceiling Invariant
 - **Condition:** Inbound `SNAPSHOT_OFFER` received or outbound `SNAPSHOT_REQUEST` handled over any supported transport.
 - **Pass Threshold:**
-  1. `calculateSnapshotAdmission()` executes exact sizing using the proven 1,600-byte envelope ceiling:
-     $$\text{chunkBinaryCapacity} = \min\left(32768, \left\lfloor \frac{\text{effectiveLimit} - 1600}{4} \right\rfloor \times 3\right)$$
+  1. `calculateSnapshotAdmission()` executes exact sizing using the proven 1,800-byte envelope ceiling and strict `SnapshotChunkEnvelopeSchema`:
+     $$\text{chunkBinaryCapacity} = \begin{cases}
+       0, & \text{if } \text{effectiveLimit} < 2144 \\
+       \min\left(32768, \left\lfloor \frac{\text{effectiveLimit} - 1800}{4} \right\rfloor \times 3\right), & \text{if } \text{effectiveLimit} \ge 2144
+     \end{cases}$$
      $$\text{calculatedRequiredChunks} = \left\lceil \frac{\text{totalSizeBytes}}{\text{chunkBinaryCapacity}} \right\rceil$$
   2. Invariant 1 verified: $\text{calculatedRequiredChunks} \le \text{MAX\_CHUNKS\_PER\_SNAPSHOT}$ (128). If exceeded, rejected upfront with `CHUNK_COUNT_EXCEEDED` before allocating reassembly buffer memory.
   3. Invariant 2 verified: $\text{offer.totalChunks} === \text{calculatedRequiredChunks}$. If inconsistent, rejected upfront with `OFFER_INCONSISTENT` before allocating reassembly buffer memory.
-  4. Explicitly verified that universal 4 MiB transfer is **NOT** claimed on a 2 KiB SCTP transport (which admits snapshots up to 42.0 KiB / 43,008 B for 128 chunks), and that full 32 KB binary chunks require an effective transport limit $\ge 45,292$ bytes (43,692 B Base64 + 1,600 B envelope).
-  5. Option A ASCII identifier alphabet (`/^[a-zA-Z0-9_.:-]+$/`) verified: no JSON escaping can expand identifiers beyond their character lengths.
+  4. Explicitly verified that universal 4 MiB transfer is **NOT** claimed on a 2.1 KiB SCTP transport (which admits snapshots up to 32.25 KiB / 33,024 B for 128 chunks), and that full 32 KB binary chunks require an effective transport limit $\ge 45,492$ bytes (43,692 B Base64 + 1,800 B envelope).
+  5. Option A ASCII identifier alphabet (`/^[a-zA-Z0-9_.:-]+$/`) and strict snapshot chunk wire contract verified: prohibited operation/replication fields (`causalContext`, `logicalEventId`, etc.) and unknown fields are rejected.
 
 ### AC-M4-ADMIT-2: Minimum Supported SCTP Limit Floor
-- **Condition:** Transport reporting SCTP limit $< 2,048$ bytes (`MIN_SUPPORTED_SCTP_LIMIT`).
+- **Condition:** Transport reporting SCTP limit $< 2,144$ bytes (`MIN_SUPPORTED_SCTP_LIMIT` / `MIN_TRANSPORT_LIMIT_CHUNK_TRANSFER`).
 - **Pass Threshold:**
   1. Transfer is immediately rejected/aborted with `TRANSPORT_LIMIT_EXCEEDED`.
   2. Zero chunk requests or transfer buffers are allocated.

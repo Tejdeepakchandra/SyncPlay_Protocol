@@ -44,21 +44,26 @@
 
 ---
 
-### R-M4-2: Chunk Framing Starvation on Severely Constrained Links ($< 2\text{ KB}$)
-- **Threat Description:** If a link negotiates an extremely small MTU/SCTP limit ($< 2,048$ bytes), the JSON envelope overhead ($\approx 1600$ bytes under worst-case schema field lengths) consumes the majority of the message budget, leaving trivial binary payload slices ($< 256$ bytes) that require thousands of chunks, starving the transfer. Furthermore, a 4 MiB snapshot would require thousands of chunks over a 2 KiB link, contradicting the 128-chunk bound.
+### R-M4-2: Chunk Framing Starvation on Severely Constrained Links ($< 2.1\text{ KB}$)
+- **Threat Description:** If a link negotiates an extremely small MTU/SCTP limit ($< 2,144$ bytes), the JSON envelope overhead ($\le 1,800$ bytes under worst-case schema field lengths) leaves insufficient budget for the minimum allowable 256-byte binary payload slice (which requires 344 Base64 bytes), starving the transfer. Furthermore, a 4 MiB snapshot would require thousands of chunks over a 2 KiB link, contradicting the 128-chunk bound.
 - **Root Cause:** Attempting large state snapshot recovery over pathologically constrained network links without evaluating capacity invariants.
 - **Mitigation:**
   1. Exact Upfront Admission Gate: The protocol computes exact required chunks upfront:
-     $$\text{chunkBinaryCapacity} = \min\left(32768, \left\lfloor \frac{\text{effectiveLimit} - 1600}{4} \right\rfloor \times 3\right)$$
+     $$\text{chunkBinaryCapacity} = \begin{cases}
+       0, & \text{if } \text{effectiveLimit} < 2144 \\
+       \min\left(32768, \left\lfloor \frac{\text{effectiveLimit} - 1800}{4} \right\rfloor \times 3\right), & \text{if } \text{effectiveLimit} \ge 2144
+     \end{cases}$$
      $$\text{calculatedRequiredChunks} = \left\lceil \frac{\text{totalSizeBytes}}{\text{chunkBinaryCapacity}} \right\rceil$$
-  2. If $\text{calculatedRequiredChunks} > \text{MAX\_CHUNKS\_PER\_SNAPSHOT}$ (128), the transfer is rejected immediately before allocating reassembly buffer memory (`CHUNK_COUNT_EXCEEDED`).
-  3. If $\text{offer.totalChunks} !== \text{calculatedRequiredChunks}$, the offer is rejected upfront with `OFFER_INCONSISTENT`.
-  4. The protocol explicitly **does NOT claim universal 4 MiB snapshot transfer support on 2 KiB transports**; effective capacity on 2 KiB transports is bounded to $\approx 42.0\text{ KiB}$ (43,008 B) for 128 chunks. Full 32 KB binary chunks require an effective transport limit $\ge 45,292$ bytes (43,692 B Base64 + 1,600 B envelope).
-  5. Option A ASCII identifier restriction (`/^[a-zA-Z0-9_.:-]+$/`) guarantees no JSON escaping overhead expands identifier fields beyond their character lengths.
-  6. `calculateChunkCapacity` throws if `effectiveLimit < MIN_SUPPORTED_SCTP_LIMIT` (2,048 bytes).
-  7. The iterative loop aborts with `TRANSPORT_LIMIT_EXCEEDED` if slice size drops below `MIN_CHUNK_BYTES = 256`.
-  8. Transfer terminates cleanly to `DEGRADED`, prompting application intervention rather than hanging.
-- **Verification Plan:** Test case with SCTP limit set to 1,024 bytes confirms immediate, clean rejection; test case with 4 MiB snapshot on 2,048-byte SCTP limit confirms upfront admission rejection without buffer allocation; test case with inconsistent `totalChunks` confirms rejection before buffer allocation.
+  2. If $\text{effectiveLimit} < 2,144$ or $\text{chunkBinaryCapacity} < 256$, the transfer is rejected immediately before allocating reassembly buffer memory (`TRANSPORT_LIMIT_EXCEEDED`).
+  3. If $\text{calculatedRequiredChunks} > \text{MAX\_CHUNKS\_PER\_SNAPSHOT}$ (128), the transfer is rejected immediately before allocating reassembly buffer memory (`CHUNK_COUNT_EXCEEDED`).
+  4. If $\text{offer.totalChunks} !== \text{calculatedRequiredChunks}$, the offer is rejected upfront with `OFFER_INCONSISTENT`.
+  5. The protocol explicitly **does NOT claim universal 4 MiB snapshot transfer support on 2 KiB transports**; effective capacity on 2,144 B transports is bounded to $\approx 32.25\text{ KiB}$ (33,024 B) for 128 chunks. Full 32 KB binary chunks require an effective transport limit $\ge 45,492$ bytes (43,692 B Base64 + 1,800 B envelope).
+  6. Option A ASCII identifier restriction (`/^[a-zA-Z0-9_.:-]+$/`) guarantees no JSON escaping overhead expands identifier fields beyond their character lengths.
+  7. Strict `SnapshotChunkEnvelopeSchema` forbids operation/causal fields (`causalContext`, `logicalEventId`, `originPeerId`, `logicalTimestamp`, `originSequenceNumber`), strictly bounding envelope overhead to $\le 1,800$ bytes.
+  8. `calculateChunkCapacity` throws if `effectiveLimit < MIN_SUPPORTED_SCTP_LIMIT` (2,144 bytes).
+  9. The iterative loop aborts with `TRANSPORT_LIMIT_EXCEEDED` if slice size drops below `MIN_CHUNK_BYTES = 256`.
+  10. Transfer terminates cleanly to `DEGRADED`, prompting application intervention rather than hanging.
+- **Verification Plan:** Test case with SCTP limit set to 1,024 or 2,048 bytes confirms immediate, clean rejection; test case with 4 MiB snapshot on 4,096-byte SCTP limit confirms upfront admission rejection without buffer allocation; test case with inconsistent `totalChunks` confirms rejection before buffer allocation.
 
 ---
 

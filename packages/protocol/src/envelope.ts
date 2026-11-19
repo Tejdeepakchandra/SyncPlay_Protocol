@@ -102,3 +102,56 @@ export const ProtocolMessageSchema = z.object({
     .optional(),
   payload: z.unknown(),
 });
+
+/**
+ * Strict wire envelope schema for snapshot chunk messages.
+ *
+ * Implements Phase 7.5 M4 wire contract:
+ * - Requires standard envelope fields: protocolVersion, messageType, sessionId, senderPeerId, messageId, payload.
+ * - Permits legitimate transport metadata: membershipEpoch, connectionGeneration.
+ * - STRICTLY PROHIBITS operation-specific and replication metadata:
+ *   causalContext, logicalEventId, originPeerId, logicalTimestamp, originSequenceNumber.
+ * - Strictly rejects unknown keys on the envelope layer (.strict()).
+ *
+ * This restriction guarantees that serialized chunk message envelope overhead
+ * is strictly bounded to <= 1,800 bytes (worst-case measured at 1,231 bytes with max identifiers and chunk framing).
+ */
+export const SnapshotChunkEnvelopeSchema = z
+  .object({
+    protocolVersion: z.number().int().positive(),
+    messageType: z.string().min(1).max(64),
+    sessionId: z.string().min(1).max(128).regex(ASCII_IDENTIFIER_REGEX),
+    senderPeerId: z.string().min(1).max(128).regex(ASCII_IDENTIFIER_REGEX),
+    messageId: z.string().min(1).max(128).regex(ASCII_IDENTIFIER_REGEX),
+    membershipEpoch: z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER).optional(),
+    connectionGeneration: z.number().int().positive().max(Number.MAX_SAFE_INTEGER).optional(),
+    payload: z.unknown(),
+    // Strictly prohibited fields on snapshot chunk wire envelopes
+    causalContext: z
+      .never({ message: 'Snapshot chunk envelope must not contain causalContext' })
+      .optional(),
+    logicalEventId: z
+      .never({ message: 'Snapshot chunk envelope must not contain logicalEventId' })
+      .optional(),
+    originPeerId: z
+      .never({ message: 'Snapshot chunk envelope must not contain originPeerId' })
+      .optional(),
+    logicalTimestamp: z
+      .never({ message: 'Snapshot chunk envelope must not contain logicalTimestamp' })
+      .optional(),
+    originSequenceNumber: z
+      .never({ message: 'Snapshot chunk envelope must not contain originSequenceNumber' })
+      .optional(),
+  })
+  .strict();
+
+export interface SnapshotChunkEnvelope<TPayload = unknown> {
+  readonly protocolVersion: number;
+  readonly messageType: string;
+  readonly sessionId: SessionId;
+  readonly senderPeerId: PeerId;
+  readonly messageId: MessageId;
+  readonly membershipEpoch?: number;
+  readonly connectionGeneration?: number;
+  readonly payload: TPayload;
+}

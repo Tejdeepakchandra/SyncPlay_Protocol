@@ -69,56 +69,70 @@ A fundamental physical and protocol reality governs state recovery over WebRTC: 
 
 #### 1.2.1 Exact Sizing Contract, Option A Alphabet Restriction, and Envelope Ceiling Proof
 The admission calculation must be completely conservative and consistent with the actual wire serialization executed by the outbound transfer pipeline. It accounts for:
-1. **Complete ProtocolMessage Envelope Overhead:** The outer framing (`protocolVersion`, `sessionId`, `type`, `senderPeerId`, `timestamp`, `signature`), optional envelope fields (`logicalEventId`, `originPeerId`, `membershipEpoch`, `connectionGeneration`, `logicalTimestamp`, `originSequenceNumber`), payload object keys, UUIDs, epoch numbers, chunk indices, total chunks, byte counts, and the 64-character hex `chunkSha256` string.
+1. **Complete ProtocolMessage Envelope Overhead:** The outer framing (`protocolVersion`, `sessionId`, `messageType`, `senderPeerId`, `messageId`), legitimate optional transport fields (`membershipEpoch`, `connectionGeneration`), payload object keys, UUIDs, chunk indices, total chunks, byte counts, and the 64-character hex `chunkSha256` string.
 2. **Schema Character Set Strategy: Option A (Adopted):**
-   - In distributed protocol implementations, identifier strings (`sessionId`, `senderPeerId`, `supplierPeerId`, `snapshotId`, `messageId`, `logicalEventId`, `originPeerId`) are restricted in schemas to an explicit ASCII-safe alphabet:
+   - In distributed protocol implementations, identifier strings (`sessionId`, `senderPeerId`, `supplierPeerId`, `snapshotId`, `messageId`) are restricted in schemas to an explicit ASCII-safe alphabet:
      $$\text{ASCII\_IDENTIFIER\_REGEX} = \text{/}\hat{\ }[a-zA-Z0-9\_.:-]+\$\text{/}$$
    - *Why Option A is Adopted:* Under this character set, every character is an ASCII printable character between `0x20` and `0x7E` (excluding quotes and backslashes). No JSON control character escaping (`\u0000` to `\u001f`) is possible, and UTF-8 byte length is strictly identical to character count ($1\text{ char} = 1\text{ byte}$).
+   - *Strict Snapshot-Chunk Wire Contract:* Under `SnapshotChunkEnvelopeSchema`, operation-specific and causal replication metadata (`causalContext`, `logicalEventId`, `originPeerId`, `logicalTimestamp`, `originSequenceNumber`) are strictly forbidden, and unknown properties are rejected via `.strict()`.
    - *Worst-Case Mathematical Serialization Proof:*
-     - Outer envelope: `protocolVersion` (20 B) + `messageType` "SNAPSHOT_CHUNK" (32 B) + `sessionId` 128 B + `senderPeerId` 128 B + `messageId` 128 B + optional `logicalEventId` 128 B + optional `originPeerId` 128 B + 4 numeric fields at `Number.MAX_SAFE_INTEGER` (110 B)
-     - Inner payload: `transferId` (UUIDv4 36 B) + `sessionId` (128 B) + `supplierPeerId` (64 B) + `snapshotId` (128 B) + `chunkSha256` (64 B) + 4 numeric fields (100 B)
-     - Structural JSON syntax (keys, quotes, colons, braces, `"dataBase64":""`): ~92 B
-     - **Exact maximum serialized UTF-8 bytes (excluding Base64 payload):** **1,554 bytes**.
-     - Since $1,554 \le 1,600$, $\text{MAX\_ENVELOPE\_OVERHEAD\_BYTES} = 1600$ bytes is an airtight, mathematically proven upper bound.
-   - *Option B (Unrestricted Character Set Evaluation):* If arbitrary Unicode and control characters were permitted in schema strings, JSON escaping could produce up to 6 bytes per code point (`\u0000`), driving envelope overhead $> 5,500$ bytes. Such an overhead would starve transfers on links $\le 8\text{ KB}$ and make transfers impossible on 2 KiB links. Option A avoids this pathological inflation while fully supporting all UUIDs, nanoIDs, and standard SyncPlay identifiers.
+     - Outer envelope: `protocolVersion` (20 B) + `messageType` "sync:state-snapshot-chunk" (35 B) + `sessionId` 128 B + `senderPeerId` 128 B + `messageId` 128 B + optional `membershipEpoch` (25 B) + optional `connectionGeneration` (25 B)
+     - Inner payload: `transferId` (UUIDv4 36 B) + `sessionId` (128 B) + `supplierPeerId` (64 B) + `snapshotId` (128 B) + `chunkSha256` (64 B) + 4 numeric fields at `Number.MAX_SAFE_INTEGER` (100 B)
+     - Structural JSON syntax (keys, quotes, colons, braces, commas, `"dataBase64":""`): ~90 B
+     - **Exact maximum serialized UTF-8 bytes (excluding Base64 payload):** **1,231 bytes** (or **1,270 bytes** with an extreme 64-character `messageType`).
+     - Since $1,270 \le 1,800$, $\text{MAX\_ENVELOPE\_OVERHEAD\_BYTES} = 1800$ bytes is an airtight, mathematically proven upper bound with a verified $1,800 - 1,270 = \mathbf{530\text{ bytes}}$ (41.7%) safety margin.
+   - *Option B (Unrestricted Character Set Evaluation):* If arbitrary Unicode and control characters were permitted in schema strings, JSON escaping could produce up to 6 bytes per code point (`\u0000`), driving envelope overhead $> 5,500$ bytes. Such an overhead would starve transfers on links $\le 8\text{ KB}$ and make transfers impossible on constrained links. Option A avoids this pathological inflation while fully supporting all UUIDs, nanoIDs, and standard SyncPlay identifiers.
 3. **Base64 Expansion and Exact Sizing Formulation:**
    Every 3 binary bytes expand to 4 Base64 characters ($4 \times \lceil B / 3 \rceil$). To guarantee that the encoded data plus envelope fits within `effectiveLimit`:
-   $$\text{maxBase64Bytes} = \text{effectiveLimit} - \text{MAX\_ENVELOPE\_OVERHEAD\_BYTES}$$
-   $$\text{chunkBinaryCapacity} = \min\left(\text{MAX\_CHUNK\_BYTES}, \left\lfloor \frac{\text{maxBase64Bytes}}{4} \right\rfloor \times 3\right)$$
-   (where $\text{MAX\_CHUNK\_BYTES} = 32,768$ bytes).
+   $$\text{maxBase64Bytes} = \max(0, \text{effectiveLimit} - \text{MAX\_ENVELOPE\_OVERHEAD\_BYTES})$$
+   $$\text{chunkBinaryCapacity} = \begin{cases}
+     0, & \text{if } \text{effectiveLimit} < \text{MIN\_TRANSPORT\_LIMIT\_CHUNK\_TRANSFER} \ (2,144\text{ B}) \\
+     \min\left(\text{MAX\_CHUNK\_BYTES}, \left\lfloor \frac{\text{maxBase64Bytes}}{4} \right\rfloor \times 3\right), & \text{if } \text{effectiveLimit} \ge 2,144\text{ B}
+   \end{cases}$$
+   (where $\text{MAX\_CHUNK\_BYTES} = 32,768$ bytes, $\text{MIN\_RAW\_CHUNK\_BYTES} = 256$ bytes).
 
-#### 1.2.2 Minimum Transport Size for Full 32 KB Binary Chunks
-For a maximum binary chunk of $B = 32,768$ bytes:
-- Base64 payload size: $\lceil 32,768 / 3 \rceil \times 4 = 10,923 \times 4 = \mathbf{43,692\text{ bytes}}$.
-- Plus proven maximum envelope budget ($1,600$ bytes):
-  $$\text{Minimum Transport Limit for 32 KB Chunk} = 43,692 + 1,600 = \mathbf{45,292\text{ bytes}} \ (44.23\text{ KiB})$$
-  *(Note: Any transport with an effective limit strictly below 45,292 bytes cannot transmit 32,768-byte binary chunks and will dynamically size down).*
+#### 1.2.2 Minimum Transport Size for Full 32 KB Binary Chunks and 256 B Minimum Chunks
+- **Minimum Transport Limit for Chunked Transfer ($B_{\text{min}} = 256$ B):**
+  - Base64 payload size: $\lceil 256 / 3 \rceil \times 4 = 86 \times 4 = \mathbf{344\text{ bytes}}$.
+  - Plus proven maximum envelope budget ($1,800$ bytes):
+    $$\text{MIN\_TRANSPORT\_LIMIT\_CHUNK\_TRANSFER} = 1,800 + 344 = \mathbf{2,144\text{ bytes}} \ (2.09\text{ KiB})$$
+  *(Note: Any transport negotiating an effective limit strictly below 2,144 bytes cannot carry even a 256-byte chunk and is rejected upfront before allocating reassembly memory).*
+- **Minimum Transport Limit for Full 32 KB Binary Chunks ($B = 32,768$ B):**
+  - Base64 payload size: $\lceil 32,768 / 3 \rceil \times 4 = 10,923 \times 4 = \mathbf{43,692\text{ bytes}}$.
+  - Plus proven maximum envelope budget ($1,800$ bytes):
+    $$\text{MIN\_TRANSPORT\_LIMIT\_FULL\_CHUNK} = 43,692 + 1,800 = \mathbf{45,492\text{ bytes}} \ (44.43\text{ KiB})$$
+  *(Note: Any transport with an effective limit strictly below 45,492 bytes cannot transmit 32,768-byte binary chunks and will dynamically size down).*
 
 #### 1.2.3 Exact Mathematical Formulation of Admission
 Before allocating reassembly memory or accepting an incoming transfer offer, both supplier and requester evaluate:
 $$\text{calculatedRequiredChunks} = \left\lceil \frac{\text{totalSizeBytes}}{\text{chunkBinaryCapacity}} \right\rceil$$
 
 #### 1.2.4 Mandatory Capacity and Consistency Invariants
-$$\mathbf{\text{Invariant 1 (Ceiling):}} \quad \text{calculatedRequiredChunks} \le \text{MAX\_CHUNKS\_PER\_SNAPSHOT} \ (128)$$
-$$\mathbf{\text{Invariant 2 (Consistency):}} \quad \text{offer.totalChunks} === \text{calculatedRequiredChunks}$$
+$$\mathbf{\text{Invariant 1 (Transport Floor):}} \quad \text{effectiveLimit} \ge \text{MIN\_TRANSPORT\_LIMIT\_CHUNK\_TRANSFER} \ (2,144\text{ B})$$
+$$\mathbf{\text{Invariant 2 (Chunk Capacity Floor):}} \quad \text{chunkBinaryCapacity} \ge \text{MIN\_RAW\_CHUNK\_BYTES} \ (256\text{ B})$$
+$$\mathbf{\text{Invariant 3 (Chunk Ceiling):}} \quad \text{calculatedRequiredChunks} \le \text{MAX\_CHUNKS\_PER\_SNAPSHOT} \ (128)$$
+$$\mathbf{\text{Invariant 4 (Offer Consistency):}} \quad \text{offer.totalChunks} === \text{calculatedRequiredChunks}$$
 
-- **Admission Rejection:** If $\text{calculatedRequiredChunks} > 128$, the transfer is rejected immediately with `CHUNK_COUNT_EXCEEDED` or `TRANSPORT_LIMIT_EXCEEDED`.
+- **Admission Rejection:** If $\text{effectiveLimit} < 2,144$ or $\text{chunkBinaryCapacity} < 256$, the transfer is rejected immediately with `TRANSPORT_LIMIT_EXCEEDED` before allocating any reassembly buffer memory.
+- **Chunk Count Rejection:** If $\text{calculatedRequiredChunks} > 128$, the transfer is rejected immediately with `CHUNK_COUNT_EXCEEDED` or `TRANSPORT_LIMIT_EXCEEDED`.
 - **Inconsistent Offer Rejection:** If $\text{offer.totalChunks} !== \text{calculatedRequiredChunks}$, the offer is rejected immediately with `OFFER_INCONSISTENT` before allocating any assembler or reassembly buffer memory. An inconsistent offer indicates a malformed or incompatible supplier slicing contract.
 - **Variable Final-Chunk Guarantee:** Chunks $0 \dots N-2$ carry exactly $\text{chunkBinaryCapacity}$ bytes. The final chunk $N-1$ carries $B_{\text{final}} = \text{totalSizeBytes} - (N-1) \times \text{chunkBinaryCapacity} \le \text{chunkBinaryCapacity}$ bytes. Because $B_{\text{final}} \le \text{chunkBinaryCapacity}$, its Base64 encoding is strictly $\le$ preceding chunks, guaranteed to fit within `effectiveLimit`.
 
 #### 1.2.5 Transport-Dependent Snapshot Capacity Matrix
-The protocol **does NOT claim universal 4 MiB snapshot transfer support over severely constrained 2 KiB SCTP transports**. On a 2,048-byte link, transferring a 4 MiB snapshot would require thousands of tiny chunks, vastly exceeding the 128-chunk bound. Instead, effective snapshot capacity scales with transport limits:
+The protocol **does NOT claim universal 4 MiB snapshot transfer support over severely constrained SCTP transports**. On a 2,144-byte link, transferring a 4 MiB snapshot would require thousands of tiny chunks, vastly exceeding the 128-chunk bound. Instead, effective snapshot capacity scales with transport limits:
 
 | Transport SCTP Limit | Envelope Overhead | Available Base64 | Chunk Binary Capacity | Max Transferable Snapshot (128 chunks) | Operational Recovery Scope |
 |:---|:---:|:---:|:---:|:---:|:---|
-| **65,536 B (Standard / Fallback)** | 1,600 B | 63,936 B | 32,768 B (Capped) | **4,194,304 B (4.00 MiB)** | Full 4 MiB Engine Snapshot |
-| **$\ge$ 45,292 B (Full Chunk Ceiling)** | 1,600 B | $\ge$ 43,692 B | 32,768 B (Capped) | **4,194,304 B (4.00 MiB)** | Full 4 MiB Engine Snapshot |
-| **32,768 B** | 1,600 B | 31,168 B | 23,376 B | **2,992,128 B (2.85 MiB)** | Admitted if $\le 2.85\text{ MiB}$; rejected otherwise |
-| **16,384 B** | 1,600 B | 14,784 B | 11,088 B | **1,419,264 B (1.35 MiB)** | Admitted if $\le 1.35\text{ MiB}$; rejected otherwise |
-| **8,192 B** | 1,600 B | 6,592 B | 4,944 B | **632,832 B (618 KiB)** | Admitted if $\le 618\text{ KiB}$; rejected otherwise |
-| **2,048 B (Minimum Floor)** | 1,600 B | 448 B | 336 B | **43,008 B (42.0 KiB)** | Small snapshot / test case support only |
-| **< 1,944 B** | N/A | < 344 B | < 256 B | **0 B (Rejected Upfront)** | Below minimum chunk threshold; immediate abort |
-| **< 2,048 B** | N/A | N/A | < 256 B | **0 B (Rejected Upfront)** | Unsupported link; immediate abort |
+| **65,536 B (Standard / Fallback)** | 1,800 B | 63,736 B | 32,768 B (Capped) | **4,194,304 B (4.00 MiB)** | Full 4 MiB Engine Snapshot |
+| **$\ge$ 45,492 B (Full Chunk Ceiling)** | 1,800 B | $\ge$ 43,692 B | 32,768 B (Capped) | **4,194,304 B (4.00 MiB)** | Full 4 MiB Engine Snapshot |
+| **32,768 B** | 1,800 B | 30,968 B | 23,226 B | **2,972,928 B (2.84 MiB)** | Admitted if $\le 2.84\text{ MiB}$; rejected otherwise |
+| **16,384 B** | 1,800 B | 14,584 B | 10,938 B | **1,400,064 B (1.34 MiB)** | Admitted if $\le 1.34\text{ MiB}$; rejected otherwise |
+| **8,192 B** | 1,800 B | 6,392 B | 4,794 B | **613,632 B (599 KiB)** | Admitted if $\le 599\text{ KiB}$; rejected otherwise |
+| **4,096 B** | 1,800 B | 2,296 B | 1,722 B | **220,416 B (215 KiB)** | Admitted if $\le 215\text{ KiB}$; rejected otherwise |
+| **2,144 B (Minimum Floor)** | 1,800 B | 344 B | 258 B ($\ge 256$ B) | **33,024 B (32.25 KiB)** | Small snapshot / constrained test support only |
+| **< 2,144 B (e.g. 2,048 B)** | N/A | < 344 B | < 256 B | **0 B (Rejected Upfront)** | Below minimum chunk threshold; immediate abort (`TRANSPORT_LIMIT_EXCEEDED`) |
+
+By evaluating the admission invariant upfront, the engine never enters a deadlocked or memory-exhausted transfer state on constrained transports.
 
 By evaluating the admission invariant upfront, the engine never enters a deadlocked or memory-exhausted transfer state on constrained transports.
 

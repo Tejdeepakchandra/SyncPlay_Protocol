@@ -19,6 +19,9 @@ export {
   MAX_SNAPSHOT_BYTES,
   ASCII_IDENTIFIER_REGEX,
   MAX_ENVELOPE_OVERHEAD_BYTES,
+  MIN_RAW_CHUNK_BYTES,
+  MIN_BASE64_CHUNK_BYTES,
+  MIN_TRANSPORT_LIMIT_CHUNK_TRANSFER,
   MIN_TRANSPORT_LIMIT_FULL_CHUNK,
 } from './constants.js';
 
@@ -42,8 +45,8 @@ export {
 export type { SyncMessageType } from './message-types.js';
 
 // ── Protocol envelope ────────────────────────────────────────
-export type { ProtocolMessage } from './envelope.js';
-export { ProtocolMessageSchema } from './envelope.js';
+export type { ProtocolMessage, SnapshotChunkEnvelope } from './envelope.js';
+export { ProtocolMessageSchema, SnapshotChunkEnvelopeSchema } from './envelope.js';
 
 // ── Payload types and schemas ────────────────────────────────
 export type {
