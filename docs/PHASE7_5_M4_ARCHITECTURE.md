@@ -14,26 +14,37 @@
 
 Phase 7.5 Milestone M4 specifies the **Chunked Snapshot Transfer Protocol** for leaderless peer-to-peer state recovery across WebRTC DataChannels. When anti-entropy repair determines that missing operation history falls outside the active log compaction horizon ($V_{\text{epoch\_safe}}$), M4 provides a bounded, flow-controlled, verifiable protocol to transfer snapshots up to 4 MB across bandwidth-constrained and MTU-limited WebRTC DataChannels.
 
-### 1.1 Strict Architectural Separation of Concerns
-To guarantee modularity, mathematical safety, and strict separation between transport transfer and engine execution:
-- **Milestone M3 (Completed & Frozen):** Snapshot generation, canonical RFC 8785 JSON SHA-256 digest computation, compaction horizon calculation, and checkpoint retention.
-- **Milestone M4 (Current Scope):** Discovery via offers, sliding-window chunk transfer, iterative wire-size enforcement at `RTCDataChannel.send()`, chunk reassembly, and full-payload digest verification.
-- **Milestone M5 (Future Scope):** Live quarantine buffer, 4-outcome prefix compatibility verification, out-of-band staged engine state construction, and atomic 14-component reference swap.
-- **Milestone M6 (Future Scope):** 4-state recovery coordinator (`ACTIVE`, `RECOVERING`, `RECONCILING`, `DEGRADED`), autonomous triggers, and end-to-end integration.
+### 1.1 Strict Architectural Phasing and Scope Boundaries
+To guarantee modularity, mathematical safety, and eliminate ambiguity between infrastructure prerequisites and transfer execution, the recovery architecture is partitioned into strict milestone boundaries:
 
-**M4 Non-Scope Boundary:** M4 strictly transfers bytes and verifies cryptographic integrity. M4 **MUST NOT** install snapshots, touch `PlaybackState`, modify `OrderedOperationLog`, reseed logical clocks, drain quarantined events, or transition the engine state machine.
+1. **Milestone M4.0: Prerequisite M3 Infrastructure Corrections (Pre-Transfer Scope):**
+   Addresses known correctness, security, and atomicity limitations in existing M3 components before introducing recovery wire traffic:
+   - **M4.0a (`STATE_DIGEST` Identity Binding):** Enforce `senderPeerId === fromPeerId` and generation currency in `TrustedTransportAdapter`.
+   - **M4.0b (Exact Timestamp Resolution):** Strict sequence-specific timestamp resolution in `OrderedOperationLog.getOriginFrontierTimestamps()`.
+   - **M4.0c (Facade Gating):** Capability-authorized gating for `recordPeerDigest()`.
+   - **M4.0d (Compaction Exception Atomicity):** Out-of-band transactional candidate staging across all 8 mutable fields in `OrderedOperationLog.compactAtFrontier()`.
+2. **Milestones M4.1–M4.4: Snapshot Transfer Protocol Implementation ONLY (Current Milestone Scope):**
+   Implements wire message contracts, upfront admission gating, chunk tracking/deduplication in `ChunkAssembler`, 7-step iterative send-boundary wire sizing, sliding-window chunk delivery, supplier failover, contiguous reassembly, and full-payload canonical RFC 8785 JSON SHA-256 digest verification.
+   - **Strict M4.1–M4.4 Non-Scope Boundary:** Milestones M4.1–M4.4 strictly transfer bytes and verify cryptographic integrity. M4.1–M4.4 **MUST NOT** install snapshots, touch `PlaybackState`, modify `OrderedOperationLog`, reseed logical clocks, drain quarantined events, or transition the engine state machine.
+3. **Milestone M5: Staged Installation & Live Quarantine Buffer (Future Scope):**
+   Implements the live quarantine event buffer, 4-outcome prefix compatibility verification, out-of-band staged engine state construction, clock reseeding, quarantine draining, and atomic 14-component reference swap.
+4. **Milestone M6: Autonomous Recovery Coordinator (Future Scope):**
+   Implements the 4-state recovery coordinator (`ACTIVE`, `RECOVERING`, `RECONCILING`, `DEGRADED`), autonomous trigger conditions, and end-to-end integration.
 
 ```mermaid
 flowchart TD
-    subgraph M3 ["Milestone M3: Snapshot & Horizon (FROZEN)"]
-        S_Gen["exportEngineSnapshotV2()"] --> S_Dig["computeSnapshotDigestV2()<br/>(RFC 8785 Canonical SHA-256)"]
-        Log_Comp["compactAtFrontier(V_epoch_safe)"] --> Checkpoints["Compacted Checkpoints (K=256)"]
+    subgraph M4_0 ["Milestone M4.0: Prerequisite M3 Infrastructure Corrections (Pre-Transfer)"]
+        M4_0a["M4.0a: STATE_DIGEST Identity Binding"]
+        M4_0b["M4.0b: Exact Timestamp Resolution"]
+        M4_0c["M4.0c: Facade Capability Gating"]
+        M4_0d["M4.0d: Transactional Compaction Staging<br/>(8-Component Out-of-Band Candidate Swap)"]
     end
 
-    subgraph M4 ["Milestone M4: Snapshot Transfer Protocol (Current Scope)"]
-        S_Dig --> Offer["SNAPSHOT_OFFER"]
+    subgraph M4_Transfer ["Milestones M4.1–M4.4: Snapshot Transfer Protocol (M4 Scope)"]
+        S_Dig["Canonical RFC 8785 Digest"] --> Admit["Upfront Admission Gate<br/>(calculateSnapshotAdmission)"]
+        Admit --> Offer["SNAPSHOT_OFFER"]
         Offer --> Req["SNAPSHOT_REQUEST"]
-        Req --> Slice["Iterative Sizing & Slicing Loop<br/>(Exact UTF-8 <= SCTP Limit)"]
+        Req --> Slice["Iterative Sizing & Slicing Loop<br/>(Exact UTF-8 <= SCTP Limit, K_max=5)"]
         Slice --> Send["SNAPSHOT_CHUNK"]
         Send --> Flow["Sliding Window Flow Control<br/>(Window: 4 Chunks)"]
         Flow --> Retrans["SNAPSHOT_CHUNK_REQUEST<br/>(Selective Retransmission)"]
@@ -47,36 +58,46 @@ flowchart TD
         Prefix --> Staged["Staged 14-Component Reference Swap"]
     end
 
-    style M3 fill:#e1f5fe,stroke:#0288d1,stroke-width:2px
-    style M4 fill:#e8f5e9,stroke:#2e7d32,stroke-width:2px
+    style M4_0 fill:#ffebee,stroke:#c62828,stroke-width:2px
+    style M4_Transfer fill:#e8f5e9,stroke:#2e7d32,stroke-width:2px
     style M5 fill:#fff3e0,stroke:#ef6c00,stroke-width:2px
 ```
 
-### 1.2 Capacity Invariant, Chunk Count Ceiling, and Upfront Admission Gate
+### 1.2 Capacity Invariant, Chunk Count Ceiling, and Exact Upfront Admission Gate
 
 A fundamental physical and protocol reality governs state recovery over WebRTC: individual snapshot capacity is fundamentally bound by the negotiated SCTP maximum message size of the transport link and the fixed maximum chunk count.
 
-#### 1.2.1 Mathematical Formulation of Admission
-Before allocating reassembly memory or accepting an incoming transfer offer, the protocol computes the expected chunk count:
-$$\text{chunkPayloadEstimate} = \text{calculateDynamicChunkSize}(\text{effectiveLimit})$$
-$$\text{requiredChunks} = \left\lceil \frac{\text{totalSizeBytes}}{\text{chunkPayloadEstimate}} \right\rceil$$
+#### 1.2.1 Exact Sizing Contract and Envelope Budget
+The admission calculation must be completely conservative and consistent with the actual wire serialization executed by the outbound transfer pipeline. It accounts for:
+1. **Complete ProtocolMessage Envelope Overhead:** The outer framing (`protocolVersion`, `sessionId`, `type`, `senderPeerId`, `timestamp`, `signature`), payload object keys, UUIDs, epoch numbers, chunk indices, total chunks, byte counts, and the 64-character hex `chunkSha256` string.
+2. **Guaranteed Maximum Envelope Budget:** Defined as $\text{MAX\_ENVELOPE\_OVERHEAD\_BYTES} = 1024$ bytes, strictly bounding the serialization overhead under maximum schema string lengths.
+3. **Base64 Expansion:** Every 3 binary bytes expand to 4 Base64 characters ($4 \times \lceil B / 3 \rceil$). To guarantee that the encoded data plus envelope fits within `effectiveLimit`:
+   $$\text{maxBase64Bytes} = \text{effectiveLimit} - \text{MAX\_ENVELOPE\_OVERHEAD\_BYTES}$$
+   $$\text{chunkBinaryCapacity} = \min\left(\text{MAX\_CHUNK\_BYTES}, \left\lfloor \frac{\text{maxBase64Bytes}}{4} \right\rfloor \times 3\right)$$
+   (where $\text{MAX\_CHUNK\_BYTES} = 32,768$ bytes).
 
-#### 1.2.2 Mandatory Capacity Invariant
-$$\text{requiredChunks} \le \text{MAX\_CHUNKS\_PER\_SNAPSHOT} \quad (\text{where } \text{MAX\_CHUNKS\_PER\_SNAPSHOT} = 128)$$
-$$\text{offer.totalChunks} \le \text{MAX\_CHUNKS\_PER\_SNAPSHOT} \quad (\le 128)$$
+#### 1.2.2 Exact Mathematical Formulation of Admission
+Before allocating reassembly memory or accepting an incoming transfer offer, both supplier and requester evaluate:
+$$\text{calculatedRequiredChunks} = \left\lceil \frac{\text{totalSizeBytes}}{\text{chunkBinaryCapacity}} \right\rceil$$
 
-If $\text{requiredChunks} > 128$ or $\text{offer.totalChunks} > 128$, the transfer is **rejected immediately at admission** with reason `CHUNK_COUNT_EXCEEDED` or `TRANSPORT_LIMIT_EXCEEDED` before allocating any reassembly buffer or assembler structures.
+#### 1.2.3 Mandatory Capacity and Consistency Invariants
+$$\mathbf{\text{Invariant 1 (Ceiling):}} \quad \text{calculatedRequiredChunks} \le \text{MAX\_CHUNKS\_PER\_SNAPSHOT} \ (128)$$
+$$\mathbf{\text{Invariant 2 (Consistency):}} \quad \text{offer.totalChunks} === \text{calculatedRequiredChunks}$$
 
-#### 1.2.3 Transport-Dependent Snapshot Capacity Matrix
-The protocol **does NOT claim universal 4 MiB snapshot transfer support over severely constrained 2 KiB SCTP transports**. On a 2,048-byte link, transferring a 4 MiB snapshot would require $\lceil 4,194,304 / 960 \rceil = 4,369$ chunks, vastly exceeding the 128-chunk bound. Instead, effective snapshot capacity scales with transport limits:
+- **Admission Rejection:** If $\text{calculatedRequiredChunks} > 128$, the transfer is rejected immediately with `CHUNK_COUNT_EXCEEDED` or `TRANSPORT_LIMIT_EXCEEDED`.
+- **Inconsistent Offer Rejection:** If $\text{offer.totalChunks} !== \text{calculatedRequiredChunks}$, the offer is rejected immediately with `OFFER_INCONSISTENT` before allocating any assembler or reassembly buffer memory. An inconsistent offer indicates a malformed or incompatible supplier slicing contract.
+- **Variable Final-Chunk Guarantee:** Chunks $0 \dots N-2$ carry exactly $\text{chunkBinaryCapacity}$ bytes. The final chunk $N-1$ carries $B_{\text{final}} = \text{totalSizeBytes} - (N-1) \times \text{chunkBinaryCapacity} \le \text{chunkBinaryCapacity}$ bytes. Because $B_{\text{final}} \le \text{chunkBinaryCapacity}$, its Base64 encoding is strictly $\le$ preceding chunks, guaranteed to fit within `effectiveLimit`.
 
-| Transport SCTP Limit | Envelope Overhead | Available Base64 | Chunk Payload Estimate | Max Transferable Snapshot (128 chunks) | Operational Recovery Scope |
+#### 1.2.4 Transport-Dependent Snapshot Capacity Matrix
+The protocol **does NOT claim universal 4 MiB snapshot transfer support over severely constrained 2 KiB SCTP transports**. On a 2,048-byte link, transferring a 4 MiB snapshot would require $\approx 5,462$ chunks of 768 bytes, vastly exceeding the 128-chunk bound. Instead, effective snapshot capacity scales with transport limits:
+
+| Transport SCTP Limit | Envelope Overhead | Available Base64 | Chunk Binary Capacity | Max Transferable Snapshot (128 chunks) | Operational Recovery Scope |
 |:---|:---:|:---:|:---:|:---:|:---|
-| **65,536 B (Standard / Fallback)** | ~768 B | ~64,768 B | 32,768 B (Capped) | **4,194,304 B (4.00 MiB)** | Full 4 MiB Engine Snapshot |
-| **32,768 B** | ~768 B | ~32,000 B | 24,000 B | **3,072,000 B (2.93 MiB)** | Admitted if $\le 2.93\text{ MiB}$; rejected otherwise |
-| **16,384 B** | ~768 B | ~15,616 B | 11,712 B | **1,499,136 B (1.43 MiB)** | Admitted if $\le 1.43\text{ MiB}$; rejected otherwise |
-| **8,192 B** | ~768 B | ~7,424 B | 5,568 B | **712,704 B (696 KiB)** | Admitted if $\le 696\text{ KiB}$; rejected otherwise |
-| **2,048 B (Minimum Floor)** | ~768 B | ~1,280 B | 960 B | **122,880 B (120 KiB)** | Small snapshot / test case support only |
+| **65,536 B (Standard / Fallback)** | ~1,024 B | ~64,512 B | 32,768 B (Capped) | **4,194,304 B (4.00 MiB)** | Full 4 MiB Engine Snapshot |
+| **32,768 B** | ~1,024 B | ~31,744 B | 23,808 B | **3,047,424 B (2.90 MiB)** | Admitted if $\le 2.90\text{ MiB}$; rejected otherwise |
+| **16,384 B** | ~1,024 B | ~15,360 B | 11,520 B | **1,474,560 B (1.40 MiB)** | Admitted if $\le 1.40\text{ MiB}$; rejected otherwise |
+| **8,192 B** | ~1,024 B | ~7,168 B | 5,376 B | **688,128 B (672 KiB)** | Admitted if $\le 672\text{ KiB}$; rejected otherwise |
+| **2,048 B (Minimum Floor)** | ~1,024 B | ~1,024 B | 768 B | **98,304 B (96 KiB)** | Small snapshot / test case support only |
 | **< 2,048 B** | N/A | N/A | < 256 B | **0 B (Rejected Upfront)** | Unsupported link; immediate abort |
 
 By evaluating the admission invariant upfront, the engine never enters a deadlocked or memory-exhausted transfer state on constrained transports.
@@ -231,24 +252,36 @@ Snapshot transfer relies on dual-level bounded retry and deadline policies to pr
 
 ## 6. Normative Iterative Sizing, Termination Proof, and Send Boundary
 
-### 6.1 Source of Negotiated SCTP Maximum Message Size & Fallback Policy
+### 6.1 Source of Negotiated SCTP Maximum Message Size & Transport Behavior
 WebRTC DataChannel message capacity is negotiated during the WebRTC SCTP handshake (`RTCSctpTransport.maxMessageSize`).
 
 1. **Production Retrieval Path:**
    - The production transport retrieval path is `PeerManager.getSctpMaxMessageSize(peerId)`.
    - This method inspects the underlying active `WebRtcTransport.sctpMaxMessageSize`, which queries `(this.peerConnection as any).sctp?.maxMessageSize`.
-2. **Missing or Invalid Value Handling & Fallback Policy:**
-   - If `sctpMaxMessageSize` is `undefined`, `null`, $\le 0$, or non-finite (`NaN` or `Infinity`), the transport adopts a conservative fallback of `65,536` bytes (`MAX_MESSAGE_BYTES`).
-   - **Crucial Clarification:** This fallback of 65,536 bytes is **strictly a conservative local implementation policy cap** in SyncPlay for outbound framing. It is **NOT** an RFC 8831 guarantee. RFC 8831 does not specify 64 KB as a universal default or minimum; WebRTC implementations negotiate SCTP message limits based on remote endpoint SCTP receive buffers (often 64 KB, 256 KB, or larger). SyncPlay deliberately chooses 65,536 bytes as a safe, conservative local outbound ceiling.
-3. **Relationship Between Effective Limit and Application Cap:**
-   - The effective wire limit is strictly bounded by the application-level framing cap:
-     $$\text{effectiveLimit} = \min(\text{sctpMaxMessageSize} \mathbin{??} 65536, 65536)$$
-   - Even if the underlying SCTP transport reports a larger negotiated limit (e.g. 262,144 bytes / 256 KB), SyncPlay's application framing policy caps individual protocol messages at 65,536 bytes to avoid data channel buffer bloat and head-of-line blocking.
-4. **Meaning of the 2,048-Byte Minimum (`MIN_SUPPORTED_SCTP_LIMIT = 2048`):**
-   - The protocol envelope (Base64 encoding expansion, JSON field keys, UUIDs, signatures, hash hex strings) requires $\approx 768$ bytes (`CHUNK_ENVELOPE_BUDGET_BYTES`).
-   - If a negotiated SCTP limit is $< 2,048$ bytes, the remaining payload budget falls below viable operational thresholds ($< 960$ bytes), and if it drops further, chunks drop below `MIN_CHUNK_BYTES = 256`, which would cause fragmentation failure.
-   - Any transport reporting an SCTP limit $< 2,048$ bytes cannot support chunked snapshot transfer; the transfer is immediately rejected/aborted upfront with `TRANSPORT_LIMIT_EXCEEDED`.
-5. **Exact Send Boundary Invariant:**
+2. **Behavior Across SCTP Negotiation States:**
+   - **Case A: Available and Valid ($> 0$ and finite):**
+     If `maxMessageSize` is a positive finite number:
+     - If `maxMessageSize < MIN_SUPPORTED_SCTP_LIMIT` (2,048 bytes): Abort transfer immediately with `TRANSPORT_LIMIT_EXCEEDED` before allocating buffers.
+     - If `maxMessageSize >= MIN_SUPPORTED_SCTP_LIMIT`: The effective message limit is capped at SyncPlay's application framing limit:
+       $$\text{effectiveLimit} = \min(65536, \text{maxMessageSize})$$
+   - **Case B: Not Yet Negotiated (`undefined` during ICE/DTLS/SCTP handshaking):**
+     - **Normative Policy:** Transfer initiation **MUST BE DEFERRED** until connection establishment and SCTP parameter negotiation are complete (`dataChannelState === 'open' && sctpMaxMessageSize !== undefined`). Neither `SNAPSHOT_REQUEST` nor `SNAPSHOT_OFFER`/`SNAPSHOT_CHUNK` may be transmitted on speculative, un-negotiated channels.
+   - **Case C: Undefined or Unavailable on Open DataChannel:**
+     - If the DataChannel is open (`dataChannelState === 'open'`) but the host environment does not expose `RTCSctpTransport.maxMessageSize` (e.g. legacy browser or Node.js mock), the transport applies the conservative fallback of `65,536` bytes (`MAX_MESSAGE_BYTES`).
+     - **Documented Limitations of Fallback:** This fallback of 65,536 bytes is **strictly a conservative local implementation policy cap** in SyncPlay for outbound framing. It is **NOT** an RFC 8831 guarantee and **CANNOT be mistaken for proof of remote transport capacity**. If the remote endpoint's actual receive buffer is smaller (e.g. 16 KB or 32 KB), a 64 KB message could fail at the transport layer. Therefore, conservative framing and robust synchronous send error handling are mandatory.
+   - **Case D: Zero, Negative, or Non-Finite (`<= 0`, `NaN`, `Infinity`):**
+     - Zero in SCTP indicates "no messages can be sent" or an unnegotiated association.
+     - Negative or non-finite values are illegal under W3C WebRTC specifications.
+     - These values are treated as invalid/unnegotiated transport states; transfer initiation is deferred until a valid finite positive limit is available, or rejected upfront if negotiation has completed without a valid value.
+3. **Handling of Synchronous `RTCDataChannel.send()` Failures:**
+   - When `PeerManager.sendSerialized()` calls `transport.send(serializedJson)` and the underlying `RTCDataChannel.send()` throws or returns `false` (e.g. DataChannel buffer backpressure, channel abruptly closed, or peer disconnected):
+     1. **Do Not Mark Unsent Chunk as Transmitted:** The chunk remains strictly un-sent. In-flight window credit is NOT consumed or acknowledged.
+     2. **Do Not Lose Retry State:** The failed transmission attempt is accounted against the chunk's retry budget: $\text{chunkRetryCount}[i]$ is incremented.
+     3. **Do Not Corrupt Transfer Counters:** `receivedBytes`, `sentBytes`, and progress counters remain un-incremented.
+     4. **Failure Policy:**
+        - If failure is due to `DataChannel not open`, `Peer not found`, or generation mismatch: Abort immediately with `SUPPLIER_DISCONNECTED`.
+        - If failure is due to size exceedance or temporary transport buffer backpressure: If $\text{chunkRetryCount}[i] < \text{MAX\_CHUNK\_RETRIES}$ (3), the supplier may retry with a further reduced binary slice or back off. If retries exceed 3, the transfer cleanly aborts with `TRANSPORT_LIMIT_EXCEEDED` or `TRANSFER_TIMEOUT`.
+4. **Exact Send Boundary Invariant:**
    - The complete `ProtocolMessage` is serialized to JSON string exactly once per sizing iteration.
    - The UTF-8 byte length is calculated from that exact serialized string using `new TextEncoder().encode(serializedString).byteLength`.
    - The identical string that was measured and verified to be $\le \text{effectiveLimit}$ is passed unchanged to `PeerManager.sendSerialized()` and `RTCDataChannel.send()`.
@@ -349,21 +382,52 @@ To maintain memory consumption well below the theoretical ceiling:
 ### 8.3 Limitation C: Compaction Exception Atomicity (M4.0d Staged Mutation Inventory)
 A documented non-throwing contract is insufficient to ensure transactional safety during log compaction. If the state reducer throws while compacting operations forward into the base snapshot, any partially updated data structures would leave the sync engine in a permanently corrupt state.
 
-#### 8.3.1 Complete Staged Mutation Inventory
-In `OrderedOperationLog.compactAtFrontier(stableFrontier)`, all modifications are performed out-of-band on a staged candidate set before any active engine reference is modified:
+#### 8.3.1 Complete Staged Mutation Inventory & Reconstruction Strategies
+In `OrderedOperationLog.compactAtFrontier(stableFrontier)`, all mutations are performed out-of-band on a staged candidate set before any active engine reference is modified. Each structure specifies an exact cloning or reconstruction strategy:
 
-1. **Candidate `baseSnapshot`:** A deep clone of the current base snapshot (`structuredClone(this.baseSnapshot)`). Operations strictly older than or equal to `stableFrontier` are reduced into this candidate clone via `this.reducer(candidateBaseSnapshot, op)`.
-2. **Candidate `operations` Array:** A shallow slice/copy containing only the retained operations strictly newer than `stableFrontier`.
-3. **Candidate `idIndex`:** A newly constructed `Map<string, number>` indexing only the retained operations in the candidate `operations` array.
-4. **Candidate `originSeqIndex`:** A newly constructed `Map<string, number>` indexing `originPeerId:sequenceNumber` for retained operations only.
-5. **Candidate `compactedCheckpoints`:** A cloned `Map<string, Map<number, CompactedCheckpoint>>` retaining historical checkpoints at $K=256$ intervals up to the compaction horizon.
-6. **Candidate `originFrontierTimestamps`:** A newly constructed `Map<string, number>` recording the exact sequence timestamps of the compacted operations at the frontier.
-7. **Candidate `baseSnapshotFrontier`:** An updated replication vector record reflecting the exact causal frontier of the candidate base snapshot.
-8. **Candidate Sequence Metadata:** Cloned and updated sequence boundary tracking variables (e.g. `firstRetainedSequence`, `minRetainedSequenceNumber`).
+1. **`this.baseSnapshot` (`PlaybackState | undefined`):**
+   - **Cloning Strategy: DEEP CLONE** via `structuredClone(this.baseSnapshot)`.
+   - The candidate clone is folded forward sequentially: `candidateBaseSnapshot = this.reducer(candidateBaseSnapshot, op)`.
+   - Immutable reference reuse is strictly prohibited because the reducer mutates or transforms playback state trees.
+2. **`this.operations` (`StoredOperation[]`):**
+   - **Cloning Strategy: SHALLOW ARRAY CLONE / FILTERED ARRAY** containing only the retained `StoredOperation` references strictly newer than `stableFrontier`.
+   - `StoredOperation` items are immutable and reused by reference.
+3. **`this.idIndex` (`Map<string, StoredOperation>`):**
+   - **Cloning Strategy: RECONSTRUCTED MAP**.
+   - A new `Map<string, StoredOperation>()` is instantiated and populated solely with `op.logicalEventId -> op` for retained candidate operations, avoiding deletion on the active map.
+4. **`this.originSeqIndex` (`Map<string, StoredOperation>`):**
+   - **Cloning Strategy: RECONSTRUCTED MAP**.
+   - A new `Map<string, StoredOperation>()` is instantiated and populated with `${op.originPeerId}:${op.originSequenceNumber} -> op` for retained candidate operations.
+5. **`this.compactedCheckpoints` (`Map<string, CompactedCheckpointRecord>`):**
+   - **Cloning Strategy: SHALLOW MAP CLONE WITH IMMUTABLE RECORD ADDITIONS**.
+   - A new `Map<string, CompactedCheckpointRecord>(this.compactedCheckpoints)` is cloned. Newly pruned operations insert new immutable `CompactedCheckpointRecord` objects, enforcing the 256-entry FIFO eviction policy. Existing records are reused by reference.
+6. **`this.originFrontierTimestamps` (`Map<string, number>`):**
+   - **Cloning Strategy: SHALLOW MAP CLONE**.
+   - A new `Map<string, number>(this.originFrontierTimestamps)` is cloned and updated with exact sequence timestamps from pruned operations, enforcing the 64-entry FIFO eviction policy.
+7. **`this.baseSnapshotFrontier` (`Record<string, number>`):**
+   - **Cloning Strategy: SHALLOW RECORD CLONE**.
+   - A new record `{ ...this.baseSnapshotFrontier }` is copied and updated with maximum sequence numbers of folded operations.
+8. **`this.hasPrunedOperations` (`boolean`):**
+   - **Cloning Strategy: SCALAR BOOLEAN VALUE**.
+   - Set to `true` if `toPrune.length > 0`, otherwise preserves previous value.
 
-#### 8.3.2 Atomicity Invariant and Exception Rollback
-- **No Mutation Before Validation:** Zero active state structures, indexes, arrays, or references are modified until all operations in the pruned range have been reduced into the candidate base snapshot without error, and all candidate metadata structures have been computed and validated.
-- **Exception Rollback Guarantee:** If `this.reducer` throws an exception at any point during candidate reduction, or if any candidate validation fails, the candidate objects are discarded, the exception is propagated to the caller, and `this.baseSnapshot`, `this.operations`, `this.idIndex`, `this.originSeqIndex`, `this.compactedCheckpoints`, `this.originFrontierTimestamps`, and `this.baseSnapshotFrontier` remain 100% untouched.
+#### 8.3.2 Atomicity Invariant, Atomic Swap, and Formal Rollback Proof
+- **Atomic Reference Swap:**
+  Only when every operation in the pruned range has been folded into `candidateBaseSnapshot` without throwing, and all candidate indexes and maps are fully constructed and validated, are the references swapped in a single synchronous block:
+  ```typescript
+  this.baseSnapshot = candidateBaseSnapshot;
+  this.operations = candidateOperations;
+  this.idIndex = candidateIdIndex;
+  this.originSeqIndex = candidateOriginSeqIndex;
+  this.compactedCheckpoints = candidateCompactedCheckpoints;
+  this.originFrontierTimestamps = candidateOriginFrontierTimestamps;
+  this.baseSnapshotFrontier = candidateBaseSnapshotFrontier;
+  this.hasPrunedOperations = candidateHasPrunedOperations;
+  ```
+- **Formal Proof Criterion:**
+  $$\mathbf{\text{ReducerFailure}} \implies \mathbf{\text{ActiveStateAfter} \equiv \text{ActiveStateBefore}}$$
+  If `this.reducer` throws at any point (e.g. during operation $k$ of $N$), or if candidate validation fails:
+  The candidate objects are discarded, the exception propagates to the caller, and **all 8 active structures remain 100% untouched** (identical references and identical content). Zero partial log mutation or corrupt state is possible.
 - **Implementation Milestone:** **M4.0d (Prerequisite)**.
 
 ---

@@ -32,12 +32,12 @@ flowchart TD
 ## 2. Sub-Milestone Breakdown
 
 ### Milestone M4.0: Pre-M4 Correctness, Security & Compaction Closures (Prerequisite)
-- **Objective:** Address mandatory M3 audit limitations A, B, and C prior to introducing recovery transfer wire traffic.
+- **Objective:** Address mandatory M3 audit limitations A, B, and C in existing infrastructure prior to introducing recovery transfer wire traffic.
 - **Scope:**
   - **M4.0a (`STATE_DIGEST` Identity Binding):** In `TrustedTransportAdapter.handleTransportMessage()`, verify `msg.payload.senderPeerId === inbound.fromPeerId` and `msg.payload.connectionGeneration === peerStatus.generation`. Drop and reject any identity or generation mismatches.
   - **M4.0b (Exact Timestamp Resolution):** In `OrderedOperationLog.getOriginFrontierTimestamps()`, eliminate loose fallback to non-sequence-specific `originFrontierTimestamps`. Return exact sequence timestamps or report metadata unavailable.
   - **M4.0c (Facade Gating):** Restrict `LeaderlessSyncEngine.recordPeerDigest()` to internal/capability-authorized registration.
-  - **M4.0d (Compaction Exception Staging & Staged Mutation Inventory):** In `OrderedOperationLog.compactAtFrontier()`, execute candidate base snapshot reduction across the complete 7-component staged mutation inventory (`candidateBaseSnapshot`, `candidateOperations`, `candidateIdIndex`, `candidateOriginSeqIndex`, `candidateCompactedCheckpoints`, `candidateOriginFrontierTimestamps`, `candidateBaseSnapshotFrontier`, plus sequence metadata) out-of-band before mutating any active log structures. If the reducer throws, candidate objects are discarded, the exception propagates, and active engine state remains 100% untouched.
+  - **M4.0d (Compaction Exception Staging & 8-Component Mutation Inventory):** In `OrderedOperationLog.compactAtFrontier()`, execute candidate base snapshot reduction across the complete 8-component mutation inventory (`baseSnapshot` via `structuredClone`, `operations` via shallow filter, `idIndex` and `originSeqIndex` via reconstruction, `compactedCheckpoints` and `originFrontierTimestamps` via shallow map clones with FIFO policies, `baseSnapshotFrontier` via shallow record copy, and `hasPrunedOperations`) out-of-band before mutating any active log structures. If the reducer throws, candidate objects are discarded, the exception propagates, and active engine state remains 100% untouched (`ReducerFailure => ActiveStateAfter === ActiveStateBefore`).
 - **Deliverables:**
   - Code changes in `packages/sync-engine/src/engine/leaderless-sync-engine.ts` and `packages/sync-engine/src/log/ordered-operation-log.ts`.
   - Targeted unit tests in `packages/sync-engine/src/__tests__/closure-m4-0.test.ts`.
@@ -48,9 +48,9 @@ flowchart TD
 ### Milestone M4.1: Wire Protocol Schemas & Chunk Assembler Primitives
 - **Objective:** Implement all recovery wire message contracts in `@syncplay/protocol` and the in-memory chunk tracking, deduplication, and failover assembly engine in `@syncplay/sync-engine`.
 - **Scope:**
-  - Add schemas to `@syncplay/protocol`: `SnapshotOfferPayloadSchema`, `SnapshotRequestPayloadSchema`, `SnapshotChunkPayloadSchema`, `SnapshotChunkRequestPayloadSchema`, `SnapshotAbortPayloadSchema` (including `CHUNK_COUNT_EXCEEDED` reason).
+  - Add schemas to `@syncplay/protocol`: `SnapshotOfferPayloadSchema`, `SnapshotRequestPayloadSchema`, `SnapshotChunkPayloadSchema`, `SnapshotChunkRequestPayloadSchema`, `SnapshotAbortPayloadSchema` (including `CHUNK_COUNT_EXCEEDED` and `OFFER_INCONSISTENT` reasons).
   - Export schemas and TypeScript types in `@syncplay/protocol/index.ts`.
-  - Implement `calculateDynamicChunkSize(sctpLimit)` and `calculateSnapshotAdmission(totalSizeBytes, sctpLimit)` in `@syncplay/protocol` with conservative local implementation policy cap (65,536 bytes).
+  - Implement `calculateChunkCapacity(effectiveLimit)` and `calculateSnapshotAdmission(totalSizeBytes, sctpLimit, advertisedTotalChunks)` in `@syncplay/protocol` enforcing `offer.totalChunks === calculatedRequiredChunks` invariant.
   - Implement `ChunkAssembler` in `packages/sync-engine/src/recovery/chunk-assembler.ts`:
     - Fixed pre-allocation bounded to $\le 128$ chunks.
     - Base64 binary decoding and per-chunk `chunkSha256` verification.
@@ -72,10 +72,12 @@ flowchart TD
 - **Scope:**
   - Implement `SnapshotTransferManager` (Supplier Role):
     - Validate incoming `SNAPSHOT_REQUEST` against active epoch, supplier identity, and snapshot availability.
+    - Defer transfer initiation if SCTP parameters are not yet negotiated.
     - Enforce upfront admission gate: evaluate `calculateSnapshotAdmission()`; reject if required chunks $> 128$.
-    - Slice binary snapshot into chunks using `calculateDynamicChunkSize()`.
+    - Slice binary snapshot into chunks using `calculateChunkCapacity()`.
     - Execute normative 7-step iterative sizing loop: serialize `SNAPSHOT_CHUNK`, measure exact UTF-8 bytes via `TextEncoder`, reduce binary slice by $\Delta = \lceil \text{overshoot} \times 0.75 \rceil + 32$ if exceeding negotiated SCTP limit.
     - Enforce hard operational bound: maximum 5 sizing attempts per chunk (`MAX_SIZING_ITERATIONS = 5`); abort with `TRANSPORT_LIMIT_EXCEEDED` if exceeded or if slice $< 256$ bytes.
+    - Synchronous send error handling: If `sendSerialized()` returns `{ ok: false }`, chunk is NOT marked as transmitted; retry counters are incremented without desynchronization; failure policy is enforced.
     - Pass exact tested serialized string unchanged to `PeerManager.sendSerialized()`.
     - Handle `SNAPSHOT_CHUNK_REQUEST` retransmissions.
     - Bound concurrent outbound transfers to at most 2 per supplier (`MAX_SUPPLIER_CONCURRENT_TRANSFERS = 2`).
@@ -91,7 +93,8 @@ flowchart TD
 - **Scope:**
   - Implement `SnapshotTransferManager` (Requester Role):
     - Enforce single active inbound transfer invariant per node.
-    - Enforce upfront admission gate on incoming `SNAPSHOT_OFFER`: calculate expected chunks and reject if required chunks $> 128$ or `offer.totalChunks > 128` before allocating reassembly buffers.
+    - Defer transfer initiation until transport SCTP negotiation is complete.
+    - Enforce upfront admission gate on incoming `SNAPSHOT_OFFER`: calculate expected chunks and reject if required chunks $> 128$ or `offer.totalChunks !== calculatedRequiredChunks` before allocating reassembly buffers.
     - Conservative memory management bounded within theoretical envelope ($\approx 28\text{–}32\text{ MiB}$).
     - Sliding-window flow control: pipeline up to 4 concurrent chunk requests (`MAX_CONCURRENT_CHUNK_REQUESTS = 4`).
     - Ingest incoming `SNAPSHOT_CHUNK` into `ChunkAssembler`.
@@ -126,11 +129,12 @@ flowchart TD
 
 ---
 
-## 3. Explicit Prohibited Work in M4
+## 3. Strict Milestone Boundaries and Prohibited Work in M4.1–M4.4
 
-To maintain architectural integrity:
-- **PROHIBITED:** Calling `engine.importSnapshot()`, `engine.importSnapshotV2()`, or modifying engine state.
-- **PROHIBITED:** Touching `PlaybackState`, `replicationVector`, or `OrderedOperationLog`.
-- **PROHIBITED:** Reseeding the Lamport logical clock or modifying `LogicalClockManager`.
-- **PROHIBITED:** Implementing quarantine event buffering or draining (deferred to M5).
-- **PROHIBITED:** Transitioning recovery state machine to `ACTIVE` or `RECONCILING` (deferred to M6).
+To maintain architectural integrity across the milestone progression:
+- **Milestone Scope Clarification:** M4.0 modifies `OrderedOperationLog.compactAtFrontier()` exclusively as a prerequisite correctness fix for M3 infrastructure. In contrast, Milestones M4.1–M4.4 implement snapshot transfer over WebRTC DataChannels and operate strictly outside the engine.
+- **PROHIBITED in M4.1–M4.4:** Calling `engine.importSnapshot()`, `engine.importSnapshotV2()`, or modifying engine state.
+- **PROHIBITED in M4.1–M4.4:** Touching `PlaybackState`, `replicationVector`, or `OrderedOperationLog`.
+- **PROHIBITED in M4.1–M4.4:** Reseeding the Lamport logical clock or modifying `LogicalClockManager`.
+- **PROHIBITED in M4.1–M4.4:** Implementing quarantine event buffering or draining (deferred to M5).
+- **PROHIBITED in M4.1–M4.4:** Transitioning recovery state machine to `ACTIVE` or `RECONCILING` (deferred to M6).

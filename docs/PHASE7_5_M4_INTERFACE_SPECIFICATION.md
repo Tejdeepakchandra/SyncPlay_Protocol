@@ -33,6 +33,9 @@ export const MIN_SUPPORTED_SCTP_LIMIT = 2048;
 /** Envelope budget in bytes for SNAPSHOT_CHUNK metadata, UUIDs, and Base64 framing overhead. */
 export const CHUNK_ENVELOPE_BUDGET_BYTES = 768;
 
+/** Guaranteed maximum envelope overhead in bytes for ProtocolMessage wrapping, JSON keys, UUIDs, and signatures. */
+export const MAX_ENVELOPE_OVERHEAD_BYTES = 1024;
+
 /** Hard operational bound on sizing loop attempts per chunk. */
 export const MAX_SIZING_ITERATIONS = 5;
 
@@ -76,6 +79,7 @@ export const SnapshotAbortReasonSchema = z.enum([
   'LOCAL_ABORT',
   'TRANSPORT_LIMIT_EXCEEDED',
   'CHUNK_COUNT_EXCEEDED',
+  'OFFER_INCONSISTENT',
   'STALE_SNAPSHOT',
   'CHECKPOINT_DIVERGENCE',
   'IDENTITY_MISMATCH',
@@ -224,24 +228,46 @@ export type SnapshotAbortPayload = z.infer<typeof SnapshotAbortPayloadSchema>;
 export interface SnapshotAdmissionResult {
   readonly eligible: boolean;
   readonly requiredChunks: number;
-  readonly maxPayloadPerChunk: number;
+  readonly chunkBinaryCapacity: number;
   readonly effectiveLimit: number;
   readonly reason?: SnapshotAbortReason;
   readonly detail?: string;
 }
 
 /**
- * Evaluates whether an advertised or requested snapshot can be admitted over a given transport link.
- * Guarantees requiredChunks <= MAX_CHUNKS_PER_SNAPSHOT (128) before allocating reassembly buffers.
+ * Calculates the exact binary capacity per chunk for a given effective message limit.
+ * Accounts for complete ProtocolMessage envelope overhead, Base64 expansion,
+ * chunk indices, UUIDs, type strings, timestamps, signatures, and hash hex strings.
  *
- * Rejection occurs upfront if:
- * 1. effectiveLimit < MIN_SUPPORTED_SCTP_LIMIT (2048) -> TRANSPORT_LIMIT_EXCEEDED
- * 2. totalSizeBytes > MAX_SNAPSHOT_BYTES (4,194,304) -> LOCAL_ABORT
- * 3. requiredChunks > MAX_CHUNKS_PER_SNAPSHOT (128) -> CHUNK_COUNT_EXCEEDED
+ * Guaranteed to never underestimate the required chunk count or overshoot wire limits.
+ */
+export function calculateChunkCapacity(effectiveLimit: number): number {
+  if (effectiveLimit < MIN_SUPPORTED_SCTP_LIMIT) {
+    throw new Error(
+      `SCTP limit (${effectiveLimit} bytes) is below minimum supported limit (${MIN_SUPPORTED_SCTP_LIMIT} bytes)`
+    );
+  }
+
+  const availableBase64 = Math.max(0, effectiveLimit - MAX_ENVELOPE_OVERHEAD_BYTES);
+  // Base64 expands 3 binary bytes to 4 characters; floor to complete 3-byte triples
+  const maxBinaryBytes = Math.floor(availableBase64 / 4) * 3;
+  return Math.min(MAX_CHUNK_BYTES, maxBinaryBytes);
+}
+
+/**
+ * Exact, conservative admission evaluation for snapshot transfers.
+ * Validates:
+ * 1. effectiveLimit >= MIN_SUPPORTED_SCTP_LIMIT (2048) -> TRANSPORT_LIMIT_EXCEEDED
+ * 2. totalSizeBytes <= MAX_SNAPSHOT_BYTES (4,194,304) -> LOCAL_ABORT
+ * 3. calculatedRequiredChunks <= MAX_CHUNKS_PER_SNAPSHOT (128) -> CHUNK_COUNT_EXCEEDED
+ * 4. If advertisedTotalChunks provided: advertisedTotalChunks === calculatedRequiredChunks -> OFFER_INCONSISTENT
+ *
+ * Guarantees rejection before allocating full reassembly buffers.
  */
 export function calculateSnapshotAdmission(
   totalSizeBytes: number,
-  sctpMaxMessageSize?: number
+  sctpMaxMessageSize?: number,
+  advertisedTotalChunks?: number
 ): SnapshotAdmissionResult {
   // Resolve effective limit against local framing policy cap of 65,536 bytes
   const fallbackLimit = 65536; // Conservative local implementation policy cap (NOT RFC 8831 guarantee)
@@ -254,7 +280,7 @@ export function calculateSnapshotAdmission(
     return {
       eligible: false,
       requiredChunks: 0,
-      maxPayloadPerChunk: 0,
+      chunkBinaryCapacity: 0,
       effectiveLimit,
       reason: 'TRANSPORT_LIMIT_EXCEEDED',
       detail: `SCTP limit (${effectiveLimit} B) is below minimum supported limit (${MIN_SUPPORTED_SCTP_LIMIT} B)`,
@@ -265,38 +291,49 @@ export function calculateSnapshotAdmission(
     return {
       eligible: false,
       requiredChunks: 0,
-      maxPayloadPerChunk: 0,
+      chunkBinaryCapacity: 0,
       effectiveLimit,
       reason: 'LOCAL_ABORT',
       detail: `Total size (${totalSizeBytes} B) exceeds maximum permitted (${MAX_SNAPSHOT_BYTES} B)`,
     };
   }
 
-  const chunkPayloadEstimate = calculateDynamicChunkSize(effectiveLimit);
-  const requiredChunks = Math.ceil(totalSizeBytes / chunkPayloadEstimate);
+  const chunkCapacity = calculateChunkCapacity(effectiveLimit);
+  const calculatedRequiredChunks = Math.ceil(totalSizeBytes / chunkCapacity);
 
-  if (requiredChunks > MAX_CHUNKS_PER_SNAPSHOT) {
+  if (calculatedRequiredChunks > MAX_CHUNKS_PER_SNAPSHOT) {
     return {
       eligible: false,
-      requiredChunks,
-      maxPayloadPerChunk: chunkPayloadEstimate,
+      requiredChunks: calculatedRequiredChunks,
+      chunkBinaryCapacity: chunkCapacity,
       effectiveLimit,
       reason: 'CHUNK_COUNT_EXCEEDED',
-      detail: `Required chunks (${requiredChunks}) exceeds maximum allowed (${MAX_CHUNKS_PER_SNAPSHOT}) on ${effectiveLimit} B transport`,
+      detail: `Required chunks (${calculatedRequiredChunks}) exceeds maximum allowed (${MAX_CHUNKS_PER_SNAPSHOT}) on ${effectiveLimit} B transport`,
+    };
+  }
+
+  if (advertisedTotalChunks !== undefined && advertisedTotalChunks !== calculatedRequiredChunks) {
+    return {
+      eligible: false,
+      requiredChunks: calculatedRequiredChunks,
+      chunkBinaryCapacity: chunkCapacity,
+      effectiveLimit,
+      reason: 'OFFER_INCONSISTENT',
+      detail: `Advertised totalChunks (${advertisedTotalChunks}) differs from calculatedRequiredChunks (${calculatedRequiredChunks})`,
     };
   }
 
   return {
     eligible: true,
-    requiredChunks,
-    maxPayloadPerChunk: chunkPayloadEstimate,
+    requiredChunks: calculatedRequiredChunks,
+    chunkBinaryCapacity: chunkCapacity,
     effectiveLimit,
   };
 }
 
 /**
- * Heuristic initial estimate for chunk payload size based on negotiated SCTP limit.
- * The normative send boundary iteratively verifies exact serialized UTF-8 bytes.
+ * Compatible initial estimate for chunk payload size based on negotiated SCTP limit.
+ * Delegates to calculateChunkCapacity(effectiveLimit).
  *
  * NOTE: The 65,536-byte fallback represents SyncPlay's conservative local framing cap,
  * NOT an RFC 8831 universal minimum guarantee.
@@ -307,6 +344,9 @@ export function calculateDynamicChunkSize(sctpMaxMessageSize?: number): number {
     sctpMaxMessageSize !== undefined && sctpMaxMessageSize > 0 && Number.isFinite(sctpMaxMessageSize)
       ? Math.min(fallbackLimit, sctpMaxMessageSize)
       : fallbackLimit;
+
+  return calculateChunkCapacity(effectiveLimit);
+}
 
   if (effectiveLimit < MIN_SUPPORTED_SCTP_LIMIT) {
     throw new Error(
@@ -410,6 +450,9 @@ export interface ISnapshotTransferManager {
    * Initiates outbound transfer to fulfill an incoming SNAPSHOT_REQUEST.
    * Enforces admission check: rejects if calculated requiredChunks > MAX_CHUNKS_PER_SNAPSHOT (128).
    * Executes normative 7-step iterative sizing loop with MAX_SIZING_ITERATIONS = 5.
+   *
+   * Synchronous send handling: If sendSerialized() returns { ok: false }, chunk is NOT marked as sent,
+   * retry counter is incremented, transfer counters are preserved, and failure policy is enforced.
    */
   startOutboundTransfer(
     request: SnapshotRequestPayload,
@@ -422,7 +465,7 @@ export interface ISnapshotTransferManager {
    * Initiates inbound transfer to accept an incoming SNAPSHOT_OFFER.
    * Enforces upfront admission check via calculateSnapshotAdmission():
    * Rejects immediately before allocating reassembly buffer if requiredChunks > 128
-   * or offer.totalChunks > 128.
+   * or offer.totalChunks !== calculatedRequiredChunks.
    */
   startInboundTransfer(
     offer: SnapshotOfferPayload,
@@ -498,44 +541,50 @@ In `OrderedOperationLog.getOriginFrontierTimestamps(frontier)`:
 ### 5.3 Transactional Staging for Compaction (Limitation C / Milestone M4.0d)
 
 ```typescript
+import type { StoredOperation, CompactedCheckpointRecord } from '../log/types.js';
+
 /**
- * Complete staged mutation inventory for transactional log compaction.
+ * Complete staged mutation inventory for transactional log compaction in OrderedOperationLog.
+ * Reconciled against all 8 mutable properties of OrderedOperationLog.
  * No active state structure is mutated before all candidate components succeed.
  */
 export interface StagedCompactionCandidate {
-  /** Deep clone of baseSnapshot reduced forward with compacted operations. */
-  readonly candidateBaseSnapshot: PlaybackState;
-  /** Sliced array containing only retained operations strictly newer than stableFrontier. */
-  readonly candidateOperations: Operation[];
-  /** Newly constructed index mapping operation IDs to candidate array indices. */
-  readonly candidateIdIndex: Map<string, number>;
-  /** Newly constructed index mapping originPeerId:sequenceNumber to candidate array indices. */
-  readonly candidateOriginSeqIndex: Map<string, number>;
-  /** Cloned map retaining checkpoints at K=256 intervals up to compaction horizon. */
-  readonly candidateCompactedCheckpoints: Map<string, Map<number, CompactedCheckpoint>>;
-  /** Newly constructed map of exact sequence timestamps for the compaction frontier. */
+  /** Deep clone of baseSnapshot folded forward with pruned operations (structuredClone). */
+  readonly candidateBaseSnapshot?: PlaybackState;
+  /** Shallow array slice containing only retained operations strictly newer than stableFrontier. */
+  readonly candidateOperations: StoredOperation[];
+  /** Reconstructed index mapping logicalEventId to candidate StoredOperation. */
+  readonly candidateIdIndex: Map<string, StoredOperation>;
+  /** Reconstructed index mapping originPeerId:sequenceNumber to candidate StoredOperation. */
+  readonly candidateOriginSeqIndex: Map<string, StoredOperation>;
+  /** Shallow Map clone retaining checkpoints at K=256 intervals up to compaction horizon. */
+  readonly candidateCompactedCheckpoints: Map<string, CompactedCheckpointRecord>;
+  /** Shallow Map clone updated with exact sequence timestamps for the compaction frontier. */
   readonly candidateOriginFrontierTimestamps: Map<string, number>;
-  /** Updated replication vector record matching candidate base snapshot frontier. */
+  /** Shallow Record clone matching candidate base snapshot frontier. */
   readonly candidateBaseSnapshotFrontier: Record<string, number>;
-  /** Updated sequence window boundaries. */
-  readonly candidateFirstRetainedSequence?: number;
-  readonly candidateMinRetainedSequenceNumber?: number;
+  /** Scalar boolean indicating whether operations have been pruned. */
+  readonly candidateHasPrunedOperations: boolean;
 }
 
 export interface StagedCompactionResult {
   readonly success: boolean;
   readonly prunedCount: number;
-  readonly newBaseSnapshot: PlaybackState;
+  readonly newBaseSnapshot?: PlaybackState;
   readonly error?: string;
 }
 ```
 In `OrderedOperationLog.compactAtFrontier(stableFrontier)`:
 - **Phase 1 (Staging):** Construct `StagedCompactionCandidate` out-of-band:
-  1. Clone `baseSnapshot` via `structuredClone()`.
-  2. Sequentially reduce pruned operations into candidate base snapshot.
-  3. Filter retained operations into candidate array and rebuild candidate indexes.
-  4. Preserve required compacted checkpoints and resolve exact frontier timestamps.
+  1. Deep clone `baseSnapshot` via `structuredClone(this.baseSnapshot)`.
+  2. Sequentially reduce pruned operations into `candidateBaseSnapshot`: `candidateBaseSnapshot = this.reducer(candidateBaseSnapshot, op)`.
+  3. Filter retained operations into `candidateOperations` (shallow array, immutable operation references).
+  4. Reconstruct `candidateIdIndex` and `candidateOriginSeqIndex` solely from `candidateOperations`.
+  5. Clone `this.compactedCheckpoints` into a new Map, adding new immutable checkpoint records for pruned operations with 256-entry FIFO eviction.
+  6. Clone `this.originFrontierTimestamps` into a new Map, updating frontier timestamps with 64-entry FIFO eviction.
+  7. Copy `this.baseSnapshotFrontier` into a new record, updating sequence maxima.
 - **Phase 2 (Atomic Swap):**
-  - **Only if candidate reduction and validation complete without error**, perform atomic reference swap across all 7 mutable fields.
-- **Rollback Guarantee:**
-  - If `this.reducer` throws or candidate construction fails, the candidate objects are discarded, the exception is re-thrown, and active engine state remains 100% untouched.
+  - **Only if candidate reduction and validation complete without error**, perform atomic reference swap across all 8 mutable fields in a single synchronous block.
+- **Formal Rollback Proof:**
+  $$\mathbf{\text{ReducerFailure}} \implies \mathbf{\text{ActiveStateAfter} \equiv \text{ActiveStateBefore}}$$
+  If `this.reducer` throws or candidate construction fails, candidate objects are discarded, the exception is re-thrown, and active engine state remains 100% untouched.

@@ -24,6 +24,7 @@
 | **R-M4-9** | High | Low | Engine Compaction | Staged candidate base snapshot reduction before splicing active operations | **Pre-M4 (M4.0d)** |
 | **R-M4-10** | High | Low | Failover Integrity | Strict snapshot identity match (`snapshotId` & `sha256Digest`) before retaining chunks | In-M4 (M4.1, M4.3) |
 | **R-M4-11** | Medium | Medium | Availability | Dual retry budget: max 3 per chunk, max 10 total transfer retries, 60s deadline | In-M4 (M4.3) |
+| **R-M4-12** | High | Low | Transport State | Deferral until SCTP negotiation complete; reject zero/non-finite limits | In-M4 (M4.2, M4.3) |
 
 ---
 
@@ -38,21 +39,25 @@
   3. If $\text{byteLength} > \text{effectiveLimit}$, the binary slice is mathematically reduced by $\Delta = \lceil \text{overshoot} \times 0.75 \rceil + 32$ and re-serialized until fitting.
   4. The exact tested string is passed unchanged to `RTCDataChannel.send()`.
   5. Hard operational bound: loop terminates in at most $K_{\text{max}} = 5$ attempts per chunk (`MAX_SIZING_ITERATIONS = 5`); aborts with `TRANSPORT_LIMIT_EXCEEDED` if exceeded.
+  6. Synchronous send failure protection: If `sendSerialized()` returns `{ ok: false }`, chunk is NOT marked as sent, retry counters are preserved, and counters are not corrupted.
 - **Verification Plan:** Unit test suite transmitting chunks across simulated SCTP boundaries of 65,536, 32,768, 16,384, and 2,048 bytes, verifying with zero exceptions that measured bytes never exceed the limit and converge in $\le 5$ iterations.
 
 ---
 
 ### R-M4-2: Chunk Framing Starvation on Severely Constrained Links ($< 2\text{ KB}$)
-- **Threat Description:** If a link negotiates an extremely small MTU/SCTP limit ($< 2,048$ bytes), the JSON envelope overhead ($\approx 768$ bytes) consumes the majority of the message budget, leaving trivial binary payload slices ($< 256$ bytes) that require thousands of chunks, starving the transfer. Furthermore, a 4 MiB snapshot would require $\approx 4,369$ chunks over a 2 KiB link, contradicting the 128-chunk bound.
+- **Threat Description:** If a link negotiates an extremely small MTU/SCTP limit ($< 2,048$ bytes), the JSON envelope overhead ($\approx 1024$ bytes) consumes the majority of the message budget, leaving trivial binary payload slices ($< 256$ bytes) that require thousands of chunks, starving the transfer. Furthermore, a 4 MiB snapshot would require $\approx 5,462$ chunks over a 2 KiB link, contradicting the 128-chunk bound.
 - **Root Cause:** Attempting large state snapshot recovery over pathologically constrained network links without evaluating capacity invariants.
 - **Mitigation:**
-  1. Safe Upfront Admission Gate: The protocol computes expected chunk count upfront: $B_{\text{req}} = \lceil \text{totalSizeBytes} / \text{chunkPayloadEstimate} \rceil$.
-  2. If $B_{\text{req}} > \text{MAX\_CHUNKS\_PER\_SNAPSHOT}$ (128) or $\text{offer.totalChunks} > 128$, the transfer is rejected immediately before allocating reassembly buffer memory (`CHUNK_COUNT_EXCEEDED`).
-  3. The protocol explicitly **does NOT claim universal 4 MiB snapshot transfer support on 2 KiB transports**; effective capacity on 2 KiB transports is bounded to $\approx 120\text{ KiB}$ for 128 chunks.
-  4. `calculateDynamicChunkSize` throws if `effectiveLimit < MIN_SUPPORTED_SCTP_LIMIT` (2,048 bytes).
-  5. The iterative loop aborts with `TRANSPORT_LIMIT_EXCEEDED` if slice size drops below `MIN_CHUNK_BYTES = 256`.
-  6. Transfer terminates cleanly to `DEGRADED`, prompting application intervention rather than hanging.
-- **Verification Plan:** Test case with SCTP limit set to 1,024 bytes confirms immediate, clean rejection; test case with 4 MiB snapshot on 2,048-byte SCTP limit confirms upfront admission rejection without buffer allocation.
+  1. Exact Upfront Admission Gate: The protocol computes exact required chunks upfront:
+     $$\text{chunkBinaryCapacity} = \min\left(32768, \left\lfloor \frac{\text{effectiveLimit} - 1024}{4} \right\rfloor \times 3\right)$$
+     $$\text{calculatedRequiredChunks} = \left\lceil \frac{\text{totalSizeBytes}}{\text{chunkBinaryCapacity}} \right\rceil$$
+  2. If $\text{calculatedRequiredChunks} > \text{MAX\_CHUNKS\_PER\_SNAPSHOT}$ (128), the transfer is rejected immediately before allocating reassembly buffer memory (`CHUNK_COUNT_EXCEEDED`).
+  3. If $\text{offer.totalChunks} !== \text{calculatedRequiredChunks}$, the offer is rejected upfront with `OFFER_INCONSISTENT`.
+  4. The protocol explicitly **does NOT claim universal 4 MiB snapshot transfer support on 2 KiB transports**; effective capacity on 2 KiB transports is bounded to $\approx 96\text{ KiB}$ for 128 chunks.
+  5. `calculateChunkCapacity` throws if `effectiveLimit < MIN_SUPPORTED_SCTP_LIMIT` (2,048 bytes).
+  6. The iterative loop aborts with `TRANSPORT_LIMIT_EXCEEDED` if slice size drops below `MIN_CHUNK_BYTES = 256`.
+  7. Transfer terminates cleanly to `DEGRADED`, prompting application intervention rather than hanging.
+- **Verification Plan:** Test case with SCTP limit set to 1,024 bytes confirms immediate, clean rejection; test case with 4 MiB snapshot on 2,048-byte SCTP limit confirms upfront admission rejection without buffer allocation; test case with inconsistent `totalChunks` confirms rejection before buffer allocation.
 
 ---
 
@@ -130,10 +135,17 @@
 - **Root Cause:** Splicing operations before verifying that state reduction succeeds.
 - **Mitigation:**
   1. Designated as **Milestone M4.0d (Prerequisite)**.
-  2. Complete Staged Mutation Inventory: Out-of-band staging across all 7 mutable fields (`candidateBaseSnapshot`, `candidateOperations`, `candidateIdIndex`, `candidateOriginSeqIndex`, `candidateCompactedCheckpoints`, `candidateOriginFrontierTimestamps`, `candidateBaseSnapshotFrontier`, plus sequence metadata).
+  2. Complete Staged Mutation Inventory: Out-of-band staging across all 8 mutable fields:
+     - `baseSnapshot`: Deep clone via `structuredClone(this.baseSnapshot)`.
+     - `operations`: Shallow array filter containing retained `StoredOperation` references.
+     - `idIndex` & `originSeqIndex`: Reconstructed Maps populated from candidate operations.
+     - `compactedCheckpoints`: Shallow Map clone with immutable records and 256-entry FIFO eviction.
+     - `originFrontierTimestamps`: Shallow Map clone with 64-entry FIFO eviction.
+     - `baseSnapshotFrontier`: Shallow Record clone `{ ...this.baseSnapshotFrontier }`.
+     - `hasPrunedOperations`: Scalar boolean copy.
   3. No active state structure or reference is modified before all candidate computations and reductions complete successfully.
-  4. If reduction throws, candidate objects are discarded, the exception propagates, and zero active mutations occur.
-- **Verification Plan:** Test case with throwing reducer in `compactAtFrontier` confirms active operations, indexes, and checkpoints remain 100% intact.
+  4. If reduction throws, candidate objects are discarded, the exception propagates, and zero active mutations occur (`ReducerFailure => ActiveStateAfter === ActiveStateBefore`).
+- **Verification Plan:** Test case with throwing reducer in `compactAtFrontier` confirms active operations, indexes, and checkpoints remain 100% intact with identical references and content.
 
 ---
 
@@ -157,3 +169,15 @@
   3. Hard wall-clock transfer deadline: 60 seconds (`OVERALL_TRANSFER_TIMEOUT_MS = 60000`).
   4. Exceeding any budget triggers clean termination with `TRANSFER_TIMEOUT` or `RETRY_BUDGET_EXHAUSTED`.
 - **Verification Plan:** Test case simulating 100% loss on a single chunk confirms termination after exactly 3 retries.
+
+---
+
+### R-M4-12: Unnegotiated or Invalid SCTP Transport State
+- **Threat Description:** Initiating snapshot transfer requests while `RTCSctpTransport.maxMessageSize` is still `undefined` (handshake in progress) or when the transport reports non-finite or zero values, leading to erroneous chunk sizing or silent frame drops.
+- **Root Cause:** Sizing wire frames against unnegotiated or invalid SCTP transport parameters.
+- **Mitigation:**
+  1. Transfer initiation is strictly deferred until transport connection state is `open` and SCTP parameters are settled.
+  2. Values $\le 0$ or non-finite are rejected as invalid transport states.
+  3. Fallback of 65,536 bytes on open channels is strictly documented as a conservative local implementation cap, not proof of remote capacity.
+  4. Synchronous `RTCDataChannel.send()` failures preserve chunk retry state and transfer counters without marking unsent frames as complete.
+- **Verification Plan:** Unit tests verifying transfer deferral on `undefined` SCTP limits, immediate rejection on zero/negative limits, and accurate retry accounting on synchronous send exceptions.

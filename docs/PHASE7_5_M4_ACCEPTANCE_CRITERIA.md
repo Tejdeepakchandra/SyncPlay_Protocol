@@ -32,11 +32,21 @@ This document defines the formal, measurable acceptance criteria for Phase 7.5 M
   2. The function **NEVER** returns a timestamp belonging to a different sequence number.
   3. Snapshot creation fails if required frontier timestamps cannot be established exactly.
 
-### AC-M4-PRE-3: Compaction Exception Atomicity (7-Component Staged Inventory)
+### AC-M4-PRE-3: Compaction Exception Atomicity (8-Component Mutation Inventory)
 - **Condition:** `compactAtFrontier()` is invoked with a throwing reducer callback.
 - **Pass Threshold:**
-  1. Candidate mutation set across all 7 mutable fields (`candidateBaseSnapshot`, `candidateOperations`, `candidateIdIndex`, `candidateOriginSeqIndex`, `candidateCompactedCheckpoints`, `candidateOriginFrontierTimestamps`, `candidateBaseSnapshotFrontier`, plus sequence metadata) is staged out-of-band on a clone before modifying active log state.
-  2. If the reducer throws at any point during candidate reduction, the exception is propagated, candidate structures are discarded, and `this.baseSnapshot`, `this.operations`, `this.idIndex`, `this.originSeqIndex`, `this.compactedCheckpoints`, `this.originFrontierTimestamps`, and `this.baseSnapshotFrontier` remain 100% untouched.
+  1. Candidate mutation set across all 8 mutable fields is staged out-of-band:
+     - `baseSnapshot`: Deep clone via `structuredClone(this.baseSnapshot)`.
+     - `operations`: Shallow array filter containing retained `StoredOperation` references.
+     - `idIndex`: Reconstructed `Map<string, StoredOperation>` populated from candidate operations.
+     - `originSeqIndex`: Reconstructed `Map<string, StoredOperation>` populated from candidate operations.
+     - `compactedCheckpoints`: Shallow Map clone `new Map(this.compactedCheckpoints)` with immutable records and 256-entry FIFO eviction.
+     - `originFrontierTimestamps`: Shallow Map clone `new Map(this.originFrontierTimestamps)` with 64-entry FIFO eviction.
+     - `baseSnapshotFrontier`: Shallow Record clone `{ ...this.baseSnapshotFrontier }`.
+     - `hasPrunedOperations`: Scalar boolean copy.
+  2. If the reducer throws at any point during candidate reduction, the exception is propagated, all candidate objects are discarded, and `this.baseSnapshot`, `this.operations`, `this.idIndex`, `this.originSeqIndex`, `this.compactedCheckpoints`, `this.originFrontierTimestamps`, `this.baseSnapshotFrontier`, and `this.hasPrunedOperations` remain 100% untouched.
+  3. Formal Proof Criterion:
+     $$\mathbf{\text{ReducerFailure}} \implies \mathbf{\text{ActiveStateAfter} \equiv \text{ActiveStateBefore}}$$
 
 ---
 
@@ -71,16 +81,25 @@ This document defines the formal, measurable acceptance criteria for Phase 7.5 M
 ### AC-M4-ADMIT-1: Upfront Admission Calculation & Chunk Ceiling Invariant
 - **Condition:** Inbound `SNAPSHOT_OFFER` received or outbound `SNAPSHOT_REQUEST` handled over any supported transport.
 - **Pass Threshold:**
-  1. `calculateSnapshotAdmission()` calculates expected chunks: $B_{\text{req}} = \lceil \text{totalSizeBytes} / \text{chunkPayloadEstimate} \rceil$.
-  2. If $B_{\text{req}} > \text{MAX\_CHUNKS\_PER\_SNAPSHOT}$ (128) or $\text{offer.totalChunks} > 128$, the transfer is rejected upfront before allocating reassembly buffer memory.
-  3. Rejection code is `CHUNK_COUNT_EXCEEDED` or `TRANSPORT_LIMIT_EXCEEDED`.
-  4. Explicitly verified that universal 4 MiB transfer is **NOT** claimed on a 2 KiB SCTP transport (which admits snapshots up to 120 KiB for 128 chunks).
+  1. `calculateSnapshotAdmission()` executes exact sizing:
+     $$\text{chunkBinaryCapacity} = \min\left(32768, \left\lfloor \frac{\text{effectiveLimit} - 1024}{4} \right\rfloor \times 3\right)$$
+     $$\text{calculatedRequiredChunks} = \left\lceil \frac{\text{totalSizeBytes}}{\text{chunkBinaryCapacity}} \right\rceil$$
+  2. Invariant 1 verified: $\text{calculatedRequiredChunks} \le \text{MAX\_CHUNKS\_PER\_SNAPSHOT}$ (128). If exceeded, rejected upfront with `CHUNK_COUNT_EXCEEDED` before allocating reassembly buffer memory.
+  3. Invariant 2 verified: $\text{offer.totalChunks} === \text{calculatedRequiredChunks}$. If inconsistent, rejected upfront with `OFFER_INCONSISTENT` before allocating reassembly buffer memory.
+  4. Explicitly verified that universal 4 MiB transfer is **NOT** claimed on a 2 KiB SCTP transport (which admits snapshots up to 96 KiB for 128 chunks).
 
 ### AC-M4-ADMIT-2: Minimum Supported SCTP Limit Floor
 - **Condition:** Transport reporting SCTP limit $< 2,048$ bytes (`MIN_SUPPORTED_SCTP_LIMIT`).
 - **Pass Threshold:**
   1. Transfer is immediately rejected/aborted with `TRANSPORT_LIMIT_EXCEEDED`.
   2. Zero chunk requests or transfer buffers are allocated.
+
+### AC-M4-ADMIT-3: SCTP Negotiation Deferral and State Handling
+- **Condition:** Peer transport where SCTP parameters are in various negotiation states.
+- **Pass Threshold:**
+  1. If `sctpMaxMessageSize` is `undefined` (negotiation underway), transfer initiation is deferred until negotiation completes.
+  2. If `sctpMaxMessageSize` is $\le 0$ or non-finite, transfer is deferred or rejected as invalid transport state.
+  3. Fallback of 65,536 bytes on open channels is verified to be a local application cap, not proof of remote capacity.
 
 ---
 
@@ -182,6 +201,16 @@ This document defines the formal, measurable acceptance criteria for Phase 7.5 M
   1. Number of serialization and sizing attempts per chunk strictly capped at $K_{\text{max}} = 5$ (`MAX_SIZING_ITERATIONS = 5`).
   2. If the serialized frame does not fit within 5 iterations, transfer aborts immediately with `TRANSPORT_LIMIT_EXCEEDED`.
   3. Zero oversized or corrupted frames are ever transmitted to the network.
+
+### AC-M4-SIZE-4: Synchronous Send Failure Handling
+- **Condition:** Underlying `RTCDataChannel.send()` throws or `PeerManager.sendSerialized()` returns `{ ok: false }`.
+- **Pass Threshold:**
+  1. The unsent chunk is strictly **NOT** marked as transmitted or in-flight; window credit is not consumed.
+  2. Retry state is preserved: `chunkRetryCount[chunkIndex]` is incremented without desynchronization.
+  3. Transfer counters (`receivedBytes`, `sentBytes`, `percentComplete`) remain un-incremented and uncorrupted.
+  4. If failure is due to disconnected peer or closed channel, transfer cleanly aborts with `SUPPLIER_DISCONNECTED`.
+  5. If failure is due to transient buffer backpressure and retries remain, supplier re-attempts transmission according to documented backoff.
+  6. The complete `ProtocolMessage` UTF-8 byte measurement and unchanged-string send boundary are 100% preserved.
 
 ---
 
