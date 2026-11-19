@@ -1,8 +1,8 @@
 # Phase 7.5 — Fault Tolerance & State Recovery: Architecture Specification
 
-**Status:** APPROVED ARCHITECTURAL DESIGN (FINAL CLOSURE)  
+**Status:** APPROVED ARCHITECTURAL DESIGN (FINAL SAFETY CLOSURE)  
 **Date:** 2026-11-19  
-**Branch Baseline:** `main` at `30b8e5f`  
+**Branch Baseline:** `main` at `377c906`  
 **Frozen Baselines:** Phase 7.3 (`e49b81a`), Phase 7.4 M1–M5 (`dbd5217`, `3a3d9e5`)  
 
 ---
@@ -55,10 +55,12 @@
 
 ## 2. Core Architectural Principles & Invariants
 
-1. **Absence of Globally Agreed Stable Frontier:**
-   In a leaderless WebRTC mesh, a globally agreed consensus frontier does NOT exist. Peers autonomously prune operation logs bounded by the membership-scoped safe frontier ($V_{\text{epoch\_safe}}$) over a verified view $\mathcal{V}$, or by local memory bounds ($K=256$). Snapshot recovery is a **first-class protocol requirement** to service reconnecting peers outside supplier log horizons.
-2. **Historical Compatibility via Prefix Verification:**
-   Because single-operation fingerprints do not hash historical chains, a snapshot is eligible if and only if $V_S[p] \ge V_L[p]$ AND all common retained sequence checkpoints in the prefix $[1, \min(V_L[p], V_S[p])]$ match bit-exact. Any unverified sequence gaps trigger `REQUIRES_HISTORY_REPAIR` and fail to `DEGRADED`.
+1. **Mandatory Local Peer Inclusion in $V_{\text{epoch\_safe}}$:**
+   The local engine's own replication vector $V_{\text{local}}$ is an explicit member of every compaction frontier calculation:
+   $$V_{\text{epoch\_safe}}[p] = \min \Big( V_{\text{local}}[p], \min_{(r, gen) \in \mathcal{P}} D_r.\text{replicationVector}[p] \Big)$$
+   A local engine never compacts beyond its own applied sequence frontier. If remote membership is empty, $V_{\text{epoch\_safe}} = V_{\text{local}}$.
+2. **Historical Compatibility via Prefix Verification (Four Outcomes):**
+   Because single-operation fingerprints do not chain history, compatibility requires verifying all common retained checkpoints across $[1, \min(V_L[p], V_S[p])]$. Four mutually exclusive outcomes are enforced: `HISTORY_VERIFIED`, `HISTORY_CONFLICT`, `HISTORY_INCOMPLETE`, and `HISTORY_UNAVAILABLE`.
 3. **No Arbitrary Tie-Breaking:**
    If two snapshots have incomparable frontiers, the engine transitions to `DEGRADED` state and notifies the application. Arbitrary tie-breaking (by peer ID or wall clock) is mathematically forbidden.
 4. **Normative Iterative Transport Sizing:**
@@ -66,8 +68,8 @@
 5. **Exact Phase 7.2 Lamport Invariant Reinstated:**
    $$S.\text{maxLogicalTimestamp} \equiv \max_{p \in \text{origins}(V_S)} S.\text{originFrontierTimestamps}[p]$$
    Reseeding executes strictly as $L_{\text{local}} = \max(L_{\text{local}}, S.\text{maxLogicalTimestamp})$ **without $+1$**.
-6. **Staged Immutable Engine-State Replacement:**
-   Installation constructs a new `OrderedOperationLog`, state, and replication vectors out-of-band. Once validated, an atomic reference swap executes in a single synchronous run-to-completion step. External listeners are notified only post-swap and post-reconciliation.
+6. **Staged Immutable Engine-State Replacement & Clock Audit:**
+   Installation constructs a new `OrderedOperationLog`, state, and replication vectors out-of-band. Once validated, an atomic reference swap executes in a single synchronous run-to-completion step across all 14 mutable components. External listeners are notified only post-swap and post-reconciliation.
 7. **Quarantine Buffer & Local Input Fencing:**
    Local control operations are blocked while recovering. Incoming live operations are quarantined (capacity: 1,000 operations). Exceeding capacity synchronously aborts transfer to `DEGRADED`.
 
@@ -88,7 +90,7 @@ stateDiagram-v2
     }
 
     RECOVERING --> RECONCILING : validateCandidate() OK & stagedReferenceSwap() OK
-    RECOVERING --> DEGRADED : Incomparable snapshot / Retries exhausted / Quarantine overflow
+    RECOVERING --> DEGRADED : Incomparable snapshot / Retries exhausted / Quarantine overflow / HISTORY_UNAVAILABLE
     RECOVERING --> ACTIVE : Transfer aborted (revert to local state)
 
     state RECONCILING {
@@ -118,18 +120,21 @@ stateDiagram-v2
 
 ### 4.1 Membership View $\mathcal{V}$ Capture
 The local peer captures:
-$$\mathcal{V} = \Big( E_{\text{local}}, \mathcal{P} = \{ (p, gen_p) \mid \text{dataChannelState}(p) === \text{'open'} \} \Big)$$
+$$\mathcal{V} = \Big( E_{\text{local}}, V_{\text{local\_snapshot}}, \mathcal{P} = \{ (p, gen_p) \mid \text{dataChannelState}(p) === \text{'open'} \} \Big)$$
 
 ### 4.2 Current Digest Requirement
 For every peer in $\mathcal{P}$, the local engine must hold an authenticated `STATE_DIGEST` $D_p$ matching $(p, gen_p, E_{\text{local}})$.
-- If any peer has not supplied a current digest, the view is incomplete. Compaction at $V_{\text{epoch\_safe}}$ is held.
+- If any peer has not supplied a current digest, view $\mathcal{V}$ is incomplete. Compaction at $V_{\text{epoch\_safe}}$ is held.
+- If remote membership $\mathcal{P} = \emptyset$, $V_{\text{epoch\_safe}} = V_{\text{local}}$.
+- Missing origins are treated strictly as sequence $0$ ($V[p] ?? 0$).
 - If memory requires pruning ($K=256$), the engine prunes locally under $V_{\text{local\_cand}}$ without peer safety guarantees.
 
 ### 4.3 Pre-Commit Revalidation
 Immediately prior to invoking `compactAtFrontier(V_epoch_safe)`:
 1. Verify `engine.epoch === V.epoch`.
 2. Verify active connected peer set in `PeerManager` matches $\mathcal{P}$ exactly.
-3. If any peer disconnected, generation changed, or epoch incremented: **abort compaction immediately**.
+3. Verify $V_{\text{epoch\_safe}}[p] \le \text{engine.replicationVector}[p]$ for all origins $p$.
+4. If any peer disconnected, generation changed, epoch incremented, or local vector rolled back: **abort compaction immediately**.
 
 ---
 
@@ -157,14 +162,16 @@ Immediately prior to invoking `compactAtFrontier(V_epoch_safe)`:
 +----------------------------------------------------------------------------------------------------+
 | STAGE 1: Pure Dry-Run Validation (validateCandidate)                                               |
 | - Validates StateSnapshotPayloadV2Schema, canonical SHA-256 digest, epoch, vector domination, and  |
-|   complete common checkpoint prefix. ZERO engine state is touched.                                 |
+|   evaluates historical prefix verification producing one of the 4 outcomes.                        |
+| - ZERO engine state is touched.                                                                    |
 +----------------------------------------------------------------------------------------------------+
                                                  │
-                                                 ▼ Validation Passed
+                                                 ▼ HISTORY_VERIFIED
 +----------------------------------------------------------------------------------------------------+
 | STAGE 2: Out-of-Band Staged Instance Construction                                                  |
 | - Construct StagedPlaybackState with stateVersion = localVersion + 1.                              |
 | - Construct new OrderedOperationLog pre-loaded with snapshot base and checkpoints.                 |
+| - Construct staged LogicalClockManager or stage reseed clock value without throwing.               |
 | - Construct new replicationVector, localCausalContext, and empty pendingQueue.                     |
 | - If any constructor throws: discard staged instances. Old engine state remains 100% active.       |
 +----------------------------------------------------------------------------------------------------+
@@ -172,7 +179,7 @@ Immediately prior to invoking `compactAtFrontier(V_epoch_safe)`:
                                                  ▼ Staging Succeeded
 +----------------------------------------------------------------------------------------------------+
 | STAGE 3: Atomic Reference Swap (installSnapshotAtomic)                                             |
-| - Synchronous run-to-completion property swap:                                                    |
+| - Synchronous run-to-completion property swap across 14 mutable components:                       |
 |     this.state = stagedState;                                                                      |
 |     this.baseSnapshot = stagedState;                                                               |
 |     this.operationLog = stagedLog;                                                                 |
@@ -193,15 +200,21 @@ Immediately prior to invoking `compactAtFrontier(V_epoch_safe)`:
 +----------------------------------------------------------------------------------------------------+
 ```
 
-### 6.2 Enumeration of Swapped State
-- Playback State (`PlaybackState`) & incremented `stateVersion`
-- Logical Clock (`clockManager` reseeded to exact $S.\text{maxLogicalTimestamp}$ without $+1$)
-- Replication Vector (`Record<string, number>`)
-- Local Causal Context (`Record<string, number>`)
-- Operation Log (`OrderedOperationLog` with reset base and checkpoints)
-- Pending Dependency Queue (`PendingOperationQueue` cleared/reset)
-- Base Snapshot Frontier (`baseSnapshotFrontier`)
-- Deduplication and replay filters
+### 6.2 Complete 14-Component State Inventory
+1. `state`: `PlaybackState` & incremented `stateVersion`
+2. `clockManager`: Lamport clock (`currentClock`, `maxObservedByOrigin`, `originRateStates`)
+3. `replicationVector`: `Record<string, number>`
+4. `localCausalContext`: `Record<string, number>`
+5. `baseSnapshot`: `PlaybackState | undefined`
+6. `baseSnapshotFrontier`: `Record<string, number>`
+7. `operationLog`: `OrderedOperationLog` (operations array, idIndex, originSeqIndex, compactedCheckpoints map, originFrontierTimestamps map)
+8. `pendingQueue`: `PendingDependencyQueue`
+9. `dedupCache`: deduplication cache
+10. `lastDecision`: `EngineDecision`
+11. `mutableStats`: stats counters
+12. `recoveryState`: `RecoveryState` (`ACTIVE`, `RECOVERING`, `RECONCILING`, `DEGRADED`)
+13. `quarantineBuffer`: `QuarantineBuffer`
+14. `stateChangeListeners`: deferred listener notifications
 
 ---
 

@@ -1,8 +1,8 @@
 # Phase 7.5 — Fault Tolerance & State Recovery: Implementation Roadmap
 
-**Status:** APPROVED ARCHITECTURAL DESIGN (FINAL CLOSURE)  
+**Status:** APPROVED ARCHITECTURAL DESIGN (FINAL SAFETY CLOSURE)  
 **Date:** 2026-11-19  
-**Branch Baseline:** `main` at `30b8e5f`  
+**Branch Baseline:** `main` at `377c906`  
 **Frozen Baselines:** Phase 7.3 (`e49b81a`), Phase 7.4 M1–M5 (`dbd5217`, `3a3d9e5`)  
 
 ---
@@ -13,7 +13,7 @@ Phase 7.5 provides state recovery and fault tolerance when operation logs are co
 
 ```mermaid
 flowchart TD
-    M1["Milestone M1: Research & Problem Definition<br/>(Complete & Final Closure)"] --> M2["Milestone M2: Architecture & Interfaces<br/>(Complete & Final Closure)"]
+    M1["Milestone M1: Research & Problem Definition<br/>(Complete & Final Safety Closure)"] --> M2["Milestone M2: Architecture & Interfaces<br/>(Complete & Final Safety Closure)"]
     M2 --> M3["Milestone M3: Snapshot Creation & Compaction Horizon<br/>(Runtime Authorization Required)"]
     M3 --> M4["Milestone M4: Iterative Chunked Transfer Protocol<br/>(Runtime Authorization Required)"]
     M4 --> M5["Milestone M5: Staged Atomic Installation & Quarantine<br/>(Runtime Authorization Required)"]
@@ -25,21 +25,21 @@ flowchart TD
 ## 2. Milestone Breakdown (M1 to M6)
 
 ### Milestone M1: Research, Problem Definition, and Threat Model
-- **Status:** COMPLETE & FINAL CLOSURE (Planning Phase)
+- **Status:** COMPLETE & FINAL SAFETY CLOSURE (Planning Phase)
 - **Objective:** Establish the theoretical foundations, failure scenarios, and boundaries of state recovery.
 - **Scope:**
   - Complete answers to the 18 research questions.
-  - Compaction frontier re-evaluation: formal captured membership view $\mathcal{V} = (E, \mathcal{P})$, current digest requirement, pre-commit revalidation, and acknowledgment that a globally agreed stable frontier does not exist.
-  - Historical compatibility proof: single-operation fingerprints do not chain history; prefix verification across all common retained sequences $[1, k]$ is mandatory.
+  - Compaction frontier re-evaluation: mandatory local peer inclusion in $V_{\text{epoch\_safe}}$, captured membership view $\mathcal{V} = (E, V_{\text{local}}, \mathcal{P})$, current digest requirement, pre-commit revalidation, and absence of globally agreed stable frontier.
+  - Historical compatibility proof: single-operation fingerprints do not chain history; prefix verification across all common retained sequences $[1, k]$ produces one of 4 explicit outcomes (`HISTORY_VERIFIED`, `HISTORY_CONFLICT`, `HISTORY_INCOMPLETE`, `HISTORY_UNAVAILABLE`).
   - Formal boundary between ordinary recovery and manual reset (deferred to Phase 8).
-  - Snapshot epoch revalidation rules.
+  - Mechanically testable non-supersession predicate for older-epoch snapshots.
 - **Deliverables:** `docs/PHASE7_5_RESEARCH_AND_PROBLEM_DEFINITION.md`
 - **Exit Conditions:** Architectural sign-off on research answers and invariants.
 
 ---
 
 ### Milestone M2: Architecture, Chunk Protocol, and Interface Specification
-- **Status:** COMPLETE & FINAL CLOSURE (Planning Phase)
+- **Status:** COMPLETE & FINAL SAFETY CLOSURE (Planning Phase)
 - **Objective:** Specify all wire contracts, schemas, component interfaces, state machines, and integration hooks.
 - **Scope:**
   - System context and block diagrams.
@@ -47,7 +47,7 @@ flowchart TD
   - Wire schemas: `SNAPSHOT_OFFER`, `SNAPSHOT_REQUEST`, `SNAPSHOT_CHUNK`, `SNAPSHOT_CHUNK_REQUEST`, `SNAPSHOT_ABORT`.
   - Component interfaces: `ISnapshotTransferManager`, `IRecoveryCoordinator`, `ISnapshotInstaller`, `IRecoveryStateMachine`.
   - Normative 7-step iterative send-boundary loop.
-  - Staged Immutable Engine-State Replacement pattern.
+  - Staged Immutable Engine-State Replacement pattern across 14 mutable components.
   - Error codes, diagnostics taxonomy, and Open Decisions register (OD-7.5-1 to OD-7.5-5).
 - **Deliverables:**
   - `docs/PHASE7_5_ARCHITECTURE.md`
@@ -66,7 +66,8 @@ flowchart TD
   - Integrate `StateSnapshotPayloadV2Schema` wire definitions into `@syncplay/protocol`.
   - Enhance `OrderedOperationLog` compaction to retain origin checkpoints up to the frontier.
   - Implement deterministic canonical RFC 8785 JSON serialization and SHA-256 digest computation.
-  - Implement captured view revalidation for `V_epoch_safe`.
+  - Implement captured view revalidation for $V_{\text{epoch\_safe}}$ with mandatory local peer inclusion.
+  - Handle empty remote membership ($V_{\text{epoch\_safe}} = V_{\text{local}}$) and missing origins ($0$).
   - Enforce exact Phase 7.2 invariant: `maxLogicalTimestamp === max(originFrontierTimestamps.values())`.
 - **Affected Packages and Files:**
   - `packages/protocol/src/payloads/recovery.ts` (new schemas)
@@ -74,11 +75,13 @@ flowchart TD
   - `packages/sync-engine/src/snapshot/snapshot-generator.ts` (canonical serialization)
   - `packages/sync-engine/src/log/ordered-operation-log.ts` (checkpoint retention & view revalidation)
 - **Invariants Enforced:**
+  - Local replication vector $V_{\text{local}}$ is an explicit member of $V_{\text{epoch\_safe}}$.
   - Compaction never discards checkpoints.
   - Canonical JSON key ordering ensures identical SHA-256 digests across all platforms and V8 versions.
   - Compaction revalidation aborts if view $\mathcal{V}$ changed.
   - Snapshot size strictly capped at 4 MB.
 - **Verification and Tests:**
+  - Unit tests verifying that local peer inclusion prevents compacting past local applied sequence.
   - Unit tests for canonical serialization determinism under varied key insertion orders.
   - Checkpoint integrity tests across multiple sequential compaction cycles.
   - Snapshot payload validation under corrupted or malformed structures.
@@ -130,8 +133,8 @@ flowchart TD
 - **Status:** PENDING AUTHORIZATION (Runtime Implementation)
 - **Objective:** Atomically install verified snapshots via staged instance replacement, restore causal vectors, and drain quarantined live events.
 - **Scope:**
-  - Implement `SnapshotInstaller` providing Stage 1 out-of-engine pre-validation (`validateCandidate`) with full prefix checkpoint verification.
-  - Implement Stage 2 out-of-band staged instance construction and Stage 3 synchronous atomic reference swap.
+  - Implement `SnapshotInstaller` providing Stage 1 out-of-engine pre-validation (`validateCandidate`) evaluating the 4 historical prefix outcomes (`HISTORY_VERIFIED`, `HISTORY_CONFLICT`, `HISTORY_INCOMPLETE`, `HISTORY_UNAVAILABLE`).
+  - Implement Stage 2 out-of-band staged instance construction and Stage 3 synchronous atomic reference swap across all 14 mutable components.
   - Defer listener notifications until Stage 4 (post-reconciliation).
   - Implement `QuarantineBuffer` in `RecoveryCoordinator` for incoming live events (capacity: 1,000 operations).
   - Block local control inputs while in `RECOVERING` and `RECONCILING` states.
@@ -143,14 +146,14 @@ flowchart TD
   - `packages/sync-engine/src/recovery/quarantine-buffer.ts` (new)
   - `packages/sync-engine/src/engine/leaderless-sync-engine.ts` (quarantine hooks & atomic install)
 - **Invariants Enforced:**
-  - Atomic commit via staged reference swap: either complete installation succeeds or state remains completely untouched.
+  - Atomic commit via staged reference swap across all 14 components.
   - Local state version is strictly incremented: $V_{\text{local}} = V_{\text{local}} + 1$.
   - Quarantined operations older than snapshot frontier are safely discarded without re-execution.
   - Local inputs are blocked while in `RECOVERING` and `RECONCILING` states.
 - **Verification and Tests:**
   - Staged rollback verification under simulated install failure.
-  - Lamport clock monotonicity before and after recovery across all peers.
   - Full prefix checkpoint divergence detection (counterexample test).
+  - Handling of `HISTORY_INCOMPLETE` vs `HISTORY_UNAVAILABLE`.
   - Quarantine queue 1,000-operation overflow abortion and transition to `DEGRADED`.
 - **Acceptance Criteria:**
   - Recovered peer converges to identical playback state with zero state corruption.
@@ -170,7 +173,7 @@ flowchart TD
   - Connect `TrustedTransportAdapter` to validate and route recovery payloads.
   - Implement partition heal verification: two divergent partitions heal and synchronize.
   - Stress test under network churn, peer drops during chunk transfers, and epoch increments.
-  - Validate clean transition to `DEGRADED` state when incomparable snapshots are detected (Cases A through E).
+  - Validate clean transition to `DEGRADED` state when incomparable snapshots or `HISTORY_UNAVAILABLE` are detected.
 - **Affected Packages and Files:**
   - `packages/sync-engine/src/replication/anti-entropy-manager.ts` (wire integration)
   - `packages/sync-engine/src/replication/repair-request-pipeline.ts` (exhaustion handoff)
@@ -181,7 +184,7 @@ flowchart TD
   - Memory usage strictly bounded under repeated disconnect/reconnect loops.
 - **Verification and Tests:**
   - End-to-end multi-peer recovery tests across simulated WebRTC DataChannels.
-  - Verification of Cases A, B, C, D, E with exact expected results.
+  - Verification of the 4 historical prefix outcomes.
   - Peer crash and failover during active snapshot transfer.
   - Deterministic property-based test of causal frontier monotonicity.
 - **Acceptance Criteria:**

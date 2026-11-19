@@ -1,8 +1,8 @@
 # Phase 7.5 — Fault Tolerance & State Recovery: Interface Specification
 
-**Status:** APPROVED ARCHITECTURAL DESIGN (FINAL CLOSURE)  
+**Status:** APPROVED ARCHITECTURAL DESIGN (FINAL SAFETY CLOSURE)  
 **Date:** 2026-11-19  
-**Branch Baseline:** `main` at `30b8e5f`  
+**Branch Baseline:** `main` at `377c906`  
 **Frozen Baselines:** Phase 7.3 (`e49b81a`), Phase 7.4 M1–M5 (`dbd5217`, `3a3d9e5`)  
 
 ---
@@ -13,12 +13,12 @@ Phase 7.5 specifies the recovery mechanisms required when a peer experiences con
 
 ### 1.1 Non-Negotiable Invariants
 1. **Preservation of Frozen Boundaries:** Existing interfaces established in Phase 7.3 (core engine, ordered operation log, logical clock) and Phase 7.4 (anti-entropy manager, repair pipeline, supplier service, transport adapter) are frozen and MUST NOT be broken or altered.
-2. **Capability-Gated Transport Provenance:** Outbound and inbound snapshot operations must route through `TrustedTransportAdapter` using unforgeable token capabilities (`EpochTransitionCapability`, `TransportRegistrationCapability`, `AuthenticatedSupplierContext`, `AuthenticatedRequesterContext`).
-3. **Iterative SCTP Wire Measurement:** Initial chunk size estimation uses `calculateDynamicChunkSize()`, but the normative send boundary requires exact UTF-8 serialization measurement and iterative binary reduction before calling `RTCDataChannel.send()`.
-4. **Historical Prefix Compatibility:** Single-operation fingerprints at sequence $k$ do not commit to historical chains. Compatibility requires verifying all common retained checkpoints across the prefix $[1, k]$; any unverified gaps trigger `REQUIRES_HISTORY_REPAIR` and fail to `DEGRADED`.
+2. **Mandatory Local Peer Inclusion:** The local engine's replication vector $V_{\text{local}}$ is an explicit member of every compaction frontier calculation: $V_{\text{epoch\_safe}}[p] = \min(V_{\text{local}}[p], \min_{r \in \mathcal{P}} D_r.\text{replicationVector}[p])$.
+3. **Four-Outcome Prefix Verification:** Single-operation fingerprints at sequence $k$ do not commit to historical chains. Compatibility requires verifying all common retained checkpoints across $[1, k]$, producing one of: `HISTORY_VERIFIED`, `HISTORY_CONFLICT`, `HISTORY_INCOMPLETE`, or `HISTORY_UNAVAILABLE`.
+4. **Iterative SCTP Wire Measurement:** Initial chunk size estimation uses `calculateDynamicChunkSize()`, but the normative send boundary requires exact UTF-8 serialization measurement and iterative binary reduction before calling `RTCDataChannel.send()`.
 5. **Exact Phase 7.2 Lamport Invariant Reinstated:**
    $$S.\text{maxLogicalTimestamp} \equiv \max_{p \in \text{origins}(V_S)} S.\text{originFrontierTimestamps}[p]$$
-6. **Staged Immutable State Replacement:** Snapshot installation constructs new engine instances out-of-band and performs a single synchronous reference swap. External listeners are notified only post-swap and post-reconciliation.
+6. **Staged Immutable State Replacement:** Snapshot installation constructs new engine instances out-of-band and performs a single synchronous reference swap across all 14 state components. Listeners are notified only post-swap and post-reconciliation.
 
 ---
 
@@ -57,6 +57,18 @@ export const MIN_SUPPORTED_SCTP_LIMIT = 2048;
 export const CHUNK_ENVELOPE_BUDGET_BYTES = 768;
 
 /**
+ * Historical prefix verification outcomes.
+ */
+export const HistoricalVerificationOutcomeSchema = z.enum([
+  'HISTORY_VERIFIED',
+  'HISTORY_CONFLICT',
+  'HISTORY_INCOMPLETE',
+  'HISTORY_UNAVAILABLE',
+]);
+
+export type HistoricalVerificationOutcome = z.infer<typeof HistoricalVerificationOutcomeSchema>;
+
+/**
  * Reason codes for aborting a snapshot recovery transfer.
  */
 export const SnapshotAbortReasonSchema = z.enum([
@@ -71,6 +83,7 @@ export const SnapshotAbortReasonSchema = z.enum([
   'TRANSPORT_LIMIT_EXCEEDED',
   'STALE_SNAPSHOT',
   'CHECKPOINT_DIVERGENCE',
+  'HISTORY_UNAVAILABLE',
 ]);
 
 export type SnapshotAbortReason = z.infer<typeof SnapshotAbortReasonSchema>;
@@ -221,6 +234,7 @@ export interface PeerConnectionDescriptor {
 
 export interface CapturedMembershipView {
   readonly epoch: number;
+  readonly localVectorSnapshot: Readonly<Record<string, number>>;
   readonly connectedPeers: ReadonlyArray<PeerConnectionDescriptor>;
 }
 ```
@@ -310,10 +324,10 @@ export interface ISnapshotTransferManager {
 
 ```typescript
 export type SnapshotEligibilityResult =
-  | { eligible: true; snapshot: StateSnapshotPayloadV2 }
-  | { eligible: false; code: 'REJECTED'; reason: string }
-  | { eligible: false; code: 'DEGRADED'; reason: string }
-  | { eligible: false; code: 'REQUIRES_HISTORY_REPAIR'; reason: string };
+  | { eligible: true; snapshot: StateSnapshotPayloadV2; outcome: 'HISTORY_VERIFIED' }
+  | { eligible: false; code: 'REJECTED'; outcome: 'HISTORY_CONFLICT'; reason: string }
+  | { eligible: false; code: 'DEGRADED'; outcome: 'HISTORY_UNAVAILABLE'; reason: string }
+  | { eligible: false; code: 'REQUIRES_HISTORY_REPAIR'; outcome: 'HISTORY_INCOMPLETE'; reason: string };
 
 export interface SnapshotInstallResult {
   readonly success: boolean;
@@ -328,7 +342,7 @@ export interface ISnapshotInstaller {
   /**
    * STAGE 1: Pure dry-run pre-commit validation out-of-engine.
    * Verifies schema, canonical SHA-256, epoch currency, vector domination,
-   * and complete common checkpoint prefix.
+   * and evaluates complete prefix verification returning one of 4 outcomes.
    * ZERO engine state is modified.
    */
   validateCandidate(
@@ -339,7 +353,7 @@ export interface ISnapshotInstaller {
 
   /**
    * STAGE 2 & 3: Constructs staged instances and executes atomic reference swap.
-   * Synchronously swaps engine references in a single run-to-completion step.
+   * Synchronously swaps engine references across 14 mutable components.
    * External listeners are deferred until reconciliation completes.
    */
   installSnapshotAtomic(
@@ -376,4 +390,4 @@ export interface IRecoveryCoordinator {
 | **OD-7.5-2** | How should `SNAPSHOT_OFFER` messages be advertised? | Flooding offers on every timer tick wastes WebRTC bandwidth on mobile/constrained clients. | **Alt A:** Periodic broadcast.<br/>**Alt B:** Request-driven / targeted responses to `onHistoryExhausted`. | **Alt B (Request-driven):** Eliminates unneeded signaling overhead; offers are published only when missing history is declared. | **YES** (Decided: Alt B) |
 | **OD-7.5-3** | How should Explicit Manual Reset be exposed to applications when in `DEGRADED` state? | When two partitions have incomparable histories, users need a way to force convergence without causing silent causal overwrites. | **Alt A:** Automatic tie-breaking (e.g. lowest peerId).<br/>**Alt B:** Provide explicit `resetSession({ newSessionId })` API with UI prompt.<br/>**Alt C:** Defer Manual Reset to Phase 8. | **Alt C (Defer to Phase 8):** Phase 7.5 provides the mathematical safety, fencing, and `DEGRADED` state. Application-level session recreation is a Phase 8 SDK concern. | **YES** (Decided: Alt C) |
 | **OD-7.5-4** | What is the minimum supported SCTP max message size? | If a WebRTC link negotiates an extremely small MTU ($< 2\text{ KB}$), chunk framing overhead exceeds data payload. | **Alt A:** Reject connections with SCTP limit $< 64\text{ KB}$.<br/>**Alt B:** Support down to 2,048 bytes; abort if $< 2048$ bytes. | **Alt B:** Supports standard constrained networks (e.g. 16 KB) while protecting against pathologically tiny MTUs. | **YES** (Decided: Alt B) |
-| **OD-7.5-5** | How should unverified intermediate sequence gaps below compaction horizon be resolved? | Since checkpoints do not chain previous operations, missing checkpoints mean history cannot be verified. | **Alt A:** Assume equality if vector dominates.<br/>**Alt B:** Declare `REQUIRES_HISTORY_REPAIR` and fail to `DEGRADED` if unrepairable. | **Alt B (Require repair / fail to DEGRADED):** Prevents silent branch overwriting when intermediate divergence exists. | **YES** (Decided: Alt B) |
+| **OD-7.5-5** | How should unverified intermediate sequence gaps below compaction horizon be resolved? | Since checkpoints do not chain previous operations, missing checkpoints mean history cannot be verified. | **Alt A:** Assume equality if vector dominates.<br/>**Alt B:** Distinguish `HISTORY_INCOMPLETE` vs `HISTORY_UNAVAILABLE` and fail to `DEGRADED` if unrepairable. | **Alt B:** Prevents silent branch overwriting when intermediate divergence exists. | **YES** (Decided: Alt B) |

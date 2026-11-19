@@ -1,8 +1,8 @@
 # Phase 7.5 — Fault Tolerance & State Recovery: Acceptance Criteria
 
-**Status:** APPROVED ARCHITECTURAL DESIGN (FINAL CLOSURE)  
+**Status:** APPROVED ARCHITECTURAL DESIGN (FINAL SAFETY CLOSURE)  
 **Date:** 2026-11-19  
-**Branch Baseline:** `main` at `30b8e5f`  
+**Branch Baseline:** `main` at `377c906`  
 **Frozen Baselines:** Phase 7.3 (`e49b81a`), Phase 7.4 M1–M5 (`dbd5217`, `3a3d9e5`)  
 
 ---
@@ -15,18 +15,27 @@ This document establishes the binding acceptance criteria for Phase 7.5: Fault T
 
 ## 2. Compaction Horizon and Checkpoint Retention (AC-COMPACT)
 
-### AC-COMPACT-1: Captured View Compaction & Pre-Commit Revalidation
-- **Condition:** Compaction at $V_{\text{epoch\_safe}}$ is computed over a captured membership view $\mathcal{V} = (E_{\text{local}}, \mathcal{P})$.
+### AC-COMPACT-1: Mandatory Local Peer Inclusion in $V_{\text{epoch\_safe}}$
+- **Condition:** Compaction at $V_{\text{epoch\_safe}}$ is computed over a captured membership view $\mathcal{V} = (E_{\text{local}}, V_{\text{local\_snapshot}}, \mathcal{P})$.
 - **Pass Threshold:**
-  1. A current, authenticated `STATE_DIGEST` is required from EVERY peer in $\mathcal{P}$. If any peer lacks a digest, compaction at $V_{\text{epoch\_safe}}$ is held.
-  2. Immediately before commit, $\mathcal{V}$ is revalidated. If epoch, membership set, or generation changes, the compaction attempt is aborted synchronously.
-  3. The architecture explicitly does NOT claim that $V_{\text{epoch\_safe}}$ protects disconnected or partitioned peers.
+  1. Local peer's replication vector $V_{\text{local}}$ is an explicit member of the GLB formula:
+     $$V_{\text{epoch\_safe}}[p] = \min \Big( V_{\text{local}}[p], \min_{(r, gen) \in \mathcal{P}} D_r.\text{replicationVector}[p] \Big)$$
+  2. If remote membership $\mathcal{P} = \emptyset$, $V_{\text{epoch\_safe}} = V_{\text{local}}$.
+  3. Any origin missing from a peer's vector is treated as sequence $0$ ($V[p] ?? 0$).
+  4. The engine MUST NEVER compact beyond its own applied sequence frontier.
 
-### AC-COMPACT-2: Checkpoint Preservation
+### AC-COMPACT-2: Pre-Commit Revalidation and Abort
+- **Condition:** Pre-commit revalidation immediately before `compactAtFrontier()` commits.
+- **Pass Threshold:**
+  1. $V_{\text{epoch\_safe}}[p] \le \text{engine.replicationVector}[p]$ is verified for all origins.
+  2. Active epoch matches $\mathcal{V}.\text{epoch}$ and connected peer set matches $\mathcal{P}$ bit-exact.
+  3. If any peer disconnected, generation changed, epoch incremented, or local vector rolled back, the compaction attempt is aborted synchronously with zero operations pruned.
+
+### AC-COMPACT-3: Checkpoint Preservation
 - **Condition:** Pruning operations MUST NOT delete compacted checkpoint entries for pruned origins.
 - **Pass Threshold:** `log.getCompactedCheckpoints()` returns a complete, contiguous record of the highest sequence and operation digest for every origin pruned.
 
-### AC-COMPACT-3: Horizon Rejection via Anti-Entropy
+### AC-COMPACT-4: Horizon Rejection via Anti-Entropy
 - **Condition:** An incoming Phase 7.4 `REPAIR_REQUEST` requesting a sequence range below the compaction frontier is evaluated by `RepairSupplierService`.
 - **Pass Threshold:** Supplier immediately returns `REPAIR_REJECTED` with reason `OUTSIDE_HORIZON`. Requester dispatches `onHistoryExhausted`.
 
@@ -34,32 +43,28 @@ This document establishes the binding acceptance criteria for Phase 7.5: Fault T
 
 ## 3. Snapshot Eligibility and Validation (AC-ELIGIBLE)
 
-### AC-ELIGIBLE-1: Complete Prefix Checkpoint Verification
-- **Condition:** Candidate snapshot $S$ is evaluated against local state.
-- **Pass Threshold:** $S$ is ELIGIBLE if and only if:
-  1. $\forall p \in \text{origins}(V_L): V_S[p] \ge V_L[p]$.
-  2. For every origin $p$ and every common sequence $i \in [1, \min(V_L[p], V_S[p])]$ retained by either party:
-     $$\text{fingerprint}_S(p, i) == \text{fingerprint}_L(p, i)$$
-     Matching only the final operation at sequence $k$ is strictly insufficient.
-  3. If unverified gaps exist in the common prefix: evaluates to `REQUIRES_HISTORY_REPAIR`. If unrepairable, transitions to `DEGRADED`.
-  4. Exact Phase 7.2 Lamport invariant holds: $S.\text{maxLogicalTimestamp} \equiv \max_{p} S.\text{originFrontierTimestamps}[p]$.
-  5. Bit-exact SHA-256 match over canonical RFC 8785 JSON representation.
+### AC-ELIGIBLE-1: Complete Prefix Checkpoint Verification (Four Outcomes)
+- **Condition:** Candidate snapshot $S$ is evaluated against local state across common prefix $[1, \min(V_L[p], V_S[p])]$.
+- **Pass Threshold:** Exactly one of the four outcomes is returned:
+  1. **`HISTORY_VERIFIED`:** All retained common sequence checkpoints match bit-exact, and zero intermediate gaps exist. Evaluates to **ELIGIBLE**.
+  2. **`HISTORY_CONFLICT`:** Any common sequence fingerprint differs. Evaluates to **REJECTED** (history fork).
+  3. **`HISTORY_INCOMPLETE`:** Gaps exist, but suppliers retain missing ranges in active logs. Evaluates to **REQUIRES_HISTORY_REPAIR**.
+  4. **`HISTORY_UNAVAILABLE`:** Gaps exist, and proof is permanently outside every retention horizon across the mesh. Evaluates to **DEGRADED**.
+- Matching only the final operation at sequence $k$ is strictly prohibited.
 
-### AC-ELIGIBLE-2: Formal Compatibility Cases (A through E)
-- **Case A (Valid Dominating Snapshot):** $V_S \ge V_L$, complete common prefix checkpoints match.
-  - *Pass Threshold:* Evaluates to **ELIGIBLE**.
-- **Case B (Incomparable Snapshots):** $V_S[A] < V_L[A]$ while $V_S[B] > V_L[B]$.
-  - *Pass Threshold:* Evaluates to **DEGRADED**. Arbitrary tie-breaking is strictly prevented.
-- **Case C (Conflicting Checkpoint):** Fingerprints differ at any sequence in common prefix.
-  - *Pass Threshold:* Evaluates to **REJECTED** (history fork detected).
-- **Case D (Unavailable Checkpoint):** Checkpoints missing across uncompacted common prefix.
-  - *Pass Threshold:* Evaluates to **REQUIRES_HISTORY_REPAIR** $\to$ **DEGRADED**.
-- **Case E (Missing Frontier Timestamp):** Origin has sequence $>0$ but lacks frontier timestamp.
-  - *Pass Threshold:* Evaluates to **REJECTED** (malformed metadata).
+### AC-ELIGIBLE-2: Exact Lamport Invariant Reinstated
+- **Condition:** Validation of `maxLogicalTimestamp`.
+- **Pass Threshold:** Must hold bit-exact:
+  $$S.\text{maxLogicalTimestamp} \equiv \max_{p \in \text{origins}(V_S)} S.\text{originFrontierTimestamps}[p]$$
 
-### AC-ELIGIBLE-3: Older-Epoch Snapshot Revalidation
+### AC-ELIGIBLE-3: Mechanical Older-Epoch Non-Supersession
 - **Condition:** Snapshot carries `membershipEpoch < currentEpoch`.
-- **Pass Threshold:** Accepted ONLY IF: (1) `sessionId` matches, (2) served in a current-epoch transport envelope, (3) certified by supplier in current epoch, and (4) local engine has committed zero newer operations conflicting with or superseding $S$.
+- **Pass Threshold:** Accepted ONLY IF:
+  1. $S.\text{sessionId} === \text{engine.sessionId}$.
+  2. Transport envelope carries current epoch $E_{\text{local}}$ and active generation.
+  3. Supplier certifies in current epoch that $S$ is its active base snapshot.
+  4. $\forall op \in \text{localOperationLog}: op.\text{membershipEpoch} > S.\text{membershipEpoch} \implies op.\text{originSequenceNumber} \le S.V_S[op.\text{originPeerId}]$.
+  5. If unprovable before M5, classified as a historical candidate that halts in `RECOVERING` or transitions to `DEGRADED`.
 
 ---
 
@@ -90,12 +95,12 @@ This document establishes the binding acceptance criteria for Phase 7.5: Fault T
 
 ## 5. Atomic Installation and Quarantine Buffer (AC-INSTALL)
 
-### AC-INSTALL-1: Staged Immutable Instance Replacement
+### AC-INSTALL-1: Staged Immutable Instance Replacement across 14 Components
 - **Condition:** Snapshot installation executes via `SnapshotInstaller`.
 - **Pass Threshold:**
   1. Stage 1 (`validateCandidate`) runs dry-run checks with zero engine mutation.
   2. Stage 2 constructs new `OrderedOperationLog`, state, and replication vectors out-of-band.
-  3. Stage 3 performs a single synchronous run-to-completion reference swap.
+  3. Stage 3 performs a single synchronous run-to-completion reference swap across all 14 mutable components.
   4. External listeners are NOT notified during staging or swap.
 
 ### AC-INSTALL-2: Deferred Listener Dispatch

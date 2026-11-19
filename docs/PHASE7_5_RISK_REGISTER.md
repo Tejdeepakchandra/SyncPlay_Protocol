@@ -1,8 +1,8 @@
 # Phase 7.5 — Fault Tolerance & State Recovery: Risk Register
 
-**Status:** APPROVED ARCHITECTURAL DESIGN (FINAL CLOSURE)  
+**Status:** APPROVED ARCHITECTURAL DESIGN (FINAL SAFETY CLOSURE)  
 **Date:** 2026-11-19  
-**Branch Baseline:** `main` at `30b8e5f`  
+**Branch Baseline:** `main` at `377c906`  
 **Frozen Baselines:** Phase 7.3 (`e49b81a`), Phase 7.4 M1–M5 (`dbd5217`, `3a3d9e5`)  
 
 ---
@@ -12,14 +12,15 @@
 | Risk ID | Description | Pre-Mitigation Risk | Post-Mitigation Risk | Primary Mitigation |
 | :--- | :--- | :---: | :---: | :--- |
 | **RSK-7.5-01** | Memory exhaustion via unbounded chunk reassembly | **HIGH** | **LOW** | 4 MB total cap, 1 active transfer, chunk size bounds |
-| **RSK-7.5-02** | Split-brain divergence from incomparable snapshots | **CRITICAL** | **LOW** | Strict vector domination + prefix checkpoint check; reject tie-break; enter `DEGRADED` |
+| **RSK-7.5-02** | Split-brain divergence from incomparable snapshots | **CRITICAL** | **LOW** | Strict vector domination + prefix check; reject tie-break; enter `DEGRADED` |
 | **RSK-7.5-03** | Quarantine buffer overflow under high traffic churn | **HIGH** | **LOW** | 1,000 operation ring buffer, fail-safe synchronous abort to `DEGRADED` |
 | **RSK-7.5-04** | Mid-transfer connection drop or epoch increment | **HIGH** | **LOW** | Synchronous abort, timer cleanup, generation binding |
 | **RSK-7.5-05** | Lamport clock inflation attack or clock regression | **HIGH** | **LOW** | Exact $\max(L_{\text{local}}, L_{\text{snap}})$ reseed without $+1$, exact Phase 7.2 invariant |
 | **RSK-7.5-06** | Checkpoint table bloat from ephemeral peers | **MEDIUM** | **LOW** | Fixed cap (256 checkpoints), pruning retired origins |
 | **RSK-7.5-07** | Re-entrant event execution during atomic install | **CRITICAL** | **LOW** | Staged immutable instance replacement, deferred listener notification |
 | **RSK-7.5-08** | SCTP transport fragmentation / 64 KB overflow | **HIGH** | **LOW** | Normative 7-step iterative UTF-8 send boundary loop |
-| **RSK-7.5-09** | Concealed intermediate history divergence | **HIGH** | **LOW** | Full prefix checkpoint verification across $[1, k]$; fail to `DEGRADED` if gaps exist |
+| **RSK-7.5-09** | Concealed intermediate history divergence | **HIGH** | **LOW** | Four-outcome prefix verification across $[1, k]$; fail to `DEGRADED` on unavailable proof |
+| **RSK-7.5-10** | Compaction frontier bypassing local applied sequence | **CRITICAL** | **LOW** | Mandatory inclusion of $V_{\text{local}}$ in GLB formula; pre-commit local vector check |
 
 ---
 
@@ -95,7 +96,7 @@
 - **Pre-Mitigation Impact:** Inconsistent state, corrupted replication vectors.
 - **Mitigation Strategy:**
   1. Staged Immutable Instance Replacement: Staged `OrderedOperationLog`, state, and replication vectors are built out-of-band.
-  2. Atomic reference swap: Synchronous property swap executes in a single run-to-completion step.
+  2. Atomic reference swap: Synchronous property swap executes in a single run-to-completion step across all 14 components.
   3. Deferred listener notification: Listeners are invoked ONLY AFTER reconciliation finishes.
 - **Verification Plan:** Test attempting to invoke `engine.executeLocalOperation()` while `installSnapshotAtomic()` is running and verifying strict rejection.
 
@@ -116,10 +117,21 @@
 - **Description:** Because operation fingerprints commit only to individual operations and not a hash chain, equality at sequence $k = \min(V_L[p], V_S[p])$ can conceal conflicting operations authored at sequence $i < k$.
 - **Pre-Mitigation Impact:** Silently adopting an incompatible fork with divergent historical state.
 - **Mitigation Strategy:**
-  1. Full prefix verification: Check all common retained sequence checkpoints across $[1, k]$.
-  2. Missing checkpoint rule: If any intermediate sequence has missing checkpoints on either side, classify as `REQUIRES_HISTORY_REPAIR`.
-  3. Fail-safe degradation: If missing checkpoints cannot be retrieved via anti-entropy, transition to `DEGRADED`.
+  1. Four-outcome prefix verification: Check all common retained sequence checkpoints across $[1, k]$.
+  2. Missing checkpoint rule: If proof is permanently missing from all active logs, classify as `HISTORY_UNAVAILABLE` $\to$ `DEGRADED`.
+  3. Refuse to declare compatibility based solely on vector domination or final sequence equality.
 - **Verification Plan:** Counterexample test with identical fingerprints at sequence 3 but divergent operation at sequence 1, asserting rejection.
+
+---
+
+### RSK-7.5-10: Compaction Frontier Bypassing Local Applied Sequence
+- **Description:** If $V_{\text{epoch\_safe}}$ is computed only over remote peers, a local peer that lags behind remote peers will compact operations it has never applied, permanently corrupting its local base snapshot.
+- **Pre-Mitigation Impact:** Irrecoverable state corruption, loss of unapplied local operations, broken convergence.
+- **Mitigation Strategy:**
+  1. Mandatory local inclusion: $V_{\text{epoch\_safe}}[p] = \min(V_{\text{local}}[p], \min_{r} D_r.\text{replicationVector}[p])$.
+  2. Pre-commit check: Re-verify $V_{\text{epoch\_safe}}[p] \le \text{engine.replicationVector}[p]$ immediately before commit.
+  3. Empty remote mesh safety: $V_{\text{epoch\_safe}} = V_{\text{local}}$.
+- **Verification Plan:** Unit test initializing a lagging local peer with advanced remote peers and verifying compaction never exceeds $V_{\text{local}}$.
 
 ---
 
@@ -131,4 +143,4 @@
 | **OD-7.5-2** | How should `SNAPSHOT_OFFER` messages be advertised? | Flooding offers on every timer tick wastes WebRTC bandwidth on mobile/constrained clients. | **Alt A:** Periodic broadcast.<br/>**Alt B:** Request-driven / targeted responses to `onHistoryExhausted`. | **Alt B (Request-driven):** Eliminates unneeded signaling overhead; offers are published only when missing history is declared. | **YES** (Decided: Alt B) |
 | **OD-7.5-3** | How should Explicit Manual Reset be exposed to applications when in `DEGRADED` state? | When two partitions have incomparable histories, users need a way to force convergence without causing silent causal overwrites. | **Alt A:** Automatic tie-breaking (e.g. lowest peerId).<br/>**Alt B:** Provide explicit `resetSession({ newSessionId })` API with UI prompt.<br/>**Alt C:** Defer Manual Reset to Phase 8. | **Alt C (Defer to Phase 8):** Phase 7.5 provides the mathematical safety, fencing, and `DEGRADED` state. Application-level session recreation is a Phase 8 SDK concern. | **YES** (Decided: Alt C) |
 | **OD-7.5-4** | What is the minimum supported SCTP max message size? | If a WebRTC link negotiates an extremely small MTU ($< 2\text{ KB}$), chunk framing overhead exceeds data payload. | **Alt A:** Reject connections with SCTP limit $< 64\text{ KB}$.<br/>**Alt B:** Support down to 2,048 bytes; abort if $< 2048$ bytes. | **Alt B:** Supports standard constrained networks (e.g. 16 KB) while protecting against pathologically tiny MTUs. | **YES** (Decided: Alt B) |
-| **OD-7.5-5** | How should unverified intermediate sequence gaps below compaction horizon be resolved? | Since checkpoints do not chain previous operations, missing checkpoints mean history cannot be verified. | **Alt A:** Assume equality if vector dominates.<br/>**Alt B:** Declare `REQUIRES_HISTORY_REPAIR` and fail to `DEGRADED` if unrepairable. | **Alt B (Require repair / fail to DEGRADED):** Prevents silent branch overwriting when intermediate divergence exists. | **YES** (Decided: Alt B) |
+| **OD-7.5-5** | How should unverified intermediate sequence gaps below compaction horizon be resolved? | Since checkpoints do not chain previous operations, missing checkpoints mean history cannot be verified. | **Alt A:** Assume equality if vector dominates.<br/>**Alt B:** Distinguish `HISTORY_INCOMPLETE` vs `HISTORY_UNAVAILABLE` and fail to `DEGRADED` if unrepairable. | **Alt B:** Prevents silent branch overwriting when intermediate divergence exists. | **YES** (Decided: Alt B) |
