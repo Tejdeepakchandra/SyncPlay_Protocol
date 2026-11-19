@@ -2,7 +2,9 @@
 
 **Status:** APPROVED FOR PLANNING (DOCUMENTATION-ONLY)  
 **Date:** 2026-11-19  
-**Branch Baseline:** `main` at `6fddcf90de5d4cb0e82bd711e7e217cd570c88a4`  
+**Refinement Date:** 2026-11-19  
+**Branch Baseline:** `main` at `3b90116`  
+**Parent Implementation Baseline:** `6fddcf90de5d4cb0e82bd711e7e217cd570c88a4`  
 **Specification Baseline:** `119da194c3feb883cfd61b6928cb81d4b200ac5d`  
 
 ---
@@ -31,14 +33,20 @@ export const MIN_SUPPORTED_SCTP_LIMIT = 2048;
 /** Envelope budget in bytes for SNAPSHOT_CHUNK metadata, UUIDs, and Base64 framing overhead. */
 export const CHUNK_ENVELOPE_BUDGET_BYTES = 768;
 
-/** Timeout in milliseconds before a single missing chunk is re-requested. */
+/** Timeout in milliseconds before missing chunks in the active window are re-requested. */
 export const CHUNK_REQUEST_TIMEOUT_MS = 5000;
 
-/** Maximum number of retransmission attempts per chunk before transfer abort. */
+/** Maximum retransmission attempts allowed for an individual chunk index. */
 export const MAX_CHUNK_RETRIES = 3;
 
-/** Overall transfer timeout in milliseconds. */
-export const OVERALL_TRANSFER_TIMEOUT_MS = 60000; // 60 seconds
+/** Maximum cumulative chunk retransmission attempts allowed across an entire transfer attempt. */
+export const MAX_TRANSFER_RETRIES = 10;
+
+/** Hard wall-clock transfer deadline in milliseconds (60 seconds). */
+export const OVERALL_TRANSFER_TIMEOUT_MS = 60000;
+
+/** Maximum concurrent outbound transfers served by a single supplier. */
+export const MAX_SUPPLIER_CONCURRENT_TRANSFERS = 2;
 ```
 
 ---
@@ -64,6 +72,7 @@ export const SnapshotAbortReasonSchema = z.enum([
   'STALE_SNAPSHOT',
   'CHECKPOINT_DIVERGENCE',
   'IDENTITY_MISMATCH',
+  'RETRY_BUDGET_EXHAUSTED',
 ]);
 
 export type SnapshotAbortReason = z.infer<typeof SnapshotAbortReasonSchema>;
@@ -82,6 +91,7 @@ export const SnapshotOfferPayloadSchema = z.object({
   membershipEpoch: z.number().int().nonnegative(),
   supplierPeerId: z.string().min(1).max(64),
   snapshotId: z.string().min(1).max(128),
+  authorPeerId: z.string().min(1).max(64),
   snapshotFrontier: z.record(
     z.string().min(1).max(64),
     z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER)
@@ -101,7 +111,7 @@ export type SnapshotOfferPayload = z.infer<typeof SnapshotOfferPayloadSchema>;
 
 ### 2.3 `SNAPSHOT_REQUEST` Wire Payload
 
-Issued by a recovering peer to select an offer and initiate chunked transfer.
+Issued by a recovering peer to select an offer and initiate or resume chunked transfer.
 
 ```typescript
 export const SnapshotRequestPayloadSchema = z.object({
@@ -113,6 +123,9 @@ export const SnapshotRequestPayloadSchema = z.object({
   snapshotId: z.string().min(1).max(128),
   requestedChunkWindow: z.number().int().positive().max(MAX_CONCURRENT_CHUNK_REQUESTS).default(4),
   clientMaxChunkBytes: z.number().int().positive().max(MAX_CHUNK_BYTES).optional(),
+  missingChunkIndices: z.array(
+    z.number().int().nonnegative().max(MAX_CHUNKS_PER_SNAPSHOT - 1)
+  ).max(MAX_CHUNKS_PER_SNAPSHOT).optional(),
 });
 
 export type SnapshotRequestPayload = z.infer<typeof SnapshotRequestPayloadSchema>;
@@ -244,20 +257,23 @@ export interface IChunkAssembler {
   readonly expectedSha256: string;
   readonly isComplete: boolean;
 
-  /**
-   * Ingests a single chunk, validates Base64 and chunkSha256.
-   */
+  /** Checks if a specific chunk index has already been received and verified. */
+  hasChunk(chunkIndex: number): boolean;
+
+  /** Ingests a single chunk, validates Base64 and chunkSha256. */
   ingestChunk(chunk: SnapshotChunkPayload): ChunkIngestResult;
 
-  /**
-   * Returns list of chunk indices not yet received.
-   */
+  /** Returns bounded list of chunk indices not yet received. */
   getMissingChunkIndices(maxCount?: number): number[];
 
   /**
-   * Reassembles contiguous buffer and verifies complete payload SHA-256 digest.
-   * Throws Error if incomplete or hash mismatch.
+   * Evaluates whether retained verified chunks can be preserved for a failover supplier.
+   * If snapshotId and expectedSha256 match bit-exact, retained chunks are preserved.
+   * If mismatch, all chunks are purged.
    */
+  prepareForFailover(newTransferId: string, newSnapshotId: string, newSha256: string): boolean;
+
+  /** Reassembles contiguous buffer and verifies complete payload SHA-256 digest. */
   finalizeAssembly(): { rawBytes: Uint8Array; payload: StateSnapshotPayloadV2 };
 
   /** Clears memory and aborts assembly. */
@@ -279,6 +295,7 @@ export interface TransferProgress {
   readonly receivedChunks: number;
   readonly totalBytes: number;
   readonly receivedBytes: number;
+  readonly retryCount: number;
   readonly percentComplete: number;
 }
 
@@ -293,10 +310,7 @@ export interface SnapshotTransferResult {
 }
 
 export interface ISnapshotTransferManager {
-  /**
-   * Initiates an outbound transfer to fulfill an incoming SNAPSHOT_REQUEST.
-   * Executes normative 7-step iterative send-boundary loop.
-   */
+  /** Initiates outbound transfer to fulfill an incoming SNAPSHOT_REQUEST. */
   startOutboundTransfer(
     request: SnapshotRequestPayload,
     snapshotBytes: Uint8Array,
@@ -304,11 +318,15 @@ export interface ISnapshotTransferManager {
     generation: number
   ): void;
 
-  /**
-   * Initiates an inbound transfer to accept an incoming SNAPSHOT_OFFER.
-   * Enforces strict single active transfer invariant.
-   */
+  /** Initiates inbound transfer to accept an incoming SNAPSHOT_OFFER. */
   startInboundTransfer(
+    offer: SnapshotOfferPayload,
+    fromPeerId: string,
+    generation: number
+  ): Promise<SnapshotTransferResult>;
+
+  /** Fails over an interrupted transfer to a replacement supplier offering the same snapshot. */
+  failoverInboundTransfer(
     offer: SnapshotOfferPayload,
     fromPeerId: string,
     generation: number
@@ -336,7 +354,7 @@ export interface ISnapshotTransferManager {
 
 ---
 
-## 5. Pre-M4 Security Boundary Corrections
+## 5. Pre-M4 Security & Compaction Boundary Corrections
 
 ### 5.1 Inbound Identity Binding in `TrustedTransportAdapter` (Limitation A)
 
@@ -368,3 +386,19 @@ In `OrderedOperationLog.getOriginFrontierTimestamps(frontier)`:
 - If exact sequence is found in active log or compacted checkpoints: resolve timestamp.
 - If not found: mark origin as unresolvable.
 - **Never substitute a later or earlier sequence timestamp.**
+
+### 5.3 Transactional Staging for Compaction (Limitation C)
+
+```typescript
+export interface StagedCompactionResult {
+  readonly success: boolean;
+  readonly prunedCount: number;
+  readonly newBaseSnapshot: PlaybackState;
+  readonly error?: string;
+}
+```
+In `OrderedOperationLog.compactAtFrontier(stableFrontier)`:
+- Step 1: Filter operations to prune.
+- Step 2: Stage reduction forward into a candidate copy of `baseSnapshot`.
+- Step 3: **Only if candidate reduction completes without throwing**, mutate `this.operations`, `idIndex`, and `originSeqIndex`.
+- Guarantees zero partial mutation if reducer throws.

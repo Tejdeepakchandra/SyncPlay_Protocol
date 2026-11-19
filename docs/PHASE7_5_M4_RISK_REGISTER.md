@@ -2,7 +2,9 @@
 
 **Status:** APPROVED FOR PLANNING (DOCUMENTATION-ONLY)  
 **Date:** 2026-11-19  
-**Branch Baseline:** `main` at `6fddcf90de5d4cb0e82bd711e7e217cd570c88a4`  
+**Refinement Date:** 2026-11-19  
+**Branch Baseline:** `main` at `3b90116`  
+**Parent Implementation Baseline:** `6fddcf90de5d4cb0e82bd711e7e217cd570c88a4`  
 **Specification Baseline:** `119da194c3feb883cfd61b6928cb81d4b200ac5d`  
 
 ---
@@ -13,13 +15,15 @@
 |:---|:---:|:---:|:---|:---|:---:|
 | **R-M4-1** | **CRITICAL** | High | Transport Boundary | Normative 7-step iterative send-boundary loop measuring exact UTF-8 bytes | In-M4 (M4.2) |
 | **R-M4-2** | High | Medium | Constrained Networks | Fail-fast abort if SCTP limit $< 2,048$ bytes or chunk $< 256$ bytes | In-M4 (M4.2) |
-| **R-M4-3** | High | Low | Memory Consumption | Strict single active transfer constraint and max 128 chunks ($4\text{ MB}$) | In-M4 (M4.1, M4.3) |
+| **R-M4-3** | High | Low | Memory Consumption | Strict single active transfer constraint, bounded buffers, max 128 chunks | In-M4 (M4.1, M4.3) |
 | **R-M4-4** | High | Medium | Data Integrity | Two-tier hash verification: per-chunk SHA-256 and full canonical RFC 8785 SHA-256 | In-M4 (M4.1, M4.4) |
 | **R-M4-5** | High | Medium | Connection Stability | Transport lifecycle event listeners aborting immediately on disconnect or gen change | In-M4 (M4.4) |
 | **R-M4-6** | High | Low | Causal Consistency | Rejection of offers with stale epoch or non-dominating frontier | In-M4 (M4.3) |
 | **R-M4-7** | **CRITICAL** | Medium | Trust Boundary | Strict transport identity binding (`senderPeerId === fromPeerId`) | **Pre-M4 (M4.0a)** |
 | **R-M4-8** | High | Medium | Clock Metadata | Strict sequence-specific timestamp resolution (no loose fallback) | **Pre-M4 (M4.0b)** |
-| **R-M4-9** | Medium | Low | Engine Compaction | Formal pure/non-throwing reducer contract and candidate staging | Pre-M5 Architecture |
+| **R-M4-9** | High | Low | Engine Compaction | Staged candidate base snapshot reduction before splicing active operations | **Pre-M4 (M4.0d)** |
+| **R-M4-10** | High | Low | Failover Integrity | Strict snapshot identity match (`snapshotId` & `sha256Digest`) before retaining chunks | In-M4 (M4.1, M4.3) |
+| **R-M4-11** | Medium | Medium | Availability | Dual retry budget: max 3 per chunk, max 10 total transfer retries, 60s deadline | In-M4 (M4.3) |
 
 ---
 
@@ -55,7 +59,7 @@
   1. Strict single active transfer constraint: A recovering node permits at most 1 active inbound transfer context.
   2. Hard bounds on buffer: Max chunks $\le 128$, max total size $\le 4\text{ MB}$.
   3. Pre-allocated sparse array bounded to declared `totalChunks`.
-  4. Immediate cleanup of buffers on abort, timeout, or epoch change.
+  4. Immediate cleanup of buffers on abort, timeout, or epoch change via explicit `dispose()`.
 - **Verification Plan:** Unit test flooding concurrent offers while a transfer is in flight confirms subsequent offers are rejected without allocating secondary buffers.
 
 ---
@@ -76,9 +80,9 @@
 - **Root Cause:** Unhandled transport lifecycle events leaving transfer state machines permanently stuck in `RECOVERING`.
 - **Mitigation:**
   1. `SnapshotTransferManager` listens to `PeerManager` status events.
-  2. If supplier status transitions to `DISCONNECTED`, `CLOSED`, or `FAILED`: active transfer aborts immediately with `SUPPLIER_DISCONNECTED`.
+  2. If supplier status transitions to `DISCONNECTED`, `CLOSED`, or `FAILED`: active transfer triggers failover if an alternate eligible supplier is known, or aborts with `SUPPLIER_DISCONNECTED`.
   3. Per-chunk timeout (5,000ms) and overall transfer timeout (60,000ms) serve as fallback tripwires.
-- **Verification Plan:** Test case simulating supplier disconnect during chunk 4 of 8 confirms immediate cleanup and abort emission.
+- **Verification Plan:** Test case simulating supplier disconnect during chunk 4 of 8 confirms failover with chunk retention when replacement matches, and clean abort when no replacement exists.
 
 ---
 
@@ -119,6 +123,30 @@
 - **Threat Description:** If `this.reducer` throws in loop 2 of `compactAtFrontier()`, operations have already been spliced from `this.operations`, leaving partial log mutation.
 - **Root Cause:** Splicing operations before verifying that state reduction succeeds.
 - **Mitigation:**
-  1. Formally enforce the reducer contract as pure and non-throwing (guaranteed by production `reduceState`).
-  2. In M5 staged replacement architecture, candidate base state reduction will execute before active array slicing.
-- **Verification Plan:** Code inspection and formal reducer contract verification.
+  1. Designated as **Milestone M4.0d (Prerequisite)**.
+  2. Transactional candidate staging: compute candidate base state reduction on an out-of-band clone before splicing active arrays or mutating indexes.
+  3. If reduction throws, zero mutations occur.
+- **Verification Plan:** Test case with throwing reducer in `compactAtFrontier` confirms active operations and checkpoints remain 100% intact.
+
+---
+
+### R-M4-10: Chunk Mixing Across Different Snapshot Identities During Failover
+- **Threat Description:** When a supplier disconnects mid-transfer, an alternate supplier is selected that offers a different snapshot ID or different digest. Ingesting chunks from both suppliers into the same assembler corrupts state.
+- **Root Cause:** Retaining chunk assembler buffer across failover without validating snapshot ID and digest equivalence.
+- **Mitigation:**
+  1. In `ChunkAssembler.prepareForFailover()`, compare `newSnapshotId === activeSnapshotId` and `newSha256 === activeSha256`.
+  2. If both match bit-exact, retained chunks are preserved.
+  3. If either differs, **all previously received chunks are purged immediately**. Mixing chunks from different snapshot identities is impossible.
+- **Verification Plan:** Test case offering differing snapshot ID during failover confirms complete chunk purge and clean fresh transfer initiation.
+
+---
+
+### R-M4-11: Unbounded Retransmission Loops on Chronically Degraded Links
+- **Threat Description:** On a link with persistent packet loss, retransmission requests could repeat endlessly without terminating.
+- **Root Cause:** Per-chunk retry timers without an overall transfer retry budget or wall-clock deadline.
+- **Mitigation:**
+  1. Per-chunk retry limit: Max 3 retries per chunk index (`MAX_CHUNK_RETRIES = 3`).
+  2. Total transfer retry budget: Max 10 retransmissions across all chunks (`MAX_TRANSFER_RETRIES = 10`).
+  3. Hard wall-clock transfer deadline: 60 seconds (`OVERALL_TRANSFER_TIMEOUT_MS = 60000`).
+  4. Exceeding any budget triggers clean termination with `TRANSFER_TIMEOUT` or `RETRY_BUDGET_EXHAUSTED`.
+- **Verification Plan:** Test case simulating 100% loss on a single chunk confirms termination after exactly 3 retries.

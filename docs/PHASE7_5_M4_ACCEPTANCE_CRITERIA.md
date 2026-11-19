@@ -2,7 +2,9 @@
 
 **Status:** APPROVED FOR PLANNING (DOCUMENTATION-ONLY)  
 **Date:** 2026-11-19  
-**Branch Baseline:** `main` at `6fddcf90de5d4cb0e82bd711e7e217cd570c88a4`  
+**Refinement Date:** 2026-11-19  
+**Branch Baseline:** `main` at `3b90116`  
+**Parent Implementation Baseline:** `6fddcf90de5d4cb0e82bd711e7e217cd570c88a4`  
 **Specification Baseline:** `119da194c3feb883cfd61b6928cb81d4b200ac5d`  
 
 ---
@@ -13,7 +15,7 @@ This document defines the formal, measurable acceptance criteria for Phase 7.5 M
 
 ---
 
-## 2. Pre-M4 Security & Metadata Criteria (AC-M4-PRE)
+## 2. Pre-M4 Security, Metadata & Compaction Criteria (AC-M4-PRE)
 
 ### AC-M4-PRE-1: `STATE_DIGEST` Transport Sender Identity Binding
 - **Condition:** Inbound `STATE_DIGEST` message received via `TrustedTransportAdapter`.
@@ -26,94 +28,152 @@ This document defines the formal, measurable acceptance criteria for Phase 7.5 M
 ### AC-M4-PRE-2: Strict Sequence-Specific Timestamp Resolution
 - **Condition:** `getOriginFrontierTimestamps(frontier)` is called with origin sequences that have been pruned and whose checkpoints were evicted from the 256-entry FIFO cache.
 - **Pass Threshold:**
-  1. If an exact sequence timestamp is not present in active log or retained checkpoints, it is reported as unresolvable / unavailable.
+  1. If an exact sequence timestamp is not present in active log or retained checkpoints, it is reported as unresolvable / unavailable (`null`).
   2. The function **NEVER** returns a timestamp belonging to a different sequence number.
   3. Snapshot creation fails if required frontier timestamps cannot be established exactly.
 
----
-
-## 3. Wire Protocol & Sizing Criteria (AC-M4-WIRE)
-
-### AC-M4-WIRE-1: Wire Schema Conformity
-- **Condition:** Processing of `SNAPSHOT_OFFER`, `SNAPSHOT_REQUEST`, `SNAPSHOT_CHUNK`, `SNAPSHOT_CHUNK_REQUEST`, and `SNAPSHOT_ABORT`.
+### AC-M4-PRE-3: Compaction Exception Atomicity
+- **Condition:** `compactAtFrontier()` is invoked with a throwing reducer callback.
 - **Pass Threshold:**
-  1. Payloads conforming to Zod schemas parse successfully.
-  2. Payloads violating bounds (e.g. `chunkIndex >= totalChunks`, `chunkSizeBytes > MAX_CHUNK_BYTES`, `totalChunks > 128`, `totalSizeBytes > 4 MB`) fail schema validation immediately.
-  3. Invalid payloads are rejected at the transport boundary without side effects.
-
-### AC-M4-WIRE-2: Normative 7-Step Iterative Sizing Enforcement
-- **Condition:** Outbound `SNAPSHOT_CHUNK` transmission across negotiated SCTP limits from 2,048 to 65,536 bytes.
-- **Pass Threshold:**
-  1. The complete serialized `ProtocolMessage` JSON string is measured via `TextEncoder().encode(wireJson).byteLength`.
-  2. The measured UTF-8 byte length strictly satisfies:
-     $$\text{byteLength} \le \min(65536, \text{sctpMaxMessageSize})$$
-  3. If the initial estimate overshoots, the iterative reduction loop dynamically decreases the binary slice until the serialized message fits.
-  4. The exact serialized string validated is passed unchanged to `RTCDataChannel.send()`.
-  5. If effective limit is $< 2,048$ bytes or chunk binary size drops below 256 bytes without fitting, transfer is cleanly aborted with `TRANSPORT_LIMIT_EXCEEDED`.
+  1. Candidate base state reduction is staged on an out-of-band clone before modifying active log state.
+  2. If the reducer throws, the exception is propagated, and `this.operations`, `idIndex`, `originSeqIndex`, and checkpoints remain 100% untouched.
 
 ---
 
-## 4. Flow Control & Assembly Criteria (AC-M4-FLOW)
+## 3. Snapshot Identity & Authorship Criteria (AC-M4-AUTH)
 
-### AC-M4-FLOW-1: Strict Single Inbound Transfer Invariant
-- **Condition:** Multiple `SNAPSHOT_OFFER` messages received by a recovering peer.
+### AC-M4-AUTH-1: Immutable Snapshot Identity vs Ephemeral Transfer Identity
+- **Condition:** Generation of snapshot offer and transfer requests across multiple forwarding peers.
 - **Pass Threshold:**
-  1. A recovering node maintains at most 1 active inbound transfer at any time.
-  2. Concurrent offers from the same epoch are queued or ignored.
-  3. An offer from a higher epoch terminates the current transfer with `EPOCH_MISMATCH` before starting a new transfer.
+  1. `authorPeerId` is bound into `StateSnapshotPayloadV2` and canonical SHA-256 digest preimage.
+  2. Forwarding supplier `supplierPeerId` is excluded from the digest preimage and is never recorded as the author.
+  3. `transferId` is regenerated uniquely per transfer attempt.
 
-### AC-M4-FLOW-2: Sliding-Window Flow Control
-- **Condition:** Multi-chunk transfer over WebRTC DataChannel.
+### AC-M4-AUTH-2: Supplier Possession Verification
+- **Condition:** Supplier transmits chunks for an advertised offer.
 - **Pass Threshold:**
-  1. Number of concurrently in-flight unacknowledged chunks strictly $\le \text{MAX\_CONCURRENT\_CHUNK\_REQUESTS} = 4$.
-  2. Chunks are dispatched in accordance with granted window credits.
-  3. `SNAPSHOT_CHUNK_REQUEST` advances the window as chunks are verified.
-
-### AC-M4-FLOW-3: Selective Retransmission Recovery
-- **Condition:** Simulated 10% packet drop and arbitrary chunk reordering on transport link.
-- **Pass Threshold:**
-  1. Out-of-order chunks are accepted and placed in the correct sparse index in `ChunkAssembler`.
-  2. Duplicate chunks are idempotently dropped without error or double-counting.
-  3. Gaps trigger `SNAPSHOT_CHUNK_REQUEST` specifying missing indices upon chunk timeout (5,000ms).
-  4. 100% of dropped chunks are recovered within max 3 retries, completing full snapshot assembly.
+  1. Every chunk's Base64 payload decodes to raw binary matching `chunkSha256`.
+  2. Reassembled contiguous buffer decodes as valid `StateSnapshotPayloadV2`.
+  3. Canonical RFC 8785 JSON SHA-256 digest of reassembled payload matches `offer.sha256Digest` bit-exact.
+  4. If supplier fails chunk hash or overall digest verification, transfer immediately aborts with `CHUNK_CORRUPTED` or `HASH_MISMATCH`.
 
 ---
 
-## 5. Integrity & Verification Criteria (AC-M4-INTEG)
+## 4. Supplier Failover Criteria (AC-M4-FAILOVER)
 
-### AC-M4-INTEG-1: Per-Chunk Binary Hash Verification
-- **Condition:** Receipt of `SNAPSHOT_CHUNK` with Base64 payload.
+### AC-M4-FAILOVER-1: Chunk Retention on Matching Snapshot Failover
+- **Condition:** Supplier disconnects after transmitting chunks $0 \dots 3$ of an 8-chunk snapshot. Alternate supplier offers identical `snapshotId` and `sha256Digest`.
 - **Pass Threshold:**
-  1. Base64 payload is decoded to raw binary bytes.
-  2. $\text{SHA-256}(\text{rawBinary}) \equiv \text{chunk.chunkSha256}$ is verified.
-  3. Any chunk with bit-flips or corrupted Base64 is rejected immediately and re-requested.
+  1. Active transfer attempt with supplier 1 is invalidated.
+  2. Chunks $0 \dots 3$ are retained in `ChunkAssembler`.
+  3. A new `transferId` is generated for supplier 2.
+  4. `SNAPSHOT_REQUEST` requests only missing chunks $4 \dots 7$.
+  5. Transfer completes successfully.
 
-### AC-M4-INTEG-2: Full-Payload Canonical SHA-256 Verification
-- **Condition:** Collation of all chunks $[0, \text{totalChunks}-1]$ in `ChunkAssembler`.
+### AC-M4-FAILOVER-2: Complete Chunk Purge on Mismatched Snapshot Failover
+- **Condition:** Supplier disconnects after transmitting chunks $0 \dots 3$. Alternate supplier offers a different `snapshotId` or different `sha256Digest`.
 - **Pass Threshold:**
-  1. Reassembled contiguous buffer is parsed as UTF-8 JSON into `StateSnapshotPayloadV2`.
-  2. Canonical RFC 8785 JSON SHA-256 digest computed over payload preimage matches `offer.sha256Digest` bit-exact.
-  3. If overall digest fails to match, all assembled memory is discarded and transfer aborts with `HASH_MISMATCH`.
+  1. All previously received chunks $0 \dots 3$ are purged immediately from `ChunkAssembler`.
+  2. Fresh transfer begins requesting chunks $0 \dots N$ of the new snapshot.
+  3. Chunks from different snapshot identities are **never mixed**.
+
+### AC-M4-FAILOVER-3: Safe Termination When All Suppliers Fail
+- **Condition:** Active supplier disconnects and no alternate eligible supplier exists.
+- **Pass Threshold:**
+  1. Transfer aborts with `SUPPLIER_DISCONNECTED`.
+  2. Engine state remains in recovery without modifying active playback state or causal vectors.
 
 ---
 
-## 6. Fencing & Handoff Criteria (AC-M4-FENCE)
+## 5. Duplicate, Stale & Corrupt Chunk Criteria (AC-M4-CHUNK)
 
-### AC-M4-FENCE-1: Disconnection Fencing
-- **Condition:** Supplier peer disconnects or closes DataChannel mid-transfer.
+### AC-M4-CHUNK-1: Idempotent Duplicate Chunk Handling
+- **Condition:** Duplicate `SNAPSHOT_CHUNK` with identical `chunkIndex` and `chunkSha256` arrives.
 - **Pass Threshold:**
-  1. Transfer is aborted immediately with reason `SUPPLIER_DISCONNECTED`.
-  2. Partial reassembly buffers are cleared from memory.
-  3. Engine state remains 100% untouched.
+  1. Duplicate is silently ignored.
+  2. Chunk is not re-decoded, re-inserted, or re-counted in received bytes.
+  3. Memory usage remains constant.
 
-### AC-M4-FENCE-2: Epoch Fencing
-- **Condition:** Membership epoch increments mid-transfer.
+### AC-M4-CHUNK-2: Corrupt Chunk Collision Abort
+- **Condition:** Incoming `SNAPSHOT_CHUNK` has `chunkIndex` matching an already received chunk but differs in content or `chunkSha256`, or fails raw binary SHA-256 verification.
 - **Pass Threshold:**
-  1. Transfer is aborted immediately with reason `EPOCH_MISMATCH`.
-  2. Outbound `SNAPSHOT_ABORT` is emitted if DataChannel is open.
-  3. Stale transfer state is cleared.
+  1. Chunk is rejected immediately.
+  2. Transfer terminates with `CHUNK_CORRUPTED`.
+  3. `SNAPSHOT_ABORT` is emitted.
 
-### AC-M4-FENCE-3: Clean Handoff to M5
+### AC-M4-CHUNK-3: Stale Context Discard
+- **Condition:** Late chunk arrives with cancelled `transferId`, stale `membershipEpoch`, or stale supplier generation.
+- **Pass Threshold:**
+  1. Chunk is dropped at transport boundary with zero allocation.
+
+### AC-M4-CHUNK-4: Missing Index Validation
+- **Condition:** `SNAPSHOT_CHUNK_REQUEST` received from requester.
+- **Pass Threshold:**
+  1. All indices verified to be unique and in range $[0, \text{totalChunks}-1]$.
+  2. Number of requested indices strictly $\le \text{MAX\_CONCURRENT\_CHUNK\_REQUESTS} = 4$.
+
+---
+
+## 6. Retry & Timeout Budget Criteria (AC-M4-BUDGET)
+
+### AC-M4-BUDGET-1: Bounded Per-Chunk Retries
+- **Condition:** A chunk index experiences repeated transmission failure.
+- **Pass Threshold:**
+  1. At most 3 retransmission requests are issued for the same chunk index.
+  2. The 4th failure triggers immediate transfer abort with `TRANSFER_TIMEOUT`.
+
+### AC-M4-BUDGET-2: Total Transfer Retransmission Budget
+- **Condition:** Intermittent packet drops across multiple chunk indices.
+- **Pass Threshold:**
+  1. Cumulative retransmissions across the entire transfer capped at 10 (`MAX_TRANSFER_RETRIES = 10`).
+  2. Exceeding 10 cumulative retransmissions aborts the transfer.
+
+### AC-M4-BUDGET-3: Absolute Wall-Clock Deadline
+- **Condition:** Transfer remains incomplete after 60 seconds (`OVERALL_TRANSFER_TIMEOUT_MS = 60000`).
+- **Pass Threshold:**
+  1. Transfer unconditionally aborts with `TRANSFER_TIMEOUT`.
+  2. All allocated assembler memory is released.
+
+---
+
+## 7. Dynamic Sizing & Termination Criteria (AC-M4-SIZE)
+
+### AC-M4-SIZE-1: Iterative Send-Boundary Measurement & Termination
+- **Condition:** `SnapshotTransferManager` prepares chunks across negotiated SCTP limits from 2,048 to 65,536 bytes.
+- **Pass Threshold:**
+  1. Each unsuccessful sizing iteration strictly reduces binary slice size by at least 33 bytes ($\Delta = \lceil \text{overshoot} \times 0.75 \rceil + 32$).
+  2. Loop strictly terminates in at most 993 iterations (proven bounded by initial slice $\le 32,768$ bytes).
+  3. Measured UTF-8 bytes of final serialized JSON string strictly $\le \text{effectiveLimit}$.
+  4. The exact tested string is passed unchanged to `RTCDataChannel.send()`.
+
+### AC-M4-SIZE-2: Minimum Size Abort
+- **Condition:** SCTP limit $< 2,048$ bytes or chunk binary slice $< 256$ bytes.
+- **Pass Threshold:**
+  1. Sizing loop halts and transfer aborts with `TRANSPORT_LIMIT_EXCEEDED`.
+
+---
+
+## 8. Memory & Resource Budget Criteria (AC-M4-MEM)
+
+### AC-M4-MEM-1: Hard Concurrency & Memory Ceilings
+- **Condition:** High-load multi-peer operation.
+- **Pass Threshold:**
+  1. Requester permits strictly 1 active inbound transfer.
+  2. Supplier permits at most 2 active outbound transfers.
+  3. Pre-allocated reassembly buffer bounded to declared `totalChunks` ($\le 128$).
+  4. Total peak transient memory during reassembly strictly $\le 8.5\text{ MB}$.
+
+### AC-M4-MEM-2: Complete Lifecycle Memory Dereferencing
+- **Condition:** Transfer completion, timeout, cancellation, or epoch increment.
+- **Pass Threshold:**
+  1. `dispose()` sets all slice references and assembled buffer references to `null`.
+  2. Verified zero retained snapshot memory after disposal.
+
+---
+
+## 9. M5 Handoff Boundary Criteria (AC-M4-HANDOFF)
+
+### AC-M4-HANDOFF-1: Clean Handoff to M5 Callback
 - **Condition:** Successful completion of snapshot reassembly and verification.
 - **Pass Threshold:**
   1. `SnapshotTransferResult` containing verified `StateSnapshotPayloadV2` and raw bytes is emitted to registered handoff callback.
