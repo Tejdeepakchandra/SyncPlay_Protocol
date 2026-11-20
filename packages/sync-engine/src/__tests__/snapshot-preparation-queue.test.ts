@@ -39,9 +39,9 @@ describe('Phase 7.5 M4.2a — SnapshotPreparationQueue', () => {
   }
 
   // ─────────────────────────────────────────────────────────────
-  // AC-M4-CONC-1: Strict Concurrency Admission: A + P <= 2
+  // Finding F2 / AC-M4-CONC-1: Automatic Lifecycle Resumption on Disposal
   // ─────────────────────────────────────────────────────────────
-  it('AC-M4-CONC-1: holds 3rd preparation in queue when 2 artifacts are retained, and resumes on release', async () => {
+  it('Finding F2 & AC-M4-CONC-1: automatically resumes waiting queue when artifact is disposed without manual notifyArtifactDisposed', async () => {
     const queue = new SnapshotPreparationQueue();
 
     // Prepare 1st artifact: starts immediately
@@ -72,9 +72,9 @@ describe('Phase 7.5 M4.2a — SnapshotPreparationQueue', () => {
     expect(queue.isBusy).toBe(false);
     expect(queue.retainedArtifactCount).toBe(2);
 
-    // Dispose artifact 1 and notify queue
+    // DISPOSE ARTIFACT 1: DO NOT call queue.notifyArtifactDisposed() manually!
+    // The artifact's internal disposal listener MUST automatically notify the queue.
     artifact1.dispose();
-    queue.notifyArtifactDisposed();
 
     // The queue should immediately resume and execute captureFn3
     const artifact3 = await promise3;
@@ -85,12 +85,106 @@ describe('Phase 7.5 M4.2a — SnapshotPreparationQueue', () => {
   });
 
   // ─────────────────────────────────────────────────────────────
+  // Finding F2: Automatic Resumption on Deferred Disposal (Last Lease Release)
+  // ─────────────────────────────────────────────────────────────
+  it('Finding F2: automatically resumes waiting queue when deferred disposal finalizes on last lease release', async () => {
+    const queue = new SnapshotPreparationQueue();
+
+    const artifact1 = await queue.enqueue(createMockRequest('l-1'), () => createArtifact());
+    const artifact2 = await queue.enqueue(createMockRequest('l-2'), () => createArtifact());
+    expect(queue.retainedArtifactCount).toBe(2);
+
+    // Artifact 1 has an active transfer lease
+    artifact1.acquireLease('transfer-active-1');
+    expect(artifact1.activeLeaseCount).toBe(1);
+
+    // Enqueue 3rd preparation request -> held in queue
+    const captureFn3 = vi.fn(async () => createArtifact());
+    const promise3 = queue.enqueue(createMockRequest('l-3'), captureFn3);
+
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    expect(queue.depth).toBe(1);
+    expect(captureFn3).not.toHaveBeenCalled();
+
+    // Request disposal of artifact 1 while lease is still active
+    artifact1.dispose();
+    expect(artifact1.isDisposalRequested).toBe(true);
+    expect(artifact1.isDisposed).toBe(false);
+
+    // Queue must STILL be held because artifact 1 is not yet detached/disposed
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    expect(captureFn3).not.toHaveBeenCalled();
+    expect(queue.depth).toBe(1);
+
+    // Active transfer completes and releases its lease
+    artifact1.releaseLease('transfer-active-1');
+    expect(artifact1.isDisposed).toBe(true);
+
+    // Now queue should have resumed automatically!
+    const artifact3 = await promise3;
+    expect(captureFn3).toHaveBeenCalledTimes(1);
+    expect(artifact3).toBeInstanceOf(SerializedSnapshotArtifact);
+    expect(queue.depth).toBe(0);
+  });
+
+  // ─────────────────────────────────────────────────────────────
+  // Finding F2: Per-Request Cancellation via queue.cancel(transferId)
+  // ─────────────────────────────────────────────────────────────
+  it('Finding F2: cancels an individual waiting request via cancel(transferId) without clearing entire queue', async () => {
+    const queue = new SnapshotPreparationQueue();
+
+    // Saturate retention
+    queue.trackArtifactRetained();
+    queue.trackArtifactRetained();
+    expect(queue.retainedArtifactCount).toBe(2);
+
+    const p1 = queue.enqueue(createMockRequest('can-1'), () => createArtifact());
+    const p2 = queue.enqueue(createMockRequest('can-2'), () => createArtifact());
+    const p3 = queue.enqueue(createMockRequest('can-3'), () => createArtifact());
+
+    expect(queue.depth).toBe(3);
+
+    // Cancel transfer can-2 specifically
+    const cancelled = queue.cancel('transfer-can-2');
+    expect(cancelled).toBe(true);
+    expect(queue.depth).toBe(2);
+
+    // p2 should be rejected with LOCAL_ABORT
+    await expect(p2).rejects.toThrow(SyncEngineError);
+    await expect(p2).rejects.toThrow(/Preparation request cancelled for transferId: transfer-can-2/);
+
+    // Cancelling unknown transfer returns false
+    expect(queue.cancel('unknown-transfer')).toBe(false);
+    expect(queue.depth).toBe(2);
+
+    // Remaining items p1 and p3 should still be in queue
+    queue.clear();
+    await Promise.allSettled([p1, p3]);
+  });
+
+  // ─────────────────────────────────────────────────────────────
+  // Finding F2: Idempotent Disposal Notification
+  // ─────────────────────────────────────────────────────────────
+  it('Finding F2: repeated artifact.dispose() does not decrement retained count more than once', async () => {
+    const queue = new SnapshotPreparationQueue();
+
+    const artifact1 = await queue.enqueue(createMockRequest('idem-1'), () => createArtifact());
+    expect(queue.retainedArtifactCount).toBe(1);
+
+    artifact1.dispose();
+    expect(queue.retainedArtifactCount).toBe(0);
+
+    // Call dispose again
+    artifact1.dispose();
+    expect(queue.retainedArtifactCount).toBe(0); // Remains 0, does not go negative
+  });
+
+  // ─────────────────────────────────────────────────────────────
   // AC-M4-CONC-2: Queue Depth Bounding & Saturation Rejection
   // ─────────────────────────────────────────────────────────────
   it('AC-M4-CONC-2: bounded preparation queue rejects immediately with LOCAL_ABORT at depth 4', async () => {
     const queue = new SnapshotPreparationQueue();
 
-    // Simulate 2 retained artifacts so subsequent requests queue up
     queue.trackArtifactRetained();
     queue.trackArtifactRetained();
     expect(queue.retainedArtifactCount).toBe(2);
@@ -117,7 +211,6 @@ describe('Phase 7.5 M4.2a — SnapshotPreparationQueue', () => {
 
     expect(dummyFn).not.toHaveBeenCalled();
 
-    // Clean up pending requests
     queue.clear();
     await Promise.allSettled(pendingPromises);
   });
@@ -142,7 +235,6 @@ describe('Phase 7.5 M4.2a — SnapshotPreparationQueue', () => {
     const p1 = queue.enqueue(createMockRequest('seq-1'), runWithDelay);
     const p2 = queue.enqueue(createMockRequest('seq-2'), runWithDelay);
 
-    // While p1 is running, queue.depth should be 1 and isBusy should be true
     expect(queue.isBusy).toBe(true);
 
     const [a1, a2] = await Promise.all([p1, p2]);
@@ -164,12 +256,10 @@ describe('Phase 7.5 M4.2a — SnapshotPreparationQueue', () => {
 
     await expect(queue.enqueue(createMockRequest('fail-1'), failingFn)).rejects.toThrow('Capture failed');
 
-    // Queue state should be reset cleanly
     expect(queue.isBusy).toBe(false);
     expect(queue.retainedArtifactCount).toBe(0);
     expect(queue.depth).toBe(0);
 
-    // Subsequent valid request should succeed normally
     const successArtifact = await queue.enqueue(createMockRequest('succ-1'), () => createArtifact());
     expect(successArtifact).toBeInstanceOf(SerializedSnapshotArtifact);
     expect(queue.retainedArtifactCount).toBe(1);
@@ -181,7 +271,6 @@ describe('Phase 7.5 M4.2a — SnapshotPreparationQueue', () => {
   it('clear() rejects all pending requests with LOCAL_ABORT', async () => {
     const queue = new SnapshotPreparationQueue();
 
-    // Saturate with 2 retained artifacts
     queue.trackArtifactRetained();
     queue.trackArtifactRetained();
 

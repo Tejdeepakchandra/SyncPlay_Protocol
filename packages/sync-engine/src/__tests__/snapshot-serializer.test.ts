@@ -1,7 +1,10 @@
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect, beforeEach } from 'vitest';
+import crypto from 'node:crypto';
 import {
   SnapshotSerializer,
   SerializedSnapshotArtifact,
+  compareCheckpointsDeterministic,
+  StrictStateSnapshotPayloadV2Schema,
 } from '../recovery/snapshot-serializer.js';
 import {
   computeSnapshotDigestV2,
@@ -130,120 +133,260 @@ describe('Phase 7.5 M4.2a — SnapshotSerializer & SerializedSnapshotArtifact', 
     expect(artifact.sha256Digest).toBe(expectedDigest);
     expect(artifact.sha256Digest).toBe(sha256(artifact.cloneBytes()).toLowerCase());
     expect(artifact.sha256Digest).toMatch(/^[0-9a-f]{64}$/);
+
+    // Independent Node crypto oracle check
+    const nodeHash = crypto.createHash('sha256').update(artifact.cloneBytes()).digest('hex');
+    expect(artifact.sha256Digest).toBe(nodeHash);
   });
 
   // ─────────────────────────────────────────────────────────────
-  // AC-M4-SER-3: Pre-Serialization Bounds & 4 MiB Size Ceiling
+  // Finding F1: Strict Structural Validation on Every Entry Point
   // ─────────────────────────────────────────────────────────────
-  it('AC-M4-SER-3: rejects snapshotFrontier with > 64 entries', () => {
-    const exported = exportEngineSnapshotV2(
-      sampleState,
-      sampleContext.sessionId,
-      sampleContext.membershipEpoch,
-      sampleContext.authorPeerId,
-      sampleContext.snapshotFrontier,
-      sampleContext.originFrontierTimestamps,
-      sampleContext.compactedCheckpoints,
-      sampleContext.snapshotId
-    );
+  describe('Finding F1 — Pre-Serialization Strict Structural Validation', () => {
+    let validSnapshot: StateSnapshotPayloadV2;
 
-    const bloatedFrontier: Record<string, number> = {};
-    for (let i = 0; i < 65; i++) {
-      bloatedFrontier[`peer-${i}`] = i;
-    }
+    beforeEach(() => {
+      validSnapshot = exportEngineSnapshotV2(
+        sampleState,
+        sampleContext.sessionId,
+        sampleContext.membershipEpoch,
+        sampleContext.authorPeerId,
+        sampleContext.snapshotFrontier,
+        sampleContext.originFrontierTimestamps,
+        sampleContext.compactedCheckpoints,
+        sampleContext.snapshotId
+      );
+    });
 
-    const invalid = { ...exported, snapshotFrontier: bloatedFrontier };
-    expect(() => SnapshotSerializer.serialize(invalid as any)).toThrow(SyncEngineError);
-    expect(() => SnapshotSerializer.serialize(invalid as any)).toThrow(/snapshotFrontier key count exceeds 64/);
+    it('rejects null or non-object snapshots', () => {
+      expect(() => SnapshotSerializer.serialize(null as any)).toThrow(SyncEngineError);
+      expect(() => SnapshotSerializer.serialize(undefined as any)).toThrow(SyncEngineError);
+      expect(() => SnapshotSerializer.serialize('string' as any)).toThrow(SyncEngineError);
+    });
+
+    it('rejects formatVersion !== 2', () => {
+      const invalid = { ...validSnapshot, formatVersion: 1 };
+      expect(() => SnapshotSerializer.serialize(invalid as any)).toThrow(SyncEngineError);
+      expect(() => SnapshotSerializer.serialize(invalid as any)).toThrow(/Pre-serialization validation failed/);
+    });
+
+    it('rejects oversized snapshotId (> 128 characters)', () => {
+      const invalid = { ...validSnapshot, snapshotId: 'a'.repeat(129) };
+      expect(() => SnapshotSerializer.serialize(invalid as any)).toThrow(SyncEngineError);
+      expect(() => SnapshotSerializer.serialize(invalid as any)).toThrow(/snapshotId/);
+    });
+
+    it('rejects non-ASCII identifier in snapshotId', () => {
+      const invalid = { ...validSnapshot, snapshotId: 'snap-id-with-spaces and symbols!' };
+      expect(() => SnapshotSerializer.serialize(invalid as any)).toThrow(SyncEngineError);
+      expect(() => SnapshotSerializer.serialize(invalid as any)).toThrow(/snapshotId/);
+    });
+
+    it('rejects oversized sessionId (> 128 characters)', () => {
+      const invalid = { ...validSnapshot, sessionId: 's'.repeat(129) };
+      expect(() => SnapshotSerializer.serialize(invalid as any)).toThrow(SyncEngineError);
+      expect(() => SnapshotSerializer.serialize(invalid as any)).toThrow(/sessionId/);
+    });
+
+    it('rejects oversized authorPeerId (> 64 characters)', () => {
+      const invalid = { ...validSnapshot, authorPeerId: 'p'.repeat(65) };
+      expect(() => SnapshotSerializer.serialize(invalid as any)).toThrow(SyncEngineError);
+      expect(() => SnapshotSerializer.serialize(invalid as any)).toThrow(/authorPeerId/);
+    });
+
+    it('rejects snapshotFrontier with > 64 entries', () => {
+      const bloatedFrontier: Record<string, number> = {};
+      for (let i = 0; i < 65; i++) {
+        bloatedFrontier[`peer-${i}`] = i;
+      }
+      const invalid = { ...validSnapshot, snapshotFrontier: bloatedFrontier };
+      expect(() => SnapshotSerializer.serialize(invalid as any)).toThrow(SyncEngineError);
+      expect(() => SnapshotSerializer.serialize(invalid as any)).toThrow(/snapshotFrontier key count exceeds 64/);
+    });
+
+    it('rejects snapshotFrontier with oversized key (> 64 characters)', () => {
+      const invalid = {
+        ...validSnapshot,
+        snapshotFrontier: { ['k'.repeat(65)]: 1 },
+      };
+      expect(() => SnapshotSerializer.serialize(invalid as any)).toThrow(SyncEngineError);
+      expect(() => SnapshotSerializer.serialize(invalid as any)).toThrow(/snapshotFrontier/);
+    });
+
+    it('rejects snapshotFrontier with non-safe-integer value', () => {
+      const invalid = {
+        ...validSnapshot,
+        snapshotFrontier: { 'peer-a': Number.MAX_SAFE_INTEGER + 10 },
+      };
+      expect(() => SnapshotSerializer.serialize(invalid as any)).toThrow(SyncEngineError);
+      expect(() => SnapshotSerializer.serialize(invalid as any)).toThrow(/snapshotFrontier/);
+    });
+
+    it('rejects originFrontierTimestamps with > 64 entries', () => {
+      const bloatedTimestamps: Record<string, number> = {};
+      for (let i = 0; i < 65; i++) {
+        bloatedTimestamps[`peer-${i}`] = 1000 + i;
+      }
+      const invalid = { ...validSnapshot, originFrontierTimestamps: bloatedTimestamps };
+      expect(() => SnapshotSerializer.serialize(invalid as any)).toThrow(SyncEngineError);
+      expect(() => SnapshotSerializer.serialize(invalid as any)).toThrow(/originFrontierTimestamps key count exceeds 64/);
+    });
+
+    it('rejects compactedCheckpoints with > 256 entries', () => {
+      const bloatedCheckpoints = Array.from({ length: 257 }, (_, i) => ({
+        originPeerId: `peer-${i % 10}`,
+        sequenceNumber: i + 1,
+        logicalTimestamp: i * 10,
+      }));
+      const invalid = { ...validSnapshot, compactedCheckpoints: bloatedCheckpoints };
+      expect(() => SnapshotSerializer.serialize(invalid as any)).toThrow(SyncEngineError);
+      expect(() => SnapshotSerializer.serialize(invalid as any)).toThrow(/compactedCheckpoints/);
+    });
+
+    it('rejects compactedCheckpoints with malformed item (sequenceNumber <= 0 or non-safe)', () => {
+      const invalid1 = {
+        ...validSnapshot,
+        compactedCheckpoints: [{ originPeerId: 'peer-a', sequenceNumber: 0, logicalTimestamp: 100 }],
+      };
+      expect(() => SnapshotSerializer.serialize(invalid1 as any)).toThrow(SyncEngineError);
+
+      const invalid2 = {
+        ...validSnapshot,
+        compactedCheckpoints: [{ originPeerId: 'peer-a', sequenceNumber: Number.MAX_SAFE_INTEGER + 5, logicalTimestamp: 100 }],
+      };
+      expect(() => SnapshotSerializer.serialize(invalid2 as any)).toThrow(SyncEngineError);
+    });
+
+    it('rejects compactedCheckpoints item with unexpected extra properties', () => {
+      const invalid = {
+        ...validSnapshot,
+        compactedCheckpoints: [
+          { originPeerId: 'peer-a', sequenceNumber: 1, logicalTimestamp: 100, unexpectedField: 'bad' },
+        ],
+      };
+      expect(() => SnapshotSerializer.serialize(invalid as any)).toThrow(SyncEngineError);
+      expect(() => SnapshotSerializer.serialize(invalid as any)).toThrow(/unexpectedField|Pre-serialization validation failed/);
+    });
+
+    it('rejects state with unexpected additional properties (strictness)', () => {
+      const invalid = {
+        ...validSnapshot,
+        state: {
+          ...validSnapshot.state,
+          extraMaliciousPayload: 'x'.repeat(1000),
+        },
+      };
+      expect(() => SnapshotSerializer.serialize(invalid as any)).toThrow(SyncEngineError);
+      expect(() => SnapshotSerializer.serialize(invalid as any)).toThrow(/extraMaliciousPayload|Pre-serialization validation failed/);
+    });
+
+    it('rejects state with non-finite numeric values (NaN, Infinity)', () => {
+      const invalid1 = {
+        ...validSnapshot,
+        state: { ...validSnapshot.state, anchorPositionMs: NaN },
+      };
+      expect(() => SnapshotSerializer.serialize(invalid1 as any)).toThrow(SyncEngineError);
+
+      const invalid2 = {
+        ...validSnapshot,
+        state: { ...validSnapshot.state, playbackRate: Infinity },
+      };
+      expect(() => SnapshotSerializer.serialize(invalid2 as any)).toThrow(SyncEngineError);
+    });
+
+    it('rejects state with negative anchorPositionMs or non-positive playbackRate', () => {
+      const invalid1 = {
+        ...validSnapshot,
+        state: { ...validSnapshot.state, anchorPositionMs: -1 },
+      };
+      expect(() => SnapshotSerializer.serialize(invalid1 as any)).toThrow(SyncEngineError);
+
+      const invalid2 = {
+        ...validSnapshot,
+        state: { ...validSnapshot.state, playbackRate: 0 },
+      };
+      expect(() => SnapshotSerializer.serialize(invalid2 as any)).toThrow(SyncEngineError);
+    });
+
+    it('rejects snapshot with unexpected top-level additional properties', () => {
+      const invalid = {
+        ...validSnapshot,
+        unexpectedTopLevelKey: 'malicious',
+      };
+      expect(() => SnapshotSerializer.serialize(invalid as any)).toThrow(SyncEngineError);
+      expect(() => SnapshotSerializer.serialize(invalid as any)).toThrow(/unexpectedTopLevelKey|Pre-serialization validation failed/);
+    });
+
+    it('rejects sessionId mismatch between snapshot header and state', () => {
+      const invalid = {
+        ...validSnapshot,
+        sessionId: 'session-header-differs',
+      };
+      expect(() => SnapshotSerializer.serialize(invalid as any)).toThrow(SyncEngineError);
+      expect(() => SnapshotSerializer.serialize(invalid as any)).toThrow(/sessionId mismatch/);
+    });
+
+    it('rejects maxLogicalTimestamp mismatch with originFrontierTimestamps', () => {
+      const invalid = {
+        ...validSnapshot,
+        maxLogicalTimestamp: 99999, // origin max is 2000
+      };
+      expect(() => SnapshotSerializer.serialize(invalid as any)).toThrow(SyncEngineError);
+      expect(() => SnapshotSerializer.serialize(invalid as any)).toThrow(/maxLogicalTimestamp/);
+    });
   });
 
-  it('AC-M4-SER-3: rejects originFrontierTimestamps with > 64 entries', () => {
-    const exported = exportEngineSnapshotV2(
-      sampleState,
-      sampleContext.sessionId,
-      sampleContext.membershipEpoch,
-      sampleContext.authorPeerId,
-      sampleContext.snapshotFrontier,
-      sampleContext.originFrontierTimestamps,
-      sampleContext.compactedCheckpoints,
-      sampleContext.snapshotId
-    );
+  // ─────────────────────────────────────────────────────────────
+  // Finding F4: Locale-Independent Checkpoint Ordering & JCS Vectors
+  // ─────────────────────────────────────────────────────────────
+  describe('Finding F4 — Locale-Independent Deterministic Ordering & JCS', () => {
+    it('compareCheckpointsDeterministic sorts by UTF-16 code units independently of locale', () => {
+      const c1 = { originPeerId: 'peer-a', sequenceNumber: 10, logicalTimestamp: 100 };
+      const c2 = { originPeerId: 'peer-b', sequenceNumber: 5, logicalTimestamp: 100 };
+      const c3 = { originPeerId: 'peer-a', sequenceNumber: 20, logicalTimestamp: 200 };
 
-    const bloatedTimestamps: Record<string, number> = {};
-    for (let i = 0; i < 65; i++) {
-      bloatedTimestamps[`peer-${i}`] = 1000 + i;
-    }
+      // peer-a seq 10 should precede peer-a seq 20
+      expect(compareCheckpointsDeterministic(c1, c3)).toBeLessThan(0);
+      expect(compareCheckpointsDeterministic(c3, c1)).toBeGreaterThan(0);
 
-    const invalid = { ...exported, originFrontierTimestamps: bloatedTimestamps };
-    expect(() => SnapshotSerializer.serialize(invalid as any)).toThrow(SyncEngineError);
-    expect(() => SnapshotSerializer.serialize(invalid as any)).toThrow(/originFrontierTimestamps key count exceeds 64/);
-  });
+      // peer-a should precede peer-b regardless of sequence number
+      expect(compareCheckpointsDeterministic(c1, c2)).toBeLessThan(0);
+      expect(compareCheckpointsDeterministic(c2, c1)).toBeGreaterThan(0);
 
-  it('AC-M4-SER-3: rejects compactedCheckpoints with > 256 entries', () => {
-    const exported = exportEngineSnapshotV2(
-      sampleState,
-      sampleContext.sessionId,
-      sampleContext.membershipEpoch,
-      sampleContext.authorPeerId,
-      sampleContext.snapshotFrontier,
-      sampleContext.originFrontierTimestamps,
-      sampleContext.compactedCheckpoints,
-      sampleContext.snapshotId
-    );
+      // Same peer and sequence number returns 0
+      expect(compareCheckpointsDeterministic(c1, { ...c1 })).toBe(0);
+    });
 
-    const bloatedCheckpoints = Array.from({ length: 257 }, (_, i) => ({
-      originPeerId: `peer-${i % 10}`,
-      sequenceNumber: i,
-      logicalTimestamp: i * 10,
-    }));
+    it('RFC 8785 test vectors: canonicalizes numbers, escaping, and negative zero deterministically', () => {
+      const snapshot = exportEngineSnapshotV2(
+        sampleState,
+        sampleContext.sessionId,
+        sampleContext.membershipEpoch,
+        sampleContext.authorPeerId,
+        sampleContext.snapshotFrontier,
+        sampleContext.originFrontierTimestamps,
+        sampleContext.compactedCheckpoints,
+        sampleContext.snapshotId
+      );
 
-    const invalid = { ...exported, compactedCheckpoints: bloatedCheckpoints };
-    expect(() => SnapshotSerializer.serialize(invalid as any)).toThrow(SyncEngineError);
-    expect(() => SnapshotSerializer.serialize(invalid as any)).toThrow(/compactedCheckpoints count exceeds 256/);
-  });
+      // Test zero canonicalization: anchorPositionMs = 0 (and -0)
+      const zeroStateSnapshot: StateSnapshotPayloadV2 = {
+        ...snapshot,
+        state: {
+          ...snapshot.state,
+          anchorPositionMs: -0, // RFC 8785 canonicalizes -0 to 0
+        },
+      };
 
-  it('AC-M4-SER-3: rejects invalid/non-plain state objects', () => {
-    const exported = exportEngineSnapshotV2(
-      sampleState,
-      sampleContext.sessionId,
-      sampleContext.membershipEpoch,
-      sampleContext.authorPeerId,
-      sampleContext.snapshotFrontier,
-      sampleContext.originFrontierTimestamps,
-      sampleContext.compactedCheckpoints,
-      sampleContext.snapshotId
-    );
+      const artifact = SnapshotSerializer.serialize(zeroStateSnapshot);
+      const jsonString = new TextDecoder().decode(artifact.cloneBytes());
+      expect(jsonString).toContain('"anchorPositionMs":0');
+      expect(jsonString).not.toContain('"anchorPositionMs":-0');
 
-    const invalid1 = { ...exported, state: null as any };
-    expect(() => SnapshotSerializer.serialize(invalid1)).toThrow(SyncEngineError);
-
-    const invalid2 = {
-      ...exported,
-      state: { ...exported.state, anchorPositionMs: NaN },
-    };
-    expect(() => SnapshotSerializer.serialize(invalid2 as any)).toThrow(SyncEngineError);
-  });
-
-  it('AC-M4-SER-3: rejects payload exceeding MAX_SNAPSHOT_BYTES', () => {
-    const exported = exportEngineSnapshotV2(
-      sampleState,
-      sampleContext.sessionId,
-      sampleContext.membershipEpoch,
-      sampleContext.authorPeerId,
-      sampleContext.snapshotFrontier,
-      sampleContext.originFrontierTimestamps,
-      sampleContext.compactedCheckpoints,
-      sampleContext.snapshotId
-    );
-
-    // Create a large snapshot by creating an oversized sessionId or strings
-    const hugePayload = {
-      ...exported,
-      sessionId: 's'.repeat(MAX_SNAPSHOT_BYTES + 1024),
-    };
-
-    expect(() => SnapshotSerializer.serialize(hugePayload as any)).toThrow(SyncEngineError);
-    expect(() => SnapshotSerializer.serialize(hugePayload as any)).toThrow(/exceeds MAX_SNAPSHOT_BYTES/);
+      // Verify node crypto independent digest
+      const nodeHash = crypto.createHash('sha256').update(artifact.cloneBytes()).digest('hex');
+      expect(artifact.sha256Digest).toBe(nodeHash);
+    });
   });
 
   // ─────────────────────────────────────────────────────────────
@@ -252,14 +395,12 @@ describe('Phase 7.5 M4.2a — SnapshotSerializer & SerializedSnapshotArtifact', 
   it('AC-M4-OWN-1: private backing storage exposes zero mutable typed-array properties or views', () => {
     const artifact = SnapshotSerializer.serializeFromEngine(sampleState, sampleContext);
 
-    // Verify property keys on the instance
     const keys = Object.keys(artifact);
     expect(keys).not.toContain('masterBuffer');
     expect(keys).not.toContain('#masterBuffer');
     expect(keys).not.toContain('masterBytes');
     expect(keys).not.toContain('#masterBytes');
 
-    // Values of all public keys should be primitive strings or numbers
     for (const key of keys) {
       const val = (artifact as any)[key];
       expect(typeof val === 'string' || typeof val === 'number' || typeof val === 'boolean').toBe(true);
@@ -277,13 +418,11 @@ describe('Phase 7.5 M4.2a — SnapshotSerializer & SerializedSnapshotArtifact', 
     const base64Str = artifact.encodeSliceToBase64(sliceOffset, sliceLen);
     expect(typeof base64Str).toBe('string');
 
-    // Verify decoded base64 matches cloned slice bytes
     const fullBytes = artifact.cloneBytes();
     const expectedSlice = fullBytes.subarray(sliceOffset, sliceOffset + sliceLen);
     const decodedBytes = Buffer.from(base64Str, 'base64');
     expect(new Uint8Array(decodedBytes)).toEqual(expectedSlice);
 
-    // Verify computeSliceSha256 matches sha256 of slice
     const sliceHash = artifact.computeSliceSha256(sliceOffset, sliceLen);
     expect(typeof sliceHash).toBe('string');
     expect(sliceHash).toMatch(/^[0-9a-f]{64}$/);

@@ -3,20 +3,100 @@
  *
  * Implements Phase 7.5 M4.2a Snapshot Serialization & JCS Digest:
  * - Deterministic RFC 8785 JSON canonicalization.
+ * - Strict upfront structural validation on every entry point before canonicalization.
+ * - Locale-independent deterministic checkpoint comparator.
  * - Direct SHA-256 computation over master Uint8Array, avoiding duplicate TextEncoder allocation.
  * - Immediate preimage and canonical JSON string dereferencing post-encoding.
- * - Encapsulated SerializedSnapshotArtifact with private backing buffer and lease ownership.
+ * - Encapsulated SerializedSnapshotArtifact with private backing buffer, lease ownership,
+ *   and automatic lifecycle disposal listeners.
  */
 
+import { z } from 'zod';
 import {
   MAX_SNAPSHOT_BYTES,
+  ASCII_IDENTIFIER_REGEX,
+  CompactedCheckpointItemSchema,
   type StateSnapshotPayloadV2,
   type CompactedCheckpointItem,
 } from '@syncplay/protocol';
 import { canonicalizeJson, sha256 } from '../log/operation-fingerprint.js';
 import { SyncEngineError } from '../errors.js';
-import { exportEngineSnapshotV2 } from '../snapshot.js';
+import { EngineSnapshotDataSchema, exportEngineSnapshotV2 } from '../snapshot.js';
 import type { PlaybackState } from '../types.js';
+
+/**
+ * Strict schema for individual compacted checkpoint items.
+ * Enforces ASCII identifier regex for peer IDs, positive sequence numbers,
+ * non-negative timestamps within safe integer range, and disallows unknown fields.
+ */
+export const StrictCompactedCheckpointItemSchema = CompactedCheckpointItemSchema.strict();
+
+/**
+ * Strict schema for inner playback state.
+ * Enforces bounds on formatVersion, sessionId, status, non-negative finite anchor position,
+ * positive finite playback rate, and strict lastAppliedOperation without unknown fields.
+ */
+export const StrictEngineSnapshotDataSchema = EngineSnapshotDataSchema.extend({
+  lastAppliedOperation: z
+    .object({
+      logicalEventId: z.string().min(1).max(128).regex(ASCII_IDENTIFIER_REGEX),
+      senderPeerId: z.string().min(1).max(128).regex(ASCII_IDENTIFIER_REGEX),
+      messageType: z.string().min(1).max(64).regex(ASCII_IDENTIFIER_REGEX),
+    })
+    .strict()
+    .optional(),
+}).strict();
+
+/**
+ * Authoritative strict schema for StateSnapshotPayloadV2.
+ * Enforces:
+ * - formatVersion = 2
+ * - snapshotId and sessionId bounded to 128 ASCII characters
+ * - authorPeerId bounded to 64 ASCII characters
+ * - snapshotFrontier keys bounded to 64 ASCII characters, values non-negative safe integers, max 64 keys
+ * - maxLogicalTimestamp non-negative safe integer
+ * - originFrontierTimestamps keys bounded to 64 ASCII characters, values non-negative safe integers, max 64 keys
+ * - compactedCheckpoints max 256 items with strict item validation
+ * - state validated against StrictEngineSnapshotDataSchema
+ * - strict rejection of any unexpected additional properties
+ */
+export const StrictStateSnapshotPayloadV2Schema = z
+  .object({
+    formatVersion: z.literal(2),
+    snapshotId: z.string().min(1).max(128).regex(ASCII_IDENTIFIER_REGEX),
+    sessionId: z.string().min(1).max(128).regex(ASCII_IDENTIFIER_REGEX),
+    membershipEpoch: z.number().int().nonnegative(),
+    authorPeerId: z.string().min(1).max(64).regex(ASCII_IDENTIFIER_REGEX),
+    snapshotFrontier: z.record(
+      z.string().min(1).max(64).regex(ASCII_IDENTIFIER_REGEX),
+      z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER)
+    ),
+    maxLogicalTimestamp: z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER),
+    originFrontierTimestamps: z.record(
+      z.string().min(1).max(64).regex(ASCII_IDENTIFIER_REGEX),
+      z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER)
+    ),
+    compactedCheckpoints: z.array(StrictCompactedCheckpointItemSchema).max(256),
+    state: StrictEngineSnapshotDataSchema,
+    sha256Digest: z.string().regex(/^[0-9a-f]{64}$/).optional(),
+  })
+  .strict();
+
+/**
+ * Locale-independent deterministic comparator for CompactedCheckpointItem.
+ * Compares originPeerId using lexicographical UTF-16 code units (< and >),
+ * and sequenceNumber numerically.
+ */
+export function compareCheckpointsDeterministic(
+  a: CompactedCheckpointItem,
+  b: CompactedCheckpointItem
+): number {
+  const pA = String(a.originPeerId);
+  const pB = String(b.originPeerId);
+  if (pA < pB) return -1;
+  if (pA > pB) return 1;
+  return a.sequenceNumber - b.sequenceNumber;
+}
 
 /**
  * Parameters required to construct a SerializedSnapshotArtifact.
@@ -65,7 +145,7 @@ export class SerializedSnapshotArtifact {
   readonly #activeLeases = new Set<string>();
   #disposalRequested = false;
   #isDisposed = false;
-  readonly #onDisposed?: () => void;
+  readonly #disposalListeners: Array<() => void> = [];
 
   public readonly snapshotId: string;
   public readonly sessionId: string;
@@ -93,10 +173,28 @@ export class SerializedSnapshotArtifact {
     this.authorPeerId = params.authorPeerId;
     this.totalSizeBytes = params.totalSizeBytes;
     this.sha256Digest = params.sha256Digest.toLowerCase();
-    this.#onDisposed = params.onDisposed;
+    if (params.onDisposed) {
+      this.#disposalListeners.push(params.onDisposed);
+    }
 
     this.#masterBuffer = params.masterBuffer;
     this.#masterBytes = new Uint8Array(this.#masterBuffer);
+  }
+
+  /**
+   * Registers a callback invoked exactly once when the artifact's disposal is finalized.
+   * If the artifact is already disposed, the callback is invoked immediately.
+   */
+  public registerDisposalListener(listener: () => void): void {
+    if (this.#isDisposed) {
+      try {
+        listener();
+      } catch {
+        // Exception isolation
+      }
+      return;
+    }
+    this.#disposalListeners.push(listener);
   }
 
   #assertReadable(): void {
@@ -217,12 +315,24 @@ export class SerializedSnapshotArtifact {
   }
 
   #finalizeDisposal(): void {
+    if (this.#isDisposed) {
+      return;
+    }
     this.#isDisposed = true;
     this.#disposalRequested = false;
     this.#masterBuffer = null;
     this.#masterBytes = null;
     this.#activeLeases.clear();
-    this.#onDisposed?.();
+
+    const listeners = [...this.#disposalListeners];
+    this.#disposalListeners.length = 0;
+    for (const listener of listeners) {
+      try {
+        listener();
+      } catch {
+        // Exception isolation
+      }
+    }
   }
 
   public get isDisposed(): boolean {
@@ -243,106 +353,94 @@ export class SerializedSnapshotArtifact {
  */
 export class SnapshotSerializer {
   /**
-   * Serializes a validated StateSnapshotPayloadV2 into a deterministic artifact.
-   * Encodes canonical bytes directly to master ArrayBuffer before computing SHA-256
-   * to eliminate duplicate 4.19 MiB TextEncoder buffer allocations.
-   * Immediately dereferences preimage and JSON string upon master buffer allocation.
-   * Throws SyncEngineError('SNAPSHOT_ERROR') if serialization fails or exceeds MAX_SNAPSHOT_BYTES.
+   * Validates a candidate snapshot object against strict structural contracts
+   * BEFORE any canonicalization or encoding memory is allocated.
+   * Throws SyncEngineError('SNAPSHOT_ERROR') on any violation.
    */
-  public static serialize(snapshot: StateSnapshotPayloadV2): SerializedSnapshotArtifact {
+  public static validateSnapshot(snapshot: unknown): StateSnapshotPayloadV2 {
     if (!snapshot || typeof snapshot !== 'object') {
       throw new SyncEngineError('SNAPSHOT_ERROR', 'Snapshot must be a non-null object');
     }
 
-    if (!snapshot.snapshotId || typeof snapshot.snapshotId !== 'string') {
-      throw new SyncEngineError('SNAPSHOT_ERROR', 'Snapshot must have a valid snapshotId string');
-    }
-    if (!snapshot.sessionId || typeof snapshot.sessionId !== 'string') {
-      throw new SyncEngineError('SNAPSHOT_ERROR', 'Snapshot must have a valid sessionId string');
-    }
-    if (
-      typeof snapshot.membershipEpoch !== 'number' ||
-      !Number.isInteger(snapshot.membershipEpoch) ||
-      snapshot.membershipEpoch < 0
-    ) {
+    const parseResult = StrictStateSnapshotPayloadV2Schema.safeParse(snapshot);
+    if (!parseResult.success) {
+      const issue = parseResult.error.issues[0];
+      const path = issue ? issue.path.join('.') : 'root';
+      const msg = issue ? issue.message : parseResult.error.message;
       throw new SyncEngineError(
         'SNAPSHOT_ERROR',
-        'Snapshot must have a non-negative integer membershipEpoch'
-      );
-    }
-    if (!snapshot.authorPeerId || typeof snapshot.authorPeerId !== 'string') {
-      throw new SyncEngineError('SNAPSHOT_ERROR', 'Snapshot must have a valid authorPeerId string');
-    }
-
-    // Pre-serialization structural bounds:
-    // 1. snapshotFrontier keys <= 64
-    if (snapshot.snapshotFrontier && typeof snapshot.snapshotFrontier === 'object') {
-      const frontierKeys = Object.keys(snapshot.snapshotFrontier);
-      if (frontierKeys.length > 64) {
-        throw new SyncEngineError(
-          'SNAPSHOT_ERROR',
-          `Pre-serialization error: snapshotFrontier key count exceeds 64 (${frontierKeys.length} > 64)`
-        );
-      }
-    }
-
-    // 2. originFrontierTimestamps keys <= 64
-    if (snapshot.originFrontierTimestamps && typeof snapshot.originFrontierTimestamps === 'object') {
-      const tsKeys = Object.keys(snapshot.originFrontierTimestamps);
-      if (tsKeys.length > 64) {
-        throw new SyncEngineError(
-          'SNAPSHOT_ERROR',
-          `Pre-serialization error: originFrontierTimestamps key count exceeds 64 (${tsKeys.length} > 64)`
-        );
-      }
-    }
-
-    // 3. compactedCheckpoints <= 256
-    if (Array.isArray(snapshot.compactedCheckpoints) && snapshot.compactedCheckpoints.length > 256) {
-      throw new SyncEngineError(
-        'SNAPSHOT_ERROR',
-        `Pre-serialization error: compactedCheckpoints count exceeds 256 (${snapshot.compactedCheckpoints.length} > 256)`
+        `Pre-serialization validation failed at "${path}": ${msg}`
       );
     }
 
-    // 4. state must be a valid plain object with finite numeric fields
-    if (!snapshot.state || typeof snapshot.state !== 'object') {
+    const data = parseResult.data;
+
+    // Additional semantic bounds:
+    // 1. snapshotFrontier key count <= 64
+    const frontierKeyCount = Object.keys(data.snapshotFrontier).length;
+    if (frontierKeyCount > 64) {
       throw new SyncEngineError(
         'SNAPSHOT_ERROR',
-        'Pre-serialization error: state must be a valid object'
-      );
-    }
-    const stateObj = snapshot.state as Record<string, unknown>;
-    const anchorPos = stateObj['anchorPositionMs'];
-    const pRate = stateObj['playbackRate'];
-    if (
-      typeof anchorPos !== 'number' ||
-      !Number.isFinite(anchorPos) ||
-      typeof pRate !== 'number' ||
-      !Number.isFinite(pRate)
-    ) {
-      throw new SyncEngineError(
-        'SNAPSHOT_ERROR',
-        'Pre-serialization error: state must have finite numeric anchorPositionMs and playbackRate'
+        `Pre-serialization error: snapshotFrontier key count exceeds 64 (${frontierKeyCount} > 64)`
       );
     }
 
-    const snapshotId = snapshot.snapshotId;
-    const sessionId = snapshot.sessionId;
-    const membershipEpoch = snapshot.membershipEpoch;
-    const authorPeerId = snapshot.authorPeerId;
+    // 2. originFrontierTimestamps key count <= 64
+    const tsKeyCount = Object.keys(data.originFrontierTimestamps).length;
+    if (tsKeyCount > 64) {
+      throw new SyncEngineError(
+        'SNAPSHOT_ERROR',
+        `Pre-serialization error: originFrontierTimestamps key count exceeds 64 (${tsKeyCount} > 64)`
+      );
+    }
+
+    // 3. maxLogicalTimestamp coherence: must equal max(originFrontierTimestamps) or 0
+    const tsValues = Object.values(data.originFrontierTimestamps);
+    const expectedMaxTs = tsValues.length > 0 ? Math.max(0, ...tsValues) : 0;
+    if (data.maxLogicalTimestamp !== expectedMaxTs) {
+      throw new SyncEngineError(
+        'SNAPSHOT_ERROR',
+        `Pre-serialization error: maxLogicalTimestamp (${data.maxLogicalTimestamp}) does not match originFrontierTimestamps maximum (${expectedMaxTs})`
+      );
+    }
+
+    // 4. Session identity coherence
+    if (data.sessionId !== data.state.sessionId) {
+      throw new SyncEngineError(
+        'SNAPSHOT_ERROR',
+        `Pre-serialization error: sessionId mismatch between header (${data.sessionId}) and state (${data.state.sessionId})`
+      );
+    }
+
+    return data as StateSnapshotPayloadV2;
+  }
+
+  /**
+   * Serializes a validated StateSnapshotPayloadV2 into a deterministic artifact.
+   * Encodes canonical bytes directly to master ArrayBuffer before computing SHA-256
+   * to eliminate duplicate 4.19 MiB TextEncoder buffer allocations.
+   * Immediately dereferences preimage and JSON string upon master buffer allocation.
+   * Throws SyncEngineError('SNAPSHOT_ERROR') if validation fails, serialization fails,
+   * or exceeds MAX_SNAPSHOT_BYTES.
+   */
+  public static serialize(snapshot: StateSnapshotPayloadV2): SerializedSnapshotArtifact {
+    // Upfront strict validation: bounds all strings, nested structures, keys, and values
+    // BEFORE any canonicalization or encoding memory is allocated.
+    const validated = SnapshotSerializer.validateSnapshot(snapshot);
+
+    const snapshotId = validated.snapshotId;
+    const sessionId = validated.sessionId;
+    const membershipEpoch = validated.membershipEpoch;
+    const authorPeerId = validated.authorPeerId;
 
     // Prepare preimage: omit sha256Digest and sort compactedCheckpoints deterministically
-    let sortedCheckpoints: CompactedCheckpointItem[] | undefined;
-    if (Array.isArray(snapshot.compactedCheckpoints)) {
-      sortedCheckpoints = [...snapshot.compactedCheckpoints].sort((a, b) => {
-        const cmp = String(a.originPeerId).localeCompare(String(b.originPeerId));
-        if (cmp !== 0) return cmp;
-        return Number(a.sequenceNumber) - Number(b.sequenceNumber);
-      });
-    }
+    // using locale-independent code-unit comparator.
+    const { sha256Digest: _, ...rest } = validated as Record<string, unknown>;
 
-    const { sha256Digest: _, ...rest } = snapshot as Record<string, unknown>;
+    let sortedCheckpoints: CompactedCheckpointItem[] | undefined;
+    if (Array.isArray(validated.compactedCheckpoints)) {
+      sortedCheckpoints = [...validated.compactedCheckpoints].sort(compareCheckpointsDeterministic);
+    }
 
     let preimage: Record<string, unknown> | null = {
       ...rest,

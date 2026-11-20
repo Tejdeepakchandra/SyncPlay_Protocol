@@ -136,6 +136,10 @@ export type {
 export {
   SerializedSnapshotArtifact,
   SnapshotSerializer,
+  StrictCompactedCheckpointItemSchema,
+  StrictEngineSnapshotDataSchema,
+  StrictStateSnapshotPayloadV2Schema,
+  compareCheckpointsDeterministic,
 } from './recovery/snapshot-serializer.js';
 export type {
   SerializedSnapshotArtifactParams,
@@ -147,4 +151,3 @@ export {
 export type {
   QueuedPreparationRequest,
 } from './recovery/snapshot-preparation-queue.js';
-
