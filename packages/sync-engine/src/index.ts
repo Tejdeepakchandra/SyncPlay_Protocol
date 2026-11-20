@@ -133,3 +133,18 @@ export type {
   PrepareForFailoverResult,
 } from './recovery/chunk-assembler.js';
 
+export {
+  SerializedSnapshotArtifact,
+  SnapshotSerializer,
+} from './recovery/snapshot-serializer.js';
+export type {
+  SerializedSnapshotArtifactParams,
+} from './recovery/snapshot-serializer.js';
+
+export {
+  SnapshotPreparationQueue,
+} from './recovery/snapshot-preparation-queue.js';
+export type {
+  QueuedPreparationRequest,
+} from './recovery/snapshot-preparation-queue.js';
+

@@ -30,7 +30,13 @@ export type SyncEngineErrorCode =
   | 'INVALID_VERSION_VECTOR'
   | 'BATCH_OVERFLOW'
   | 'INCOMPLETE_FRONTIER_METADATA'
-  | 'UNAUTHORIZED_FACADE_CALL';
+  | 'UNAUTHORIZED_FACADE_CALL'
+  | 'ARTIFACT_DISPOSED'
+  | 'LOCAL_ABORT'
+  | 'INVALID_RANGE'
+  | 'INVALID_STATE'
+  | 'PARTITION_ERROR'
+  | 'TRANSPORT_LIMIT_EXCEEDED';
 
 export class SyncEngineError extends Error {
   public readonly code: SyncEngineErrorCode;
