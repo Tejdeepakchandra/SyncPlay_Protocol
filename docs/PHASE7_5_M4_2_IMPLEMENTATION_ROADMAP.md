@@ -1,7 +1,7 @@
 # Phase 7.5 M4.2 — Implementation Roadmap: Snapshot Serialization & Outbound Pipeline
 
-**Document Version:** 1.0.0  
-**Status:** Approved Implementation Roadmap  
+**Document Version:** 1.1.0  
+**Status:** Approved Implementation Roadmap (Targeted Planning Correction Applied)  
 **Target Milestone:** M4.2  
 **Baseline Commit:** `fd23edae5bdb52cff32674860229277a79cb1aca`  
 
@@ -13,8 +13,8 @@ Milestone M4.2 is partitioned into four focused, incremental sub-milestones to g
 
 ```mermaid
 flowchart LR
-    M4_2a["M4.2a:<br/>SnapshotSerializer<br/>& JCS Digest"] --> M4_2b["M4.2b:<br/>SnapshotChunkProducer<br/>& Zero-Copy Slicing"]
-    M4_2b --> M4_2c["M4.2c:<br/>SnapshotOutboundPipeline<br/>& 7-Step Sizing Loop"]
+    M4_2a["M4.2a:<br/>Queue, Serializer<br/>& Artifact Encapsulation"] --> M4_2b["M4.2b:<br/>SnapshotChunkProducer<br/>& Canonical Partitioning"]
+    M4_2b --> M4_2c["M4.2c:<br/>SnapshotOutboundPipeline<br/>& Send-Boundary Verification"]
     M4_2c --> M4_2d["M4.2d:<br/>M4.1 Round-Trip Integration<br/>& Monorepo Build"]
 ```
 
@@ -22,64 +22,84 @@ flowchart LR
 
 ## 2. Sub-Milestone Work Breakdown
 
-### Sub-Milestone M4.2a: Snapshot Serializer & Canonical JCS Hashing
-- **Goal:** Implement deterministic serialization of engine snapshots into canonical bytes and verify digest consistency.
+### Sub-Milestone M4.2a: Preparation Queue, Serializer & Artifact Encapsulation
+- **Goal:** Implement the sequential preparation gate, deterministic RFC 8785 snapshot serialization, immediate resource dereferencing, and private master buffer encapsulation.
 - **Tasks:**
-  1. Author `packages/sync-engine/src/recovery/snapshot-serializer.ts`:
-     - Implement `SnapshotSerializer.serialize()`: canonicalize `StateSnapshotPayloadV2` using RFC 8785 `canonicalizeJson`.
-     - Implement `SnapshotSerializer.serializeFromEngine()`: integrate with `exportEngineSnapshotV2()` to export and canonicalize live playback state.
-     - Enforce `MAX_SNAPSHOT_BYTES = 4,194,304` (4 MiB) limit before and after serialization.
-     - Compute bit-exact SHA-256 digest over preimage.
-     - Return immutable `SerializedSnapshotArtifact`.
-  2. Author comprehensive unit test suite: `packages/sync-engine/src/__tests__/snapshot-serializer.test.ts`:
-     - Test empty snapshot, realistic snapshot, and maximum 4 MiB snapshot.
-     - Test deterministic key ordering and Lamport timestamp calculation.
-     - Verify identical SHA-256 digests across multiple runs.
-     - Verify rejection of non-serializable objects and values exceeding 4 MiB.
-- **Exit Condition:** 100% of serializer unit tests pass; SHA-256 output matches `computeSnapshotDigestV2()` bit-exact.
+  1. Author `packages/sync-engine/src/recovery/snapshot-preparation-queue.ts`:
+     - Implement `SnapshotPreparationQueue`:
+       - Enforce `MAX_CONCURRENT_PREPARATIONS = 1` sequential critical section.
+       - Enforce `MAX_PREPARATION_QUEUE_DEPTH = 4` metadata-only queue (< 1 KiB footprint).
+       - Ensure snapshot capture (`exportEngineSnapshotV2()`) executes **inside** the gate.
+       - Immediately reject requests when queue is saturated with `LOCAL_ABORT` ('Preparation queue saturated').
+  2. Author `packages/sync-engine/src/recovery/snapshot-serializer.ts`:
+     - Implement `SerializedSnapshotArtifact`:
+       - Encapsulate private `#masterBuffer: ArrayBuffer`.
+       - Implement package-private `getBorrowedSliceView(offset, length)` for recovery pipeline.
+       - Implement public `copyByteRange(offset, length)` and `cloneBytes()` returning unaliased copies.
+       - Implement `dispose()`: detaches buffer and prevents further reads (`ARTIFACT_DISPOSED`).
+     - Implement `SnapshotSerializer.serialize()`:
+       - Canonicalize `StateSnapshotPayloadV2` using RFC 8785 `canonicalizeJson`.
+       - Encode canonical UTF-8 bytes to master buffer.
+       - Compute bit-exact SHA-256 digest over master buffer.
+       - Immediately dereference `StateSnapshotPayloadV2` object and canonical JSON string.
+       - Enforce `MAX_SNAPSHOT_BYTES = 4,194,304` (4 MiB) ceiling.
+     - Implement `SnapshotSerializer.serializeFromEngine()`: integrate with `exportEngineSnapshotV2()`.
+  3. Author comprehensive unit test suites:
+     - `packages/sync-engine/src/__tests__/snapshot-preparation-queue.test.ts`:
+       - Verify sequential execution (`MAX_CONCURRENT_PREPARATIONS = 1`).
+       - Verify queue depth bounding and saturation rejection at depth 4.
+       - Verify capture function is invoked only when active execution begins.
+     - `packages/sync-engine/src/__tests__/snapshot-serializer.test.ts`:
+       - Test empty snapshot, realistic snapshot, and maximum 4 MiB snapshot.
+       - Verify identical SHA-256 digests across runs matching `computeSnapshotDigestV2()`.
+       - Verify private buffer encapsulation: `cloneBytes()` does not alias master buffer; mutating clone leaves artifact intact.
+       - Verify post-disposal access throws `SyncEngineError('ARTIFACT_DISPOSED')`.
+       - Verify rejection of non-serializable objects and values exceeding 4 MiB.
+- **Exit Condition:** 100% unit tests pass; queue, serializer, and artifact encapsulation verified.
 
 ---
 
 ### Sub-Milestone M4.2b: Zero-Copy Canonical Chunk Producer
-- **Goal:** Partition serialized snapshot artifacts into canonical binary slices using zero-copy memory views.
+- **Goal:** Partition serialized snapshot artifacts into canonical binary slices using zero-copy borrowed slice views.
 - **Tasks:**
   1. Author `packages/sync-engine/src/recovery/snapshot-chunk-producer.ts`:
      - Implement `SnapshotChunkProducer.partition()`.
      - Accept `SerializedSnapshotArtifact` and `ChunkProducerConfig`.
      - Calculate nominal chunk size and canonical chunk count via `calculateChunkCapacity()` and `calculateSnapshotAdmission()`.
-     - Enforce partition math: $N = \lceil S / C \rceil$, final slice $\le C$, $N \le 128$.
-     - Slice buffer zero-copy using `artifact.rawBytes.subarray()`.
+     - Enforce canonical partition geometry: $N = \lceil S / C \rceil$, slices $0 \dots N-2$ have size $C$, slice $N-1$ has size $S - (N-1) \cdot C$.
+     - Borrow slice views zero-copy using `artifact.getBorrowedSliceView()`.
      - Compute per-chunk SHA-256 digests (`chunkSha256`).
      - Return immutable `PartitionedSnapshot`.
   2. Author comprehensive unit test suite: `packages/sync-engine/src/__tests__/snapshot-chunk-producer.test.ts`:
-     - Verify zero-copy memory preservation (`sliceView.buffer === artifact.rawBytes.buffer`).
+     - Verify zero-copy borrowed slice memory preservation.
      - Verify exact partition counts across boundary conditions ($S = 1$ B, $S = 256$ B, $S = 32,768$ B, $S = 4$ MiB).
+     - Verify canonical partition sizes: non-final chunks equal $C$, final chunk equals $S - (N-1) \cdot C$.
      - Verify per-chunk SHA-256 digest correctness by re-hashing slices.
      - Verify rejection when transport requires $> 128$ chunks or chunk capacity $< 256$ B.
-- **Exit Condition:** Chunk producer tests pass; zero memory duplication confirmed.
+- **Exit Condition:** Chunk producer tests pass; zero memory duplication and canonical geometry confirmed.
 
 ---
 
-### Sub-Milestone M4.2c: Normative Iterative Sizing Loop & Outbound Pipeline
-- **Goal:** Format wire protocol messages and enforce the normative 7-step iterative send-boundary sizing loop.
+### Sub-Milestone M4.2c: Send-Boundary Verification & Outbound Pipeline
+- **Goal:** Format wire protocol messages and enforce mandatory exact complete-message UTF-8 byte length measurement at the send boundary.
 - **Tasks:**
   1. Author `packages/sync-engine/src/recovery/snapshot-outbound-pipeline.ts`:
-     - Implement `SnapshotOutboundPipeline.createOfferMessage()`.
-     - Implement `SnapshotOutboundPipeline.prepareChunkMessage()`.
-     - Implement the 7-step iterative sizing algorithm:
-       - Initial binary slice $B_0 \le \text{nominalChunkSizeBytes}$.
+     - Implement `SnapshotOutboundPipeline.createOfferMessage()`:
+       - Validate context and construct `ProtocolMessage<SnapshotOfferPayload>`.
+     - Implement `SnapshotOutboundPipeline.prepareChunkMessage()`:
+       - Read canonical slice view via `partition.getBorrowedSlice(chunkIndex)`.
        - Encode to Base64 using `@syncplay/protocol`'s isomorphic `encodeBase64()`.
        - Frame complete `ProtocolMessage<SnapshotChunkPayload>`.
-       - Serialize to JSON and measure exact UTF-8 byte length via `new TextEncoder().encode()`.
-       - If overshoot $O_k > 0$, reduce binary slice by $\Delta_k = \lceil O_k \times 0.75 \rceil + 32$ B.
-       - Enforce `MAX_SIZING_ITERATIONS = 5` and minimum chunk floor of 256 B.
-       - Return `OutboundChunkResult`.
+       - Serialize to JSON string via `JSON.stringify()`.
+       - Measure exact complete-message UTF-8 byte length via `new TextEncoder().encode(serializedJson).byteLength`.
+       - If exact byte length $\le \text{context.sctpMaxMessageSize}$: return `{ ok: true, protocolMessage, serializedJson, byteLength }`.
+       - If exact byte length $> \text{context.sctpMaxMessageSize}$: return `{ ok: false, reason: 'TRANSPORT_LIMIT_EXCEEDED', detail: ... }`. Never shrink chunks mid-transfer!
   2. Author comprehensive unit test suite: `packages/sync-engine/src/__tests__/snapshot-outbound-pipeline.test.ts`:
      - Test offer message schema compliance with `SnapshotOfferPayloadSchema`.
      - Test chunk message schema compliance with `SnapshotChunkPayloadSchema`.
-     - Test convergence on simulated SCTP limits (64 KB, 45,492 B, 32 KB, 16 KB, 4,096 B, 2,144 B).
-     - Test termination within $\le 5$ iterations.
-     - Test exact byte measurement matches string UTF-8 byte length.
+     - Test exact byte measurement matches UTF-8 byte length.
+     - Test that valid messages comfortably fit within negotiated limits thanks to 1,800 B reservation.
+     - Test immediate rejection with `TRANSPORT_LIMIT_EXCEEDED` if synthetic message exceeds limit.
 - **Exit Condition:** All outbound pipeline unit tests pass; generated chunk messages strictly stay $\le \text{sctpMaxMessageSize}$.
 
 ---
@@ -89,10 +109,10 @@ flowchart LR
 - **Tasks:**
   1. Author integration test suite: `packages/sync-engine/src/__tests__/m4-2-outbound-integration.test.ts`:
      - Generate a full 4 MiB engine snapshot.
-     - Serialize via `SnapshotSerializer`.
+     - Enqueue and serialize via `SnapshotPreparationQueue` and `SnapshotSerializer`.
      - Partition via `SnapshotChunkProducer`.
      - Produce all chunk messages via `SnapshotOutboundPipeline`.
-     - Ingest all produced chunk messages into M4.1 `ChunkAssembler`.
+     - Ingest all produced chunk messages into frozen M4.1 `ChunkAssembler`.
      - Finalize assembly in `ChunkAssembler` and verify reconstructed buffer matches original byte-for-byte.
      - Verify reconstructed snapshot SHA-256 digest matches original digest.
   2. Execute complete monorepo test suite (`npm test`).
