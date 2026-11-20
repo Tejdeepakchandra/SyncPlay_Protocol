@@ -76,5 +76,11 @@ The master planning suite for Phase 7 is located at the root of the `docs/` dire
 - `docs/PHASE7_5_IMPLEMENTATION_ROADMAP.md`: Six-stage staged delivery plan (M1–M6), affected files, dependency gating, invariants, verification plans, and prohibited work per milestone.
 - `docs/PHASE7_5_ACCEPTANCE_CRITERIA.md`: Granular, testable pass/fail acceptance criteria (AC-COMPACT, AC-ELIGIBLE, AC-XFER, AC-INSTALL, AC-CLOCK, AC-REGRESSION).
 - `docs/PHASE7_5_RISK_REGISTER.md`: Comprehensive risk inventory (memory exhaustion, split-brain divergence, quarantine overflow, SCTP overflow, clock inflation), severity ratings, triggers, automated mitigations, and test plans.
+- `docs/PHASE7_5_M4_ARCHITECTURE.md`: Milestone M4 high-level architecture, transport sizing, memory boundaries, and failover rules.
+- `docs/PHASE7_5_M4_2_ARCHITECTURE.md`: Milestone M4.2 snapshot serialization, RFC 8785 canonicalization, zero-copy chunk partitioning, and normative 7-step iterative send-boundary sizing architecture.
+- `docs/PHASE7_5_M4_2_INTERFACE_SPECIFICATION.md`: Milestone M4.2 TypeScript interfaces (`SnapshotSerializer`, `SnapshotChunkProducer`, `SnapshotOutboundPipeline`), data structures, and error contracts.
+- `docs/PHASE7_5_M4_2_IMPLEMENTATION_ROADMAP.md`: Milestone M4.2 staged execution roadmap (M4.2a–M4.2d) with deliverables and exit criteria.
+- `docs/PHASE7_5_M4_2_ACCEPTANCE_CRITERIA.md`: Milestone M4.2 measurable pass/fail acceptance criteria (AC-M4-SER, AC-M4-PRT, AC-M4-SIZ, AC-M4-B64, AC-M4-MEM, AC-M4-ISO, AC-M4-COM).
+- `docs/PHASE7_5_M4_2_RISK_REGISTER.md`: Milestone M4.2 risk analysis, failure modes, triggers, and automated mitigations.
 
 Use the consistency review and interface contracts as cross-module references; module LLDs provide task-specific detail.
