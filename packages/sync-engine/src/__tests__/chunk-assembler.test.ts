@@ -503,8 +503,119 @@ describe('ChunkAssembler (Phase 7.5 M4.1)', () => {
     });
   });
 
-  describe('Failover Handling (AC-M4-TR-4)', () => {
-    it('should preserve verified chunks on exact snapshot failover match', () => {
+  describe('Failover Handling & Non-Destructive Incompatible Rejection (AC-M4-TR-4)', () => {
+    // 3.A Valid same-epoch supplier failover
+    it('should retain verified chunks on valid same-epoch supplier failover', () => {
+      const rawData = new Uint8Array(1024);
+      for (let i = 0; i < rawData.byteLength; i++) rawData[i] = i % 256;
+      const { totalChunks, totalSizeBytes, overallSha256, chunks } = createChunksFromBuffer(
+        rawData,
+        256
+      );
+
+      assembler.initTransfer({
+        transferId: sampleTransferId,
+        sessionId: sampleSessionId,
+        snapshotId: sampleSnapshotId,
+        totalChunks,
+        totalSizeBytes,
+        nominalChunkSizeBytes: 256,
+        expectedSha256Digest: overallSha256,
+        supplierPeerId: sampleSupplier,
+        membershipEpoch: sampleEpoch,
+        connectionGeneration: 1,
+      });
+
+      // Ingest chunks 0 and 1
+      expect(assembler.ingestChunk(chunks[0]!).ok).toBe(true);
+      expect(assembler.ingestChunk(chunks[1]!).ok).toBe(true);
+      expect(assembler.getReceivedChunkIndices()).toEqual([0, 1]);
+
+      // Failover to a new supplier and new transfer ID in the SAME epoch with new generation
+      const newTransferId = 'aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee';
+      const newSupplier = 'peer-supplier-2';
+      const newGeneration = 5;
+
+      const failoverResult = assembler.prepareForFailover({
+        transferId: newTransferId,
+        supplierPeerId: newSupplier,
+        membershipEpoch: sampleEpoch, // Same epoch
+        connectionGeneration: newGeneration,
+        snapshotId: sampleSnapshotId,
+        expectedSha256Digest: overallSha256,
+        totalChunks,
+        totalSizeBytes,
+        nominalChunkSizeBytes: 256,
+      });
+
+      expect(failoverResult.ok).toBe(true);
+      expect(failoverResult.retainedChunks).toBe(2);
+      expect(assembler.getReceivedChunkIndices()).toEqual([0, 1]);
+      expect(assembler.getMissingChunkIndices()).toEqual([2, 3]);
+
+      // Active transfer context must be updated
+      const active = assembler.getActiveTransfer();
+      expect(active?.transferId).toBe(newTransferId);
+      expect(active?.supplierPeerId).toBe(newSupplier);
+      expect(active?.connectionGeneration).toBe(newGeneration);
+      expect(active?.membershipEpoch).toBe(sampleEpoch);
+
+      // Chunks carrying the OLD transferId or supplier must be rejected
+      const oldSupplierChunk2: SnapshotChunkPayload = {
+        ...chunks[2]!,
+        transferId: sampleTransferId,
+        membershipEpoch: sampleEpoch,
+        supplierPeerId: sampleSupplier,
+      };
+      const oldRes = assembler.ingestChunk(oldSupplierChunk2);
+      expect(oldRes.ok).toBe(false);
+      if (!oldRes.ok) {
+        expect(oldRes.reason).toBe('IDENTITY_MISMATCH');
+      }
+
+      // Chunks carrying the NEW transferId, supplier, and generation must be accepted
+      const chunk2New: SnapshotChunkPayload = {
+        ...chunks[2]!,
+        transferId: newTransferId,
+        membershipEpoch: sampleEpoch,
+        supplierPeerId: newSupplier,
+      };
+      const chunk3New: SnapshotChunkPayload = {
+        ...chunks[3]!,
+        transferId: newTransferId,
+        membershipEpoch: sampleEpoch,
+        supplierPeerId: newSupplier,
+      };
+
+      expect(
+        assembler.ingestChunk(chunk2New, {
+          sessionId: sampleSessionId,
+          senderPeerId: newSupplier,
+          membershipEpoch: sampleEpoch,
+          connectionGeneration: newGeneration,
+        }).ok
+      ).toBe(true);
+
+      expect(
+        assembler.ingestChunk(chunk3New, {
+          sessionId: sampleSessionId,
+          senderPeerId: newSupplier,
+          membershipEpoch: sampleEpoch,
+          connectionGeneration: newGeneration,
+        }).ok
+      ).toBe(true);
+
+      expect(assembler.isComplete()).toBe(true);
+      const finalize = assembler.finalizeAssembly();
+      expect(finalize.ok).toBe(true);
+      if (finalize.ok) {
+        expect(finalize.snapshot.buffer.byteLength).toBe(1024);
+        expect(finalize.snapshot.sha256Digest).toBe(overallSha256);
+      }
+    });
+
+    // 3.B Cross-epoch candidate rejection
+    it('should reject failover candidate from a different membership epoch without mutating active transfer', () => {
       const rawData = new Uint8Array(1024);
       const { totalChunks, totalSizeBytes, overallSha256, chunks } = createChunksFromBuffer(
         rawData,
@@ -523,20 +634,15 @@ describe('ChunkAssembler (Phase 7.5 M4.1)', () => {
         membershipEpoch: sampleEpoch,
       });
 
-      // Ingest chunks 0 and 1
       assembler.ingestChunk(chunks[0]!);
       assembler.ingestChunk(chunks[1]!);
       expect(assembler.getReceivedChunkIndices()).toEqual([0, 1]);
 
-      // Failover to a new supplier and new epoch with exact same snapshot
-      const newTransferId = 'aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee';
-      const newSupplier = 'peer-supplier-2';
-      const newEpoch = sampleEpoch + 1;
-
+      // Attempt failover using Epoch E+1 with otherwise identical snapshot and geometry
       const failoverResult = assembler.prepareForFailover({
-        transferId: newTransferId,
-        supplierPeerId: newSupplier,
-        membershipEpoch: newEpoch,
+        transferId: 'aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee',
+        supplierPeerId: 'peer-supplier-2',
+        membershipEpoch: sampleEpoch + 1, // DIFFERENT EPOCH!
         snapshotId: sampleSnapshotId,
         expectedSha256Digest: overallSha256,
         totalChunks,
@@ -544,37 +650,92 @@ describe('ChunkAssembler (Phase 7.5 M4.1)', () => {
         nominalChunkSizeBytes: 256,
       });
 
-      expect(failoverResult.retainedChunks).toBe(2);
-      expect(assembler.getReceivedChunkIndices()).toEqual([0, 1]);
-      expect(assembler.getMissingChunkIndices()).toEqual([2, 3]);
-
-      // Now chunks 2 and 3 must carry the new transferId, epoch, and supplier
-      const chunk2New: SnapshotChunkPayload = {
-        ...chunks[2]!,
-        transferId: newTransferId,
-        membershipEpoch: newEpoch,
-        supplierPeerId: newSupplier,
-      };
-      const chunk3New: SnapshotChunkPayload = {
-        ...chunks[3]!,
-        transferId: newTransferId,
-        membershipEpoch: newEpoch,
-        supplierPeerId: newSupplier,
-      };
-
-      expect(assembler.ingestChunk(chunk2New).ok).toBe(true);
-      expect(assembler.ingestChunk(chunk3New).ok).toBe(true);
-      expect(assembler.isComplete()).toBe(true);
-
-      const finalize = assembler.finalizeAssembly();
-      expect(finalize.ok).toBe(true);
-      if (finalize.ok) {
-        expect(finalize.snapshot.buffer.byteLength).toBe(1024);
+      // Must be non-destructively rejected
+      expect(failoverResult.ok).toBe(false);
+      if (!failoverResult.ok) {
+        expect(failoverResult.reason).toBe('EPOCH_MISMATCH');
+        expect(failoverResult.retainedChunks).toBe(0);
       }
+
+      // Active transfer state must remain UNCHANGED
+      expect(assembler.getReceivedChunkIndices()).toEqual([0, 1]);
+      const active = assembler.getActiveTransfer();
+      expect(active?.membershipEpoch).toBe(sampleEpoch);
+      expect(active?.supplierPeerId).toBe(sampleSupplier);
+      expect(active?.transferId).toBe(sampleTransferId);
+
+      // Verify no E+1 chunk can be accepted into the E transfer
+      const crossEpochChunk: SnapshotChunkPayload = {
+        ...chunks[2]!,
+        membershipEpoch: sampleEpoch + 1,
+      };
+      const ingestCrossEpoch = assembler.ingestChunk(crossEpochChunk);
+      expect(ingestCrossEpoch.ok).toBe(false);
+      if (!ingestCrossEpoch.ok) {
+        expect(ingestCrossEpoch.reason).toBe('EPOCH_MISMATCH');
+      }
+
+      // Active transfer is still healthy and can accept E chunk from original supplier
+      expect(assembler.ingestChunk(chunks[2]!).ok).toBe(true);
+      expect(assembler.getReceivedChunkIndices()).toEqual([0, 1, 2]);
     });
 
-    it('should purge all chunks immediately when failover snapshot differs', () => {
-      const rawData = new Uint8Array(512);
+    // 3.C Stale snapshot candidate rejection
+    it('should reject failover candidate with mismatched snapshotId without mutating active transfer', () => {
+      const rawData = new Uint8Array(1024);
+      const { totalChunks, totalSizeBytes, overallSha256, chunks } = createChunksFromBuffer(
+        rawData,
+        256
+      );
+
+      assembler.initTransfer({
+        transferId: sampleTransferId,
+        sessionId: sampleSessionId,
+        snapshotId: sampleSnapshotId,
+        totalChunks,
+        totalSizeBytes,
+        nominalChunkSizeBytes: 256,
+        expectedSha256Digest: overallSha256,
+        supplierPeerId: sampleSupplier,
+        membershipEpoch: sampleEpoch,
+      });
+
+      assembler.ingestChunk(chunks[0]!);
+      assembler.ingestChunk(chunks[1]!);
+      expect(assembler.getReceivedChunkIndices()).toEqual([0, 1]);
+
+      // Failover candidate offering a different snapshotId
+      const failoverResult = assembler.prepareForFailover({
+        transferId: 'bbbbbbbb-cccc-4ddd-8eee-ffffffffffff',
+        supplierPeerId: 'peer-supplier-3',
+        membershipEpoch: sampleEpoch,
+        snapshotId: 'stale-snapshot-999',
+        expectedSha256Digest: overallSha256,
+        totalChunks,
+        totalSizeBytes,
+        nominalChunkSizeBytes: 256,
+      });
+
+      expect(failoverResult.ok).toBe(false);
+      if (!failoverResult.ok) {
+        expect(failoverResult.reason).toBe('SNAPSHOT_ID_MISMATCH');
+        expect(failoverResult.retainedChunks).toBe(0);
+      }
+
+      // Original chunks and transfer state must be completely preserved
+      expect(assembler.getReceivedChunkIndices()).toEqual([0, 1]);
+      const active = assembler.getActiveTransfer();
+      expect(active?.snapshotId).toBe(sampleSnapshotId);
+      expect(active?.supplierPeerId).toBe(sampleSupplier);
+      expect(active?.transferId).toBe(sampleTransferId);
+
+      // Verify active transfer remains usable
+      expect(assembler.ingestChunk(chunks[2]!).ok).toBe(true);
+    });
+
+    // 3.D Digest mismatch rejection
+    it('should reject failover candidate with mismatched digest without mutating active transfer', () => {
+      const rawData = new Uint8Array(1024);
       const { totalChunks, totalSizeBytes, overallSha256, chunks } = createChunksFromBuffer(
         rawData,
         256
@@ -595,21 +756,487 @@ describe('ChunkAssembler (Phase 7.5 M4.1)', () => {
       assembler.ingestChunk(chunks[0]!);
       expect(assembler.getReceivedChunkIndices()).toEqual([0]);
 
-      // Failover to a completely new snapshotId
+      // Candidate offers same snapshotId but different SHA-256 digest
       const failoverResult = assembler.prepareForFailover({
-        transferId: 'bbbbbbbb-cccc-4ddd-8eee-ffffffffffff',
-        supplierPeerId: 'peer-supplier-3',
-        membershipEpoch: sampleEpoch + 1,
-        snapshotId: 'snap-002-newer',
-        expectedSha256Digest: 'f'.repeat(64),
-        totalChunks: 2,
-        totalSizeBytes: 512,
+        transferId: 'cccccccc-dddd-4eee-8fff-000000000000',
+        supplierPeerId: 'peer-supplier-4',
+        membershipEpoch: sampleEpoch,
+        snapshotId: sampleSnapshotId,
+        expectedSha256Digest: 'e'.repeat(64),
+        totalChunks,
+        totalSizeBytes,
         nominalChunkSizeBytes: 256,
       });
 
-      expect(failoverResult.retainedChunks).toBe(0);
-      expect(assembler.getReceivedChunkIndices()).toEqual([]);
-      expect(assembler.getMissingChunkIndices()).toEqual([0, 1]);
+      expect(failoverResult.ok).toBe(false);
+      if (!failoverResult.ok) {
+        expect(failoverResult.reason).toBe('DIGEST_MISMATCH');
+        expect(failoverResult.retainedChunks).toBe(0);
+      }
+
+      // Existing transfer state must remain intact
+      expect(assembler.getReceivedChunkIndices()).toEqual([0]);
+      expect(assembler.getActiveTransfer()?.expectedSha256Digest).toBe(overallSha256);
+      expect(assembler.ingestChunk(chunks[1]!).ok).toBe(true);
+    });
+
+    // 3.E Geometry mismatch rejection
+    describe('Geometry mismatch rejection', () => {
+      it('should reject candidate with mismatched totalSizeBytes without mutating active transfer', () => {
+        const rawData = new Uint8Array(1024);
+        const { totalChunks, totalSizeBytes, overallSha256, chunks } = createChunksFromBuffer(
+          rawData,
+          256
+        );
+
+        assembler.initTransfer({
+          transferId: sampleTransferId,
+          sessionId: sampleSessionId,
+          snapshotId: sampleSnapshotId,
+          totalChunks,
+          totalSizeBytes,
+          nominalChunkSizeBytes: 256,
+          expectedSha256Digest: overallSha256,
+          supplierPeerId: sampleSupplier,
+          membershipEpoch: sampleEpoch,
+        });
+
+        assembler.ingestChunk(chunks[0]!);
+
+        const failoverResult = assembler.prepareForFailover({
+          transferId: 'dddddddd-eeee-4fff-8aaa-111111111111',
+          supplierPeerId: 'peer-supplier-5',
+          membershipEpoch: sampleEpoch,
+          snapshotId: sampleSnapshotId,
+          expectedSha256Digest: overallSha256,
+          totalChunks: 3,
+          totalSizeBytes: 768, // Mismatched size
+          nominalChunkSizeBytes: 256,
+        });
+
+        expect(failoverResult.ok).toBe(false);
+        if (!failoverResult.ok) {
+          expect(failoverResult.reason).toBe('GEOMETRY_MISMATCH');
+        }
+        expect(assembler.getReceivedChunkIndices()).toEqual([0]);
+        expect(assembler.getActiveTransfer()?.totalSizeBytes).toBe(1024);
+      });
+
+      it('should reject candidate with mismatched totalChunks without mutating active transfer', () => {
+        const rawData = new Uint8Array(1024);
+        const { totalChunks, totalSizeBytes, overallSha256, chunks } = createChunksFromBuffer(
+          rawData,
+          256
+        );
+
+        assembler.initTransfer({
+          transferId: sampleTransferId,
+          sessionId: sampleSessionId,
+          snapshotId: sampleSnapshotId,
+          totalChunks,
+          totalSizeBytes,
+          nominalChunkSizeBytes: 256,
+          expectedSha256Digest: overallSha256,
+          supplierPeerId: sampleSupplier,
+          membershipEpoch: sampleEpoch,
+        });
+
+        assembler.ingestChunk(chunks[0]!);
+
+        const failoverResult = assembler.prepareForFailover({
+          transferId: 'dddddddd-eeee-4fff-8aaa-222222222222',
+          supplierPeerId: 'peer-supplier-5',
+          membershipEpoch: sampleEpoch,
+          snapshotId: sampleSnapshotId,
+          expectedSha256Digest: overallSha256,
+          totalChunks: 2, // Mismatched chunk count
+          totalSizeBytes: 1024,
+          nominalChunkSizeBytes: 512,
+        });
+
+        expect(failoverResult.ok).toBe(false);
+        if (!failoverResult.ok) {
+          expect(failoverResult.reason).toBe('GEOMETRY_MISMATCH');
+        }
+        expect(assembler.getReceivedChunkIndices()).toEqual([0]);
+        expect(assembler.getActiveTransfer()?.totalChunks).toBe(4);
+      });
+
+      it('should reject candidate with mismatched nominalChunkSizeBytes without mutating active transfer', () => {
+        const rawData = new Uint8Array(1024);
+        const { totalChunks, totalSizeBytes, overallSha256, chunks } = createChunksFromBuffer(
+          rawData,
+          256
+        );
+
+        assembler.initTransfer({
+          transferId: sampleTransferId,
+          sessionId: sampleSessionId,
+          snapshotId: sampleSnapshotId,
+          totalChunks,
+          totalSizeBytes,
+          nominalChunkSizeBytes: 256,
+          expectedSha256Digest: overallSha256,
+          supplierPeerId: sampleSupplier,
+          membershipEpoch: sampleEpoch,
+        });
+
+        assembler.ingestChunk(chunks[0]!);
+
+        const failoverResult = assembler.prepareForFailover({
+          transferId: 'dddddddd-eeee-4fff-8aaa-333333333333',
+          supplierPeerId: 'peer-supplier-5',
+          membershipEpoch: sampleEpoch,
+          snapshotId: sampleSnapshotId,
+          expectedSha256Digest: overallSha256,
+          totalChunks: 4,
+          totalSizeBytes: 1024,
+          nominalChunkSizeBytes: 512, // Mismatched nominal size
+        });
+
+        expect(failoverResult.ok).toBe(false);
+        expect(assembler.getReceivedChunkIndices()).toEqual([0]);
+        expect(assembler.getActiveTransfer()?.nominalChunkSizeBytes).toBe(256);
+      });
+    });
+
+    // 3.F Invalid candidate parameter rejection
+    describe('Invalid candidate parameter rejection', () => {
+      it('should reject candidate with invalid nominalChunkSizeBytes without destroying transfer', () => {
+        const rawData = new Uint8Array(1024);
+        const { totalChunks, totalSizeBytes, overallSha256, chunks } = createChunksFromBuffer(
+          rawData,
+          256
+        );
+
+        assembler.initTransfer({
+          transferId: sampleTransferId,
+          sessionId: sampleSessionId,
+          snapshotId: sampleSnapshotId,
+          totalChunks,
+          totalSizeBytes,
+          nominalChunkSizeBytes: 256,
+          expectedSha256Digest: overallSha256,
+          supplierPeerId: sampleSupplier,
+          membershipEpoch: sampleEpoch,
+        });
+
+        assembler.ingestChunk(chunks[0]!);
+
+        const failoverResult = assembler.prepareForFailover({
+          transferId: 'eeeeeeee-ffff-4aaa-8bbb-000000000001',
+          supplierPeerId: 'peer-supplier-6',
+          membershipEpoch: sampleEpoch,
+          snapshotId: sampleSnapshotId,
+          expectedSha256Digest: overallSha256,
+          totalChunks,
+          totalSizeBytes,
+          nominalChunkSizeBytes: 100, // < MIN_RAW_CHUNK_BYTES (256)
+        });
+
+        expect(failoverResult.ok).toBe(false);
+        if (!failoverResult.ok) {
+          expect(failoverResult.reason).toBe('INVALID_PARAMETERS');
+        }
+        expect(assembler.getReceivedChunkIndices()).toEqual([0]);
+        expect(assembler.ingestChunk(chunks[1]!).ok).toBe(true);
+      });
+
+      it('should reject candidate with invalid partition chunk count without destroying transfer', () => {
+        const rawData = new Uint8Array(1024);
+        const { totalChunks, totalSizeBytes, overallSha256, chunks } = createChunksFromBuffer(
+          rawData,
+          256
+        );
+
+        assembler.initTransfer({
+          transferId: sampleTransferId,
+          sessionId: sampleSessionId,
+          snapshotId: sampleSnapshotId,
+          totalChunks,
+          totalSizeBytes,
+          nominalChunkSizeBytes: 256,
+          expectedSha256Digest: overallSha256,
+          supplierPeerId: sampleSupplier,
+          membershipEpoch: sampleEpoch,
+        });
+
+        assembler.ingestChunk(chunks[0]!);
+
+        const failoverResult = assembler.prepareForFailover({
+          transferId: 'eeeeeeee-ffff-4aaa-8bbb-000000000002',
+          supplierPeerId: 'peer-supplier-6',
+          membershipEpoch: sampleEpoch,
+          snapshotId: sampleSnapshotId,
+          expectedSha256Digest: overallSha256,
+          totalChunks: 99, // Inconsistent with ceil(1024 / 256) = 4
+          totalSizeBytes,
+          nominalChunkSizeBytes: 256,
+        });
+
+        expect(failoverResult.ok).toBe(false);
+        if (!failoverResult.ok) {
+          expect(failoverResult.reason).toBe('INVALID_PARAMETERS');
+        }
+        expect(assembler.getReceivedChunkIndices()).toEqual([0]);
+      });
+
+      it('should reject candidate with malformed digest without destroying transfer', () => {
+        const rawData = new Uint8Array(1024);
+        const { totalChunks, totalSizeBytes, overallSha256, chunks } = createChunksFromBuffer(
+          rawData,
+          256
+        );
+
+        assembler.initTransfer({
+          transferId: sampleTransferId,
+          sessionId: sampleSessionId,
+          snapshotId: sampleSnapshotId,
+          totalChunks,
+          totalSizeBytes,
+          nominalChunkSizeBytes: 256,
+          expectedSha256Digest: overallSha256,
+          supplierPeerId: sampleSupplier,
+          membershipEpoch: sampleEpoch,
+        });
+
+        assembler.ingestChunk(chunks[0]!);
+
+        const failoverResult = assembler.prepareForFailover({
+          transferId: 'eeeeeeee-ffff-4aaa-8bbb-000000000003',
+          supplierPeerId: 'peer-supplier-6',
+          membershipEpoch: sampleEpoch,
+          snapshotId: sampleSnapshotId,
+          expectedSha256Digest: 'invalid-non-hex-hash',
+          totalChunks,
+          totalSizeBytes,
+          nominalChunkSizeBytes: 256,
+        });
+
+        expect(failoverResult.ok).toBe(false);
+        if (!failoverResult.ok) {
+          expect(failoverResult.reason).toBe('INVALID_PARAMETERS');
+        }
+        expect(assembler.getReceivedChunkIndices()).toEqual([0]);
+      });
+
+      it('should reject candidate with mismatched sessionId without destroying transfer', () => {
+        const rawData = new Uint8Array(1024);
+        const { totalChunks, totalSizeBytes, overallSha256, chunks } = createChunksFromBuffer(
+          rawData,
+          256
+        );
+
+        assembler.initTransfer({
+          transferId: sampleTransferId,
+          sessionId: sampleSessionId,
+          snapshotId: sampleSnapshotId,
+          totalChunks,
+          totalSizeBytes,
+          nominalChunkSizeBytes: 256,
+          expectedSha256Digest: overallSha256,
+          supplierPeerId: sampleSupplier,
+          membershipEpoch: sampleEpoch,
+        });
+
+        assembler.ingestChunk(chunks[0]!);
+
+        const failoverResult = assembler.prepareForFailover({
+          transferId: 'eeeeeeee-ffff-4aaa-8bbb-000000000004',
+          supplierPeerId: 'peer-supplier-6',
+          membershipEpoch: sampleEpoch,
+          snapshotId: sampleSnapshotId,
+          expectedSha256Digest: overallSha256,
+          totalChunks,
+          totalSizeBytes,
+          nominalChunkSizeBytes: 256,
+          sessionId: 'different-session-xyz', // Mismatched sessionId
+        });
+
+        expect(failoverResult.ok).toBe(false);
+        if (!failoverResult.ok) {
+          expect(failoverResult.reason).toBe('SESSION_MISMATCH');
+        }
+        expect(assembler.getReceivedChunkIndices()).toEqual([0]);
+      });
+    });
+
+    // 3.G Explicit restart
+    describe('Explicit transfer restart', () => {
+      it('should support explicit restart via abortTransfer() and initTransfer()', () => {
+        const rawDataE = new Uint8Array(1024).fill(11);
+        const chunksE = createChunksFromBuffer(
+          rawDataE,
+          256,
+          sampleTransferId,
+          sampleSessionId,
+          'snap-epoch-1',
+          sampleSupplier,
+          sampleEpoch
+        );
+
+        assembler.initTransfer({
+          transferId: sampleTransferId,
+          sessionId: sampleSessionId,
+          snapshotId: 'snap-epoch-1',
+          totalChunks: chunksE.totalChunks,
+          totalSizeBytes: chunksE.totalSizeBytes,
+          nominalChunkSizeBytes: 256,
+          expectedSha256Digest: chunksE.overallSha256,
+          supplierPeerId: sampleSupplier,
+          membershipEpoch: sampleEpoch,
+        });
+
+        // Ingest chunks in epoch E
+        assembler.ingestChunk(chunksE.chunks[0]!);
+        assembler.ingestChunk(chunksE.chunks[1]!);
+        expect(assembler.getReceivedChunkIndices()).toEqual([0, 1]);
+
+        // Explicit caller action: coordinator aborts transfer
+        assembler.abortTransfer();
+        expect(assembler.getActiveTransfer()).toBeNull();
+        expect(assembler.getProgress()).toBeNull();
+
+        // Initialize new transfer in epoch E+1 with new snapshot
+        const rawDataEPlus1 = new Uint8Array(512).fill(22);
+        const newTransferId = 'ffffffff-0000-4111-8222-333333333333';
+        const newEpoch = sampleEpoch + 1;
+        const chunksEPlus1 = createChunksFromBuffer(
+          rawDataEPlus1,
+          256,
+          newTransferId,
+          sampleSessionId,
+          'snap-epoch-2',
+          'peer-supplier-new',
+          newEpoch
+        );
+
+        assembler.initTransfer({
+          transferId: newTransferId,
+          sessionId: sampleSessionId,
+          snapshotId: 'snap-epoch-2',
+          totalChunks: chunksEPlus1.totalChunks,
+          totalSizeBytes: chunksEPlus1.totalSizeBytes,
+          nominalChunkSizeBytes: 256,
+          expectedSha256Digest: chunksEPlus1.overallSha256,
+          supplierPeerId: 'peer-supplier-new',
+          membershipEpoch: newEpoch,
+        });
+
+        // Verify no old chunks remain
+        expect(assembler.getReceivedChunkIndices()).toEqual([]);
+        expect(assembler.getMissingChunkIndices()).toEqual([0, 1]);
+
+        // Old-epoch chunks must be rejected
+        const oldChunkRes = assembler.ingestChunk(chunksE.chunks[0]!);
+        expect(oldChunkRes.ok).toBe(false);
+
+        // New-epoch chunks must be accepted
+        expect(assembler.ingestChunk(chunksEPlus1.chunks[0]!).ok).toBe(true);
+        expect(assembler.ingestChunk(chunksEPlus1.chunks[1]!).ok).toBe(true);
+
+        expect(assembler.isComplete()).toBe(true);
+        const finalSnapshot = assembler.finalizeAssembly();
+        expect(finalSnapshot.ok).toBe(true);
+      });
+
+      it('should support explicit restart via restartTransfer() method', () => {
+        const rawData1 = new Uint8Array(512).fill(7);
+        const chunks1 = createChunksFromBuffer(
+          rawData1,
+          256,
+          sampleTransferId,
+          sampleSessionId,
+          'snap-1',
+          sampleSupplier,
+          sampleEpoch
+        );
+
+        assembler.initTransfer({
+          transferId: sampleTransferId,
+          sessionId: sampleSessionId,
+          snapshotId: 'snap-1',
+          totalChunks: 2,
+          totalSizeBytes: 512,
+          nominalChunkSizeBytes: 256,
+          expectedSha256Digest: chunks1.overallSha256,
+          supplierPeerId: sampleSupplier,
+          membershipEpoch: sampleEpoch,
+        });
+
+        assembler.ingestChunk(chunks1.chunks[0]!);
+        expect(assembler.getReceivedChunkIndices()).toEqual([0]);
+
+        // Call explicit restartTransfer
+        const rawData2 = new Uint8Array(256).fill(8);
+        const newTransferId = '00000000-1111-4222-8333-444444444444';
+        const chunks2 = createChunksFromBuffer(
+          rawData2,
+          256,
+          newTransferId,
+          sampleSessionId,
+          'snap-2',
+          'peer-supplier-2',
+          sampleEpoch + 1
+        );
+
+        assembler.restartTransfer({
+          transferId: newTransferId,
+          sessionId: sampleSessionId,
+          snapshotId: 'snap-2',
+          totalChunks: 1,
+          totalSizeBytes: 256,
+          nominalChunkSizeBytes: 256,
+          expectedSha256Digest: chunks2.overallSha256,
+          supplierPeerId: 'peer-supplier-2',
+          membershipEpoch: sampleEpoch + 1,
+        });
+
+        expect(assembler.getReceivedChunkIndices()).toEqual([]);
+        expect(assembler.getActiveTransfer()?.snapshotId).toBe('snap-2');
+        expect(assembler.getActiveTransfer()?.membershipEpoch).toBe(sampleEpoch + 1);
+
+        const ingestRes = assembler.ingestChunk(chunks2.chunks[0]!);
+        expect(ingestRes.ok).toBe(true);
+        expect(assembler.isComplete()).toBe(true);
+      });
+    });
+
+    it('should reject prepareForFailover when assembler is disposed or has no active transfer', () => {
+      // Disposed assembler
+      const disposedAssembler = new ChunkAssembler();
+      disposedAssembler.dispose();
+      const disposedRes = disposedAssembler.prepareForFailover({
+        transferId: sampleTransferId,
+        supplierPeerId: sampleSupplier,
+        membershipEpoch: sampleEpoch,
+        snapshotId: sampleSnapshotId,
+        expectedSha256Digest: 'a'.repeat(64),
+        totalChunks: 1,
+        totalSizeBytes: 256,
+        nominalChunkSizeBytes: 256,
+      });
+      expect(disposedRes.ok).toBe(false);
+      if (!disposedRes.ok) {
+        expect(disposedRes.reason).toBe('DISPOSED');
+      }
+
+      // Inactive assembler (no transfer active)
+      const inactiveAssembler = new ChunkAssembler();
+      const inactiveRes = inactiveAssembler.prepareForFailover({
+        transferId: sampleTransferId,
+        supplierPeerId: sampleSupplier,
+        membershipEpoch: sampleEpoch,
+        snapshotId: sampleSnapshotId,
+        expectedSha256Digest: 'a'.repeat(64),
+        totalChunks: 1,
+        totalSizeBytes: 256,
+        nominalChunkSizeBytes: 256,
+      });
+      expect(inactiveRes.ok).toBe(false);
+      if (!inactiveRes.ok) {
+        expect(inactiveRes.reason).toBe('NO_ACTIVE_TRANSFER');
+      }
     });
   });
 
@@ -918,7 +1545,7 @@ describe('ChunkAssembler (Phase 7.5 M4.1)', () => {
       ).toThrow(/totalSizeBytes.*positive/i);
     });
 
-    it('should purge all chunks when failover nominalChunkSizeBytes differs from active transfer', () => {
+    it('should reject candidate and preserve active chunks when failover nominalChunkSizeBytes differs from active transfer', () => {
       const rawData = new Uint8Array(1024);
       const { totalChunks, totalSizeBytes, overallSha256, chunks } = createChunksFromBuffer(
         rawData,
@@ -945,7 +1572,7 @@ describe('ChunkAssembler (Phase 7.5 M4.1)', () => {
       const failoverResult = assembler.prepareForFailover({
         transferId: 'cccccccc-dddd-4eee-8fff-000000000000',
         supplierPeerId: 'peer-supplier-4',
-        membershipEpoch: sampleEpoch + 1,
+        membershipEpoch: sampleEpoch,
         snapshotId: sampleSnapshotId,
         expectedSha256Digest: overallSha256,
         totalChunks: 2,
@@ -953,10 +1580,10 @@ describe('ChunkAssembler (Phase 7.5 M4.1)', () => {
         nominalChunkSizeBytes: 512, // Different partition!
       });
 
-      // All chunks must be purged due to partition mismatch
+      // Candidate must be rejected non-destructively; active transfer chunks preserved
+      expect(failoverResult.ok).toBe(false);
       expect(failoverResult.retainedChunks).toBe(0);
-      expect(assembler.getReceivedChunkIndices()).toEqual([]);
-      expect(assembler.getMissingChunkIndices()).toEqual([0, 1]);
+      expect(assembler.getReceivedChunkIndices()).toEqual([0]);
     });
   });
 

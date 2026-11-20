@@ -53,6 +53,41 @@ export type IngestChunkResult =
   | { ok: true; duplicate: boolean; completed: boolean }
   | { ok: false; reason: SnapshotAbortReason; detail: string };
 
+export interface FailoverCandidateParams {
+  transferId: string;
+  supplierPeerId: string;
+  membershipEpoch: number;
+  connectionGeneration?: number;
+  snapshotId: string;
+  expectedSha256Digest: string;
+  totalChunks: number;
+  totalSizeBytes: number;
+  nominalChunkSizeBytes: number;
+  sessionId?: string;
+}
+
+export type FailoverRejectReason =
+  | 'NO_ACTIVE_TRANSFER'
+  | 'DISPOSED'
+  | 'INVALID_PARAMETERS'
+  | 'SESSION_MISMATCH'
+  | 'EPOCH_MISMATCH'
+  | 'SNAPSHOT_ID_MISMATCH'
+  | 'DIGEST_MISMATCH'
+  | 'GEOMETRY_MISMATCH';
+
+export type PrepareForFailoverResult =
+  | {
+      ok: true;
+      retainedChunks: number;
+    }
+  | {
+      ok: false;
+      reason: FailoverRejectReason;
+      detail: string;
+      retainedChunks: 0;
+    };
+
 export interface AssembledSnapshot {
   buffer: Uint8Array;
   snapshotId: string;
@@ -101,7 +136,7 @@ export class ChunkAssembler {
       throw new Error('ChunkAssembler is disposed');
     }
     if (this.transferParams !== null) {
-      throw new Error('Transfer already active. Call reset() or prepareForFailover() first.');
+      throw new Error('Transfer already active. Call abortTransfer(), reset(), or restartTransfer() first.');
     }
     if (params.totalSizeBytes <= 0 || params.totalSizeBytes > this.maxSnapshotBytes) {
       throw new Error(
@@ -339,54 +374,239 @@ export class ChunkAssembler {
   }
 
   /**
-   * Prepares the assembler for failover to a new supplier or epoch.
-   * If snapshotId, expectedSha256Digest, totalChunks, and totalSizeBytes match bit-exact,
-   * all previously received and verified chunks are retained.
-   * Otherwise, all state is purged immediately.
+   * Prepares the assembler for failover to a new supplier in the same membership epoch.
+   *
+   * Verifies that the failover candidate matches all immutable transfer identity and geometry:
+   * sessionId (if provided), membershipEpoch, snapshotId, expectedSha256Digest, totalSizeBytes,
+   * totalChunks, and nominalChunkSizeBytes.
+   *
+   * Non-destructive: if the candidate is incompatible or invalid, it is rejected with a specific
+   * reason, and the active transfer, its received chunks, and state remain completely unchanged.
+   *
+   * Only upon passing all compatibility and parameter checks are the new transferId,
+   * supplierPeerId, and connectionGeneration installed, retaining all verified chunks.
    */
-  public prepareForFailover(params: {
-    transferId: string;
-    supplierPeerId: string;
-    membershipEpoch: number;
-    connectionGeneration?: number;
-    snapshotId: string;
-    expectedSha256Digest: string;
-    totalChunks: number;
-    totalSizeBytes: number;
-    nominalChunkSizeBytes: number;
-  }): { retainedChunks: number } {
+  public prepareForFailover(params: FailoverCandidateParams): PrepareForFailoverResult {
     if (this.disposed) {
-      throw new Error('ChunkAssembler is disposed');
+      return {
+        ok: false,
+        reason: 'DISPOSED',
+        detail: 'ChunkAssembler is disposed',
+        retainedChunks: 0,
+      };
     }
     if (!this.transferParams) {
-      throw new Error('No active transfer session to failover');
+      return {
+        ok: false,
+        reason: 'NO_ACTIVE_TRANSFER',
+        detail: 'No active transfer session to failover',
+        retainedChunks: 0,
+      };
     }
 
-    const isExactMatch =
-      this.transferParams.snapshotId === params.snapshotId &&
-      this.transferParams.expectedSha256Digest.toLowerCase() ===
-        params.expectedSha256Digest.toLowerCase() &&
-      this.transferParams.totalChunks === params.totalChunks &&
-      this.transferParams.totalSizeBytes === params.totalSizeBytes &&
-      this.transferParams.nominalChunkSizeBytes === params.nominalChunkSizeBytes;
-
-    if (isExactMatch) {
-      // Retain verified chunks and update context
-      this.transferParams.transferId = params.transferId;
-      this.transferParams.supplierPeerId = params.supplierPeerId;
-      this.transferParams.membershipEpoch = params.membershipEpoch;
-      this.transferParams.connectionGeneration = params.connectionGeneration;
-      return { retainedChunks: this.receivedChunksCount };
-    } else {
-      // Incompatible snapshot: purge everything
-      const sessionId = this.transferParams.sessionId;
-      this.abortTransfer();
-      this.initTransfer({
-        ...params,
-        sessionId,
-      });
-      return { retainedChunks: 0 };
+    // 1. Candidate parameter validation (must not modify active transfer on invalid inputs)
+    if (params === null || typeof params !== 'object') {
+      return {
+        ok: false,
+        reason: 'INVALID_PARAMETERS',
+        detail: 'Failover candidate parameters must be an object',
+        retainedChunks: 0,
+      };
     }
+    if (typeof params.transferId !== 'string' || params.transferId.trim() === '') {
+      return {
+        ok: false,
+        reason: 'INVALID_PARAMETERS',
+        detail: 'transferId must be a non-empty string',
+        retainedChunks: 0,
+      };
+    }
+    if (typeof params.supplierPeerId !== 'string' || params.supplierPeerId.trim() === '') {
+      return {
+        ok: false,
+        reason: 'INVALID_PARAMETERS',
+        detail: 'supplierPeerId must be a non-empty string',
+        retainedChunks: 0,
+      };
+    }
+    if (
+      typeof params.membershipEpoch !== 'number' ||
+      !Number.isInteger(params.membershipEpoch) ||
+      params.membershipEpoch < 0
+    ) {
+      return {
+        ok: false,
+        reason: 'INVALID_PARAMETERS',
+        detail: 'membershipEpoch must be a non-negative integer',
+        retainedChunks: 0,
+      };
+    }
+    if (
+      params.connectionGeneration !== undefined &&
+      (typeof params.connectionGeneration !== 'number' ||
+        !Number.isInteger(params.connectionGeneration) ||
+        params.connectionGeneration < 0)
+    ) {
+      return {
+        ok: false,
+        reason: 'INVALID_PARAMETERS',
+        detail: 'connectionGeneration must be a non-negative integer when provided',
+        retainedChunks: 0,
+      };
+    }
+    if (typeof params.snapshotId !== 'string' || params.snapshotId.trim() === '') {
+      return {
+        ok: false,
+        reason: 'INVALID_PARAMETERS',
+        detail: 'snapshotId must be a non-empty string',
+        retainedChunks: 0,
+      };
+    }
+    if (
+      typeof params.expectedSha256Digest !== 'string' ||
+      !/^[0-9a-fA-F]{64}$/.test(params.expectedSha256Digest)
+    ) {
+      return {
+        ok: false,
+        reason: 'INVALID_PARAMETERS',
+        detail: 'expectedSha256Digest must be a valid 64-character hexadecimal SHA-256 hash',
+        retainedChunks: 0,
+      };
+    }
+    if (
+      typeof params.totalSizeBytes !== 'number' ||
+      !Number.isInteger(params.totalSizeBytes) ||
+      params.totalSizeBytes <= 0 ||
+      params.totalSizeBytes > this.maxSnapshotBytes
+    ) {
+      return {
+        ok: false,
+        reason: 'INVALID_PARAMETERS',
+        detail: `totalSizeBytes (${params.totalSizeBytes}) must be positive and not exceed maxSnapshotBytes (${this.maxSnapshotBytes})`,
+        retainedChunks: 0,
+      };
+    }
+    if (
+      typeof params.nominalChunkSizeBytes !== 'number' ||
+      !Number.isInteger(params.nominalChunkSizeBytes) ||
+      params.nominalChunkSizeBytes < this.minRawChunkBytes ||
+      params.nominalChunkSizeBytes > this.maxChunkBytes
+    ) {
+      return {
+        ok: false,
+        reason: 'INVALID_PARAMETERS',
+        detail: `nominalChunkSizeBytes (${params.nominalChunkSizeBytes}) must be between ${this.minRawChunkBytes} and ${this.maxChunkBytes}`,
+        retainedChunks: 0,
+      };
+    }
+    const expectedChunks = Math.ceil(params.totalSizeBytes / params.nominalChunkSizeBytes);
+    if (
+      typeof params.totalChunks !== 'number' ||
+      !Number.isInteger(params.totalChunks) ||
+      params.totalChunks !== expectedChunks
+    ) {
+      return {
+        ok: false,
+        reason: 'INVALID_PARAMETERS',
+        detail: `totalChunks (${params.totalChunks}) does not match expected canonical partition count (${expectedChunks})`,
+        retainedChunks: 0,
+      };
+    }
+    if (params.totalChunks < 1 || params.totalChunks > this.maxChunks) {
+      return {
+        ok: false,
+        reason: 'INVALID_PARAMETERS',
+        detail: `totalChunks (${params.totalChunks}) must be between 1 and ${this.maxChunks}`,
+        retainedChunks: 0,
+      };
+    }
+    const finalChunkSize =
+      params.totalSizeBytes - (params.totalChunks - 1) * params.nominalChunkSizeBytes;
+    if (finalChunkSize < 1 || finalChunkSize > params.nominalChunkSizeBytes) {
+      return {
+        ok: false,
+        reason: 'INVALID_PARAMETERS',
+        detail: `Final chunk size (${finalChunkSize}) must be at least 1 and not exceed nominalChunkSizeBytes (${params.nominalChunkSizeBytes})`,
+        retainedChunks: 0,
+      };
+    }
+
+    // 2. Compatibility predicate check against active transfer
+    // Session binding: candidate must match active session (if provided)
+    if (params.sessionId !== undefined && params.sessionId !== this.transferParams.sessionId) {
+      return {
+        ok: false,
+        reason: 'SESSION_MISMATCH',
+        detail: `Candidate sessionId '${params.sessionId}' does not match active transfer sessionId '${this.transferParams.sessionId}'`,
+        retainedChunks: 0,
+      };
+    }
+
+    // Epoch fencing: snapshot recovery is strictly epoch-scoped
+    if (params.membershipEpoch !== this.transferParams.membershipEpoch) {
+      return {
+        ok: false,
+        reason: 'EPOCH_MISMATCH',
+        detail: `Candidate membershipEpoch ${params.membershipEpoch} does not match active transfer epoch ${this.transferParams.membershipEpoch}`,
+        retainedChunks: 0,
+      };
+    }
+
+    // Snapshot ID match
+    if (params.snapshotId !== this.transferParams.snapshotId) {
+      return {
+        ok: false,
+        reason: 'SNAPSHOT_ID_MISMATCH',
+        detail: `Candidate snapshotId '${params.snapshotId}' does not match active transfer snapshotId '${this.transferParams.snapshotId}'`,
+        retainedChunks: 0,
+      };
+    }
+
+    // Expected digest match (case-insensitive)
+    if (
+      params.expectedSha256Digest.toLowerCase() !==
+      this.transferParams.expectedSha256Digest.toLowerCase()
+    ) {
+      return {
+        ok: false,
+        reason: 'DIGEST_MISMATCH',
+        detail: `Candidate digest '${params.expectedSha256Digest}' does not match active transfer digest '${this.transferParams.expectedSha256Digest}'`,
+        retainedChunks: 0,
+      };
+    }
+
+    // Geometry match (totalSizeBytes, totalChunks, nominalChunkSizeBytes)
+    if (
+      params.totalSizeBytes !== this.transferParams.totalSizeBytes ||
+      params.totalChunks !== this.transferParams.totalChunks ||
+      params.nominalChunkSizeBytes !== this.transferParams.nominalChunkSizeBytes
+    ) {
+      return {
+        ok: false,
+        reason: 'GEOMETRY_MISMATCH',
+        detail: `Candidate geometry (size: ${params.totalSizeBytes}, chunks: ${params.totalChunks}, nominal: ${params.nominalChunkSizeBytes}) does not match active transfer (size: ${this.transferParams.totalSizeBytes}, chunks: ${this.transferParams.totalChunks}, nominal: ${this.transferParams.nominalChunkSizeBytes})`,
+        retainedChunks: 0,
+      };
+    }
+
+    // 3. Candidate is compatible: update supplier and transfer attempt context
+    this.transferParams.transferId = params.transferId;
+    this.transferParams.supplierPeerId = params.supplierPeerId;
+    this.transferParams.connectionGeneration = params.connectionGeneration;
+
+    return {
+      ok: true,
+      retainedChunks: this.receivedChunksCount,
+    };
+  }
+
+  /**
+   * Explicitly restarts the recovery transfer session with new parameters.
+   * Purges all previously buffered chunks and metadata before initializing.
+   */
+  public restartTransfer(params: InitTransferParams): void {
+    this.abortTransfer();
+    this.initTransfer(params);
   }
 
   /** Returns true if all chunks for the active transfer have been received. */

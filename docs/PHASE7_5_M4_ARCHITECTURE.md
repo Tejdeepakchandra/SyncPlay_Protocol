@@ -212,12 +212,33 @@ stateDiagram-v2
   - The current `transferId` becomes immediately **invalid**.
   - All pending timers and in-flight chunk requests for that `transferId` are cancelled.
 
-### 3.2 Verified Chunk Retention Rule
-Already received and verified chunks in `ChunkAssembler` may be retained **if and only if**:
-$$\text{offer}_{\text{new}}.\text{snapshotId} === \text{offer}_{\text{active}}.\text{snapshotId} \quad \land \quad \text{offer}_{\text{new}}.\text{sha256Digest} === \text{offer}_{\text{active}}.\text{sha256Digest}$$
-- **Exact Match:** Chunks $0 \dots k$ already verified against their `chunkSha256` remain valid. The requester issues `SNAPSHOT_REQUEST` with a new `transferId` and `missingChunkIndices = assembler.getMissingChunkIndices()`.
-- **Mismatch (Different Snapshot):** If the replacement supplier offers a different snapshot ID or digest, **all previously received chunks are purged immediately**. Mixing chunks from different snapshot identities is mathematically forbidden.
-- **No Eligible Supplier:** If no replacement supplier is available, the transfer terminates cleanly with `SUPPLIER_DISCONNECTED`, leaving active engine state 100% untouched.
+### 3.2 Verified Chunk Retention Rule and Non-Destructive Failover
+Already received and verified chunks in `ChunkAssembler` may be retained **if and only if** all immutable transfer identity and partition geometry fields match bit-exact:
+$$\begin{aligned}
+\text{candidate}.\text{sessionId} &=== \text{active}.\text{sessionId} \quad (\text{if provided}) \\
+\land \quad \text{candidate}.\text{membershipEpoch} &=== \text{active}.\text{membershipEpoch} \\
+\land \quad \text{candidate}.\text{snapshotId} &=== \text{active}.\text{snapshotId} \\
+\land \quad \text{candidate}.\text{expectedSha256Digest} &=== \text{active}.\text{expectedSha256Digest} \\
+\land \quad \text{candidate}.\text{totalSizeBytes} &=== \text{active}.\text{totalSizeBytes} \\
+\land \quad \text{candidate}.\text{totalChunks} &=== \text{active}.\text{totalChunks} \\
+\land \quad \text{candidate}.\text{nominalChunkSizeBytes} &=== \text{active}.\text{nominalChunkSizeBytes}
+\end{aligned}$$
+
+- **Legitimate Changes Across Failover:**
+  During an authorized same-epoch supplier failover, the following fields legitimately change to track the new delivery attempt:
+  - `transferId`: A fresh attempt ID to fence out late or in-flight chunks from the prior supplier.
+  - `supplierPeerId`: The identity of the replacement peer supplying the chunks.
+  - `connectionGeneration`: The transport generation of the replacement supplier connection.
+
+- **Non-Destructive Candidate Rejection:**
+  If a candidate fails any validation or compatibility check (mismatched epoch, mismatched snapshot ID, digest difference, partition geometry discrepancy, or invalid parameters), `prepareForFailover()` **rejects the candidate non-destructively**.
+  The active transfer, its accumulated chunks, received byte counts, and memory reservation remain completely intact and undisturbed. A stale or invalid failover attempt cannot destroy an in-progress transfer.
+
+- **Explicit Transfer Restart:**
+  Discarding an existing transfer to adopt a different snapshot or start in a new membership epoch is an explicit caller decision. The caller must explicitly invoke `assembler.abortTransfer()` followed by `assembler.initTransfer()`, or call `assembler.restartTransfer(params)`. The candidate failover check never automatically restarts a transfer as a side effect.
+
+- **Admission Authority Boundary (M4.1 vs M4.3):**
+  `ChunkAssembler.initTransfer()` validates internal mathematical partition consistency and per-chunk bounds, but does not query transport SCTP limits directly. The future recovery coordinator (M4.3) is solely responsible for evaluating `calculateSnapshotAdmission()` against the actual negotiated transport limit and passing the admitted parameters into `ChunkAssembler`. Production admission enforcement belongs to the M4.3 coordinator integration.
 
 ---
 

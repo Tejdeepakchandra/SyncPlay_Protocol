@@ -128,5 +128,8 @@ export type {
   AssembledSnapshot,
   FinalizeResult,
   TransferProgress,
+  FailoverCandidateParams,
+  FailoverRejectReason,
+  PrepareForFailoverResult,
 } from './recovery/chunk-assembler.js';
 
