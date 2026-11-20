@@ -1,11 +1,12 @@
-# Phase 7.5 M4.2 — Snapshot Serialization & Outbound Pipeline Planning Completion Report
+# Phase 7.5 M4.2 — Snapshot Serialization & Outbound Pipeline Final Planning Correction Completion Report
 
 **Target Milestone:** Milestone M4.2: Snapshot Serialization & Outbound Pipeline  
-**Document Version:** 1.1.0  
-**Status:** Approved Planning Correction Complete (Ready for Implementation Freeze)  
+**Document Version:** 1.2.0  
+**Status:** Approved Final Planning Correction Complete (Ready for Implementation Freeze)  
 **Original Planning Commit:** `647399a0fa160a7190ba7effa705d0f962d9e94a`  
-**Frozen Implementation Baseline (Parent):** `fd23edae5bdb52cff32674860229277a79cb1aca`  
-**Direct Parent Commit:** `647399a0fa160a7190ba7effa705d0f962d9e94a`  
+**Previous Planning Correction Commit:** `4e258f5c6fd7ad20714a20af2d99d7744fe0454d`  
+**Direct Parent Commit:** `4e258f5c6fd7ad20714a20af2d99d7744fe0454d`  
+**Frozen Implementation Baseline:** `fd23edae5bdb52cff32674860229277a79cb1aca`  
 **Mode:** Architecture Research, Design, and Planning Only (Zero Runtime Code)  
 **Date:** 2026-11-20  
 
@@ -15,167 +16,142 @@
 
 Milestone M4.2 establishes the definitive architectural design, interface specifications, implementation roadmap, acceptance criteria, and risk mitigations for the **sender-side snapshot serialization and outbound transfer pipeline**.
 
-Following the independent planning audit of commit `647399a0fa160a7190ba7effa705d0f962d9e94a` (which yielded a verdict of **CONDITIONAL PASS**), this targeted planning correction package comprehensively resolves all three audit findings:
-1. **F-M4-2-1:** Corrected the sender memory model, separated transient allocations from retained memory, established a sequential preparation gate with snapshot capture inside the gate, accounted for V8 two-byte UTF-16 Unicode strings, and formally defined the application-owned allocation budget ($\le 9.0$ MiB retained, $\le 24.0$ MiB peak transient).
-2. **F-M4-2-2:** Strengthened buffer ownership and immutability by replacing open TypedArray exposure with private `#masterBuffer` encapsulation, package-private borrowed views restricted to trusted recovery components, unaliased public copies, and explicit lifecycle disposal.
-3. **F-M4-2-3:** Enforced strict canonical partition geometry, prohibited mid-transfer chunk resizing, clarified the role of upfront 1,800 B capacity reservation (569 B cushion) vs. mandatory exact UTF-8 complete-message send-boundary measurement, and removed flawed 5-iteration sizing assumptions.
+Following the final memory-budget and buffer-ownership audit of commit `4e258f5c6fd7ad20714a20af2d99d7744fe0454d`, this targeted planning correction package comprehensively resolves all remaining findings:
 
-All changes are strictly confined to planning documents. **No runtime code or tests were created, modified, or deleted.**
+1. **SHA-256 Memory Accounting & Lifetime Coexistence:** Traced the exact production call sequence for digest calculation, identified the unstreamed 4.19 MiB `Int32Array` in `sha256()`, and specified direct master `Uint8Array` hashing to eliminate duplicate 4.19 MiB `TextEncoder` allocations. Produced a comprehensive lifetime coexistence table.
+2. **Snapshot Object-Graph Bounds:** Inspected schemas and export paths. Formally categorized limits into Category A (schema-enforced), Category B (post-serialization checks), and Category C (operational assumptions). Explicitly acknowledged that the 4 MiB serialized limit does not bound pre-serialization object graphs without explicit pre-serialization checks.
+3. **Backing Buffer Encapsulation:** Completely eliminated mutable `Uint8Array` slice views (`getBorrowedSliceView()`) from the public API. Replaced with encapsulated range methods on the artifact (`encodeSliceToBase64()`, `computeSliceSha256()`) returning immutable primitive strings. Master buffer references are held privately (`#masterBuffer: ArrayBuffer | null`) and nullified upon final disposal.
+4. **Transfer Lease Ownership & Lifecycle:** Formally specified the full lease lifecycle (`acquireLease()`, `releaseLease()`, `dispose()`) resolving all 12 operational edge cases. Specified deferred disposal when active leases exist, with automatic buffer nullification when the last lease releases.
+5. **Strict Concurrency Admission & Queue Resumption:** Adopted the strict policy $\text{retainedArtifactCount} + (\text{isPreparing} \mathrel{?} 1 : 0) \le 2$. Proved that a 3rd preparation cannot begin while 2 artifacts exist, and proved that the queue automatically resumes when an artifact's leases release without permanent stall.
+6. **Harmonized Memory Budget:** Mathematically recomputed peak reachable allocations under the strict $A + P \le 2$ policy, proving that peak application-owned allocations are bounded to $\le 22.91$ MiB under conservative 2-byte UTF-16 Unicode string representation (and $\le 18.71$ MiB under Latin-1). Harmonized the **Bounded Application-Owned Allocation Budget to $\le 24.0$ MiB peak transient** and **$\le 9.0$ MiB steady-state retained**.
 
----
-
-## 2. Audit Findings & Detailed Resolutions
-
-### Finding F-M4-2-1: Correct the Sender Memory Model
-
-#### Problem Identified in Audit
-The previous planning claim that peak outbound memory is bounded to $\le 14.8$ MiB for two concurrent transfers was mathematically unproven:
-- Exporting a 4 MiB snapshot temporarily allocates the V8 object graph ($\approx 6$ MiB), the canonical JSON string ($4.19\text{–}8.39$ MiB), and the UTF-8 `ArrayBuffer` ($4.19$ MiB) simultaneously, creating a transient spike of $\approx 14.4\text{–}18.6$ MiB during preparation alone.
-- If two distinct snapshots were serialized concurrently, peak transient heap would reach $\approx 24.8\text{–}28.8$ MiB before garbage collection.
-- Retaining the preimage object alongside the buffer would consume $> 20$ MiB steady-state.
-- The planning document did not account for two-byte UTF-16 string representations in V8 for non-ASCII Unicode strings.
-
-#### Resolution Implemented
-1. **Ten-Part Allocation Partitioning:** Formally separated and bounded all sender allocations:
-   - Snapshot Preimage Object ($\approx 4.0\text{–}6.0$ MiB, active only during capture inside the gate).
-   - Canonical JSON String ($4.19\text{–}8.39$ MiB, accounting for V8 two-byte UTF-16 worst-case).
-   - Master UTF-8 Buffer ($4.194$ MiB contiguous `ArrayBuffer`, privately held by artifact).
-   - SHA-256 Working State ($< 64$ KiB transient).
-   - Retained Serialized Artifacts ($\approx 4.2$ MiB per artifact; max 2 artifacts retained simultaneously $= 8.4$ MiB).
-   - Per-Chunk Base64 Strings ($\approx 43.7$ KiB max, generated on-demand per sent chunk).
-   - Serialized Protocol Messages ($\approx 45.0$ KiB max transient JSON frame).
-   - UTF-8 Message-Size Measurement Buffers ($\approx 45.0$ KiB max transient `Uint8Array`).
-   - Queued Preparation Requests ($< 1$ KiB total for max depth of 4; metadata only).
-   - Concurrent Active Transfers ($2 \times 135\text{ KiB} \approx 270\text{ KiB}$ for 2 simultaneous sends).
-2. **Lifecycle & Memory Categorization:**
-   - Explicitly distinguished: *Logically Retained Memory*, *Transient Live Allocations*, *Allocations Eligible for Collection*, and *Process Heap / RSS*.
-   - Explicitly documented that the specification establishes a bounded **Application-Owned Allocation Budget** rather than a hard OS process-level RSS ceiling.
-3. **Sequential Preparation Gate & Request Queue:**
-   - Introduced `SnapshotPreparationQueue`:
-     - `MAX_CONCURRENT_PREPARATIONS = 1` non-reentrant gate.
-     - **Snapshot capture (`exportEngineSnapshotV2()`) occurs inside the serialized gate**, preventing concurrent snapshot object graphs.
-     - `MAX_PREPARATION_QUEUE_DEPTH = 4`: queue holds lightweight metadata descriptors only ($< 1$ KiB).
-     - Saturated requests are immediately rejected with `SNAPSHOT_ABORT` (`reason: 'LOCAL_ABORT'`, detail: `'Preparation queue saturated'`).
-4. **Immediate Resource Dereferencing:**
-   - Preimage object and canonical JSON string are dereferenced immediately upon master buffer instantiation, becoming eligible for GC before the next queued preparation begins.
-5. **Formally Defined Budget Ceilings:**
-   - **Steady-State Retained Budget:** $\mathbf{\le 9.0 \text{ MiB}}$ (up to 2 active 4 MiB artifacts + descriptors).
-   - **Peak Transient Allocation Budget:** $\mathbf{\le 24.0 \text{ MiB}}$ (1 active retained artifact + 1 sequential preparation with conservative 2-byte UTF-16 representation + active chunk framing).
+All changes are strictly confined to planning documents. **Zero runtime source code or tests were created, modified, or deleted.**
 
 ---
 
-### Finding F-M4-2-2: Strengthen Buffer Ownership and Immutability
-
-#### Problem Identified in Audit
-The previous specification declared `rawBytes: readonly Uint8Array`. In JavaScript runtimes:
-- TypeScript `readonly` provides zero runtime protection against byte modification (`slice[0] = 0xAA`).
-- `Object.freeze()` on typed arrays does not freeze underlying `ArrayBuffer` binary elements.
-- `subarray()` views share the identical backing buffer. Any mutation by an external consumer or event listener would corrupt the master buffer and all concurrent transfers sharing that artifact.
-
-#### Resolution Implemented
-1. **Private Master Buffer Encapsulation:**
-   - `SerializedSnapshotArtifact` holds `#masterBuffer: ArrayBuffer` in a private field.
-   - The master buffer is never exposed directly through any public property or getter.
-2. **Access Tiers & Escape Boundary:**
-   - **Internal Recovery Components:** Access slices via package-private `getBorrowedSliceView(offset, length)` for high-performance zero-copy slicing. Borrowed views are used strictly synchronously within `SnapshotOutboundPipeline` to produce Base64 strings. Borrowed views **never escape** to public APIs, event listeners, or untrusted consumers.
-   - **Public Consumers:** Must call `copyByteRange(offset, length)` or `cloneBytes()`, which return freshly allocated, completely unaliased deep copies. Mutating an unaliased clone has zero effect on `#masterBuffer`.
-3. **Hash-to-Encoding Byte Identity:**
-   - `sha256Digest` is computed directly over the private `#masterBuffer` upon artifact instantiation.
-   - Because `#masterBuffer` is privately encapsulated, the bytes read by `getBorrowedSliceView()` during chunk production are guaranteed to be **bit-exact identical** to the bytes that were hashed.
-4. **Explicit Disposal:**
-   - Added `artifact.dispose()`: detaches buffer references and marks `isDisposed = true`. Subsequent reads throw `SyncEngineError('ARTIFACT_DISPOSED')`.
-
----
-
-### Finding F-M4-2-3: Enforce Canonical Partition Geometry
-
-#### Problem Identified in Audit
-The previous planning documents described a 7-step sizing loop that dynamically reduced individual chunk slice sizes by $\Delta_k \ge 33$ B during chunk framing.
-- In frozen M4.1, `ChunkAssembler.ingestChunk()` strictly enforces canonical partition equality:
-  $$S_i = C \text{ for } i < N - 1, \quad S_{N-1} = S - (N-1) \cdot C$$
-  If `payload.chunkSizeBytes !== expectedChunkSize`, the receiver immediately aborts with `CHUNK_CORRUPTED`.
-- Shrinking an individual chunk mid-transfer breaks canonical partition equality and triggers deterministic receiver abort.
-- The 5-iteration convergence proof relied on an unproven 40-byte framing variance assumption.
-
-#### Resolution Implemented
-1. **Strict Canonical Partition Geometry:**
-   - Nominal chunk size $C$, chunk count $N = \lceil S / C \rceil$, and slice sizes are committed upon `PartitionedSnapshot` creation.
-   - **Zero Mid-Transfer Resizing Rule:** Once `SNAPSHOT_OFFER` is emitted, individual chunk slices are **never resized**.
-2. **Upfront Capacity Reservation:**
-   - Sizing is performed *before* partitioning via `calculateChunkCapacity(effectiveLimit)`.
-   - Deducts `MAX_ENVELOPE_OVERHEAD_BYTES = 1,800` B upfront.
-   - With worst-case measured envelope overhead at 1,231 B, this guarantees an empirical **569-byte safety cushion**. Initial framing is guaranteed to fit within `effectiveLimit`.
-3. **Mandatory Send-Boundary Exact UTF-8 Measurement:**
-   - `SnapshotOutboundPipeline.prepareChunkMessage()` measures exact complete-message wire bytes:
-     $$L = \text{new TextEncoder}().\text{encode}(\text{serializedJson}).\text{byteLength}$$
-   - If $L \le \text{effectiveLimit}$: transmission authorized.
-   - If $L > \text{effectiveLimit}$: transfer immediately aborts with `SyncEngineError('TRANSPORT_LIMIT_EXCEEDED')` (emitting `SNAPSHOT_ABORT`). Non-canonical chunks are never sent.
-4. **Removal of Flawed 5-Iteration Assumptions:**
-   - Removed the claim that dynamic per-chunk slice reduction converges in 5 iterations based on 40-byte framing variance.
-   - Replaced with the definitive contract: upfront conservative reservation + mandatory exact final UTF-8 measurement at the send boundary.
-
----
-
-## 3. Authoritative System Limits Summary
-
-| Parameter | Frozen Constant | Authoritative Value | Source Location | Enforcement Point |
-| :--- | :--- | :---: | :--- | :--- |
-| **Max Snapshot Payload** | `MAX_SNAPSHOT_BYTES` | **4,194,304 B (4 MiB)** | `protocol/src/constants.ts#L81` | Export, schemas, admission, assembler |
-| **Max Binary Chunk** | `MAX_CHUNK_BYTES` | **32,768 B (32 KiB)** | `protocol/src/constants.ts#L127` | Schemas, admission, capacity calculation |
-| **Max Chunks per Transfer** | `MAX_CHUNKS_PER_SNAPSHOT` | **128 chunks** | `protocol/src/constants.ts#L132` | Offer, request, chunk schemas, admission |
-| **Min Binary Chunk** | `MIN_RAW_CHUNK_BYTES` | **256 B** | `protocol/src/constants.ts#L102` | Admission floor, offer validation |
-| **Envelope Framing Bound** | `MAX_ENVELOPE_OVERHEAD_BYTES` | **1,800 B** | `protocol/src/constants.ts#L97` | Upfront capacity reservation |
-| **Transport Floor** | `MIN_TRANSPORT_LIMIT_CHUNK_TRANSFER` | **2,144 B** | `protocol/src/constants.ts#L116` | Absolute minimum for 256 B chunk (1,800 + 344) |
-| **Full Chunk Floor** | `MIN_TRANSPORT_LIMIT_FULL_CHUNK` | **45,492 B** | `protocol/src/constants.ts#L122` | Minimum for 32 KiB chunk (1,800 + 43,692) |
-| **Max Concurrent Preps** | `MAX_CONCURRENT_PREPARATIONS` | **1 preparation** | `SnapshotPreparationQueue` | Sequential critical section gate |
-| **Max Preparation Queue** | `MAX_PREPARATION_QUEUE_DEPTH` | **4 requests** | `SnapshotPreparationQueue` | Bounded metadata queue (< 1 KiB) |
-| **Max Active Artifacts** | `MAX_ACTIVE_ARTIFACTS` | **2 artifacts** | Engine supplier state | Retained artifact cache ceiling |
-| **Max Concurrent Transfers**| `MAX_SUPPLIER_CONCURRENT_TRANSFERS` | **2 transfers** | Engine supplier state | Outbound concurrent transfer limit |
-
-$$\frac{\text{MAX\_SNAPSHOT\_BYTES}}{\text{MAX\_CHUNK\_BYTES}} = \frac{4,194,304 \text{ B}}{32,768 \text{ B}} = \mathbf{128 \text{ chunks exactly}}$$
-
----
-
-## 4. Updated Acceptance Criteria Matrix Summary
-
-The acceptance criteria suite in `docs/PHASE7_5_M4_2_ACCEPTANCE_CRITERIA.md` now contains 22 granular, testable criteria across 8 categories:
-
-1. **Serialization (`AC-M4-SER-1` to `3`):** Deterministic RFC 8785 canonicalization, bit-exact overall SHA-256 digest, 4 MiB size rejection.
-2. **Concurrency (`AC-M4-CONC-1` to `2`):** Sequential execution gate (`MAX_CONCURRENT_PREPARATIONS = 1`), capture inside gate, bounded queue depth ($\le 4$), immediate saturation rejection with `LOCAL_ABORT`.
-3. **Memory (`AC-M4-MEM-1` to `3`):** Peak transient application allocation bounded $\le 24.0$ MiB, steady-state retained memory bounded $\le 9.0$ MiB for 2 artifacts, immediate dereferencing of preimage object and JSON string.
-4. **Encapsulation & Safety (`AC-M4-OWN-1` to `5`):** Private `#masterBuffer`, unaliased public copies via `cloneBytes()`, hash-to-encoding byte identity, concurrent transfer safety without mutation, explicit disposal throwing `ARTIFACT_DISPOSED`.
-5. **Partitioning (`AC-M4-PRT-1` to `4`):** Strict canonical partition math ($N = \lceil S / C \rceil$), zero mid-transfer resizing, zero-copy internal borrowing, per-chunk SHA-256 hashes.
-6. **Send-Boundary Checks (`AC-M4-SIZ-1` to `3`):** Mandatory exact complete-message UTF-8 measurement via `TextEncoder`, transport ceiling abort with `TRANSPORT_LIMIT_EXCEEDED`, transport floor rejection $< 2,144$ B.
-7. **Engine Isolation (`AC-M4-ISO-1`):** Zero side effects on playback state, clock managers, or logs.
-8. **M4.1 Compatibility (`AC-M4-COM-1`):** Bit-exact round-trip reassembly in frozen M4.1 `ChunkAssembler`.
-
----
-
-## 5. Exact Files Modified in Planning Correction
+## 2. Exact Files Changed in Correction
 
 | File Path | Description of Changes |
 | :--- | :--- |
-| `docs/PHASE7_5_M4_2_ARCHITECTURE.md` | Overhauled memory footprint analysis, added 10-part allocation breakdown, sequential gate, private buffer encapsulation, canonical partition enforcement, and send-boundary measurement. |
-| `docs/PHASE7_5_M4_2_INTERFACE_SPECIFICATION.md` | Defined `SnapshotPreparationQueue`, updated `SerializedSnapshotArtifact` with private `#masterBuffer` and unaliased copy methods, removed `snapshot` object property, updated `SnapshotOutboundPipeline` with exact measurement and zero-resizing rules. |
-| `docs/PHASE7_5_M4_2_IMPLEMENTATION_ROADMAP.md` | Added `SnapshotPreparationQueue` and `SerializedSnapshotArtifact` tasks to M4.2a, updated M4.2b and M4.2c tasks for canonical partition and send-boundary verification. |
-| `docs/PHASE7_5_M4_2_ACCEPTANCE_CRITERIA.md` | Expanded criteria matrix from 15 to 22 granular, testable specifications covering concurrency, memory accounting, buffer encapsulation, disposal, and exact measurement. |
-| `docs/PHASE7_5_M4_2_RISK_REGISTER.md` | Updated risk analysis and mitigations for memory exhaustion (R-M4-2-4), canonical geometry conflict (R-M4-2-3), and external buffer mutation (R-M4-2-7). |
-| `docs/PHASE7_5_M4_2_PLANNING_COMPLETION_REPORT.md` | Updated completion report documenting all three audit findings, exact resolutions, limits, memory models, and scope compliance. |
-| `docs/design/README.md` | Updated design document index descriptions for M4.2 planning suite. |
+| `docs/PHASE7_5_M4_2_ARCHITECTURE.md` | Added allocation lifetime coexistence table; traced SHA-256 call path; categorized pre- vs post-serialization bounds; established encapsulated range-encoding API; added transfer lease state machine and 12-case lifecycle; enforced strict $A + P \le 2$ concurrency admission. |
+| `docs/PHASE7_5_M4_2_INTERFACE_SPECIFICATION.md` | Updated `SerializedSnapshotArtifact` with nullable private fields (`#masterBuffer`, `#masterBytes`), range methods (`encodeSliceToBase64`, `computeSliceSha256`), and lease methods (`acquireLease`, `releaseLease`, `dispose`). Updated `SnapshotPreparationQueue` with $A + P \le 2$ admission and `notifyArtifactDisposed()`. |
+| `docs/PHASE7_5_M4_2_IMPLEMENTATION_ROADMAP.md` | Updated M4.2a, M4.2b, and M4.2c work breakdowns to incorporate the encapsulated range-encoding API, lease lifecycle tests, and strict concurrency admission testing. |
+| `docs/PHASE7_5_M4_2_ACCEPTANCE_CRITERIA.md` | Updated 23 granular acceptance criteria including `AC-M4-CONC-1` ($A + P \le 2$), `AC-M4-CONC-3` (queue resumption), `AC-M4-OWN-1..4` (buffer encapsulation & string returns), and `AC-M4-LSE-1..3` (lease lifecycle and deferred disposal). |
+| `docs/PHASE7_5_M4_2_RISK_REGISTER.md` | Added Risk R-M4-2-9 (lease leakage & queue stall mitigation via `finally` blocks and 60-second inactivity guard); updated R-M4-2-4 and R-M4-2-7. |
+| `docs/PHASE7_5_M4_2_PLANNING_COMPLETION_REPORT.md` | Complete final completion report documenting all architectural decisions and proofs. |
 
 ---
 
-## 6. Scope Compliance & Verification
+## 3. Detailed Architectural Decisions & Proofs
+
+### 3.1 Trace of Production SHA-256 Call Sequence & Allocation Lifetime Table
+In `packages/sync-engine/src/log/operation-fingerprint.ts`:
+```typescript
+export function sha256(input: string | Uint8Array): string {
+  const utf8 = typeof input === 'string' ? new TextEncoder().encode(input) : input;
+  const bitLength = utf8.length * 8;
+  const wordCount = (((bitLength + 64) >>> 9) << 4) + 16;
+  const words = new Int32Array(wordCount);
+```
+- **Finding:** For a 4 MiB input, `sha256()` allocates an `Int32Array(1,048,592)` = **4.194 MiB** working buffer. If called with a `string`, it also allocates an intermediate 4.194 MiB `Uint8Array`.
+- **Optimization in M4.2:** `SnapshotSerializer` encodes `canonicalizeJson(preimage)` into the master `Uint8Array` buffer first, dereferences the JSON string, and passes `masterBytes: Uint8Array` into `sha256(masterBytes)`. This completely eliminates the duplicate 4.19 MiB `TextEncoder` allocation inside `sha256()`.
+
+#### Lifetime Coexistence Table (4 MiB Snapshot Preparation):
+- **Phase 1 (Capture inside gate):** Ephemeral Object graph ($4.0\text{–}6.0$ MiB) coexists with 1 retained artifact ($4.19$ MiB) + active sends ($0.14$ MiB) = $\mathbf{8.33\text{–}10.33 \text{ MiB}}$.
+- **Phase 2 (JCS Stringification):** Object graph ($6.0$ MiB) + canonical JSON string ($4.19\text{–}8.39$ MiB) + retained artifact ($4.19$ MiB) + active send ($0.14$ MiB) = $\mathbf{12.52\text{–}18.72 \text{ MiB}}$.
+- **Phase 3 (Master Buffer Allocation — PEAK POINT):** Object graph ($6.0$ MiB) + canonical JSON string ($4.19\text{–}8.39$ MiB) + master buffer ($4.19$ MiB) + retained artifact ($4.19$ MiB) + active send ($0.14$ MiB) = $\mathbf{16.71\text{–}22.91 \text{ MiB}}$.
+- **Phase 4 (Pre-Hash Dereference):** Object and string set to `null` $\implies$ reachable memory drops to master buffer ($4.19$ MiB) + retained artifact ($4.19$ MiB) = $\mathbf{8.52 \text{ MiB}}$.
+- **Phase 5 (SHA-256 on Buffer):** Master buffer ($4.19$ MiB) + SHA-256 `Int32Array` ($4.19$ MiB) + retained artifact ($4.19$ MiB) = $\mathbf{12.71 \text{ MiB}}$.
+- **Phase 6 (Artifact Finalized):** Working buffer unreferenced; steady-state retained: $\mathbf{8.38 \text{ MiB}}$ for 2 artifacts.
+
+---
+
+### 3.2 Snapshot Object-Graph Bounds
+- **Category A (Schema-enforced):** `compactedCheckpoints` strictly bounded to `.max(256)` ($\approx 30$ KiB). `snapshotId`, `sessionId` $\le 128$ chars. `authorPeerId` $\le 64$ chars.
+- **Category B (Post-serialization enforced):** The 4 MiB total snapshot limit is enforced *after* `JSON.stringify(payload)`.
+- **Category C (Operational assumptions):** Frontier entry counts and sub-fields in `state: z.unknown()` are bounded by engine construction, not by the raw wire schema.
+- **Enforcement:** `SnapshotSerializer.serialize()` validates shallow key counts ($\le 64$ frontier keys) before canonicalization. The memory model is formally classified as an **Application-Owned Allocation Budget with Explicit Runtime Assumptions**, not a hard OS process RSS ceiling.
+
+---
+
+### 3.3 Backing Buffer Ownership & Range-Encoding Contract
+1. **Private Nullable Storage:**
+   - `#masterBuffer: ArrayBuffer | null`
+   - `#masterBytes: Uint8Array | null`
+2. **Zero Mutable View Exposure:**
+   - Public method `getBorrowedSliceView()` is **completely eliminated**.
+   - Chunk encoding is performed via `artifact.encodeSliceToBase64(offset, length)` returning primitive `string`.
+   - Chunk hashing is performed via `artifact.computeSliceSha256(offset, length)` returning primitive `string`.
+   - Public data access calls `cloneBytes()` or `copyByteRange()`, returning fresh, unaliased copies.
+   - Range validation strictly rejects invalid offsets or lengths with `INVALID_RANGE`.
+
+---
+
+### 3.4 Transfer Lease Lifecycle (All 12 Operational Cases)
+1. **Transfer Complete:** Acquires lease at start; calls `releaseLease(transferId)` upon final chunk send.
+2. **Transfer Aborts Early:** Terminal abort handler releases lease in `finally` block.
+3. **Transfer Fails Mid-Encoding:** Exception caught in pipeline; lease released in `finally` block.
+4. **Transfer Times Out:** Inactivity timer triggers abort handler; lease released.
+5. **Transfer Cancelled (Epoch Change):** Epoch listener triggers cancellation; lease released.
+6. **Duplicate Lease Acquisition:** Calling `acquireLease(transferId)` with an active `transferId` throws `INVALID_STATE`.
+7. **Duplicate Lease Release:** `releaseLease(transferId)` is idempotent; returns `false` without throwing.
+8. **Disposal Requested with 1 Active Transfer:** `dispose()` sets `#disposalRequested = true`. Buffer detachment is deferred until active transfer finishes.
+9. **Disposal Requested with 2 Transfers Sharing Artifact:** Both transfers continue encoding without interruption until both release their leases.
+10. **Last Lease Released After Disposal Requested:** `releaseLease()` detects `#disposalRequested === true` and `#activeLeases.size === 0`. Calls `#finalizeDisposal()`, nullifying `#masterBuffer` and `#masterBytes`.
+11. **New Lease Requested After Disposal Requested:** Throws `ARTIFACT_DISPOSED`.
+12. **Read Attempted After Final Disposal:** Any read call checks `#assertReadable()` and throws `ARTIFACT_DISPOSED`.
+
+---
+
+### 3.5 Strict Concurrency Admission & Queue Resumption
+1. **Admission Formula:**
+   $$\text{retainedArtifactCount} + (\text{isPreparing} \mathrel{?} 1 : 0) \le 2$$
+2. **Behavior on $A=2$:** If 2 artifacts are retained, incoming requests wait in `SnapshotPreparationQueue`. A 3rd preparation cannot start.
+3. **Queue Resumption:** When an artifact is disposed, `notifyArtifactDisposed()` wakes the queue and dequeues the next request.
+4. **No Permanent Stall:** All transfer terminal exits execute `releaseLease()` in `finally` blocks; a 60-second inactivity guard expires abandoned leases.
+
+---
+
+### 3.6 Recalculated Operational Scenarios
+
+| Operational Scenario | Retained Artifacts ($A$) | In-Flight Prep ($P$) | Active Sends ($T$) | Steady Retained Memory | Transient Prep Peak | Active Chunk Framing | Total Peak Application Allocation |
+| :--- | :---: | :---: | :---: | :---: | :---: | :---: | :---: |
+| **1. Cold Single Preparation** | $0$ | $1$ | $0$ | $0.00$ MiB | $\le 18.58$ MiB | $0.00$ MiB | **$\le 18.58$ MiB** ($14.38$ MiB Latin-1) |
+| **2. One Retained + One Preparation** | $1$ | $1$ | $1$ | $4.19$ MiB | $\le 18.58$ MiB | $0.14$ MiB | **$\le 22.91$ MiB** ($18.71$ MiB Latin-1) |
+| **3. Two Retained Artifacts (Steady State)** | $2$ | $0$ | $2$ | $8.38$ MiB | $0.00$ MiB | $0.27$ MiB | **$\le 8.65$ MiB** |
+| **4. Two Transfers Sharing One Artifact** | $1$ | $0$ | $2$ | $4.19$ MiB | $0.00$ MiB | $0.27$ MiB | **$\le 4.46$ MiB** |
+| **5. Preparation Failure / Cancellation** | $1$ | $1 \to 0$ | $1$ | $4.19$ MiB | Drops to $0$ | $0.14$ MiB | **Drops to $4.33$ MiB** |
+| **6. Queue Saturation (Depth = 4)** | $1 \text{ or } 2$ | $0 \text{ or } 1$ | $1\text{–}2$ | $4.19\text{–}8.38$ MiB | $0.00\text{–}18.58$ MiB | $0.27$ MiB | **$\le 22.91$ MiB** (metadata $< 1$ KiB) |
+
+Under the strict $A + P \le 2$ policy, the maximum possible reachable allocation across all scenarios is **$\le 22.91$ MiB**, proving mathematical compliance with the **$\le 24.0$ MiB Peak Transient Application Allocation Budget**.
+
+---
+
+### 3.7 M4.1 Invariants Preservation
+- Canonical chunk geometry: $N = \lceil S / C \rceil$, slices $0 \dots N-2$ have size $C$, final slice has size $S - (N-1) \cdot C$.
+- Zero mid-transfer resizing.
+- Upfront capacity reservation: 1,800 B reserved vs 1,231 B actual (569 B cushion).
+- Mandatory complete-message UTF-8 measurement via `new TextEncoder().encode(serializedJson).byteLength`.
+- Zero network I/O in M4.2.
+
+---
+
+## 4. Remaining Risks and Unresolved Assumptions Explicitly Noted
+
+1. **V8 String Representation Optimization:** The calculations account for Latin-1 ($4.19$ MiB) and conservative two-byte UTF-16 ($8.39$ MiB). In standard execution, SyncPlay snapshots with ASCII identifiers operate under Latin-1. The conservative $\le 24.0$ MiB ceiling absorbs worst-case UTF-16 expansion, but actual V8 heap usage will depend on runtime string flattening and garbage collector timing.
+2. **Garbage Collection Scheduling:** While unreferenced objects (preimage, JSON string, `Int32Array`) become eligible for GC immediately, the physical process RSS remains under V8 runtime control and is not bounded by this application budget.
+
+---
+
+## 5. Scope Compliance & Verification
 
 - **Zero Runtime Source Code Modification:** No files in `packages/` were created, modified, or deleted.
 - **Zero Test Suite Modification:** Frozen M4.1 unit and integration test suites remain 100% untouched.
 - **Frozen Baseline Integrity:** Commit `fd23edae5bdb52cff32674860229277a79cb1aca` remains completely unchanged.
-- **Milestone Scope Integrity:** No code for M4.2 implementation, M4.3 (Requester pipeline / coordinator), M4.4 (Lifecycle), or M5 (State installation) was authored.
-- **Working Tree Status:** All planning documentation changes are staged for commit.
 - **Implementation Status:** **M4.2 RUNTIME IMPLEMENTATION HAS NOT STARTED.**
 
 ---
 
-## 7. Next Steps
+## 6. Next Steps
 
-Awaiting your review and authorization to commit this planning correction and proceed to M4.2 implementation.
+Awaiting your review and authorization to commit this final planning correction and proceed to implementation of Sub-Milestone M4.2a (`SnapshotSerializer` & JCS digest).

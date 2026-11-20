@@ -1,7 +1,7 @@
 # Phase 7.5 M4.2 — Interface Specification: Snapshot Serialization & Outbound Pipeline
 
-**Document Version:** 1.1.0  
-**Status:** Approved Specification (Targeted Planning Correction Applied)  
+**Document Version:** 1.2.0  
+**Status:** Approved Specification (Final Planning Correction Applied)  
 **Frozen Baseline:** `fd23edae5bdb52cff32674860229277a79cb1aca`  
 **Specification Target:** `@syncplay/sync-engine/recovery`  
 
@@ -14,9 +14,11 @@ This specification establishes the contracts, data structures, and operational b
 ```mermaid
 classDiagram
     class SnapshotPreparationQueue {
-        +enqueue(request: QueuedPreparationRequest): Promise~SerializedSnapshotArtifact~
+        +enqueue(request: QueuedPreparationRequest, captureAndSerializeFn): Promise~SerializedSnapshotArtifact~
         +depth: number
         +isBusy: boolean
+        +retainedArtifactCount: number
+        +notifyArtifactDisposed(): void
     }
 
     class SnapshotSerializer {
@@ -25,8 +27,11 @@ classDiagram
     }
 
     class SerializedSnapshotArtifact {
-        -ArrayBuffer #masterBuffer
-        -number #byteLength
+        -ArrayBuffer|null #masterBuffer
+        -Uint8Array|null #masterBytes
+        -Set~string~ #activeLeases
+        -boolean #disposalRequested
+        -boolean #isDisposed
         +string snapshotId
         +string sessionId
         +number membershipEpoch
@@ -34,9 +39,13 @@ classDiagram
         +number totalSizeBytes
         +string sha256Digest
         +boolean isDisposed
-        +getBorrowedSliceView(offset: number, length: number) Uint8Array
-        +copyByteRange(offset: number, length: number) Uint8Array
+        +number activeLeaseCount
+        +encodeSliceToBase64(offset, length) string
+        +computeSliceSha256(offset, length) string
+        +copyByteRange(offset, length) Uint8Array
         +cloneBytes() Uint8Array
+        +acquireLease(transferId) void
+        +releaseLease(transferId) boolean
         +dispose() void
     }
 
@@ -50,7 +59,7 @@ classDiagram
         +number totalChunks
         +ReadonlyArray~SnapshotChunkSlice~ slices
         +getSlice(index: number) SnapshotChunkSlice
-        +getBorrowedSlice(index: number) Uint8Array
+        +encodeChunkBase64(index: number) string
     }
 
     class SnapshotChunkSlice {
@@ -97,31 +106,56 @@ export interface QueuedPreparationRequest {
 ### 2.2 Serialized Snapshot Artifact Contract
 
 ```typescript
-/**
- * Encapsulated artifact holding canonical, deterministically serialized snapshot bytes.
- * The underlying ArrayBuffer is private and exclusively owned by the artifact.
- * Guaranteed to conform to MAX_SNAPSHOT_BYTES (4 MiB) and RFC 8785 JCS.
- */
-export class SerializedSnapshotArtifact {
-  readonly #masterBuffer: ArrayBuffer;
-  readonly #byteLength: number;
+export interface SerializedSnapshotArtifactParams {
   readonly snapshotId: string;
   readonly sessionId: string;
   readonly membershipEpoch: number;
   readonly authorPeerId: string;
   readonly totalSizeBytes: number;
   readonly sha256Digest: string;
-  #isDisposed: boolean;
+  readonly masterBuffer: ArrayBuffer;
+}
+
+/**
+ * Encapsulated artifact holding canonical, deterministically serialized snapshot bytes.
+ * The underlying ArrayBuffer is private and exclusively owned by the artifact.
+ * Range encoding and hashing methods return immutable primitive strings.
+ * Zero mutable typed-array views are exposed publicly.
+ */
+export class SerializedSnapshotArtifact {
+  #masterBuffer: ArrayBuffer | null;
+  #masterBytes: Uint8Array | null;
+
+  readonly #activeLeases = new Set<string>();
+  #disposalRequested = false;
+  #isDisposed = false;
+
+  readonly snapshotId: string;
+  readonly sessionId: string;
+  readonly membershipEpoch: number;
+  readonly authorPeerId: string;
+  readonly totalSizeBytes: number;
+  readonly sha256Digest: string;
+
+  constructor(params: SerializedSnapshotArtifactParams);
 
   /**
-   * Internal package-private accessor for trusted recovery components.
-   * Returns a borrowed Uint8Array view referencing the private master buffer.
-   * Borrowed views MUST NOT escape into public APIs, event listeners, or untrusted consumers.
+   * Synchronously Base64-encodes a slice range.
+   * Master buffer and typed-array views NEVER leave the artifact instance.
+   * Returns an immutable primitive string.
+   * Throws ARTIFACT_DISPOSED if disposed; throws INVALID_RANGE if offset/length out of bounds.
    */
-  public getBorrowedSliceView(offset: number, length: number): Uint8Array;
+  public encodeSliceToBase64(offset: number, length: number): string;
 
   /**
-   * Public accessor returning a fresh, unaliased Uint8Array copy of a byte range.
+   * Synchronously computes SHA-256 hex digest for a slice range.
+   * Returns an immutable 64-character lowercase hex string.
+   * Throws ARTIFACT_DISPOSED if disposed; throws INVALID_RANGE if offset/length out of bounds.
+   */
+  public computeSliceSha256(offset: number, length: number): string;
+
+  /**
+   * Public accessor returning a freshly allocated, completely unaliased deep copy of a byte range.
    */
   public copyByteRange(offset: number, length: number): Uint8Array;
 
@@ -131,21 +165,37 @@ export class SerializedSnapshotArtifact {
   public cloneBytes(): Uint8Array;
 
   /**
-   * Disposes the artifact, detaching references to the master buffer.
+   * Registers an active transfer lease.
+   * Throws ARTIFACT_DISPOSED if disposal has been requested or finalized.
+   * Throws INVALID_STATE if the transferId already holds an active lease.
+   */
+  public acquireLease(transferId: string): void;
+
+  /**
+   * Releases an active transfer lease.
+   * Idempotent: returns false if transferId was not active, true if released.
+   * If disposal was requested and activeLeaseCount reaches 0, detaches buffer immediately.
+   */
+  public releaseLease(transferId: string): boolean;
+
+  /**
+   * Disposes the artifact.
+   * If active leases exist, marks disposalRequested = true and defers buffer detachment.
+   * If activeLeaseCount === 0, detaches buffer immediately (#masterBuffer = null, #masterBytes = null).
    */
   public dispose(): void;
 
   public get isDisposed(): boolean;
+  public get isDisposalRequested(): boolean;
+  public get activeLeaseCount(): number;
 }
 ```
 
 #### Invariants:
-1. `#byteLength === totalSizeBytes`.
-2. `totalSizeBytes > 0 && totalSizeBytes <= MAX_SNAPSHOT_BYTES` (4,194,304 bytes).
-3. `sha256Digest === sha256(new Uint8Array(#masterBuffer))`.
-4. `#masterBuffer` contains the exact UTF-8 byte encoding of `canonicalizeJson(preimage)`.
-5. Preimage object and canonical JSON string are dereferenced immediately post-instantiation; they are not retained by the artifact.
-6. Once `dispose()` is invoked, `#isDisposed === true`, and any subsequent access throws `SyncEngineError('ARTIFACT_DISPOSED')`.
+1. `totalSizeBytes > 0 && totalSizeBytes <= MAX_SNAPSHOT_BYTES` (4,194,304 bytes).
+2. `sha256Digest === sha256(new Uint8Array(#masterBuffer))` at creation time.
+3. Preimage object and canonical JSON string are dereferenced immediately post-instantiation; they are not retained by the artifact.
+4. Once disposal is finalized, `#masterBuffer === null` and `#masterBytes === null`, detaching the buffer and making memory eligible for GC. Subsequent read operations throw `SyncEngineError('ARTIFACT_DISPOSED')`.
 
 ---
 
@@ -175,10 +225,10 @@ export interface PartitionedSnapshot {
   getSlice(chunkIndex: number): SnapshotChunkSlice | undefined;
 
   /**
-   * Package-private reader: returns a borrowed Uint8Array view of the slice bytes.
-   * Accessible only to trusted recovery components during chunk framing.
+   * Encodes chunk slice to Base64 via artifact encapsulation.
+   * Raw buffer views never escape.
    */
-  getBorrowedSlice(chunkIndex: number): Uint8Array;
+  encodeChunkBase64(chunkIndex: number): string;
 }
 ```
 
@@ -189,9 +239,8 @@ export interface PartitionedSnapshot {
 4. $\text{totalChunks} === \lceil \text{totalSizeBytes} / \text{nominalChunkSizeBytes} \rceil$.
 5. For all $i \in [0, \text{totalChunks} - 1)$: $\text{slices}[i].\text{chunkSizeBytes} === \text{nominalChunkSizeBytes}$.
 6. Final chunk: $\text{slices}[\text{totalChunks} - 1].\text{chunkSizeBytes} === \text{totalSizeBytes} - (\text{totalChunks} - 1) \times \text{nominalChunkSizeBytes} \in (0, \text{nominalChunkSizeBytes}]$.
-7. For each slice $i$, `getBorrowedSlice(i)` returns a borrowed view of $\text{artifact.getBorrowedSliceView}(i \cdot C, \text{slices}[i].\text{chunkSizeBytes})$.
-8. For each slice $i$, $\text{chunkSha256} === \text{sha256}(\text{getBorrowedSlice}(i))$.
-9. Canonical partition geometry is locked immutably upon creation and is **never** modified mid-transfer.
+7. For each slice $i$, `encodeChunkBase64(i)` delegates to `artifact.encodeSliceToBase64(i * C, slices[i].chunkSizeBytes)`.
+8. Canonical partition geometry is locked immutably upon creation and is **never** modified mid-transfer.
 
 ---
 
@@ -240,20 +289,26 @@ export type OutboundChunkResult =
 export class SnapshotPreparationQueue {
   public static readonly MAX_CONCURRENT_PREPARATIONS = 1;
   public static readonly MAX_PREPARATION_QUEUE_DEPTH = 4;
+  public static readonly MAX_TOTAL_ARTIFACTS = 2;
 
   /**
    * Enqueues an outbound snapshot preparation request.
-   * If the queue is saturated (>= 4 requests waiting), throws/rejects immediately
-   * with SyncEngineError('LOCAL_ABORT', 'Preparation queue saturated').
-   * Guarantees that snapshot capture occurs inside the serialized gate.
+   * Strict Concurrency Admission:
+   *   retainedArtifactCount + (isPreparing ? 1 : 0) <= 2
+   * If 2 artifacts are already retained, preparation does not start until one is released.
+   * If queue is saturated (depth >= 4), rejects immediately with LOCAL_ABORT ('Preparation queue saturated').
    */
   public enqueue(
     request: QueuedPreparationRequest,
     captureAndSerializeFn: () => Promise<SerializedSnapshotArtifact> | SerializedSnapshotArtifact
   ): Promise<SerializedSnapshotArtifact>;
 
+  /** Called when a retained artifact is disposed, waking queued preparation requests. */
+  public notifyArtifactDisposed(): void;
+
   public get depth(): number;
   public get isBusy(): boolean;
+  public get retainedArtifactCount(): number;
   public clear(): void;
 }
 ```
@@ -267,6 +322,8 @@ export class SnapshotPreparationQueue {
 export class SnapshotSerializer {
   /**
    * Serializes a validated StateSnapshotPayloadV2 into a deterministic artifact.
+   * Encodes canonical bytes directly to master ArrayBuffer before computing SHA-256
+   * to eliminate duplicate 4.19 MiB TextEncoder buffer allocations.
    * Immediately dereferences preimage and JSON string upon master buffer allocation.
    * Throws SyncEngineError('SNAPSHOT_ERROR') if serialization fails or exceeds MAX_SNAPSHOT_BYTES.
    */
@@ -274,6 +331,7 @@ export class SnapshotSerializer {
 
   /**
    * Exports and serializes an active engine state into a deterministic artifact.
+   * Captures state inside the serialized gate.
    */
   public static serializeFromEngine(
     state: PlaybackState,
@@ -289,11 +347,6 @@ export class SnapshotSerializer {
   ): SerializedSnapshotArtifact;
 }
 ```
-
-- **Thread-Safety & Synchronization:** Fully synchronous within the preparation gate.
-- **Resource Usage:** Allocates a single `ArrayBuffer` of size $\le 4$ MiB.
-- **Immediate Dereferencing:** Preimage object and canonical JSON string are dereferenced immediately.
-- **No Side Effects:** Does not alter `PlaybackState`, clock managers, or operation logs.
 
 ---
 
@@ -313,7 +366,7 @@ export interface ChunkProducerConfig {
 export class SnapshotChunkProducer {
   /**
    * Partitions a serialized snapshot artifact into canonical chunk slices.
-   * Enforces admission invariants and zero-copy borrowed slice views.
+   * Computes per-chunk hashes via artifact.computeSliceSha256().
    * Throws SyncEngineError('PARTITION_ERROR') on geometry or admission violation.
    */
   public static partition(
@@ -322,9 +375,6 @@ export class SnapshotChunkProducer {
   ): PartitionedSnapshot;
 }
 ```
-
-- **Zero-Copy Guarantee:** Uses `artifact.getBorrowedSliceView()` internally. Does not clone chunk payload memory.
-- **Upfront Admission Gating:** Calls `calculateSnapshotAdmission()`; aborts immediately if required chunks exceed 128 or slice capacity $< 256$ B.
 
 ---
 
@@ -357,10 +407,6 @@ export class SnapshotOutboundPipeline {
 }
 ```
 
-- **Exact Complete-Message Measurement:** Measures exact UTF-8 wire bytes via `new TextEncoder().encode(serializedJson).byteLength`.
-- **Zero Chunk Shrinking:** Strictly maintains canonical partition geometry. Never resizes a chunk mid-transfer.
-- **Transport Delivery Readiness:** Provides `serializedJson` ready to pass unchanged to `PeerManager.sendSerialized()`.
-
 ---
 
 ## 4. Error Handling & Failure Semantics
@@ -370,5 +416,7 @@ export class SnapshotOutboundPipeline {
 3. **Partition Count Ceiling:** If required chunks $> 128 \implies$ `CHUNK_COUNT_EXCEEDED`.
 4. **Queue Saturation:** If $\ge 4$ requests in preparation queue $\implies$ `LOCAL_ABORT` ('Preparation queue saturated').
 5. **Artifact Disposed:** Method call on disposed artifact $\implies$ `ARTIFACT_DISPOSED`.
-6. **Send-Boundary Overshoot:** If exact UTF-8 complete-message size exceeds `sctpMaxMessageSize` $\implies$ `TRANSPORT_LIMIT_EXCEEDED`.
-7. **No State Pollution:** All failure paths terminate synchronously with zero modifications to engine state or logs.
+6. **Invalid Range:** Out-of-bounds slice offset/length $\implies$ `INVALID_RANGE`.
+7. **Duplicate Lease:** Same transferId acquires lease twice $\implies$ `INVALID_STATE`.
+8. **Send-Boundary Overshoot:** If exact UTF-8 complete-message size exceeds `sctpMaxMessageSize` $\implies$ `TRANSPORT_LIMIT_EXCEEDED`.
+9. **No State Pollution:** All failure paths terminate synchronously with zero modifications to engine state or logs.

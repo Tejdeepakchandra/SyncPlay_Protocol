@@ -1,7 +1,7 @@
 # Phase 7.5 M4.2 — Implementation Roadmap: Snapshot Serialization & Outbound Pipeline
 
-**Document Version:** 1.1.0  
-**Status:** Approved Implementation Roadmap (Targeted Planning Correction Applied)  
+**Document Version:** 1.2.0  
+**Status:** Approved Implementation Roadmap (Final Planning Correction Applied)  
 **Target Milestone:** M4.2  
 **Baseline Commit:** `fd23edae5bdb52cff32674860229277a79cb1aca`  
 
@@ -23,60 +23,68 @@ flowchart LR
 ## 2. Sub-Milestone Work Breakdown
 
 ### Sub-Milestone M4.2a: Preparation Queue, Serializer & Artifact Encapsulation
-- **Goal:** Implement the sequential preparation gate, deterministic RFC 8785 snapshot serialization, immediate resource dereferencing, and private master buffer encapsulation.
+- **Goal:** Implement the sequential preparation gate, strict concurrency admission ($A + P \le 2$), deterministic RFC 8785 snapshot serialization, immediate resource dereferencing, private master buffer encapsulation with primitive string range-encoding API, and transfer lease lifecycle management.
 - **Tasks:**
   1. Author `packages/sync-engine/src/recovery/snapshot-preparation-queue.ts`:
      - Implement `SnapshotPreparationQueue`:
        - Enforce `MAX_CONCURRENT_PREPARATIONS = 1` sequential critical section.
+       - Enforce strict concurrency admission: `retainedArtifactCount + (isPreparing ? 1 : 0) <= 2`.
        - Enforce `MAX_PREPARATION_QUEUE_DEPTH = 4` metadata-only queue (< 1 KiB footprint).
        - Ensure snapshot capture (`exportEngineSnapshotV2()`) executes **inside** the gate.
+       - Implement `notifyArtifactDisposed()` to resume waiting queued preparation requests.
        - Immediately reject requests when queue is saturated with `LOCAL_ABORT` ('Preparation queue saturated').
   2. Author `packages/sync-engine/src/recovery/snapshot-serializer.ts`:
      - Implement `SerializedSnapshotArtifact`:
-       - Encapsulate private `#masterBuffer: ArrayBuffer`.
-       - Implement package-private `getBorrowedSliceView(offset, length)` for recovery pipeline.
-       - Implement public `copyByteRange(offset, length)` and `cloneBytes()` returning unaliased copies.
-       - Implement `dispose()`: detaches buffer and prevents further reads (`ARTIFACT_DISPOSED`).
+       - Encapsulate private `#masterBuffer: ArrayBuffer | null` and `#masterBytes: Uint8Array | null`.
+       - Implement `encodeSliceToBase64(offset, length): string` (never exposes raw buffer).
+       - Implement `computeSliceSha256(offset, length): string` (never exposes raw buffer).
+       - Implement public `copyByteRange(offset, length)` and `cloneBytes()` returning unaliased deep copies.
+       - Implement `acquireLease(transferId: string): void` and `releaseLease(transferId: string): boolean`.
+       - Implement `dispose()`: defers detachment if leases exist; nullifies buffers when leases reach 0.
+       - Range checks and post-disposal assertion (`ARTIFACT_DISPOSED`).
      - Implement `SnapshotSerializer.serialize()`:
+       - Validate pre-serialization structural bounds (checkpoints $\le 256$, frontier keys $\le 64$).
        - Canonicalize `StateSnapshotPayloadV2` using RFC 8785 `canonicalizeJson`.
-       - Encode canonical UTF-8 bytes to master buffer.
-       - Compute bit-exact SHA-256 digest over master buffer.
+       - Encode canonical UTF-8 bytes directly to master buffer.
        - Immediately dereference `StateSnapshotPayloadV2` object and canonical JSON string.
+       - Compute bit-exact SHA-256 digest by passing `Uint8Array` into `sha256()` to avoid duplicate `TextEncoder` allocation.
        - Enforce `MAX_SNAPSHOT_BYTES = 4,194,304` (4 MiB) ceiling.
      - Implement `SnapshotSerializer.serializeFromEngine()`: integrate with `exportEngineSnapshotV2()`.
   3. Author comprehensive unit test suites:
      - `packages/sync-engine/src/__tests__/snapshot-preparation-queue.test.ts`:
        - Verify sequential execution (`MAX_CONCURRENT_PREPARATIONS = 1`).
+       - Verify strict admission check: request held if $A=2$, resumes when artifact disposed.
        - Verify queue depth bounding and saturation rejection at depth 4.
        - Verify capture function is invoked only when active execution begins.
      - `packages/sync-engine/src/__tests__/snapshot-serializer.test.ts`:
        - Test empty snapshot, realistic snapshot, and maximum 4 MiB snapshot.
        - Verify identical SHA-256 digests across runs matching `computeSnapshotDigestV2()`.
-       - Verify private buffer encapsulation: `cloneBytes()` does not alias master buffer; mutating clone leaves artifact intact.
-       - Verify post-disposal access throws `SyncEngineError('ARTIFACT_DISPOSED')`.
+       - Verify private buffer encapsulation: zero mutable buffer or view exposure.
+       - Verify `encodeSliceToBase64` returns valid Base64 string.
+       - Verify `cloneBytes()` does not alias master buffer; mutating clone leaves artifact intact.
+       - Verify lease lifecycle: acquire, release, deferred disposal, and rejection after final disposal (`ARTIFACT_DISPOSED`).
        - Verify rejection of non-serializable objects and values exceeding 4 MiB.
 - **Exit Condition:** 100% unit tests pass; queue, serializer, and artifact encapsulation verified.
 
 ---
 
-### Sub-Milestone M4.2b: Zero-Copy Canonical Chunk Producer
-- **Goal:** Partition serialized snapshot artifacts into canonical binary slices using zero-copy borrowed slice views.
+### Sub-Milestone M4.2b: Canonical Chunk Producer
+- **Goal:** Partition serialized snapshot artifacts into canonical binary slices using encapsulated artifact encoding.
 - **Tasks:**
   1. Author `packages/sync-engine/src/recovery/snapshot-chunk-producer.ts`:
      - Implement `SnapshotChunkProducer.partition()`.
      - Accept `SerializedSnapshotArtifact` and `ChunkProducerConfig`.
      - Calculate nominal chunk size and canonical chunk count via `calculateChunkCapacity()` and `calculateSnapshotAdmission()`.
      - Enforce canonical partition geometry: $N = \lceil S / C \rceil$, slices $0 \dots N-2$ have size $C$, slice $N-1$ has size $S - (N-1) \cdot C$.
-     - Borrow slice views zero-copy using `artifact.getBorrowedSliceView()`.
-     - Compute per-chunk SHA-256 digests (`chunkSha256`).
+     - Compute per-chunk SHA-256 digests via `artifact.computeSliceSha256()`.
+     - Delegate Base64 chunk encoding via `artifact.encodeSliceToBase64()`.
      - Return immutable `PartitionedSnapshot`.
   2. Author comprehensive unit test suite: `packages/sync-engine/src/__tests__/snapshot-chunk-producer.test.ts`:
-     - Verify zero-copy borrowed slice memory preservation.
      - Verify exact partition counts across boundary conditions ($S = 1$ B, $S = 256$ B, $S = 32,768$ B, $S = 4$ MiB).
      - Verify canonical partition sizes: non-final chunks equal $C$, final chunk equals $S - (N-1) \cdot C$.
-     - Verify per-chunk SHA-256 digest correctness by re-hashing slices.
+     - Verify per-chunk SHA-256 digest correctness.
      - Verify rejection when transport requires $> 128$ chunks or chunk capacity $< 256$ B.
-- **Exit Condition:** Chunk producer tests pass; zero memory duplication and canonical geometry confirmed.
+- **Exit Condition:** Chunk producer tests pass; canonical geometry and encapsulated hashing confirmed.
 
 ---
 
@@ -87,8 +95,7 @@ flowchart LR
      - Implement `SnapshotOutboundPipeline.createOfferMessage()`:
        - Validate context and construct `ProtocolMessage<SnapshotOfferPayload>`.
      - Implement `SnapshotOutboundPipeline.prepareChunkMessage()`:
-       - Read canonical slice view via `partition.getBorrowedSlice(chunkIndex)`.
-       - Encode to Base64 using `@syncplay/protocol`'s isomorphic `encodeBase64()`.
+       - Obtain chunk Base64 string via `partition.encodeChunkBase64(chunkIndex)`.
        - Frame complete `ProtocolMessage<SnapshotChunkPayload>`.
        - Serialize to JSON string via `JSON.stringify()`.
        - Measure exact complete-message UTF-8 byte length via `new TextEncoder().encode(serializedJson).byteLength`.
@@ -111,10 +118,12 @@ flowchart LR
      - Generate a full 4 MiB engine snapshot.
      - Enqueue and serialize via `SnapshotPreparationQueue` and `SnapshotSerializer`.
      - Partition via `SnapshotChunkProducer`.
+     - Acquire transfer lease on artifact.
      - Produce all chunk messages via `SnapshotOutboundPipeline`.
      - Ingest all produced chunk messages into frozen M4.1 `ChunkAssembler`.
      - Finalize assembly in `ChunkAssembler` and verify reconstructed buffer matches original byte-for-byte.
      - Verify reconstructed snapshot SHA-256 digest matches original digest.
+     - Release lease and verify artifact disposal detaches master buffer.
   2. Execute complete monorepo test suite (`npm test`).
   3. Execute full TypeScript compilations and Vite production bundle build.
 - **Exit Condition:** Full round-trip reassembly passes with bit-exact equality; monorepo builds with zero errors.
