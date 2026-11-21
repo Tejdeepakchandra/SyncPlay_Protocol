@@ -162,3 +162,16 @@ export type {
   ChunkProductionContext,
   ProducedChunkMessage,
 } from './recovery/snapshot-chunk-producer.js';
+
+export {
+  SnapshotOutboundPipeline,
+} from './recovery/snapshot-outbound-pipeline.js';
+export type {
+  OutboundOfferContext,
+  OutboundChunkContext,
+  OutboundChunkResult,
+  OutboundTransferState,
+  OutboundTransferSession,
+  OutboundPipelineConfig,
+  StartTransferParams,
+} from './recovery/snapshot-outbound-pipeline.js';
