@@ -110,7 +110,10 @@ export interface SerializedSnapshotArtifactParams {
   readonly sha256Digest: string;
   readonly masterBuffer: ArrayBuffer;
   readonly onDisposed?: () => void;
+  readonly _trustedPrevalidated?: symbol;
 }
+
+const INTERNAL_SERIALIZER_TOKEN = Symbol('INTERNAL_SERIALIZER_TOKEN');
 
 /**
  * Helper to encode a Uint8Array slice into Base64 across Node and browser runtimes.
@@ -155,10 +158,21 @@ export class SerializedSnapshotArtifact {
   public readonly sha256Digest: string;
 
   constructor(params: SerializedSnapshotArtifactParams) {
-    if (params.totalSizeBytes <= 0 || params.totalSizeBytes > MAX_SNAPSHOT_BYTES) {
+    if (!params || typeof params !== 'object') {
+      throw new SyncEngineError('SNAPSHOT_ERROR', 'Artifact params must be a non-null object');
+    }
+    if (!params.masterBuffer || !(params.masterBuffer instanceof ArrayBuffer)) {
+      throw new SyncEngineError('SNAPSHOT_ERROR', 'Artifact masterBuffer must be an ArrayBuffer');
+    }
+    if (
+      typeof params.totalSizeBytes !== 'number' ||
+      !Number.isInteger(params.totalSizeBytes) ||
+      params.totalSizeBytes <= 0 ||
+      params.totalSizeBytes > MAX_SNAPSHOT_BYTES
+    ) {
       throw new SyncEngineError(
         'SNAPSHOT_ERROR',
-        `Artifact totalSizeBytes must be between 1 and ${MAX_SNAPSHOT_BYTES}, got ${params.totalSizeBytes}`
+        `Artifact totalSizeBytes must be an integer between 1 and ${MAX_SNAPSHOT_BYTES}, got ${params.totalSizeBytes}`
       );
     }
     if (params.masterBuffer.byteLength !== params.totalSizeBytes) {
@@ -167,6 +181,107 @@ export class SerializedSnapshotArtifact {
         `masterBuffer.byteLength (${params.masterBuffer.byteLength}) must equal totalSizeBytes (${params.totalSizeBytes})`
       );
     }
+    if (
+      typeof params.snapshotId !== 'string' ||
+      params.snapshotId.length < 1 ||
+      params.snapshotId.length > 128 ||
+      !ASCII_IDENTIFIER_REGEX.test(params.snapshotId)
+    ) {
+      throw new SyncEngineError(
+        'SNAPSHOT_ERROR',
+        `Invalid snapshotId: must be 1..128 ASCII characters, got "${params.snapshotId}"`
+      );
+    }
+    if (
+      typeof params.sessionId !== 'string' ||
+      params.sessionId.length < 1 ||
+      params.sessionId.length > 128 ||
+      !ASCII_IDENTIFIER_REGEX.test(params.sessionId)
+    ) {
+      throw new SyncEngineError(
+        'SNAPSHOT_ERROR',
+        `Invalid sessionId: must be 1..128 ASCII characters, got "${params.sessionId}"`
+      );
+    }
+    if (
+      typeof params.authorPeerId !== 'string' ||
+      params.authorPeerId.length < 1 ||
+      params.authorPeerId.length > 64 ||
+      !ASCII_IDENTIFIER_REGEX.test(params.authorPeerId)
+    ) {
+      throw new SyncEngineError(
+        'SNAPSHOT_ERROR',
+        `Invalid authorPeerId: must be 1..64 ASCII characters, got "${params.authorPeerId}"`
+      );
+    }
+    if (
+      typeof params.membershipEpoch !== 'number' ||
+      !Number.isInteger(params.membershipEpoch) ||
+      params.membershipEpoch < 0
+    ) {
+      throw new SyncEngineError(
+        'SNAPSHOT_ERROR',
+        `Invalid membershipEpoch: must be a non-negative integer, got ${params.membershipEpoch}`
+      );
+    }
+    if (
+      typeof params.sha256Digest !== 'string' ||
+      !/^[0-9a-f]{64}$/i.test(params.sha256Digest)
+    ) {
+      throw new SyncEngineError(
+        'SNAPSHOT_ERROR',
+        `Invalid sha256Digest: must be 64 hex characters, got "${params.sha256Digest}"`
+      );
+    }
+
+    // Direct instantiation path: if constructed externally without the internal
+    // pre-validation token, enforce identical strict structural validation on the
+    // masterBuffer payload and verify digest and metadata coherence.
+    if (params._trustedPrevalidated !== INTERNAL_SERIALIZER_TOKEN) {
+      let parsedPayload: unknown;
+      try {
+        const text = new TextDecoder('utf-8', { fatal: true }).decode(params.masterBuffer);
+        parsedPayload = JSON.parse(text);
+      } catch (err) {
+        throw new SyncEngineError(
+          'SNAPSHOT_ERROR',
+          `Direct artifact creation failed: masterBuffer is not valid UTF-8 JSON: ${err instanceof Error ? err.message : String(err)}`
+        );
+      }
+      const validated = SnapshotSerializer.validateSnapshot(parsedPayload);
+      if (validated.snapshotId !== params.snapshotId) {
+        throw new SyncEngineError(
+          'SNAPSHOT_ERROR',
+          `Direct artifact creation error: masterBuffer snapshotId (${validated.snapshotId}) does not match params.snapshotId (${params.snapshotId})`
+        );
+      }
+      if (validated.sessionId !== params.sessionId) {
+        throw new SyncEngineError(
+          'SNAPSHOT_ERROR',
+          `Direct artifact creation error: masterBuffer sessionId (${validated.sessionId}) does not match params.sessionId (${params.sessionId})`
+        );
+      }
+      if (validated.authorPeerId !== params.authorPeerId) {
+        throw new SyncEngineError(
+          'SNAPSHOT_ERROR',
+          `Direct artifact creation error: masterBuffer authorPeerId (${validated.authorPeerId}) does not match params.authorPeerId (${params.authorPeerId})`
+        );
+      }
+      if (validated.membershipEpoch !== params.membershipEpoch) {
+        throw new SyncEngineError(
+          'SNAPSHOT_ERROR',
+          `Direct artifact creation error: masterBuffer membershipEpoch (${validated.membershipEpoch}) does not match params.membershipEpoch (${params.membershipEpoch})`
+        );
+      }
+      const actualDigest = sha256(new Uint8Array(params.masterBuffer)).toLowerCase();
+      if (actualDigest !== params.sha256Digest.toLowerCase()) {
+        throw new SyncEngineError(
+          'SNAPSHOT_ERROR',
+          `Direct artifact creation error: sha256Digest mismatch: expected ${params.sha256Digest}, computed ${actualDigest}`
+        );
+      }
+    }
+
     this.snapshotId = params.snapshotId;
     this.sessionId = params.sessionId;
     this.membershipEpoch = params.membershipEpoch;
@@ -498,6 +613,7 @@ export class SnapshotSerializer {
       totalSizeBytes,
       sha256Digest,
       masterBuffer,
+      _trustedPrevalidated: INTERNAL_SERIALIZER_TOKEN,
     });
   }
 

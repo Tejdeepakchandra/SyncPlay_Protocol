@@ -265,6 +265,28 @@ describe('Phase 7.5 M4.2a — SnapshotPreparationQueue', () => {
     expect(queue.retainedArtifactCount).toBe(1);
   });
 
+  it('rejects when captureAndSerializeFn returns a non-artifact object without leaking retainedArtifactCount', async () => {
+    const queue = new SnapshotPreparationQueue();
+
+    const badFn = vi.fn(async () => {
+      return { not: 'an artifact' } as any;
+    });
+
+    await expect(queue.enqueue(createMockRequest('bad-1'), badFn)).rejects.toThrow(SyncEngineError);
+    await expect(queue.enqueue(createMockRequest('bad-1'), badFn)).rejects.toThrow(
+      /captureAndSerializeFn must return an instance of SerializedSnapshotArtifact/
+    );
+
+    expect(queue.isBusy).toBe(false);
+    expect(queue.retainedArtifactCount).toBe(0); // MUST NOT LEAK!
+    expect(queue.depth).toBe(0);
+
+    // Queue remains completely functional
+    const successArtifact = await queue.enqueue(createMockRequest('succ-2'), () => createArtifact());
+    expect(successArtifact).toBeInstanceOf(SerializedSnapshotArtifact);
+    expect(queue.retainedArtifactCount).toBe(1);
+  });
+
   // ─────────────────────────────────────────────────────────────
   // Clear Method
   // ─────────────────────────────────────────────────────────────

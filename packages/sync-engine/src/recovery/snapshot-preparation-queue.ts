@@ -10,7 +10,7 @@
  */
 
 import { SyncEngineError } from '../errors.js';
-import type { SerializedSnapshotArtifact } from './snapshot-serializer.js';
+import { SerializedSnapshotArtifact } from './snapshot-serializer.js';
 
 export interface QueuedPreparationRequest {
   readonly transferId: string;
@@ -84,6 +84,12 @@ export class SnapshotPreparationQueue {
     (async () => {
       try {
         const artifact = await item.captureAndSerializeFn();
+        if (!(artifact instanceof SerializedSnapshotArtifact)) {
+          throw new SyncEngineError(
+            'SNAPSHOT_ERROR',
+            'captureAndSerializeFn must return an instance of SerializedSnapshotArtifact'
+          );
+        }
         this.#retainedArtifactCount++;
 
         // Exactly-once lifecycle notification: when this artifact is disposed

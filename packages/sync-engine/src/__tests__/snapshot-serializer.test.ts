@@ -540,4 +540,201 @@ describe('Phase 7.5 M4.2a — SnapshotSerializer & SerializedSnapshotArtifact', 
     expect(() => artifact.cloneBytes()).toThrow(SyncEngineError);
     expect(() => artifact.acquireLease('new-transfer')).toThrow(SyncEngineError);
   });
+
+  // ─────────────────────────────────────────────────────────────
+  // Finding F1: Direct SerializedSnapshotArtifact Instantiation Validation
+  // ─────────────────────────────────────────────────────────────
+  describe('Finding F1 — Direct SerializedSnapshotArtifact Public Creation Path', () => {
+    let validBuffer: ArrayBuffer;
+    let validDigest: string;
+    let validParams: {
+      snapshotId: string;
+      sessionId: string;
+      membershipEpoch: number;
+      authorPeerId: string;
+      totalSizeBytes: number;
+      sha256Digest: string;
+      masterBuffer: ArrayBuffer;
+    };
+
+    beforeEach(() => {
+      const art = SnapshotSerializer.serializeFromEngine(sampleState, sampleContext);
+      validBuffer = art.cloneBytes().buffer as ArrayBuffer;
+      validDigest = art.sha256Digest;
+      validParams = {
+        snapshotId: art.snapshotId,
+        sessionId: art.sessionId,
+        membershipEpoch: art.membershipEpoch,
+        authorPeerId: art.authorPeerId,
+        totalSizeBytes: art.totalSizeBytes,
+        sha256Digest: validDigest,
+        masterBuffer: validBuffer,
+      };
+    });
+
+    it('succeeds when directly instantiating with valid buffer, valid metadata, and valid snapshot payload', () => {
+      const direct = new SerializedSnapshotArtifact(validParams);
+      expect(direct).toBeInstanceOf(SerializedSnapshotArtifact);
+      expect(direct.snapshotId).toBe(validParams.snapshotId);
+      expect(direct.sessionId).toBe(validParams.sessionId);
+      expect(direct.authorPeerId).toBe(validParams.authorPeerId);
+      expect(direct.membershipEpoch).toBe(validParams.membershipEpoch);
+      expect(direct.totalSizeBytes).toBe(validParams.totalSizeBytes);
+      expect(direct.sha256Digest).toBe(validDigest);
+      expect(direct.isDisposed).toBe(false);
+      expect(direct.cloneBytes().byteLength).toBe(validParams.totalSizeBytes);
+    });
+
+    it('rejects direct instantiation with non-object params or non-ArrayBuffer', () => {
+      expect(() => new SerializedSnapshotArtifact(null as any)).toThrow(SyncEngineError);
+      expect(() => new SerializedSnapshotArtifact({ ...validParams, masterBuffer: 'not-buffer' as any })).toThrow(
+        SyncEngineError
+      );
+    });
+
+    it('rejects direct instantiation with invalid snapshotId (empty, non-ASCII, or > 128 chars)', () => {
+      expect(() => new SerializedSnapshotArtifact({ ...validParams, snapshotId: '' })).toThrow(SyncEngineError);
+      expect(
+        () => new SerializedSnapshotArtifact({ ...validParams, snapshotId: 'invalid id with spaces' })
+      ).toThrow(SyncEngineError);
+      expect(() => new SerializedSnapshotArtifact({ ...validParams, snapshotId: 'a'.repeat(129) })).toThrow(
+        SyncEngineError
+      );
+    });
+
+    it('rejects direct instantiation with invalid sessionId (empty, non-ASCII, or > 128 chars)', () => {
+      expect(() => new SerializedSnapshotArtifact({ ...validParams, sessionId: '' })).toThrow(SyncEngineError);
+      expect(
+        () => new SerializedSnapshotArtifact({ ...validParams, sessionId: 'invalid session id!' })
+      ).toThrow(SyncEngineError);
+      expect(() => new SerializedSnapshotArtifact({ ...validParams, sessionId: 's'.repeat(129) })).toThrow(
+        SyncEngineError
+      );
+    });
+
+    it('rejects direct instantiation with invalid authorPeerId (empty, non-ASCII, or > 64 chars)', () => {
+      expect(() => new SerializedSnapshotArtifact({ ...validParams, authorPeerId: '' })).toThrow(SyncEngineError);
+      expect(
+        () => new SerializedSnapshotArtifact({ ...validParams, authorPeerId: 'peer with spaces!' })
+      ).toThrow(SyncEngineError);
+      expect(() => new SerializedSnapshotArtifact({ ...validParams, authorPeerId: 'p'.repeat(65) })).toThrow(
+        SyncEngineError
+      );
+    });
+
+    it('rejects direct instantiation with invalid membershipEpoch (negative or non-integer)', () => {
+      expect(() => new SerializedSnapshotArtifact({ ...validParams, membershipEpoch: -1 })).toThrow(SyncEngineError);
+      expect(() => new SerializedSnapshotArtifact({ ...validParams, membershipEpoch: 1.5 })).toThrow(SyncEngineError);
+    });
+
+    it('rejects direct instantiation with invalid sha256Digest (non-hex or wrong length)', () => {
+      expect(() => new SerializedSnapshotArtifact({ ...validParams, sha256Digest: 'invalid-hex' })).toThrow(
+        SyncEngineError
+      );
+      expect(() => new SerializedSnapshotArtifact({ ...validParams, sha256Digest: 'a'.repeat(63) })).toThrow(
+        SyncEngineError
+      );
+      expect(() => new SerializedSnapshotArtifact({ ...validParams, sha256Digest: 'a'.repeat(65) })).toThrow(
+        SyncEngineError
+      );
+    });
+
+    it('rejects direct instantiation with totalSizeBytes mismatch with masterBuffer.byteLength', () => {
+      expect(
+        () => new SerializedSnapshotArtifact({ ...validParams, totalSizeBytes: validParams.totalSizeBytes + 1 })
+      ).toThrow(SyncEngineError);
+      expect(() => new SerializedSnapshotArtifact({ ...validParams, totalSizeBytes: 0 })).toThrow(SyncEngineError);
+      expect(
+        () => new SerializedSnapshotArtifact({ ...validParams, totalSizeBytes: MAX_SNAPSHOT_BYTES + 1 })
+      ).toThrow(SyncEngineError);
+    });
+
+    it('rejects direct instantiation with masterBuffer containing non-JSON raw bytes', () => {
+      const corruptBytes = new Uint8Array([0x00, 0x01, 0x02, 0xff, 0xfe]);
+      const corruptDigest = sha256(corruptBytes);
+      expect(
+        () =>
+          new SerializedSnapshotArtifact({
+            ...validParams,
+            masterBuffer: corruptBytes.buffer as ArrayBuffer,
+            totalSizeBytes: corruptBytes.byteLength,
+            sha256Digest: corruptDigest,
+          })
+      ).toThrow(SyncEngineError);
+    });
+
+    it('rejects direct instantiation with masterBuffer containing invalid snapshot payload (bypassing validateSnapshot)', () => {
+      const badSnapshot = {
+        formatVersion: 1, // Invalid formatVersion
+        snapshotId: validParams.snapshotId,
+        sessionId: validParams.sessionId,
+        authorPeerId: validParams.authorPeerId,
+        membershipEpoch: validParams.membershipEpoch,
+      };
+      const badBytes = new TextEncoder().encode(JSON.stringify(badSnapshot));
+      const badDigest = sha256(badBytes);
+      expect(
+        () =>
+          new SerializedSnapshotArtifact({
+            ...validParams,
+            masterBuffer: badBytes.buffer as ArrayBuffer,
+            totalSizeBytes: badBytes.byteLength,
+            sha256Digest: badDigest,
+          })
+      ).toThrow(SyncEngineError);
+    });
+
+    it('rejects direct instantiation with masterBuffer metadata mismatch (e.g. authorPeerId mismatch)', () => {
+      const mismatchedParams = {
+        ...validParams,
+        authorPeerId: 'peer-different-author',
+      };
+      expect(() => new SerializedSnapshotArtifact(mismatchedParams)).toThrow(SyncEngineError);
+      expect(() => new SerializedSnapshotArtifact(mismatchedParams)).toThrow(/authorPeerId/);
+    });
+
+    it('rejects direct instantiation when declared sha256Digest does not match masterBuffer', () => {
+      const mismatchedDigestParams = {
+        ...validParams,
+        sha256Digest: '0'.repeat(64),
+      };
+      expect(() => new SerializedSnapshotArtifact(mismatchedDigestParams)).toThrow(SyncEngineError);
+      expect(() => new SerializedSnapshotArtifact(mismatchedDigestParams)).toThrow(/sha256Digest mismatch/);
+    });
+  });
+
+  // ─────────────────────────────────────────────────────────────
+  // Finding F2: Disposal Listener Exception Isolation & Order
+  // ─────────────────────────────────────────────────────────────
+  describe('Finding F2 — Disposal Listener Exception Isolation', () => {
+    it('executes all registered listeners in order even if one throws', () => {
+      const artifact = SnapshotSerializer.serializeFromEngine(sampleState, sampleContext);
+      const executionOrder: number[] = [];
+
+      artifact.registerDisposalListener(() => {
+        executionOrder.push(1);
+      });
+      artifact.registerDisposalListener(() => {
+        executionOrder.push(2);
+        throw new Error('Listener 2 catastrophic error');
+      });
+      artifact.registerDisposalListener(() => {
+        executionOrder.push(3);
+      });
+
+      // Dispose
+      expect(() => artifact.dispose()).not.toThrow();
+      expect(executionOrder).toEqual([1, 2, 3]);
+      expect(artifact.isDisposed).toBe(true);
+
+      // Registering on already disposed artifact runs immediately with exception isolation
+      expect(() => {
+        artifact.registerDisposalListener(() => {
+          executionOrder.push(4);
+          throw new Error('Post-disposal listener failure');
+        });
+      }).not.toThrow();
+      expect(executionOrder).toEqual([1, 2, 3, 4]);
+    });
+  });
 });
