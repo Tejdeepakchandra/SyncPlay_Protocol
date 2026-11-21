@@ -151,3 +151,14 @@ export {
 export type {
   QueuedPreparationRequest,
 } from './recovery/snapshot-preparation-queue.js';
+
+export {
+  SnapshotChunkProducer,
+} from './recovery/snapshot-chunk-producer.js';
+export type {
+  SnapshotChunkSlice,
+  PartitionedSnapshot,
+  ChunkProducerConfig,
+  ChunkProductionContext,
+  ProducedChunkMessage,
+} from './recovery/snapshot-chunk-producer.js';

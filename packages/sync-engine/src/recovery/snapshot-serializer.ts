@@ -113,7 +113,7 @@ export interface SerializedSnapshotArtifactParams {
   readonly _trustedPrevalidated?: symbol;
 }
 
-const INTERNAL_SERIALIZER_TOKEN = Symbol('INTERNAL_SERIALIZER_TOKEN');
+export const INTERNAL_SERIALIZER_TOKEN = Symbol('INTERNAL_SERIALIZER_TOKEN');
 
 /**
  * Helper to encode a Uint8Array slice into Base64 across Node and browser runtimes.
