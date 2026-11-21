@@ -83,8 +83,6 @@ export interface ChunkProducerConfig {
   transferId?: string;
   /** Whether to acquire a transfer lease on the artifact. Defaults to true when a transferId is provided or instantiated. */
   acquireLease?: boolean;
-  /** Whether to automatically release the transfer lease when the last chunk is produced. Default: false. */
-  autoReleaseOnFinalChunk?: boolean;
 }
 
 /**
@@ -125,7 +123,6 @@ export class SnapshotChunkProducer implements PartitionedSnapshot {
 
   #hasLease = false;
   #isDisposed = false;
-  readonly #autoReleaseOnFinalChunk: boolean;
 
   constructor(artifact: SerializedSnapshotArtifact, config: ChunkProducerConfig = {}) {
     if (!artifact || !(artifact instanceof SerializedSnapshotArtifact)) {
@@ -136,7 +133,6 @@ export class SnapshotChunkProducer implements PartitionedSnapshot {
     }
 
     this.artifact = artifact;
-    this.#autoReleaseOnFinalChunk = config.autoReleaseOnFinalChunk ?? false;
 
     // 1. Resolve transport limit and effective limit
     const fallbackLimit = 65536;
@@ -419,10 +415,6 @@ export class SnapshotChunkProducer implements PartitionedSnapshot {
         'TRANSPORT_LIMIT_EXCEEDED',
         `Complete serialized chunk message byte length (${byteLength} B) exceeds effective transport limit (${this.effectiveLimit} B)`
       );
-    }
-
-    if (this.#autoReleaseOnFinalChunk && chunkIndex === this.totalChunks - 1) {
-      this.dispose();
     }
 
     return {

@@ -8,7 +8,6 @@ import {
 import {
   SnapshotSerializer,
   SerializedSnapshotArtifact,
-  INTERNAL_SERIALIZER_TOKEN,
 } from '../recovery/snapshot-serializer.js';
 import {
   ChunkAssembler,
@@ -60,7 +59,8 @@ describe('Phase 7.5 M4.2b — SnapshotChunkProducer & Canonical Partitioning', (
     return basePayload;
   }
 
-  // Helper to create an artifact of exact byte size
+  // Test-only fixture helper to instantiate an artifact of arbitrary binary size
+  // without relying on or exposing internal serializer pre-validation tokens.
   function createArtifactOfSize(exactBytes: number, idSuffix = 'size-test'): SerializedSnapshotArtifact {
     const masterBuffer = new ArrayBuffer(exactBytes);
     const view = new Uint8Array(masterBuffer);
@@ -68,18 +68,61 @@ describe('Phase 7.5 M4.2b — SnapshotChunkProducer & Canonical Partitioning', (
       view[i] = (i * 37 + 13) & 0xff;
     }
     const digest = sha256(view).toLowerCase();
+    const leases = new Set<string>();
+    let disposed = false;
 
-    // Use internal prevalidated token to instantiate test artifact of arbitrary binary size
-    return new (SerializedSnapshotArtifact as any)({
-      snapshotId: `snap-${idSuffix}`,
-      sessionId: `sess-${idSuffix}`,
-      membershipEpoch: 2,
-      authorPeerId: `peer-supplier-${idSuffix}`,
-      totalSizeBytes: exactBytes,
-      sha256Digest: digest,
-      masterBuffer,
-      _trustedPrevalidated: INTERNAL_SERIALIZER_TOKEN,
+    const artifact = Object.create(SerializedSnapshotArtifact.prototype);
+    Object.defineProperties(artifact, {
+      snapshotId: { value: `snap-${idSuffix}`, enumerable: true },
+      sessionId: { value: `sess-${idSuffix}`, enumerable: true },
+      membershipEpoch: { value: 2, enumerable: true },
+      authorPeerId: { value: `peer-supplier-${idSuffix}`, enumerable: true },
+      totalSizeBytes: { value: exactBytes, enumerable: true },
+      sha256Digest: { value: digest, enumerable: true },
+      isDisposed: { get: () => disposed, enumerable: true },
+      activeLeaseCount: { get: () => leases.size, enumerable: true },
+      acquireLease: {
+        value(transferId: string) {
+          if (disposed) {
+            throw new SyncEngineError('ARTIFACT_DISPOSED', '[ARTIFACT_DISPOSED] Cannot acquire lease on disposed artifact');
+          }
+          leases.add(transferId);
+          return true;
+        },
+      },
+      releaseLease: {
+        value(transferId: string) {
+          return leases.delete(transferId);
+        },
+      },
+      computeSliceSha256: {
+        value(offset: number, length: number) {
+          if (disposed) throw new SyncEngineError('ARTIFACT_DISPOSED', '[ARTIFACT_DISPOSED] Artifact disposed');
+          return sha256(view.subarray(offset, offset + length)).toLowerCase();
+        },
+      },
+      encodeSliceToBase64: {
+        value(offset: number, length: number) {
+          if (disposed) throw new SyncEngineError('ARTIFACT_DISPOSED', '[ARTIFACT_DISPOSED] Artifact disposed');
+          const slice = view.subarray(offset, offset + length);
+          return Buffer.from(slice).toString('base64');
+        },
+      },
+      cloneBytes: {
+        value() {
+          if (disposed) throw new SyncEngineError('ARTIFACT_DISPOSED', '[ARTIFACT_DISPOSED] Artifact disposed');
+          return new Uint8Array(view);
+        },
+      },
+      dispose: {
+        value() {
+          disposed = true;
+          leases.clear();
+        },
+      },
     });
+
+    return artifact;
   }
 
   // Robust helper using SnapshotSerializer for valid structured snapshots
@@ -433,28 +476,96 @@ describe('Phase 7.5 M4.2b — SnapshotChunkProducer & Canonical Partitioning', (
       vi.restoreAllMocks();
     });
 
-    it('supports autoReleaseOnFinalChunk configuration', () => {
-      const artifact = createStructuredArtifact('auto-rel');
+    it('producing the final chunk does not release the artifact lease', () => {
+      const artifact = createArtifactOfSize(65000, 'no-auto-rel');
       const producer = new SnapshotChunkProducer(artifact, {
         allowSctpFallback: true,
         transferId: '00000000-0000-4000-8000-000000000004',
-        autoReleaseOnFinalChunk: true,
       });
 
       expect(producer.isLeaseActive).toBe(true);
-      const total = producer.totalChunks;
+      expect(artifact.activeLeaseCount).toBe(1);
 
-      // Produce non-final chunks (if any)
-      for (let i = 0; i < total - 1; i++) {
-        producer.produceChunk(i);
-        expect(producer.isLeaseActive).toBe(true);
-      }
+      // Produce final chunk (index 1 for 65,000 B payload)
+      const finalChunk = producer.produceChunk(producer.totalChunks - 1);
+      expect(finalChunk.ok).toBe(true);
 
-      // Produce final chunk -> triggers auto-release
-      producer.produceChunk(total - 1);
+      // Lease MUST remain active after final chunk production!
+      expect(producer.isLeaseActive).toBe(true);
+      expect(producer.isDisposed).toBe(false);
+      expect(artifact.activeLeaseCount).toBe(1);
+
+      producer.dispose();
       expect(producer.isLeaseActive).toBe(false);
       expect(producer.isDisposed).toBe(true);
       expect(artifact.activeLeaseCount).toBe(0);
+    });
+
+    it('earlier chunks can still be produced after the final chunk', () => {
+      const artifact = createArtifactOfSize(65000, 'out-of-order');
+      const producer = new SnapshotChunkProducer(artifact, {
+        allowSctpFallback: true,
+        transferId: '00000000-0000-4000-8000-000000000044',
+      });
+
+      // Produce final chunk first
+      const finalChunk = producer.produceChunk(1);
+      expect(finalChunk.ok).toBe(true);
+      expect(producer.isLeaseActive).toBe(true);
+
+      // Produce earlier chunk 0 after final chunk
+      const chunk0 = producer.produceChunk(0);
+      expect(chunk0.ok).toBe(true);
+      expect(chunk0.payload.chunkIndex).toBe(0);
+      expect(producer.isLeaseActive).toBe(true);
+
+      producer.dispose();
+    });
+
+    it('a previously produced chunk can be produced again for retransmission while producer remains active', () => {
+      const artifact = createArtifactOfSize(65000, 'retransmit');
+      const producer = new SnapshotChunkProducer(artifact, {
+        allowSctpFallback: true,
+        transferId: '00000000-0000-4000-8000-000000000045',
+      });
+
+      // First transmission of chunk 0
+      const tx1 = producer.produceChunk(0);
+      // Retransmission of chunk 0
+      const tx2 = producer.produceChunk(0);
+
+      expect(tx1.ok).toBe(true);
+      expect(tx2.ok).toBe(true);
+      expect(tx1.payload.chunkSha256).toBe(tx2.payload.chunkSha256);
+      expect(tx1.payload.dataBase64).toBe(tx2.payload.dataBase64);
+      expect(producer.isLeaseActive).toBe(true);
+
+      producer.dispose();
+    });
+
+    it('explicit release and disposal remain idempotent', () => {
+      const artifact = createArtifactOfSize(1000, 'idem-rel');
+      const producer = new SnapshotChunkProducer(artifact, {
+        allowSctpFallback: true,
+        transferId: '00000000-0000-4000-8000-000000000046',
+      });
+
+      expect(producer.isLeaseActive).toBe(true);
+      expect(artifact.activeLeaseCount).toBe(1);
+
+      // Explicit release
+      expect(producer.releaseLease()).toBe(true);
+      expect(producer.isLeaseActive).toBe(false);
+      expect(artifact.activeLeaseCount).toBe(0);
+
+      // Repeated release returns false
+      expect(producer.releaseLease()).toBe(false);
+
+      // dispose is idempotent
+      producer.dispose();
+      expect(producer.isDisposed).toBe(true);
+      producer.dispose();
+      expect(producer.isDisposed).toBe(true);
     });
 
     it('rejects operations after disposal with ARTIFACT_DISPOSED', () => {
@@ -630,6 +741,137 @@ describe('Phase 7.5 M4.2b — SnapshotChunkProducer & Canonical Partitioning', (
       expect(() => producer.produceChunk(0)).toThrow(/exceeds effective transport limit/);
 
       producer.dispose();
+    });
+  });
+
+  // ─────────────────────────────────────────────────────────────
+  // 7. Boundary Regressions & Security Constraints
+  // ─────────────────────────────────────────────────────────────
+  describe('7. Boundary Regressions & Security Constraints', () => {
+    it('rejects 4 MiB snapshot at 34,568 bytes transport limit with PARTITION_ERROR', () => {
+      const artifact = createArtifactOfSize(MAX_SNAPSHOT_BYTES, '4mb-34k');
+      // At 34,568 B, availableBase64 = 32,768, chunkCapacity = 24,576 B.
+      // ceil(4,194,304 / 24,576) = 171 chunks > 128 chunks!
+      expect(() => {
+        new SnapshotChunkProducer(artifact, {
+          sctpMaxMessageSize: 34568,
+        });
+      }).toThrow(SyncEngineError);
+
+      try {
+        new SnapshotChunkProducer(artifact, { sctpMaxMessageSize: 34568 });
+      } catch (err: any) {
+        expect(err.code).toBe('PARTITION_ERROR');
+        expect(err.message).toMatch(/exceeds MAX_CHUNKS_PER_SNAPSHOT \(128\) on 34568 B transport/);
+      }
+    });
+
+    it('rejects 4 MiB snapshot at 45,491 bytes transport limit with PARTITION_ERROR', () => {
+      const artifact = createArtifactOfSize(MAX_SNAPSHOT_BYTES, '4mb-45491');
+      // At 45,491 B, availableBase64 = 43,691, chunkCapacity = 32,766 B.
+      // ceil(4,194,304 / 32,766) = 129 chunks > 128 chunks!
+      expect(() => {
+        new SnapshotChunkProducer(artifact, {
+          sctpMaxMessageSize: 45491,
+        });
+      }).toThrow(SyncEngineError);
+
+      try {
+        new SnapshotChunkProducer(artifact, { sctpMaxMessageSize: 45491 });
+      } catch (err: any) {
+        expect(err.code).toBe('PARTITION_ERROR');
+        expect(err.message).toMatch(/exceeds MAX_CHUNKS_PER_SNAPSHOT \(128\) on 45491 B transport/);
+      }
+    });
+
+    it('admits 4 MiB snapshot at 45,492 bytes transport limit for exactly 128 chunks', () => {
+      const artifact = createArtifactOfSize(MAX_SNAPSHOT_BYTES, '4mb-45492');
+      // At 45,492 B, availableBase64 = 43,692, chunkCapacity = 32,768 B.
+      // ceil(4,194,304 / 32,768) = 128 chunks <= 128 chunks!
+      const producer = new SnapshotChunkProducer(artifact, {
+        sctpMaxMessageSize: 45492,
+      });
+
+      expect(producer.nominalChunkSizeBytes).toBe(MAX_CHUNK_BYTES); // 32,768
+      expect(producer.totalChunks).toBe(128);
+      expect(producer.slices.length).toBe(128);
+      producer.dispose();
+    });
+
+    it('partitions a small snapshot at the 2,144 bytes transport floor', () => {
+      // 500 B snapshot on 2,144 B transport (capacity = 258 B)
+      const artifact = createArtifactOfSize(500, 'small-2144');
+      const producer = new SnapshotChunkProducer(artifact, {
+        sctpMaxMessageSize: 2144,
+      });
+
+      expect(producer.nominalChunkSizeBytes).toBe(258);
+      expect(producer.totalChunks).toBe(2); // ceil(500 / 258) = 2
+      expect(producer.slices[0].chunkSizeBytes).toBe(258);
+      expect(producer.slices[1].chunkSizeBytes).toBe(242);
+
+      const chunk0 = producer.produceChunk(0);
+      const chunk1 = producer.produceChunk(1);
+      expect(chunk0.byteLength).toBeLessThanOrEqual(2144);
+      expect(chunk1.byteLength).toBeLessThanOrEqual(2144);
+      producer.dispose();
+    });
+
+    it('preserves partition immutability with no dynamic resizing after producer construction', () => {
+      const artifact = createArtifactOfSize(65000, 'immutable-geom');
+      const producer = new SnapshotChunkProducer(artifact, { allowSctpFallback: true });
+
+      const initialTotalChunks = producer.totalChunks;
+      const initialNominal = producer.nominalChunkSizeBytes;
+
+      expect(Object.isFrozen(producer.slices)).toBe(true);
+      expect(Object.isFrozen(producer.slices[0])).toBe(true);
+
+      // Attempting to mutate slice property in strict mode throws or fails silently
+      expect(() => {
+        (producer.slices as any)[0] = null;
+      }).toThrow();
+
+      // Check invariant preservation
+      expect(producer.totalChunks).toBe(initialTotalChunks);
+      expect(producer.nominalChunkSizeBytes).toBe(initialNominal);
+      producer.dispose();
+    });
+
+    it('allows final-chunk production followed by earlier-chunk retransmission', () => {
+      const artifact = createArtifactOfSize(65000, 'retransmit-seq');
+      const producer = new SnapshotChunkProducer(artifact, {
+        allowSctpFallback: true,
+        transferId: '00000000-0000-4000-8000-000000000099',
+      });
+
+      // 1. Produce chunk 0 with explicit messageId
+      const c0_first = producer.produceChunk(0, { messageId: 'msg-tx-0' });
+      expect(c0_first.ok).toBe(true);
+
+      // 2. Produce final chunk (chunk 1)
+      const c1 = producer.produceChunk(1);
+      expect(c1.ok).toBe(true);
+      expect(producer.isLeaseActive).toBe(true);
+
+      // 3. Retransmit chunk 0 after final chunk was produced with same messageId
+      const c0_retry = producer.produceChunk(0, { messageId: 'msg-tx-0' });
+      expect(c0_retry.ok).toBe(true);
+      expect(c0_retry.payload.chunkSha256).toBe(c0_first.payload.chunkSha256);
+      expect(c0_retry.payload.dataBase64).toBe(c0_first.payload.dataBase64);
+      expect(c0_retry.serializedJson).toBe(c0_first.serializedJson);
+
+      producer.dispose();
+    });
+
+    it('verifies validation-bypass token is NOT available through production exports', async () => {
+      // 1. Check barrel export of sync-engine
+      const syncEngine = await import('../index.js');
+      expect((syncEngine as any).INTERNAL_SERIALIZER_TOKEN).toBeUndefined();
+
+      // 2. Check snapshot-serializer module export
+      const serializerModule = await import('../recovery/snapshot-serializer.js');
+      expect((serializerModule as any).INTERNAL_SERIALIZER_TOKEN).toBeUndefined();
     });
   });
 });
