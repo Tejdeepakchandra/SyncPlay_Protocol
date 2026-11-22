@@ -494,6 +494,9 @@ describe('Phase 7.5 M4.2c — SnapshotOutboundPipeline & Send-Boundary Verificat
       expect(pipeline.getTransfer(transferId)!.inflightChunks.size).toBe(1);
       expect(pipeline.getTransfer(transferId)!.retryCounts.get(0)).toBeUndefined();
 
+      // Hand off frame1 to transport send buffer
+      pipeline.handleHandoffSuccess(transferId, 0, frame1.message.messageId, frame1.attemptToken, context);
+
       // Retransmit chunk 0 (first retransmission: retryCounts = 1, fresh messageId per Rule 7)
       const [frame2] = pipeline.handleChunkRequest(transferId, [0], context);
       expect(frame2.payload.chunkIndex).toBe(0);
@@ -622,16 +625,19 @@ describe('Phase 7.5 M4.2c — SnapshotOutboundPipeline & Send-Boundary Verificat
       const context = createContext(pipeline, transferId);
 
       // Request 1 (initial transmission): retryCount = undefined / 0
-      pipeline.handleChunkRequest(transferId, [0], context);
+      const [f1] = pipeline.handleChunkRequest(transferId, [0], context);
       expect(pipeline.getTransfer(transferId)!.retryCounts.get(0)).toBeUndefined();
+      pipeline.handleHandoffSuccess(transferId, 0, f1.message.messageId, f1.attemptToken, context);
 
       // Request 2 (retry 1): retryCount = 1 <= 2
-      pipeline.handleChunkRequest(transferId, [0], context);
+      const [f2] = pipeline.handleChunkRequest(transferId, [0], context);
       expect(pipeline.getTransfer(transferId)!.retryCounts.get(0)).toBe(1);
+      pipeline.handleHandoffSuccess(transferId, 0, f2.message.messageId, f2.attemptToken, context);
 
       // Request 3 (retry 2): retryCount = 2 <= 2
-      pipeline.handleChunkRequest(transferId, [0], context);
+      const [f3] = pipeline.handleChunkRequest(transferId, [0], context);
       expect(pipeline.getTransfer(transferId)!.retryCounts.get(0)).toBe(2);
+      pipeline.handleHandoffSuccess(transferId, 0, f3.message.messageId, f3.attemptToken, context);
 
       // Request 4 (retry 3 > 2): exceeds maxRetriesPerChunk of 2 -> aborts with RETRY_BUDGET_EXHAUSTED
       expect(() => pipeline.handleChunkRequest(transferId, [0], context)).toThrowError(/Retry budget exhausted/);
@@ -1591,20 +1597,24 @@ describe('Phase 7.5 M4.2c — SnapshotOutboundPipeline & Send-Boundary Verificat
       const context = createContext(pipeline, transferId);
 
       // 1. Initial transmission: transmitted=true, retryCount=0
-      pipeline.handleChunkRequest(transferId, [0], context);
+      const [f0] = pipeline.handleChunkRequest(transferId, [0], context);
       expect(pipeline.getTransfer(transferId)!.retryCounts.get(0)).toBeUndefined();
+      pipeline.handleHandoffSuccess(transferId, 0, f0.message.messageId, f0.attemptToken, context);
 
       // 2. Retransmission 1: retryCount=1 <= 3
-      pipeline.handleChunkRequest(transferId, [0], context);
+      const [f1] = pipeline.handleChunkRequest(transferId, [0], context);
       expect(pipeline.getTransfer(transferId)!.retryCounts.get(0)).toBe(1);
+      pipeline.handleHandoffSuccess(transferId, 0, f1.message.messageId, f1.attemptToken, context);
 
       // 3. Retransmission 2: retryCount=2 <= 3
-      pipeline.handleChunkRequest(transferId, [0], context);
+      const [f2] = pipeline.handleChunkRequest(transferId, [0], context);
       expect(pipeline.getTransfer(transferId)!.retryCounts.get(0)).toBe(2);
+      pipeline.handleHandoffSuccess(transferId, 0, f2.message.messageId, f2.attemptToken, context);
 
       // 4. Retransmission 3: retryCount=3 <= 3
-      pipeline.handleChunkRequest(transferId, [0], context);
+      const [f3] = pipeline.handleChunkRequest(transferId, [0], context);
       expect(pipeline.getTransfer(transferId)!.retryCounts.get(0)).toBe(3);
+      pipeline.handleHandoffSuccess(transferId, 0, f3.message.messageId, f3.attemptToken, context);
 
       // 5. Retransmission 4 (> 3): exceeds retry limit -> throws and aborts transfer
       expect(() => {
@@ -1634,10 +1644,13 @@ describe('Phase 7.5 M4.2c — SnapshotOutboundPipeline & Send-Boundary Verificat
       const context = createContext(pipeline, transferId);
 
       // Initial transmission of both 0 and 1
-      pipeline.handleChunkRequest(transferId, [0, 1], context);
+      const [f0, f1] = pipeline.handleChunkRequest(transferId, [0, 1], context);
+      pipeline.handleHandoffSuccess(transferId, 0, f0.message.messageId, f0.attemptToken, context);
+      pipeline.handleHandoffSuccess(transferId, 1, f1.message.messageId, f1.attemptToken, context);
 
       // Retransmit chunk 0 twice
-      pipeline.handleChunkRequest(transferId, [0], context);
+      const [f0Retry1] = pipeline.handleChunkRequest(transferId, [0], context);
+      pipeline.handleHandoffSuccess(transferId, 0, f0Retry1.message.messageId, f0Retry1.attemptToken, context);
       pipeline.handleChunkRequest(transferId, [0], context);
 
       const session = pipeline.getTransfer(transferId)!;
@@ -1663,7 +1676,8 @@ describe('Phase 7.5 M4.2c — SnapshotOutboundPipeline & Send-Boundary Verificat
       const context = createContext(pipeline, transferId);
 
       // Initial + 1 retry of chunk 0
-      pipeline.handleChunkRequest(transferId, [0], context);
+      const [f0] = pipeline.handleChunkRequest(transferId, [0], context);
+      pipeline.handleHandoffSuccess(transferId, 0, f0.message.messageId, f0.attemptToken, context);
       pipeline.handleChunkRequest(transferId, [0], context);
       expect(pipeline.getTransfer(transferId)!.retryCounts.get(0)).toBe(1);
 
@@ -1748,7 +1762,7 @@ describe('Phase 7.5 M4.2c — SnapshotOutboundPipeline & Send-Boundary Verificat
       pipeline.handleChunkRequest(transferId, [1], context);
 
       // Simulate a handoff failure on chunk 0 so its reservation is released
-      pipeline.handleHandoffFailure(transferId, 0, context);
+      pipeline.handleHandoffFailure(transferId, 0, originalMessageId, frame0.attemptToken, context);
 
       // Now request chunks 2 and 3: this causes preparedFrames to evict chunk 0 due to sliding window
       // First ACK chunk 1
@@ -1793,14 +1807,14 @@ describe('Phase 7.5 M4.2c — SnapshotOutboundPipeline & Send-Boundary Verificat
       const context = createContext(pipeline, transferId);
 
       // Request 2 chunks to fill window (W = 2)
-      pipeline.handleChunkRequest(transferId, [0, 1], context);
+      const [f0, f1] = pipeline.handleChunkRequest(transferId, [0, 1], context);
 
       let session = pipeline.getTransfer(transferId)!;
       expect(session.state).toBe('WAITING_ACK');
       expect(session.inflightChunks.size).toBe(2);
 
       // Handoff failure reported on chunk 1
-      pipeline.handleHandoffFailure(transferId, 1, context);
+      pipeline.handleHandoffFailure(transferId, 1, f1.message.messageId, f1.attemptToken, context);
 
       session = pipeline.getTransfer(transferId)!;
       // Reservation released from inflightChunks
@@ -1838,7 +1852,7 @@ describe('Phase 7.5 M4.2c — SnapshotOutboundPipeline & Send-Boundary Verificat
       expect(artifact.activeLeaseCount).toBe(1);
 
       // Report handoff failure
-      pipeline.handleHandoffFailure(transferId, 0, context);
+      pipeline.handleHandoffFailure(transferId, 0, initialFrame.message.messageId, initialFrame.attemptToken, context);
 
       // Lease is retained
       expect(artifact.activeLeaseCount).toBe(1);
@@ -1874,7 +1888,7 @@ describe('Phase 7.5 M4.2c — SnapshotOutboundPipeline & Send-Boundary Verificat
       expect(session.inflightChunks.has(0)).toBe(true);
 
       // 3. Report local transport handoff failure
-      pipeline.handleHandoffFailure(transferId, 0, context);
+      pipeline.handleHandoffFailure(transferId, 0, frame0.message.messageId, frame0.attemptToken, context);
 
       // Verify in-flight reservation released and transmittedChunks rolled back
       session = pipeline.getTransfer(transferId)!;
@@ -1911,10 +1925,10 @@ describe('Phase 7.5 M4.2c — SnapshotOutboundPipeline & Send-Boundary Verificat
 
       // Repeat handoff failure 5 times on initial transmission
       for (let i = 0; i < 5; i++) {
-        pipeline.handleChunkRequest(transferId, [0], context);
+        const [frame] = pipeline.handleChunkRequest(transferId, [0], context);
         expect(pipeline.getTransfer(transferId)!.inflightChunks.has(0)).toBe(true);
 
-        pipeline.handleHandoffFailure(transferId, 0, context);
+        pipeline.handleHandoffFailure(transferId, 0, frame.message.messageId, frame.attemptToken, context);
         const session = pipeline.getTransfer(transferId)!;
         expect(session.inflightChunks.has(0)).toBe(false);
         expect(session.transmittedChunks.has(0)).toBe(false);
@@ -1945,17 +1959,18 @@ describe('Phase 7.5 M4.2c — SnapshotOutboundPipeline & Send-Boundary Verificat
 
       const context = createContext(pipeline, transferId);
 
-      // Initial transmission succeeds (no handoff failure)
-      pipeline.handleChunkRequest(transferId, [0], context);
+      // Initial transmission succeeds (handed off)
+      const [f0] = pipeline.handleChunkRequest(transferId, [0], context);
+      pipeline.handleHandoffSuccess(transferId, 0, f0.message.messageId, f0.attemptToken, context);
       expect(pipeline.getTransfer(transferId)!.transmittedChunks.has(0)).toBe(true);
       expect(pipeline.getTransfer(transferId)!.retryCounts.get(0)).toBeUndefined();
 
       // Recipient requests retransmission -> retryCounts becomes 1
-      pipeline.handleChunkRequest(transferId, [0], context);
+      const [f0Retry1] = pipeline.handleChunkRequest(transferId, [0], context);
       expect(pipeline.getTransfer(transferId)!.retryCounts.get(0)).toBe(1);
 
       // Local handoff of this retransmission fails
-      pipeline.handleHandoffFailure(transferId, 0, context);
+      pipeline.handleHandoffFailure(transferId, 0, f0Retry1.message.messageId, f0Retry1.attemptToken, context);
 
       // Retry count is rolled back, chunk remains transmitted
       let session = pipeline.getTransfer(transferId)!;
@@ -1964,7 +1979,7 @@ describe('Phase 7.5 M4.2c — SnapshotOutboundPipeline & Send-Boundary Verificat
       expect(session.retryCounts.get(0)).toBeUndefined();
 
       // Transport retries the retransmission
-      pipeline.handleChunkRequest(transferId, [0], context);
+      const [f0Retry2] = pipeline.handleChunkRequest(transferId, [0], context);
       session = pipeline.getTransfer(transferId)!;
       // Retried retransmission is retry #1, NOT retry #2!
       expect(session.retryCounts.get(0)).toBe(1);
@@ -1986,13 +2001,13 @@ describe('Phase 7.5 M4.2c — SnapshotOutboundPipeline & Send-Boundary Verificat
       });
 
       const context = createContext(pipeline, transferId);
-      pipeline.handleChunkRequest(transferId, [0], context);
+      const [frame0] = pipeline.handleChunkRequest(transferId, [0], context);
 
       // First failure report
-      expect(() => pipeline.handleHandoffFailure(transferId, 0, context)).not.toThrow();
+      expect(() => pipeline.handleHandoffFailure(transferId, 0, frame0.message.messageId, frame0.attemptToken, context)).not.toThrow();
 
       // Duplicate failure report: idempotent no-op
-      expect(() => pipeline.handleHandoffFailure(transferId, 0, context)).not.toThrow();
+      expect(() => pipeline.handleHandoffFailure(transferId, 0, frame0.message.messageId, frame0.attemptToken, context)).not.toThrow();
 
       const session = pipeline.getTransfer(transferId)!;
       expect(session.inflightChunks.size).toBe(0);
@@ -2014,13 +2029,13 @@ describe('Phase 7.5 M4.2c — SnapshotOutboundPipeline & Send-Boundary Verificat
       });
 
       const context = createContext(pipeline, transferId);
-      pipeline.handleChunkRequest(transferId, [0], context);
+      const [frame0] = pipeline.handleChunkRequest(transferId, [0], context);
       pipeline.handleChunkAck(transferId, 0, context);
 
       expect(pipeline.getTransfer(transferId)!.acknowledgedChunks.has(0)).toBe(true);
 
       // Late handoff failure arrives for chunk 0
-      pipeline.handleHandoffFailure(transferId, 0, context);
+      pipeline.handleHandoffFailure(transferId, 0, frame0.message.messageId, frame0.attemptToken, context);
 
       // Chunk 0 remains acknowledged!
       expect(pipeline.getTransfer(transferId)!.acknowledgedChunks.has(0)).toBe(true);
@@ -2042,13 +2057,13 @@ describe('Phase 7.5 M4.2c — SnapshotOutboundPipeline & Send-Boundary Verificat
       });
 
       const context = createContext(pipeline, transferId);
-      pipeline.handleChunkRequest(transferId, [0], context);
+      const [frame0] = pipeline.handleChunkRequest(transferId, [0], context);
       pipeline.cancelTransfer(transferId);
 
       expect(pipeline.getTransfer(transferId)!.state).toBe('CANCELLED');
 
       // Late handoff failure
-      expect(() => pipeline.handleHandoffFailure(transferId, 0, context)).not.toThrow();
+      expect(() => pipeline.handleHandoffFailure(transferId, 0, frame0.message.messageId, frame0.attemptToken, context)).not.toThrow();
       expect(pipeline.getTransfer(transferId)!.state).toBe('CANCELLED');
 
       pipeline.dispose();
@@ -2068,12 +2083,15 @@ describe('Phase 7.5 M4.2c — SnapshotOutboundPipeline & Send-Boundary Verificat
         captureAndSerializeFn: () => createSerializedArtifact(1, 'f4-stale'),
       });
 
+      const validContext = createContext(pipeline, transferId, { connectionGeneration: 3 });
+      const [frame0] = pipeline.handleChunkRequest(transferId, [0], validContext);
+
       const staleContext = createContext(pipeline, transferId, {
         connectionGeneration: 2,
       });
 
       try {
-        pipeline.handleHandoffFailure(transferId, 0, staleContext);
+        pipeline.handleHandoffFailure(transferId, 0, frame0.message.messageId, frame0.attemptToken, staleContext);
         expect.unreachable('Should have thrown UNAUTHORIZED');
       } catch (err) {
         expect((err as SyncEngineError).code).toBe('UNAUTHORIZED');
@@ -2085,7 +2103,7 @@ describe('Phase 7.5 M4.2c — SnapshotOutboundPipeline & Send-Boundary Verificat
       });
 
       try {
-        pipeline.handleHandoffFailure(transferId, 0, imposterContext);
+        pipeline.handleHandoffFailure(transferId, 0, frame0.message.messageId, frame0.attemptToken, imposterContext);
         expect.unreachable('Should have thrown UNAUTHORIZED');
       } catch (err) {
         expect((err as SyncEngineError).code).toBe('UNAUTHORIZED');
@@ -2110,7 +2128,7 @@ describe('Phase 7.5 M4.2c — SnapshotOutboundPipeline & Send-Boundary Verificat
       const context = createContext(pipeline, transferId);
 
       try {
-        pipeline.handleHandoffFailure(transferId, 9999, context);
+        pipeline.handleHandoffFailure(transferId, 9999, 'msg-none', 'msg-none:1', context);
         expect.unreachable('Should have thrown INVALID_RANGE');
       } catch (err) {
         expect((err as SyncEngineError).code).toBe('INVALID_RANGE');
@@ -2144,7 +2162,7 @@ describe('Phase 7.5 M4.2c — SnapshotOutboundPipeline & Send-Boundary Verificat
       expect(a1.message.messageId).toBeDefined();
 
       // 2. A1 successfully handed off to DataChannel send buffer
-      pipeline.handleHandoffSuccess(transferId, 0, a1.message.messageId, context);
+      pipeline.handleHandoffSuccess(transferId, 0, a1.message.messageId, a1.attemptToken, context);
 
       // 3. Network retransmission A2 requested
       const [a2] = pipeline.handleChunkRequest(transferId, [0], context);
@@ -2152,10 +2170,10 @@ describe('Phase 7.5 M4.2c — SnapshotOutboundPipeline & Send-Boundary Verificat
       expect(pipeline.getTransfer(transferId)!.retryCounts.get(0)).toBe(1);
 
       // 4. A2 successfully handed off
-      pipeline.handleHandoffSuccess(transferId, 0, a2.message.messageId, context);
+      pipeline.handleHandoffSuccess(transferId, 0, a2.message.messageId, a2.attemptToken, context);
 
       // 5. Delayed failure notification for A1 arrives
-      pipeline.handleHandoffFailure(transferId, 0, a1.message.messageId, context);
+      pipeline.handleHandoffFailure(transferId, 0, a1.message.messageId, a1.attemptToken, context);
 
       // 6. Verify that A2's reservation and retry accounting remain completely unchanged
       const session = pipeline.getTransfer(transferId)!;
@@ -2182,7 +2200,7 @@ describe('Phase 7.5 M4.2c — SnapshotOutboundPipeline & Send-Boundary Verificat
 
       // 1. Attempt A1 fails locally
       const [a1] = pipeline.handleChunkRequest(transferId, [0], context);
-      pipeline.handleHandoffFailure(transferId, 0, a1.message.messageId, context, (a1 as any).attemptToken);
+      pipeline.handleHandoffFailure(transferId, 0, a1.message.messageId, a1.attemptToken, context);
 
       // 2. Reservation is released
       expect(pipeline.getTransfer(transferId)!.inflightChunks.has(0)).toBe(false);
@@ -2192,7 +2210,7 @@ describe('Phase 7.5 M4.2c — SnapshotOutboundPipeline & Send-Boundary Verificat
       expect(pipeline.getTransfer(transferId)!.inflightChunks.has(0)).toBe(true);
 
       // 4. Duplicate failure notification for A1 arrives with A1's attemptToken
-      pipeline.handleHandoffFailure(transferId, 0, a1.message.messageId, context, (a1 as any).attemptToken);
+      pipeline.handleHandoffFailure(transferId, 0, a1.message.messageId, a1.attemptToken, context);
 
       // 5. Verify that A2 is not released
       const session = pipeline.getTransfer(transferId)!;
@@ -2220,10 +2238,14 @@ describe('Phase 7.5 M4.2c — SnapshotOutboundPipeline & Send-Boundary Verificat
       // 1. Chunks requested and handed off
       const totalChunks = pipeline.getTransfer(transferId)!.totalChunks;
       let firstFrameMessageId = '';
+      let firstFrameAttemptToken = '';
       for (let i = 0; i < totalChunks; i++) {
         const [frame] = pipeline.handleChunkRequest(transferId, [i], context);
-        if (i === 0) firstFrameMessageId = frame.message.messageId;
-        pipeline.handleHandoffSuccess(transferId, i, frame.message.messageId, context);
+        if (i === 0) {
+          firstFrameMessageId = frame.message.messageId;
+          firstFrameAttemptToken = frame.attemptToken;
+        }
+        pipeline.handleHandoffSuccess(transferId, i, frame.message.messageId, frame.attemptToken, context);
         pipeline.handleChunkAck(transferId, i, context);
       }
 
@@ -2232,7 +2254,7 @@ describe('Phase 7.5 M4.2c — SnapshotOutboundPipeline & Send-Boundary Verificat
       expect(pipeline.getTransfer(transferId)!.acknowledgedChunks.size).toBe(totalChunks);
 
       // 3. Delayed handoff-failure notification arrives for chunk 0
-      pipeline.handleHandoffFailure(transferId, 0, firstFrameMessageId, context);
+      pipeline.handleHandoffFailure(transferId, 0, firstFrameMessageId, firstFrameAttemptToken, context);
 
       // 4. Verify terminal completion and acknowledged state remain intact
       const session = pipeline.getTransfer(transferId)!;
@@ -2260,27 +2282,27 @@ describe('Phase 7.5 M4.2c — SnapshotOutboundPipeline & Send-Boundary Verificat
 
       // Initial attempt A1
       const [a1] = pipeline.handleChunkRequest(transferId, [0], context);
-      pipeline.handleHandoffSuccess(transferId, 0, a1.message.messageId, context);
+      pipeline.handleHandoffSuccess(transferId, 0, a1.message.messageId, a1.attemptToken, context);
 
       // Retransmission attempt A2
       const [a2] = pipeline.handleChunkRequest(transferId, [0], context);
       expect(pipeline.getTransfer(transferId)!.retryCounts.get(0)).toBe(1);
 
       // Out-of-order failure for attempt A1 arrives
-      pipeline.handleHandoffFailure(transferId, 0, a1.message.messageId, context);
+      pipeline.handleHandoffFailure(transferId, 0, a1.message.messageId, a1.attemptToken, context);
       // Ignored: retry count remains 1 and inflight remains true
       let session = pipeline.getTransfer(transferId)!;
       expect(session.retryCounts.get(0)).toBe(1);
       expect(session.inflightChunks.has(0)).toBe(true);
 
       // Success for attempt A2 arrives
-      pipeline.handleHandoffSuccess(transferId, 0, a2.message.messageId, context);
+      pipeline.handleHandoffSuccess(transferId, 0, a2.message.messageId, a2.attemptToken, context);
       session = pipeline.getTransfer(transferId)!;
       expect(session.retryCounts.get(0)).toBe(1);
       expect(session.inflightChunks.has(0)).toBe(true);
 
       // Duplicate failure for A1 arrives again
-      pipeline.handleHandoffFailure(transferId, 0, a1.message.messageId, context);
+      pipeline.handleHandoffFailure(transferId, 0, a1.message.messageId, a1.attemptToken, context);
       session = pipeline.getTransfer(transferId)!;
       expect(session.retryCounts.get(0)).toBe(1);
       expect(session.inflightChunks.has(0)).toBe(true);
@@ -2318,9 +2340,9 @@ describe('Phase 7.5 M4.2c — SnapshotOutboundPipeline & Send-Boundary Verificat
         expect(pipeline.getTransfer(transferId)!.inflightChunks.has(0)).toBe(true);
 
         // First failure callback
-        pipeline.handleHandoffFailure(transferId, 0, frame.message.messageId, context, (frame as any).attemptToken);
+        pipeline.handleHandoffFailure(transferId, 0, frame.message.messageId, frame.attemptToken, context);
         // Duplicate failure callback for same attempt
-        pipeline.handleHandoffFailure(transferId, 0, frame.message.messageId, context, (frame as any).attemptToken);
+        pipeline.handleHandoffFailure(transferId, 0, frame.message.messageId, frame.attemptToken, context);
 
         const session = pipeline.getTransfer(transferId)!;
         expect(session.inflightChunks.has(0)).toBe(false);
@@ -2331,7 +2353,7 @@ describe('Phase 7.5 M4.2c — SnapshotOutboundPipeline & Send-Boundary Verificat
       // 6th attempt: succeeds as initial transmission with zero retries consumed
       const [finalFrame] = pipeline.handleChunkRequest(transferId, [0], context);
       expect(finalFrame.message.messageId).toBe(initialMessageId);
-      pipeline.handleHandoffSuccess(transferId, 0, finalFrame.message.messageId, context);
+      pipeline.handleHandoffSuccess(transferId, 0, finalFrame.message.messageId, finalFrame.attemptToken, context);
 
       const finalSession = pipeline.getTransfer(transferId)!;
       expect(finalSession.transmittedChunks.has(0)).toBe(true);
@@ -2359,7 +2381,7 @@ describe('Phase 7.5 M4.2c — SnapshotOutboundPipeline & Send-Boundary Verificat
       const [frame0] = pipeline.handleChunkRequest(transferId, [0], context);
 
       // Report handoff success
-      pipeline.handleHandoffSuccess(transferId, 0, frame0.message.messageId, context);
+      pipeline.handleHandoffSuccess(transferId, 0, frame0.message.messageId, frame0.attemptToken, context);
 
       const session = pipeline.getTransfer(transferId)!;
       // In-flight reservation is retained (waiting for remote ACK)
@@ -2370,7 +2392,7 @@ describe('Phase 7.5 M4.2c — SnapshotOutboundPipeline & Send-Boundary Verificat
       expect(session.state).toBe('ACTIVE');
 
       // Stale handoff success with wrong messageId is a strict no-op
-      pipeline.handleHandoffSuccess(transferId, 0, 'msg-wrong-999', context);
+      pipeline.handleHandoffSuccess(transferId, 0, 'msg-wrong-999', 'msg-wrong-999:1', context);
       expect(pipeline.getTransfer(transferId)!.inflightChunks.has(0)).toBe(true);
 
       pipeline.dispose();
@@ -2398,7 +2420,7 @@ describe('Phase 7.5 M4.2c — SnapshotOutboundPipeline & Send-Boundary Verificat
         recipientPeerId: 'peer-imposter',
         connectionGeneration: 2,
       });
-      expect(() => pipeline.handleHandoffSuccess(transferId, 0, frame0.message.messageId, wrongPeerCtx)).toThrowError(
+      expect(() => pipeline.handleHandoffSuccess(transferId, 0, frame0.message.messageId, frame0.attemptToken, wrongPeerCtx)).toThrowError(
         /Authenticated peer 'peer-imposter' does not match/
       );
 
@@ -2407,14 +2429,462 @@ describe('Phase 7.5 M4.2c — SnapshotOutboundPipeline & Send-Boundary Verificat
         sessionId: 'sess-wrong',
         connectionGeneration: 2,
       });
-      expect(() => pipeline.handleHandoffSuccess(transferId, 0, frame0.message.messageId, wrongSessCtx)).toThrowError(
+      expect(() => pipeline.handleHandoffSuccess(transferId, 0, frame0.message.messageId, frame0.attemptToken, wrongSessCtx)).toThrowError(
         /Context sessionId 'sess-wrong' does not match/
       );
 
       // Out-of-bounds index
-      expect(() => pipeline.handleHandoffSuccess(transferId, 9999, frame0.message.messageId, validContext)).toThrowError(
+      expect(() => pipeline.handleHandoffSuccess(transferId, 9999, frame0.message.messageId, frame0.attemptToken, validContext)).toThrowError(
         /out of bounds/
       );
+
+      pipeline.dispose();
+    });
+  });
+
+  // ─────────────────────────────────────────────────────────────
+  // Phase 7.5 M4.2c-R4: Adversarial Attempt Identity & Retransmission Lifecycle Tests
+  // ─────────────────────────────────────────────────────────────
+  describe('Phase 7.5 M4.2c-R4: Adversarial Attempt Identity & Retransmission Lifecycle Tests', () => {
+    // R4-1 — Omitted attempt token
+    it('R4-1: omitted attempt token is safely ignored and cannot release or mutate active attempt H2', async () => {
+      const pipeline = createPipeline();
+      const transferId = generateUUID();
+
+      await pipeline.startTransfer({
+        transferId,
+        recipientPeerId: RECIPIENT_PEER_ID,
+        supplierPeerId: SUPPLIER_PEER_ID,
+        membershipEpoch: MEMBERSHIP_EPOCH,
+        sctpMaxMessageSize: 2144,
+        captureAndSerializeFn: () => createSerializedArtifact(5, 'r4-1'),
+      });
+
+      const context = createContext(pipeline, transferId);
+
+      // Attempt H1
+      const [h1] = pipeline.handleChunkRequest(transferId, [0], context);
+      const m1 = h1.message.messageId;
+      const t1 = h1.attemptToken;
+
+      // H1 fails locally
+      pipeline.handleHandoffFailure(transferId, 0, m1, t1, context);
+      expect(pipeline.getTransfer(transferId)!.inflightChunks.has(0)).toBe(false);
+
+      // Attempt H2 requested: reuses m1 with new token T2
+      const [h2] = pipeline.handleChunkRequest(transferId, [0], context);
+      expect(h2.message.messageId).toBe(m1);
+      expect(h2.attemptToken).not.toBe(t1);
+      expect(pipeline.getTransfer(transferId)!.inflightChunks.has(0)).toBe(true);
+
+      // Stale callback for H1 with undefined/omitted attemptToken arrives
+      (pipeline as any).handleHandoffFailure(transferId, 0, m1, undefined, context);
+
+      // Verify H2 is NOT released and NOT mutated!
+      let session = pipeline.getTransfer(transferId)!;
+      expect(session.inflightChunks.has(0)).toBe(true);
+      expect(session.transmittedChunks.has(0)).toBe(true);
+
+      // Stale success callback without token
+      (pipeline as any).handleHandoffSuccess(transferId, 0, m1, undefined, context);
+      session = pipeline.getTransfer(transferId)!;
+      expect(session.inflightChunks.has(0)).toBe(true);
+
+      pipeline.dispose();
+    });
+
+    // R4-2 — Empty and malformed tokens
+    it('R4-2: rejects/ignores empty, whitespace, null, and non-string malformed tokens safely without error', async () => {
+      const pipeline = createPipeline();
+      const transferId = generateUUID();
+
+      await pipeline.startTransfer({
+        transferId,
+        recipientPeerId: RECIPIENT_PEER_ID,
+        supplierPeerId: SUPPLIER_PEER_ID,
+        membershipEpoch: MEMBERSHIP_EPOCH,
+        sctpMaxMessageSize: 2144,
+        captureAndSerializeFn: () => createSerializedArtifact(5, 'r4-2'),
+      });
+
+      const context = createContext(pipeline, transferId);
+      const [frame] = pipeline.handleChunkRequest(transferId, [0], context);
+      const msgId = frame.message.messageId;
+
+      const malformedTokens = ['', '   ', null, undefined, 12345, {}, [], true, 'wrong-token'];
+
+      for (const token of malformedTokens) {
+        expect(() => {
+          (pipeline as any).handleHandoffFailure(transferId, 0, msgId, token, context);
+        }).not.toThrow();
+        expect(() => {
+          (pipeline as any).handleHandoffSuccess(transferId, 0, msgId, token, context);
+        }).not.toThrow();
+
+        // Attempt remains active and in-flight
+        const session = pipeline.getTransfer(transferId)!;
+        expect(session.inflightChunks.has(0)).toBe(true);
+      }
+
+      pipeline.dispose();
+    });
+
+    // R4-3 — Stale success and failure
+    it('R4-3: stale success and failure callbacks from H1 cannot mutate active attempt H2', async () => {
+      const pipeline = createPipeline();
+      const transferId = generateUUID();
+
+      await pipeline.startTransfer({
+        transferId,
+        recipientPeerId: RECIPIENT_PEER_ID,
+        supplierPeerId: SUPPLIER_PEER_ID,
+        membershipEpoch: MEMBERSHIP_EPOCH,
+        sctpMaxMessageSize: 2144,
+        captureAndSerializeFn: () => createSerializedArtifact(5, 'r4-3'),
+      });
+
+      const context = createContext(pipeline, transferId);
+
+      const [h1] = pipeline.handleChunkRequest(transferId, [0], context);
+      pipeline.handleHandoffFailure(transferId, 0, h1.message.messageId, h1.attemptToken, context);
+
+      const [h2] = pipeline.handleChunkRequest(transferId, [0], context);
+      expect(pipeline.getTransfer(transferId)!.inflightChunks.has(0)).toBe(true);
+
+      // Stale failure for H1 with H1 token arrives
+      pipeline.handleHandoffFailure(transferId, 0, h1.message.messageId, h1.attemptToken, context);
+      expect(pipeline.getTransfer(transferId)!.inflightChunks.has(0)).toBe(true);
+
+      // Stale success for H1 with H1 token arrives
+      pipeline.handleHandoffSuccess(transferId, 0, h1.message.messageId, h1.attemptToken, context);
+      expect(pipeline.getTransfer(transferId)!.inflightChunks.has(0)).toBe(true);
+
+      pipeline.dispose();
+    });
+
+    // R4-4 — Attempt-history isolation
+    it('R4-4: tracks attempt history by attemptToken so H1 failure and H2 success remain independent', async () => {
+      const pipeline = createPipeline();
+      const transferId = generateUUID();
+
+      await pipeline.startTransfer({
+        transferId,
+        recipientPeerId: RECIPIENT_PEER_ID,
+        supplierPeerId: SUPPLIER_PEER_ID,
+        membershipEpoch: MEMBERSHIP_EPOCH,
+        sctpMaxMessageSize: 2144,
+        captureAndSerializeFn: () => createSerializedArtifact(5, 'r4-4'),
+      });
+
+      const context = createContext(pipeline, transferId);
+
+      const [h1] = pipeline.handleChunkRequest(transferId, [0], context);
+      pipeline.handleHandoffFailure(transferId, 0, h1.message.messageId, h1.attemptToken, context);
+
+      const [h2] = pipeline.handleChunkRequest(transferId, [0], context);
+      expect(h2.message.messageId).toBe(h1.message.messageId);
+      expect(h2.attemptToken).not.toBe(h1.attemptToken);
+
+      pipeline.handleHandoffSuccess(transferId, 0, h2.message.messageId, h2.attemptToken, context);
+
+      // Observable verification:
+      // H1 is failed, so repeating H1 callback is a no-op
+      pipeline.handleHandoffFailure(transferId, 0, h1.message.messageId, h1.attemptToken, context);
+      pipeline.handleHandoffSuccess(transferId, 0, h1.message.messageId, h1.attemptToken, context);
+
+      // H2 remains successfully handed off and waiting for ACK
+      const session = pipeline.getTransfer(transferId)!;
+      expect(session.inflightChunks.has(0)).toBe(true);
+      expect(session.acknowledgedChunks.has(0)).toBe(false);
+
+      // ACK H2 succeeds
+      pipeline.handleChunkAck(transferId, 0, context);
+      expect(pipeline.getTransfer(transferId)!.acknowledgedChunks.has(0)).toBe(true);
+
+      pipeline.dispose();
+    });
+
+    // R4-5 — Frame return is not successful handoff
+    it('R4-5: returning a frame and requesting it again before handoff does not allocate new messageId or consume retry', async () => {
+      const pipeline = createPipeline({ maxRetriesPerChunk: 3 });
+      const transferId = generateUUID();
+
+      await pipeline.startTransfer({
+        transferId,
+        recipientPeerId: RECIPIENT_PEER_ID,
+        supplierPeerId: SUPPLIER_PEER_ID,
+        membershipEpoch: MEMBERSHIP_EPOCH,
+        sctpMaxMessageSize: 2144,
+        captureAndSerializeFn: () => createSerializedArtifact(5, 'r4-5'),
+      });
+
+      const context = createContext(pipeline, transferId);
+
+      // Initial request: returns F1
+      const [f1] = pipeline.handleChunkRequest(transferId, [0], context);
+      expect(pipeline.getTransfer(transferId)!.retryCounts.get(0)).toBeUndefined();
+
+      // Request again without any handoff success or failure
+      const [f2] = pipeline.handleChunkRequest(transferId, [0], context);
+
+      // Must preserve the exact same messageId
+      expect(f2.message.messageId).toBe(f1.message.messageId);
+      // Zero retries consumed
+      expect(pipeline.getTransfer(transferId)!.retryCounts.get(0)).toBeUndefined();
+      expect(pipeline.getTransfer(transferId)!.inflightChunks.has(0)).toBe(true);
+
+      pipeline.dispose();
+    });
+
+    // R4-6 — Initial failure and retry
+    it('R4-6: repeated initial local failures preserve M1 and consume zero network retries across new attemptTokens', async () => {
+      const pipeline = createPipeline({ maxRetriesPerChunk: 3 });
+      const transferId = generateUUID();
+
+      await pipeline.startTransfer({
+        transferId,
+        recipientPeerId: RECIPIENT_PEER_ID,
+        supplierPeerId: SUPPLIER_PEER_ID,
+        membershipEpoch: MEMBERSHIP_EPOCH,
+        sctpMaxMessageSize: 2144,
+        captureAndSerializeFn: () => createSerializedArtifact(5, 'r4-6'),
+      });
+
+      const context = createContext(pipeline, transferId);
+
+      const seenTokens = new Set<string>();
+      let initialMsgId = '';
+
+      for (let attempt = 1; attempt <= 4; attempt++) {
+        const [frame] = pipeline.handleChunkRequest(transferId, [0], context);
+        if (attempt === 1) {
+          initialMsgId = frame.message.messageId;
+        } else {
+          expect(frame.message.messageId).toBe(initialMsgId);
+        }
+        expect(seenTokens.has(frame.attemptToken)).toBe(false);
+        seenTokens.add(frame.attemptToken);
+
+        // Fail locally
+        pipeline.handleHandoffFailure(transferId, 0, frame.message.messageId, frame.attemptToken, context);
+        const session = pipeline.getTransfer(transferId)!;
+        expect(session.inflightChunks.has(0)).toBe(false);
+        expect(session.retryCounts.get(0)).toBeUndefined();
+      }
+
+      // 5th attempt succeeds
+      const [finalFrame] = pipeline.handleChunkRequest(transferId, [0], context);
+      expect(finalFrame.message.messageId).toBe(initialMsgId);
+      expect(seenTokens.has(finalFrame.attemptToken)).toBe(false);
+
+      pipeline.handleHandoffSuccess(transferId, 0, finalFrame.message.messageId, finalFrame.attemptToken, context);
+
+      const finalSession = pipeline.getTransfer(transferId)!;
+      expect(finalSession.retryCounts.get(0)).toBeUndefined(); // Zero retries!
+      expect(finalSession.inflightChunks.has(0)).toBe(true);
+
+      pipeline.dispose();
+    });
+
+    // R4-7 — Retransmission local failure
+    it('R4-7: retransmission local failure rolls back reservation and next local attempt reuses M2 with new token, not M3', async () => {
+      const pipeline = createPipeline({ maxRetriesPerChunk: 3 });
+      const transferId = generateUUID();
+
+      await pipeline.startTransfer({
+        transferId,
+        recipientPeerId: RECIPIENT_PEER_ID,
+        supplierPeerId: SUPPLIER_PEER_ID,
+        membershipEpoch: MEMBERSHIP_EPOCH,
+        sctpMaxMessageSize: 2144,
+        captureAndSerializeFn: () => createSerializedArtifact(5, 'r4-7'),
+      });
+
+      const context = createContext(pipeline, transferId);
+
+      // 1. Initial M1 succeeds
+      const [m1] = pipeline.handleChunkRequest(transferId, [0], context);
+      pipeline.handleHandoffSuccess(transferId, 0, m1.message.messageId, m1.attemptToken, context);
+      expect(pipeline.getTransfer(transferId)!.retryCounts.get(0)).toBeUndefined();
+
+      // 2. Genuine network retransmission requested: receives M2
+      const [m2Attempt1] = pipeline.handleChunkRequest(transferId, [0], context);
+      expect(m2Attempt1.message.messageId).not.toBe(m1.message.messageId);
+      const m2Id = m2Attempt1.message.messageId;
+      expect(pipeline.getTransfer(transferId)!.retryCounts.get(0)).toBe(1);
+
+      // 3. M2 fails locally
+      pipeline.handleHandoffFailure(transferId, 0, m2Id, m2Attempt1.attemptToken, context);
+      // Reservation rolled back: retryCount becomes undefined (0 retries)
+      expect(pipeline.getTransfer(transferId)!.retryCounts.get(0)).toBeUndefined();
+      expect(pipeline.getTransfer(transferId)!.inflightChunks.has(0)).toBe(false);
+
+      // 4. Next local attempt requested: must reuse M2 with new attemptToken, NOT create M3!
+      const [m2Attempt2] = pipeline.handleChunkRequest(transferId, [0], context);
+      expect(m2Attempt2.message.messageId).toBe(m2Id);
+      expect(m2Attempt2.attemptToken).not.toBe(m2Attempt1.attemptToken);
+      expect(pipeline.getTransfer(transferId)!.retryCounts.get(0)).toBe(1);
+
+      // 5. M2 succeeds local handoff
+      pipeline.handleHandoffSuccess(transferId, 0, m2Id, m2Attempt2.attemptToken, context);
+      expect(pipeline.getTransfer(transferId)!.retryCounts.get(0)).toBe(1);
+
+      // 6. Next genuine network retransmission receives M3
+      const [m3] = pipeline.handleChunkRequest(transferId, [0], context);
+      expect(m3.message.messageId).not.toBe(m2Id);
+      expect(m3.message.messageId).not.toBe(m1.message.messageId);
+      expect(pipeline.getTransfer(transferId)!.retryCounts.get(0)).toBe(2);
+
+      pipeline.dispose();
+    });
+
+    // R4-8 — Multiple retransmissions
+    it('R4-8: multiple genuine network retransmissions each receive fresh messageId and increment retries exactly once up to limit', async () => {
+      const pipeline = createPipeline({ maxRetriesPerChunk: 3 });
+      const transferId = generateUUID();
+
+      await pipeline.startTransfer({
+        transferId,
+        recipientPeerId: RECIPIENT_PEER_ID,
+        supplierPeerId: SUPPLIER_PEER_ID,
+        membershipEpoch: MEMBERSHIP_EPOCH,
+        sctpMaxMessageSize: 2144,
+        captureAndSerializeFn: () => createSerializedArtifact(5, 'r4-8'),
+      });
+
+      const context = createContext(pipeline, transferId);
+
+      // Initial transmission (M1)
+      const [m1] = pipeline.handleChunkRequest(transferId, [0], context);
+      expect(pipeline.getTransfer(transferId)!.retryCounts.get(0)).toBeUndefined();
+      pipeline.handleHandoffSuccess(transferId, 0, m1.message.messageId, m1.attemptToken, context);
+
+      // Retransmission 1 (M2)
+      const [m2] = pipeline.handleChunkRequest(transferId, [0], context);
+      expect(m2.message.messageId).not.toBe(m1.message.messageId);
+      expect(pipeline.getTransfer(transferId)!.retryCounts.get(0)).toBe(1);
+      pipeline.handleHandoffSuccess(transferId, 0, m2.message.messageId, m2.attemptToken, context);
+
+      // Retransmission 2 (M3)
+      const [m3] = pipeline.handleChunkRequest(transferId, [0], context);
+      expect(m3.message.messageId).not.toBe(m2.message.messageId);
+      expect(pipeline.getTransfer(transferId)!.retryCounts.get(0)).toBe(2);
+      pipeline.handleHandoffSuccess(transferId, 0, m3.message.messageId, m3.attemptToken, context);
+
+      // Retransmission 3 (M4)
+      const [m4] = pipeline.handleChunkRequest(transferId, [0], context);
+      expect(m4.message.messageId).not.toBe(m3.message.messageId);
+      expect(pipeline.getTransfer(transferId)!.retryCounts.get(0)).toBe(3);
+      pipeline.handleHandoffSuccess(transferId, 0, m4.message.messageId, m4.attemptToken, context);
+
+      // Retransmission 4 (exceeds maxRetriesPerChunk 3) -> aborts
+      expect(() => {
+        pipeline.handleChunkRequest(transferId, [0], context);
+      }).toThrowError(/Retry budget exhausted/);
+
+      const session = pipeline.getTransfer(transferId)!;
+      expect(session.state).toBe('ABORTED');
+      expect(session.failureReason).toBe('RETRY_BUDGET_EXHAUSTED');
+
+      pipeline.dispose();
+    });
+
+    // R4-9 — Delayed callback after a newer successful attempt
+    it('R4-9: delayed callback after a newer successful attempt does not alter the attempt or ACK lifecycle', async () => {
+      const pipeline = createPipeline({ maxRetriesPerChunk: 3 });
+      const transferId = generateUUID();
+
+      await pipeline.startTransfer({
+        transferId,
+        recipientPeerId: RECIPIENT_PEER_ID,
+        supplierPeerId: SUPPLIER_PEER_ID,
+        membershipEpoch: MEMBERSHIP_EPOCH,
+        sctpMaxMessageSize: 2144,
+        captureAndSerializeFn: () => createSerializedArtifact(5, 'r4-9'),
+      });
+
+      const context = createContext(pipeline, transferId);
+
+      // M1 succeeds
+      const [m1] = pipeline.handleChunkRequest(transferId, [0], context);
+      pipeline.handleHandoffSuccess(transferId, 0, m1.message.messageId, m1.attemptToken, context);
+
+      // M2 retransmission succeeds
+      const [m2] = pipeline.handleChunkRequest(transferId, [0], context);
+      pipeline.handleHandoffSuccess(transferId, 0, m2.message.messageId, m2.attemptToken, context);
+
+      // Delayed failure for M1 arrives
+      pipeline.handleHandoffFailure(transferId, 0, m1.message.messageId, m1.attemptToken, context);
+      expect(pipeline.getTransfer(transferId)!.inflightChunks.has(0)).toBe(true);
+      expect(pipeline.getTransfer(transferId)!.retryCounts.get(0)).toBe(1);
+
+      // Chunk ACK arrives
+      pipeline.handleChunkAck(transferId, 0, context);
+      expect(pipeline.getTransfer(transferId)!.acknowledgedChunks.has(0)).toBe(true);
+
+      // Late callbacks for M2 arrive after ACK
+      pipeline.handleHandoffFailure(transferId, 0, m2.message.messageId, m2.attemptToken, context);
+      pipeline.handleHandoffSuccess(transferId, 0, m2.message.messageId, m2.attemptToken, context);
+      expect(pipeline.getTransfer(transferId)!.acknowledgedChunks.has(0)).toBe(true);
+
+      pipeline.dispose();
+    });
+
+    // R4-10 — Context and terminal fencing
+    it('R4-10: enforces contextual fencing on callbacks and ensures terminal state immunity', async () => {
+      const pipeline = createPipeline();
+      const transferId = generateUUID();
+
+      await pipeline.startTransfer({
+        transferId,
+        recipientPeerId: RECIPIENT_PEER_ID,
+        supplierPeerId: SUPPLIER_PEER_ID,
+        membershipEpoch: MEMBERSHIP_EPOCH,
+        connectionGeneration: 1,
+        sctpMaxMessageSize: FALLBACK_SCTP_LIMIT,
+        captureAndSerializeFn: () => createSerializedArtifact(1, 'r4-10'),
+      });
+
+      const validContext = createContext(pipeline, transferId, { connectionGeneration: 1 });
+      const [frame] = pipeline.handleChunkRequest(transferId, [0], validContext);
+
+      // 1. Context fencing checks:
+      const imposterPeer = createContext(pipeline, transferId, { recipientPeerId: 'peer-wrong' });
+      expect(() => {
+        pipeline.handleHandoffSuccess(transferId, 0, frame.message.messageId, frame.attemptToken, imposterPeer);
+      }).toThrowError(/Authenticated peer 'peer-wrong' does not match/);
+      expect(() => {
+        pipeline.handleHandoffFailure(transferId, 0, frame.message.messageId, frame.attemptToken, imposterPeer);
+      }).toThrowError(/Authenticated peer 'peer-wrong' does not match/);
+
+      const imposterSession = createContext(pipeline, transferId, { sessionId: 'sess-wrong' });
+      expect(() => {
+        pipeline.handleHandoffSuccess(transferId, 0, frame.message.messageId, frame.attemptToken, imposterSession);
+      }).toThrowError(/Context sessionId 'sess-wrong' does not match/);
+
+      const staleEpoch = createContext(pipeline, transferId, { membershipEpoch: 999 });
+      expect(() => {
+        pipeline.handleHandoffSuccess(transferId, 0, frame.message.messageId, frame.attemptToken, staleEpoch);
+      }).toThrowError(/Context membershipEpoch/);
+
+      const staleGeneration = createContext(pipeline, transferId, { connectionGeneration: 99 });
+      expect(() => {
+        pipeline.handleHandoffSuccess(transferId, 0, frame.message.messageId, frame.attemptToken, staleGeneration);
+      }).toThrowError(/Context connectionGeneration/);
+
+      // 2. Terminal state immunity: cancel transfer
+      pipeline.cancelTransfer(transferId);
+      expect(pipeline.getTransfer(transferId)!.state).toBe('CANCELLED');
+
+      // Duplicate callbacks on cancelled transfer are harmless no-ops
+      expect(() => {
+        pipeline.handleHandoffSuccess(transferId, 0, frame.message.messageId, frame.attemptToken, validContext);
+      }).not.toThrow();
+      expect(() => {
+        pipeline.handleHandoffFailure(transferId, 0, frame.message.messageId, frame.attemptToken, validContext);
+      }).not.toThrow();
+
+      expect(pipeline.getTransfer(transferId)!.state).toBe('CANCELLED');
 
       pipeline.dispose();
     });

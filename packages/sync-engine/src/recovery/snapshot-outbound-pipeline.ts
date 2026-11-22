@@ -150,6 +150,15 @@ export type OutboundChunkResult =
     };
 
 /**
+ * Produced chunk frame decorated with attempt identity metadata.
+ */
+export interface OutboundPreparedChunk extends ProducedChunkMessage {
+  readonly messageId: string;
+  readonly attemptSeq: number;
+  readonly attemptToken: string;
+}
+
+/**
  * Finite state machine states for an outbound transfer session.
  */
 export type OutboundTransferState =
@@ -242,11 +251,13 @@ interface InternalTransferRecord {
   readonly handedOffChunks: Set<number>;
   readonly handedOffAttempts: Set<string>;
   readonly failedAttempts: Set<string>;
-  readonly activeAttempts: Map<number, { messageId: string; attemptSeq: number; attemptToken: string }>;
+  readonly activeAttempts: Map<number, { messageId: string; attemptSeq: number; attemptToken: string; isRetransmission: boolean }>;
   readonly attemptCounters: Map<number, number>;
   readonly retryCounts: Map<number, number>;
+  readonly confirmedRetries: Map<number, number>;
   readonly preparedFrames: Map<number, ProducedChunkMessage>;
   readonly chunkMessageIds: Map<number, string>;
+  readonly lastHandedOffMessageIds: Map<number, string>;
   leaseHeld: boolean;
   timeoutTimer?: ReturnType<typeof setTimeout> | undefined;
 }
@@ -664,8 +675,10 @@ export class SnapshotOutboundPipeline {
       activeAttempts: new Map(),
       attemptCounters: new Map(),
       retryCounts: new Map(),
+      confirmedRetries: new Map(),
       preparedFrames: new Map(),
       chunkMessageIds: new Map(),
+      lastHandedOffMessageIds: new Map(),
       leaseHeld: false,
     };
 
@@ -771,7 +784,7 @@ export class SnapshotOutboundPipeline {
     transferId: string,
     requestedChunkIndices: number[],
     context: AuthenticatedRecipientContext
-  ): ProducedChunkMessage[] {
+  ): OutboundPreparedChunk[] {
     this.#assertNotDisposed();
 
     const record = this.#assertActiveTransfer(transferId);
@@ -782,7 +795,7 @@ export class SnapshotOutboundPipeline {
     }
 
     const producer = record.producer!;
-    const results: ProducedChunkMessage[] = [];
+    const results: OutboundPreparedChunk[] = [];
     const uniqueIndices = Array.from(new Set(requestedChunkIndices));
 
     for (const chunkIndex of uniqueIndices) {
@@ -798,41 +811,12 @@ export class SnapshotOutboundPipeline {
       }
 
       const currentMessageId = record.chunkMessageIds.get(chunkIndex);
-      const isFailedLocalAttempt =
-        currentMessageId !== undefined && record.failedAttempts.has(currentMessageId);
-
-      // A request is a network retransmission if this chunk was already transmitted
-      const isRetransmission = record.transmittedChunks.has(chunkIndex);
+      const lastHandedOffMessageId = record.lastHandedOffMessageIds.get(chunkIndex);
 
       let messageId: string;
+      let isRetransmission: boolean;
 
-      if (isRetransmission) {
-        // Retransmission check: capped at maxRetriesPerChunk (Rule 9)
-        const currentRetries = record.retryCounts.get(chunkIndex) ?? 0;
-        if (currentRetries >= this.#maxRetriesPerChunk) {
-          this.#terminate(
-            record,
-            'ABORTED',
-            `Retry budget (${this.#maxRetriesPerChunk}) exhausted for chunk ${chunkIndex}`,
-            'RETRY_BUDGET_EXHAUSTED'
-          );
-          throw new SyncEngineError(
-            'LOCAL_ABORT',
-            `Retry budget exhausted for chunk ${chunkIndex} in transfer ${transferId}`
-          );
-        }
-        record.retryCounts.set(chunkIndex, currentRetries + 1);
-
-        if (isFailedLocalAttempt) {
-          // Rule 5: Failed local handoff preserves messageId for next local attempt
-          messageId = currentMessageId!;
-          record.failedAttempts.delete(messageId);
-        } else {
-          // Rule 7: Subsequent network retransmission receives a new messageId
-          messageId = `msg-${generateUUID()}`;
-          record.chunkMessageIds.set(chunkIndex, messageId);
-        }
-      } else {
+      if (currentMessageId === undefined) {
         // Initial transmission check: enforce sliding window capacity
         if (!record.inflightChunks.has(chunkIndex) && record.inflightChunks.size >= this.#slidingWindowSize) {
           throw new SyncEngineError(
@@ -841,16 +825,58 @@ export class SnapshotOutboundPipeline {
           );
         }
 
-        if (isFailedLocalAttempt) {
-          // Rule 5: Failed local handoff preserves messageId for next local attempt
-          messageId = currentMessageId!;
-          record.failedAttempts.delete(messageId);
-        } else {
-          // Initial transmission attempt: allocate initial messageId
+        // Initial transmission attempt: allocate initial messageId
+        messageId = `msg-${generateUUID()}`;
+        record.chunkMessageIds.set(chunkIndex, messageId);
+        record.transmittedChunks.add(chunkIndex);
+        isRetransmission = false;
+      } else {
+        const currentMessageWasHandedOff =
+          lastHandedOffMessageId !== undefined && lastHandedOffMessageId === currentMessageId;
+
+        if (currentMessageWasHandedOff) {
+          // Current message was ALREADY successfully handed off to the transport send buffer.
+          // This new request is a GENUINE NETWORK RETRANSMISSION!
+          const confirmedRetries = record.confirmedRetries.get(chunkIndex) ?? 0;
+          if (confirmedRetries >= this.#maxRetriesPerChunk) {
+            this.#terminate(
+              record,
+              'ABORTED',
+              `Retry budget (${this.#maxRetriesPerChunk}) exhausted for chunk ${chunkIndex}`,
+              'RETRY_BUDGET_EXHAUSTED'
+            );
+            throw new SyncEngineError(
+              'LOCAL_ABORT',
+              `Retry budget exhausted for chunk ${chunkIndex} in transfer ${transferId}`
+            );
+          }
+
+          // Rule 7: Subsequent network retransmission receives a new messageId
           messageId = `msg-${generateUUID()}`;
           record.chunkMessageIds.set(chunkIndex, messageId);
+          // Reserve retry count for this new retransmission attempt
+          record.retryCounts.set(chunkIndex, confirmedRetries + 1);
+          isRetransmission = true;
+        } else {
+          // Rule 5: Failed local handoff preserves messageId for next local attempt
+          // Zero network retries consumed; reuse currentMessageId
+          messageId = currentMessageId;
+          const isPriorRetransmissionChunk = record.handedOffChunks.has(chunkIndex);
+          if (isPriorRetransmissionChunk) {
+            isRetransmission = true;
+            const confirmed = record.confirmedRetries.get(chunkIndex) ?? 0;
+            record.retryCounts.set(chunkIndex, confirmed + 1);
+          } else {
+            isRetransmission = false;
+            if (!record.inflightChunks.has(chunkIndex) && record.inflightChunks.size >= this.#slidingWindowSize) {
+              throw new SyncEngineError(
+                'LOCAL_ABORT',
+                `In-flight sliding window capacity (${this.#slidingWindowSize}) reached for transfer ${transferId}`
+              );
+            }
+            record.transmittedChunks.add(chunkIndex);
+          }
         }
-        record.transmittedChunks.add(chunkIndex);
       }
 
       // Re-use already prepared frame from sliding window cache if available and matching messageId
@@ -886,8 +912,8 @@ export class SnapshotOutboundPipeline {
       record.attemptCounters.set(chunkIndex, attemptSeq);
       const attemptToken = `${messageId}:${attemptSeq}`;
 
-      // Return attempt-bound ProducedChunkMessage descriptor
-      const attemptFrame: ProducedChunkMessage = Object.freeze({
+      // Return attempt-bound OutboundPreparedChunk descriptor
+      const attemptFrame: OutboundPreparedChunk = Object.freeze({
         ...frame,
         messageId,
         attemptSeq,
@@ -895,7 +921,7 @@ export class SnapshotOutboundPipeline {
       });
 
       // Rule 3: Track active attempt using at least (transferId, chunkIndex, messageId)
-      record.activeAttempts.set(chunkIndex, { messageId, attemptSeq, attemptToken });
+      record.activeAttempts.set(chunkIndex, { messageId, attemptSeq, attemptToken, isRetransmission });
       record.inflightChunks.add(chunkIndex);
       results.push(attemptFrame);
     }
@@ -976,8 +1002,8 @@ export class SnapshotOutboundPipeline {
     transferId: string,
     chunkIndex: number,
     messageId: string,
-    context: AuthenticatedRecipientContext,
-    attemptToken?: string | number
+    attemptToken: string,
+    context: AuthenticatedRecipientContext
   ): void {
     this.#assertNotDisposed();
 
@@ -1003,25 +1029,33 @@ export class SnapshotOutboundPipeline {
       return;
     }
 
+    if (!attemptToken || typeof attemptToken !== 'string' || attemptToken.trim() === '') {
+      return;
+    }
+    if (!messageId || typeof messageId !== 'string' || messageId.trim() === '') {
+      return;
+    }
+
     const active = record.activeAttempts.get(chunkIndex);
     if (!active) {
       return;
     }
-    if (active.messageId !== messageId) {
-      // Stale or duplicate callback for an older or mismatched attempt: NO-OP (Rule 4, 8)
-      return;
-    }
-    if (
-      attemptToken !== undefined &&
-      attemptToken !== active.attemptToken &&
-      attemptToken !== active.attemptSeq
-    ) {
+    if (active.messageId !== messageId || active.attemptToken !== attemptToken) {
+      // Stale, duplicate, or mismatched attempt: NO-OP (Rule 4, 8)
       return;
     }
 
     // Record entry into local send buffer (Rule 6, 10)
-    record.handedOffAttempts.add(messageId);
+    record.handedOffAttempts.add(attemptToken);
     record.handedOffChunks.add(chunkIndex);
+    record.lastHandedOffMessageIds.set(chunkIndex, messageId);
+
+    if (active.isRetransmission) {
+      const currentConfirmed = record.confirmedRetries.get(chunkIndex) ?? 0;
+      const newConfirmed = currentConfirmed + 1;
+      record.confirmedRetries.set(chunkIndex, newConfirmed);
+      record.retryCounts.set(chunkIndex, newConfirmed);
+    }
   }
 
   /**
@@ -1034,40 +1068,14 @@ export class SnapshotOutboundPipeline {
     transferId: string,
     chunkIndex: number,
     messageId: string,
-    context: AuthenticatedRecipientContext,
-    attemptToken?: string | number
-  ): void;
-  public handleHandoffFailure(
-    transferId: string,
-    chunkIndex: number,
+    attemptToken: string,
     context: AuthenticatedRecipientContext
-  ): void;
-  public handleHandoffFailure(
-    transferId: string,
-    chunkIndex: number,
-    messageIdOrContext: string | AuthenticatedRecipientContext,
-    maybeContext?: AuthenticatedRecipientContext,
-    attemptToken?: string | number
   ): void {
     this.#assertNotDisposed();
 
     const record = this.#transfers.get(transferId);
     if (!record || this.#isTerminalState(record.state)) {
       return;
-    }
-
-    let messageId: string | undefined;
-    let context: AuthenticatedRecipientContext;
-
-    if (typeof messageIdOrContext === 'string') {
-      messageId = messageIdOrContext;
-      if (!maybeContext || typeof maybeContext !== 'object') {
-        throw new SyncEngineError('UNAUTHORIZED', 'Authenticated recipient context is required');
-      }
-      context = maybeContext;
-    } else {
-      context = messageIdOrContext;
-      messageId = undefined;
     }
 
     this.#validateContext(record, transferId, context);
@@ -1088,43 +1096,38 @@ export class SnapshotOutboundPipeline {
       return;
     }
 
-    const active = record.activeAttempts.get(chunkIndex);
+    if (!attemptToken || typeof attemptToken !== 'string' || attemptToken.trim() === '') {
+      return;
+    }
+    if (!messageId || typeof messageId !== 'string' || messageId.trim() === '') {
+      return;
+    }
 
-    // Rule 4 & 8: A callback whose messageId does not match the active attempt must be a strict no-op.
-    if (messageId !== undefined) {
-      if (!active || active.messageId !== messageId) {
-        return;
-      }
-      if (
-        attemptToken !== undefined &&
-        attemptToken !== active.attemptToken &&
-        attemptToken !== active.attemptSeq
-      ) {
-        return;
-      }
-    } else {
-      // Legacy 3-arg call fallback
-      if (!active) {
-        return;
-      }
-      messageId = active.messageId;
+    const active = record.activeAttempts.get(chunkIndex);
+    if (!active) {
+      return;
+    }
+
+    // Rule 4 & 8: A callback whose messageId or attemptToken does not match the active attempt must be a strict no-op.
+    if (active.messageId !== messageId || active.attemptToken !== attemptToken) {
+      return;
     }
 
     // Mark attempt as failed locally and remove from active attempt tracking
     record.activeAttempts.delete(chunkIndex);
-    record.failedAttempts.add(messageId);
+    record.failedAttempts.add(attemptToken);
 
     // Release in-flight reservation
     if (record.inflightChunks.has(chunkIndex)) {
       record.inflightChunks.delete(chunkIndex);
 
-      // Roll back retry count if this attempt was a retransmission that failed local handoff (Rule 9)
-      const currentRetries = record.retryCounts.get(chunkIndex);
-      if (currentRetries !== undefined && currentRetries > 0) {
-        if (currentRetries <= 1) {
+      if (active.isRetransmission) {
+        // Roll back uncompleted retry reservation (Section 4, Rule 9)
+        const confirmed = record.confirmedRetries.get(chunkIndex) ?? 0;
+        if (confirmed === 0) {
           record.retryCounts.delete(chunkIndex);
         } else {
-          record.retryCounts.set(chunkIndex, currentRetries - 1);
+          record.retryCounts.set(chunkIndex, confirmed);
         }
       } else {
         // Failed initial transmission handoff: chunk was never successfully handed off
