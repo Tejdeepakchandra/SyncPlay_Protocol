@@ -189,6 +189,10 @@ export interface OutboundTransferSession {
   readonly inflightChunks: ReadonlySet<number>;
   readonly transmittedChunks: ReadonlySet<number>;
   readonly retryCounts: ReadonlyMap<number, number>;
+  readonly confirmedRetries: ReadonlyMap<number, number>;
+  readonly activeAttempts: ReadonlyMap<number, { messageId: string; attemptSeq: number; attemptToken: string; isRetransmission: boolean }>;
+  readonly handedOffAttempts: ReadonlySet<string>;
+  readonly failedAttempts: ReadonlySet<string>;
   readonly offerMessage?: ProtocolMessage<SnapshotOfferPayload>;
   readonly failureReason?: SnapshotAbortReason;
   readonly failureDetail?: string;
@@ -810,6 +814,15 @@ export class SnapshotOutboundPipeline {
         throw new SyncEngineError('INVALID_STATE', `Chunk ${chunkIndex} is already acknowledged`);
       }
 
+      // Safe Coalescing Policy (Finding D1):
+      // If this chunk already has an active attempt pending local handoff callback,
+      // produce no additional dispatchable handoff to prevent duplicate physical transmission
+      // and preserve the pending attempt's identity and callbacks intact.
+      const active = record.activeAttempts.get(chunkIndex);
+      if (active && !record.handedOffAttempts.has(active.attemptToken)) {
+        continue;
+      }
+
       const currentMessageId = record.chunkMessageIds.get(chunkIndex);
       const lastHandedOffMessageId = record.lastHandedOffMessageIds.get(chunkIndex);
 
@@ -1036,6 +1049,18 @@ export class SnapshotOutboundPipeline {
       return;
     }
 
+    // Finding D2 — Idempotent Success Callback Guard:
+    // If this exact attemptToken has ALREADY been successfully handed off,
+    // repeated success callbacks must be a strict NO-OP.
+    if (record.handedOffAttempts.has(attemptToken)) {
+      return;
+    }
+
+    // Retired attempt guard: an attempt that failed cannot later succeed
+    if (record.failedAttempts.has(attemptToken)) {
+      return;
+    }
+
     const active = record.activeAttempts.get(chunkIndex);
     if (!active) {
       return;
@@ -1100,6 +1125,20 @@ export class SnapshotOutboundPipeline {
       return;
     }
     if (!messageId || typeof messageId !== 'string' || messageId.trim() === '') {
+      return;
+    }
+
+    // Finding D3 — Failure-After-Success Guard:
+    // If this exact attemptToken has ALREADY been successfully handed off,
+    // late failure callbacks must be a strict NO-OP.
+    // We must NOT un-reserve in-flight status, NOT delete active attempt, and NOT roll back retries!
+    if (record.handedOffAttempts.has(attemptToken)) {
+      return;
+    }
+
+    // Duplicate Failure Guard:
+    // If this exact attemptToken was already marked as failed, repeated failure callback is a strict NO-OP.
+    if (record.failedAttempts.has(attemptToken)) {
       return;
     }
 
@@ -1399,6 +1438,10 @@ export class SnapshotOutboundPipeline {
       inflightChunks: new Set(record.inflightChunks),
       transmittedChunks: new Set(record.transmittedChunks),
       retryCounts: new Map(record.retryCounts),
+      confirmedRetries: new Map(record.confirmedRetries),
+      activeAttempts: new Map(record.activeAttempts),
+      handedOffAttempts: new Set(record.handedOffAttempts),
+      failedAttempts: new Set(record.failedAttempts),
       offerMessage: record.offerMessage,
       failureReason: record.failureReason,
       failureDetail: record.failureDetail,

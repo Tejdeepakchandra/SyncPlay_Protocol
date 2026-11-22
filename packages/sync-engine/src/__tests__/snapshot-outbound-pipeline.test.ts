@@ -2624,11 +2624,12 @@ describe('Phase 7.5 M4.2c — SnapshotOutboundPipeline & Send-Boundary Verificat
       const [f1] = pipeline.handleChunkRequest(transferId, [0], context);
       expect(pipeline.getTransfer(transferId)!.retryCounts.get(0)).toBeUndefined();
 
-      // Request again without any handoff success or failure
-      const [f2] = pipeline.handleChunkRequest(transferId, [0], context);
+      // Request again without any handoff success or failure: coalesced!
+      const duplicateFrames = pipeline.handleChunkRequest(transferId, [0], context);
+      expect(duplicateFrames).toHaveLength(0);
 
-      // Must preserve the exact same messageId
-      expect(f2.message.messageId).toBe(f1.message.messageId);
+      // Active attempt remains F1
+      expect(pipeline.getTransfer(transferId)!.activeAttempts.get(0)?.attemptToken).toBe(f1.attemptToken);
       // Zero retries consumed
       expect(pipeline.getTransfer(transferId)!.retryCounts.get(0)).toBeUndefined();
       expect(pipeline.getTransfer(transferId)!.inflightChunks.has(0)).toBe(true);
@@ -2887,6 +2888,494 @@ describe('Phase 7.5 M4.2c — SnapshotOutboundPipeline & Send-Boundary Verificat
       expect(pipeline.getTransfer(transferId)!.state).toBe('CANCELLED');
 
       pipeline.dispose();
+    });
+  });
+
+  // Phase 7.5 M4.2c-R5: Active Attempt Coalescing & Callback Idempotency Closure
+  describe('Phase 7.5 M4.2c-R5: Active Attempt Coalescing & Callback Idempotency', () => {
+    // D1 — Prevent active-attempt overwrite & safe coalescing policy
+    it('R5-D1-1: repeated request while attempt T1 is active produces no additional dispatchable handoff and preserves T1', async () => {
+      const pipeline = createPipeline({ maxRetriesPerChunk: 3 });
+      const transferId = generateUUID();
+
+      await pipeline.startTransfer({
+        transferId,
+        recipientPeerId: RECIPIENT_PEER_ID,
+        supplierPeerId: SUPPLIER_PEER_ID,
+        membershipEpoch: MEMBERSHIP_EPOCH,
+        sctpMaxMessageSize: 2144,
+        captureAndSerializeFn: () => createSerializedArtifact(5, 'r5-d1-1'),
+      });
+
+      const context = createContext(pipeline, transferId);
+
+      // 1. Request chunk 0 and obtain attempt T1
+      const initialFrames = pipeline.handleChunkRequest(transferId, [0], context);
+      expect(initialFrames).toHaveLength(1);
+      const t1 = initialFrames[0].attemptToken;
+      const m1Id = initialFrames[0].message.messageId;
+
+      // 2. Request chunk 0 again before T1 receives a callback
+      const repeatedFrames = pipeline.handleChunkRequest(transferId, [0], context);
+
+      // 3. Verify no second independent attempt is created and API returns no dispatchable handoff
+      expect(repeatedFrames).toHaveLength(0);
+
+      // 4. Verify T1 remains the active attempt
+      const session = pipeline.getTransfer(transferId)!;
+      expect(session.activeAttempts.get(0)?.attemptToken).toBe(t1);
+      expect(session.activeAttempts.get(0)?.messageId).toBe(m1Id);
+      expect(session.inflightChunks.has(0)).toBe(true);
+
+      // 5. Verify T1's success callback is accepted
+      pipeline.handleHandoffSuccess(transferId, 0, m1Id, t1, context);
+      const postSuccess = pipeline.getTransfer(transferId)!;
+      expect(postSuccess.handedOffAttempts.has(t1)).toBe(true);
+      expect(postSuccess.inflightChunks.has(0)).toBe(true);
+      expect(postSuccess.retryCounts.get(0)).toBeUndefined(); // initial transmission: 0 retries
+
+      pipeline.dispose();
+    });
+
+    it('R5-D1-2: repeated request while T1 is active preserves T1 and accepts T1 failure callback if failure occurs first', async () => {
+      const pipeline = createPipeline({ maxRetriesPerChunk: 3 });
+      const transferId = generateUUID();
+
+      await pipeline.startTransfer({
+        transferId,
+        recipientPeerId: RECIPIENT_PEER_ID,
+        supplierPeerId: SUPPLIER_PEER_ID,
+        membershipEpoch: MEMBERSHIP_EPOCH,
+        sctpMaxMessageSize: 2144,
+        captureAndSerializeFn: () => createSerializedArtifact(5, 'r5-d1-2'),
+      });
+
+      const context = createContext(pipeline, transferId);
+
+      // Request chunk 0
+      const [f1] = pipeline.handleChunkRequest(transferId, [0], context);
+      const t1 = f1.attemptToken;
+      const m1Id = f1.message.messageId;
+
+      // Request again before callback: coalesced
+      const repeated = pipeline.handleChunkRequest(transferId, [0], context);
+      expect(repeated).toHaveLength(0);
+      expect(pipeline.getTransfer(transferId)!.activeAttempts.get(0)?.attemptToken).toBe(t1);
+
+      // 6. Verify T1's failure callback is accepted
+      pipeline.handleHandoffFailure(transferId, 0, m1Id, t1, context);
+      const postFailure = pipeline.getTransfer(transferId)!;
+      expect(postFailure.failedAttempts.has(t1)).toBe(true);
+      expect(postFailure.activeAttempts.has(0)).toBe(false);
+      expect(postFailure.inflightChunks.has(0)).toBe(false);
+
+      // Next local retry request reuses m1Id with fresh attemptToken T2
+      const [f2] = pipeline.handleChunkRequest(transferId, [0], context);
+      expect(f2.message.messageId).toBe(m1Id);
+      expect(f2.attemptToken).not.toBe(t1);
+      expect(pipeline.getTransfer(transferId)!.activeAttempts.get(0)?.attemptToken).toBe(f2.attemptToken);
+      expect(pipeline.getTransfer(transferId)!.retryCounts.get(0)).toBeUndefined(); // 0 retries consumed
+
+      pipeline.dispose();
+    });
+
+    it('R5-D1-3: duplicate polling cannot create additional retry reservations or message IDs', async () => {
+      const pipeline = createPipeline({ maxRetriesPerChunk: 3 });
+      const transferId = generateUUID();
+
+      await pipeline.startTransfer({
+        transferId,
+        recipientPeerId: RECIPIENT_PEER_ID,
+        supplierPeerId: SUPPLIER_PEER_ID,
+        membershipEpoch: MEMBERSHIP_EPOCH,
+        sctpMaxMessageSize: 2144,
+        captureAndSerializeFn: () => createSerializedArtifact(5, 'r5-d1-3'),
+      });
+
+      const context = createContext(pipeline, transferId);
+
+      // Initial request
+      const [f1] = pipeline.handleChunkRequest(transferId, [0], context);
+      const t1 = f1.attemptToken;
+
+      // Poll 5 times while attempt is active
+      for (let i = 0; i < 5; i++) {
+        const pollResult = pipeline.handleChunkRequest(transferId, [0], context);
+        expect(pollResult).toHaveLength(0);
+      }
+
+      // Assert state invariants: zero retries, same attemptToken, single in-flight chunk
+      const session = pipeline.getTransfer(transferId)!;
+      expect(session.activeAttempts.get(0)?.attemptToken).toBe(t1);
+      expect(session.retryCounts.get(0)).toBeUndefined();
+      expect(session.inflightChunks.size).toBe(1);
+
+      pipeline.dispose();
+    });
+
+    it('R5-D1-4: batch requests coalesce active chunks while allowing inactive chunks to utilize sliding-window capacity', async () => {
+      const pipeline = createPipeline({ slidingWindowSize: 4 });
+      const transferId = generateUUID();
+
+      await pipeline.startTransfer({
+        transferId,
+        recipientPeerId: RECIPIENT_PEER_ID,
+        supplierPeerId: SUPPLIER_PEER_ID,
+        membershipEpoch: MEMBERSHIP_EPOCH,
+        sctpMaxMessageSize: 2144,
+        captureAndSerializeFn: () => createSerializedArtifact(5, 'r5-d1-4'),
+      });
+
+      const context = createContext(pipeline, transferId);
+
+      // Request chunk 0 alone (window usage: 1/4)
+      const [f0] = pipeline.handleChunkRequest(transferId, [0], context);
+      expect(f0.payload.chunkIndex).toBe(0);
+
+      // Now request batch [0, 1]: chunk 0 is active (coalesced), chunk 1 is newly produced
+      const batchResult = pipeline.handleChunkRequest(transferId, [0, 1], context);
+      expect(batchResult).toHaveLength(1);
+      expect(batchResult[0].payload.chunkIndex).toBe(1);
+
+      const session = pipeline.getTransfer(transferId)!;
+      expect(session.inflightChunks.size).toBe(2);
+      expect(session.activeAttempts.get(0)?.attemptToken).toBe(f0.attemptToken);
+      expect(session.activeAttempts.get(1)?.attemptToken).toBe(batchResult[0].attemptToken);
+
+      pipeline.dispose();
+    });
+
+    // D2 — Make successful handoff callbacks idempotent
+    it('R5-D2-1: duplicate success callbacks on initial transmission are idempotent and do not corrupt state', async () => {
+      const pipeline = createPipeline({ maxRetriesPerChunk: 3 });
+      const transferId = generateUUID();
+
+      await pipeline.startTransfer({
+        transferId,
+        recipientPeerId: RECIPIENT_PEER_ID,
+        supplierPeerId: SUPPLIER_PEER_ID,
+        membershipEpoch: MEMBERSHIP_EPOCH,
+        sctpMaxMessageSize: 2144,
+        captureAndSerializeFn: () => createSerializedArtifact(5, 'r5-d2-1'),
+      });
+
+      const context = createContext(pipeline, transferId);
+
+      const [m1] = pipeline.handleChunkRequest(transferId, [0], context);
+
+      // First success callback
+      pipeline.handleHandoffSuccess(transferId, 0, m1.message.messageId, m1.attemptToken, context);
+      expect(pipeline.getTransfer(transferId)!.retryCounts.get(0)).toBeUndefined();
+      expect(pipeline.getTransfer(transferId)!.confirmedRetries.get(0)).toBeUndefined();
+
+      // Repeated duplicate success callbacks
+      for (let i = 0; i < 5; i++) {
+        pipeline.handleHandoffSuccess(transferId, 0, m1.message.messageId, m1.attemptToken, context);
+      }
+
+      // Assert invariants unchanged
+      const session = pipeline.getTransfer(transferId)!;
+      expect(session.retryCounts.get(0)).toBeUndefined();
+      expect(session.confirmedRetries.get(0)).toBeUndefined();
+      expect(session.inflightChunks.has(0)).toBe(true);
+      expect(session.handedOffAttempts.has(m1.attemptToken)).toBe(true);
+
+      pipeline.dispose();
+    });
+
+    it('R5-D2-2: duplicate success callbacks on retransmissions do not inflate confirmedRetries or retryCounts', async () => {
+      const pipeline = createPipeline({ maxRetriesPerChunk: 3 });
+      const transferId = generateUUID();
+
+      await pipeline.startTransfer({
+        transferId,
+        recipientPeerId: RECIPIENT_PEER_ID,
+        supplierPeerId: SUPPLIER_PEER_ID,
+        membershipEpoch: MEMBERSHIP_EPOCH,
+        sctpMaxMessageSize: 2144,
+        captureAndSerializeFn: () => createSerializedArtifact(5, 'r5-d2-2'),
+      });
+
+      const context = createContext(pipeline, transferId);
+
+      // 1. Initial M1 succeeds
+      const [m1] = pipeline.handleChunkRequest(transferId, [0], context);
+      pipeline.handleHandoffSuccess(transferId, 0, m1.message.messageId, m1.attemptToken, context);
+
+      // 2. Request retransmission M2
+      const [m2] = pipeline.handleChunkRequest(transferId, [0], context);
+      expect(m2.message.messageId).not.toBe(m1.message.messageId);
+
+      // 3. Successfully hand off M2 once
+      pipeline.handleHandoffSuccess(transferId, 0, m2.message.messageId, m2.attemptToken, context);
+
+      // 4. Record confirmedRetries and retryCounts
+      const initialRetries = pipeline.getTransfer(transferId)!.confirmedRetries.get(0);
+      const initialRetryCounts = pipeline.getTransfer(transferId)!.retryCounts.get(0);
+      expect(initialRetries).toBe(1);
+      expect(initialRetryCounts).toBe(1);
+
+      // 5. Deliver the exact same success callback again
+      pipeline.handleHandoffSuccess(transferId, 0, m2.message.messageId, m2.attemptToken, context);
+
+      // 6. Verify every relevant state field is unchanged
+      expect(pipeline.getTransfer(transferId)!.confirmedRetries.get(0)).toBe(initialRetries);
+      expect(pipeline.getTransfer(transferId)!.retryCounts.get(0)).toBe(initialRetryCounts);
+
+      // 7. Deliver multiple duplicate success callbacks
+      for (let i = 0; i < 5; i++) {
+        pipeline.handleHandoffSuccess(transferId, 0, m2.message.messageId, m2.attemptToken, context);
+      }
+      expect(pipeline.getTransfer(transferId)!.confirmedRetries.get(0)).toBe(1);
+      expect(pipeline.getTransfer(transferId)!.retryCounts.get(0)).toBe(1);
+
+      // 8. Verify next genuine retransmission receives M3 and retry budget advances exactly once
+      const [m3] = pipeline.handleChunkRequest(transferId, [0], context);
+      expect(m3.message.messageId).not.toBe(m2.message.messageId);
+      expect(pipeline.getTransfer(transferId)!.retryCounts.get(0)).toBe(2);
+
+      pipeline.handleHandoffSuccess(transferId, 0, m3.message.messageId, m3.attemptToken, context);
+      expect(pipeline.getTransfer(transferId)!.confirmedRetries.get(0)).toBe(2);
+      expect(pipeline.getTransfer(transferId)!.retryCounts.get(0)).toBe(2);
+
+      pipeline.dispose();
+    });
+
+    // D3 — Make failure-after-success a strict no-op
+    it('R5-D3-1: failure callback arriving after successful handoff on initial transmission is a strict no-op', async () => {
+      const pipeline = createPipeline({ maxRetriesPerChunk: 3 });
+      const transferId = generateUUID();
+
+      await pipeline.startTransfer({
+        transferId,
+        recipientPeerId: RECIPIENT_PEER_ID,
+        supplierPeerId: SUPPLIER_PEER_ID,
+        membershipEpoch: MEMBERSHIP_EPOCH,
+        sctpMaxMessageSize: 2144,
+        captureAndSerializeFn: () => createSerializedArtifact(5, 'r5-d3-1'),
+      });
+
+      const context = createContext(pipeline, transferId);
+
+      // 1. Successfully hand off initial M1
+      const [m1] = pipeline.handleChunkRequest(transferId, [0], context);
+      pipeline.handleHandoffSuccess(transferId, 0, m1.message.messageId, m1.attemptToken, context);
+
+      // Verify post-success state
+      expect(pipeline.getTransfer(transferId)!.inflightChunks.has(0)).toBe(true);
+      expect(pipeline.getTransfer(transferId)!.activeAttempts.get(0)?.attemptToken).toBe(m1.attemptToken);
+      expect(pipeline.getTransfer(transferId)!.handedOffAttempts.has(m1.attemptToken)).toBe(true);
+
+      // 2. Deliver a failure callback for the same M1 and token
+      pipeline.handleHandoffFailure(transferId, 0, m1.message.messageId, m1.attemptToken, context);
+
+      // 3. Verify no state changes
+      const session = pipeline.getTransfer(transferId)!;
+      expect(session.inflightChunks.has(0)).toBe(true); // NOT removed from inflight!
+      expect(session.activeAttempts.get(0)?.attemptToken).toBe(m1.attemptToken); // NOT deleted from activeAttempts!
+      expect(session.failedAttempts.has(m1.attemptToken)).toBe(false); // NOT recorded as failed!
+      expect(session.retryCounts.get(0)).toBeUndefined();
+
+      pipeline.dispose();
+    });
+
+    it('R5-D3-2: failure-after-success on retransmission preserves inflightChunks, retries, and active attempt', async () => {
+      const pipeline = createPipeline({ maxRetriesPerChunk: 3 });
+      const transferId = generateUUID();
+
+      await pipeline.startTransfer({
+        transferId,
+        recipientPeerId: RECIPIENT_PEER_ID,
+        supplierPeerId: SUPPLIER_PEER_ID,
+        membershipEpoch: MEMBERSHIP_EPOCH,
+        sctpMaxMessageSize: 2144,
+        captureAndSerializeFn: () => createSerializedArtifact(5, 'r5-d3-2'),
+      });
+
+      const context = createContext(pipeline, transferId);
+
+      // Initial M1 succeeds
+      const [m1] = pipeline.handleChunkRequest(transferId, [0], context);
+      pipeline.handleHandoffSuccess(transferId, 0, m1.message.messageId, m1.attemptToken, context);
+
+      // Retransmission M2 succeeds
+      const [m2] = pipeline.handleChunkRequest(transferId, [0], context);
+      pipeline.handleHandoffSuccess(transferId, 0, m2.message.messageId, m2.attemptToken, context);
+
+      // Deliver duplicate success then late failure
+      pipeline.handleHandoffSuccess(transferId, 0, m2.message.messageId, m2.attemptToken, context);
+      pipeline.handleHandoffFailure(transferId, 0, m2.message.messageId, m2.attemptToken, context);
+
+      // Verify invariants intact
+      const session = pipeline.getTransfer(transferId)!;
+      expect(session.inflightChunks.has(0)).toBe(true);
+      expect(session.activeAttempts.get(0)?.attemptToken).toBe(m2.attemptToken);
+      expect(session.confirmedRetries.get(0)).toBe(1);
+      expect(session.retryCounts.get(0)).toBe(1);
+
+      // Genuine later retransmission proceeds normally
+      const [m3] = pipeline.handleChunkRequest(transferId, [0], context);
+      expect(m3.message.messageId).not.toBe(m2.message.messageId);
+      expect(pipeline.getTransfer(transferId)!.retryCounts.get(0)).toBe(2);
+
+      pipeline.dispose();
+    });
+
+    // Combined callback ordering & concurrency adversarial tests
+    it('R5-ADV-1: Failure -> duplicate failure is idempotent and does not corrupt state', async () => {
+      const pipeline = createPipeline();
+      const transferId = generateUUID();
+
+      await pipeline.startTransfer({
+        transferId,
+        recipientPeerId: RECIPIENT_PEER_ID,
+        supplierPeerId: SUPPLIER_PEER_ID,
+        membershipEpoch: MEMBERSHIP_EPOCH,
+        sctpMaxMessageSize: 2144,
+        captureAndSerializeFn: () => createSerializedArtifact(5, 'r5-adv-1'),
+      });
+
+      const context = createContext(pipeline, transferId);
+
+      const [f1] = pipeline.handleChunkRequest(transferId, [0], context);
+
+      // First failure
+      pipeline.handleHandoffFailure(transferId, 0, f1.message.messageId, f1.attemptToken, context);
+      expect(pipeline.getTransfer(transferId)!.failedAttempts.has(f1.attemptToken)).toBe(true);
+      expect(pipeline.getTransfer(transferId)!.inflightChunks.has(0)).toBe(false);
+
+      // Duplicate failure
+      pipeline.handleHandoffFailure(transferId, 0, f1.message.messageId, f1.attemptToken, context);
+      expect(pipeline.getTransfer(transferId)!.failedAttempts.has(f1.attemptToken)).toBe(true);
+      expect(pipeline.getTransfer(transferId)!.inflightChunks.has(0)).toBe(false);
+
+      pipeline.dispose();
+    });
+
+    it('R5-ADV-2: Failure -> success using retired token is safely dropped', async () => {
+      const pipeline = createPipeline();
+      const transferId = generateUUID();
+
+      await pipeline.startTransfer({
+        transferId,
+        recipientPeerId: RECIPIENT_PEER_ID,
+        supplierPeerId: SUPPLIER_PEER_ID,
+        membershipEpoch: MEMBERSHIP_EPOCH,
+        sctpMaxMessageSize: 2144,
+        captureAndSerializeFn: () => createSerializedArtifact(5, 'r5-adv-2'),
+      });
+
+      const context = createContext(pipeline, transferId);
+
+      const [f1] = pipeline.handleChunkRequest(transferId, [0], context);
+
+      // Failure retires f1.attemptToken
+      pipeline.handleHandoffFailure(transferId, 0, f1.message.messageId, f1.attemptToken, context);
+      expect(pipeline.getTransfer(transferId)!.failedAttempts.has(f1.attemptToken)).toBe(true);
+
+      // Late success for retired token arrives: dropped as strict no-op
+      pipeline.handleHandoffSuccess(transferId, 0, f1.message.messageId, f1.attemptToken, context);
+      expect(pipeline.getTransfer(transferId)!.handedOffAttempts.has(f1.attemptToken)).toBe(false);
+      expect(pipeline.getTransfer(transferId)!.inflightChunks.has(0)).toBe(false);
+
+      pipeline.dispose();
+    });
+
+    it('R5-ADV-3: Success M1 -> new retransmission M2 -> delayed failure for M1 does not touch M2', async () => {
+      const pipeline = createPipeline({ maxRetriesPerChunk: 3 });
+      const transferId = generateUUID();
+
+      await pipeline.startTransfer({
+        transferId,
+        recipientPeerId: RECIPIENT_PEER_ID,
+        supplierPeerId: SUPPLIER_PEER_ID,
+        membershipEpoch: MEMBERSHIP_EPOCH,
+        sctpMaxMessageSize: 2144,
+        captureAndSerializeFn: () => createSerializedArtifact(5, 'r5-adv-3'),
+      });
+
+      const context = createContext(pipeline, transferId);
+
+      // M1 succeeds
+      const [m1] = pipeline.handleChunkRequest(transferId, [0], context);
+      pipeline.handleHandoffSuccess(transferId, 0, m1.message.messageId, m1.attemptToken, context);
+
+      // M2 requested
+      const [m2] = pipeline.handleChunkRequest(transferId, [0], context);
+      expect(pipeline.getTransfer(transferId)!.activeAttempts.get(0)?.attemptToken).toBe(m2.attemptToken);
+
+      // Delayed failure for M1 arrives
+      pipeline.handleHandoffFailure(transferId, 0, m1.message.messageId, m1.attemptToken, context);
+
+      // M2 must remain active and in-flight!
+      const session = pipeline.getTransfer(transferId)!;
+      expect(session.activeAttempts.get(0)?.attemptToken).toBe(m2.attemptToken);
+      expect(session.inflightChunks.has(0)).toBe(true);
+      expect(session.retryCounts.get(0)).toBe(1);
+
+      pipeline.dispose();
+    });
+
+    it('R5-ADV-4: Success -> ACK -> late success and failure callbacks are strict no-ops', async () => {
+      const pipeline = createPipeline();
+      const transferId = generateUUID();
+
+      await pipeline.startTransfer({
+        transferId,
+        recipientPeerId: RECIPIENT_PEER_ID,
+        supplierPeerId: SUPPLIER_PEER_ID,
+        membershipEpoch: MEMBERSHIP_EPOCH,
+        sctpMaxMessageSize: FALLBACK_SCTP_LIMIT,
+        captureAndSerializeFn: () => createSerializedArtifact(1, 'r5-adv-4'),
+      });
+
+      const context = createContext(pipeline, transferId);
+
+      const [f0] = pipeline.handleChunkRequest(transferId, [0], context);
+      pipeline.handleHandoffSuccess(transferId, 0, f0.message.messageId, f0.attemptToken, context);
+
+      // Remote ACK arrives -> transfer completes!
+      pipeline.handleChunkAck(transferId, 0, context);
+      expect(pipeline.getTransfer(transferId)!.state).toBe('COMPLETED');
+      expect(pipeline.getTransfer(transferId)!.acknowledgedChunks.has(0)).toBe(true);
+
+      // Late success callback on completed transfer
+      pipeline.handleHandoffSuccess(transferId, 0, f0.message.messageId, f0.attemptToken, context);
+      expect(pipeline.getTransfer(transferId)!.state).toBe('COMPLETED');
+
+      // Late failure callback on completed transfer cannot undo ACK
+      pipeline.handleHandoffFailure(transferId, 0, f0.message.messageId, f0.attemptToken, context);
+      expect(pipeline.getTransfer(transferId)!.state).toBe('COMPLETED');
+      expect(pipeline.getTransfer(transferId)!.acknowledgedChunks.has(0)).toBe(true);
+
+      pipeline.dispose();
+    });
+
+    it('R5-ADV-5: Callbacks after pipeline disposal throw DISPOSED and do not mutate state', async () => {
+      const pipeline = createPipeline();
+      const transferId = generateUUID();
+
+      await pipeline.startTransfer({
+        transferId,
+        recipientPeerId: RECIPIENT_PEER_ID,
+        supplierPeerId: SUPPLIER_PEER_ID,
+        membershipEpoch: MEMBERSHIP_EPOCH,
+        sctpMaxMessageSize: 2144,
+        captureAndSerializeFn: () => createSerializedArtifact(1, 'r5-adv-5'),
+      });
+
+      const context = createContext(pipeline, transferId);
+      const [f0] = pipeline.handleChunkRequest(transferId, [0], context);
+
+      pipeline.dispose();
+
+      expect(() => {
+        pipeline.handleHandoffSuccess(transferId, 0, f0.message.messageId, f0.attemptToken, context);
+      }).toThrowError(/SnapshotOutboundPipeline has been disposed/);
+
+      expect(() => {
+        pipeline.handleHandoffFailure(transferId, 0, f0.message.messageId, f0.attemptToken, context);
+      }).toThrowError(/SnapshotOutboundPipeline has been disposed/);
     });
   });
 });
