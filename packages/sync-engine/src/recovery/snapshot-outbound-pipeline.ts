@@ -959,6 +959,20 @@ export class SnapshotOutboundPipeline {
     if (record.inflightChunks.has(chunkIndex)) {
       record.inflightChunks.delete(chunkIndex);
 
+      // Roll back transmission marking or retry count if this attempt failed local handoff
+      const currentRetries = record.retryCounts.get(chunkIndex);
+      if (currentRetries !== undefined && currentRetries > 0) {
+        // Failed retransmission handoff: roll back the incremented retry count
+        if (currentRetries <= 1) {
+          record.retryCounts.delete(chunkIndex);
+        } else {
+          record.retryCounts.set(chunkIndex, currentRetries - 1);
+        }
+      } else {
+        // Failed initial transmission handoff: chunk was never successfully handed off
+        record.transmittedChunks.delete(chunkIndex);
+      }
+
       // If waiting for ACK and in-flight count dropped below window, return to ACTIVE
       if (record.state === 'WAITING_ACK' && record.inflightChunks.size < this.#slidingWindowSize) {
         record.state = 'ACTIVE';

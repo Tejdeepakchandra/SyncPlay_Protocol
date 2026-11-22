@@ -1842,9 +1842,131 @@ describe('Phase 7.5 M4.2c — SnapshotOutboundPipeline & Send-Boundary Verificat
       // Lease is retained
       expect(artifact.activeLeaseCount).toBe(1);
 
-      // Subsequent retry succeeds using preserved cached frame
+      // Subsequent attempt succeeds using preserved cached frame
       const [retryFrame] = pipeline.handleChunkRequest(transferId, [0], context);
       expect(retryFrame.serializedJson).toBe(initialFrame.serializedJson);
+
+      pipeline.dispose();
+    });
+
+    it('M4.2c-R2: does not consume retry budget on initial handoff failure', async () => {
+      const pipeline = createPipeline({ maxRetriesPerChunk: 3 });
+      const transferId = generateUUID();
+
+      await pipeline.startTransfer({
+        transferId,
+        recipientPeerId: RECIPIENT_PEER_ID,
+        supplierPeerId: SUPPLIER_PEER_ID,
+        membershipEpoch: MEMBERSHIP_EPOCH,
+        sctpMaxMessageSize: 2144,
+        captureAndSerializeFn: () => createSerializedArtifact(5, 'r2-initial-fail'),
+      });
+
+      const context = createContext(pipeline, transferId);
+
+      // 1. Request chunk 0 for initial transmission
+      const [frame0] = pipeline.handleChunkRequest(transferId, [0], context);
+      expect(frame0).toBeDefined();
+
+      // 2. Verify in-flight reservation
+      let session = pipeline.getTransfer(transferId)!;
+      expect(session.inflightChunks.has(0)).toBe(true);
+
+      // 3. Report local transport handoff failure
+      pipeline.handleHandoffFailure(transferId, 0, context);
+
+      // Verify in-flight reservation released and transmittedChunks rolled back
+      session = pipeline.getTransfer(transferId)!;
+      expect(session.inflightChunks.has(0)).toBe(false);
+      expect(session.transmittedChunks.has(0)).toBe(false);
+      expect(session.retryCounts.get(0)).toBeUndefined();
+
+      // 4. Request the same chunk again
+      const [frame0Retry] = pipeline.handleChunkRequest(transferId, [0], context);
+      expect(frame0Retry.serializedJson).toBe(frame0.serializedJson);
+
+      // 5 & 6. Verify chunk is NOT classified as a retransmission and consumes 0 retries
+      session = pipeline.getTransfer(transferId)!;
+      expect(session.transmittedChunks.has(0)).toBe(true);
+      expect(session.retryCounts.get(0)).toBeUndefined();
+
+      pipeline.dispose();
+    });
+
+    it('M4.2c-R2: repeated initial handoff failures consume zero retries', async () => {
+      const pipeline = createPipeline({ maxRetriesPerChunk: 3 });
+      const transferId = generateUUID();
+
+      await pipeline.startTransfer({
+        transferId,
+        recipientPeerId: RECIPIENT_PEER_ID,
+        supplierPeerId: SUPPLIER_PEER_ID,
+        membershipEpoch: MEMBERSHIP_EPOCH,
+        sctpMaxMessageSize: 2144,
+        captureAndSerializeFn: () => createSerializedArtifact(5, 'r2-repeat-fail'),
+      });
+
+      const context = createContext(pipeline, transferId);
+
+      // Repeat handoff failure 5 times on initial transmission
+      for (let i = 0; i < 5; i++) {
+        pipeline.handleChunkRequest(transferId, [0], context);
+        expect(pipeline.getTransfer(transferId)!.inflightChunks.has(0)).toBe(true);
+
+        pipeline.handleHandoffFailure(transferId, 0, context);
+        const session = pipeline.getTransfer(transferId)!;
+        expect(session.inflightChunks.has(0)).toBe(false);
+        expect(session.transmittedChunks.has(0)).toBe(false);
+        expect(session.retryCounts.get(0)).toBeUndefined();
+      }
+
+      // 6th attempt: succeeds as initial transmission with 0 retry budget consumed
+      pipeline.handleChunkRequest(transferId, [0], context);
+      const finalSession = pipeline.getTransfer(transferId)!;
+      expect(finalSession.transmittedChunks.has(0)).toBe(true);
+      expect(finalSession.retryCounts.get(0)).toBeUndefined();
+
+      pipeline.dispose();
+    });
+
+    it('M4.2c-R2: failed retransmission handoff rolls back retry count for another retry', async () => {
+      const pipeline = createPipeline({ maxRetriesPerChunk: 3 });
+      const transferId = generateUUID();
+
+      await pipeline.startTransfer({
+        transferId,
+        recipientPeerId: RECIPIENT_PEER_ID,
+        supplierPeerId: SUPPLIER_PEER_ID,
+        membershipEpoch: MEMBERSHIP_EPOCH,
+        sctpMaxMessageSize: 2144,
+        captureAndSerializeFn: () => createSerializedArtifact(5, 'r2-retransmit-fail'),
+      });
+
+      const context = createContext(pipeline, transferId);
+
+      // Initial transmission succeeds (no handoff failure)
+      pipeline.handleChunkRequest(transferId, [0], context);
+      expect(pipeline.getTransfer(transferId)!.transmittedChunks.has(0)).toBe(true);
+      expect(pipeline.getTransfer(transferId)!.retryCounts.get(0)).toBeUndefined();
+
+      // Recipient requests retransmission -> retryCounts becomes 1
+      pipeline.handleChunkRequest(transferId, [0], context);
+      expect(pipeline.getTransfer(transferId)!.retryCounts.get(0)).toBe(1);
+
+      // Local handoff of this retransmission fails
+      pipeline.handleHandoffFailure(transferId, 0, context);
+
+      // Retry count is rolled back, chunk remains transmitted
+      let session = pipeline.getTransfer(transferId)!;
+      expect(session.inflightChunks.has(0)).toBe(false);
+      expect(session.transmittedChunks.has(0)).toBe(true);
+      expect(session.retryCounts.get(0)).toBeUndefined();
+
+      // Transport retries the retransmission
+      pipeline.handleChunkRequest(transferId, [0], context);
+      session = pipeline.getTransfer(transferId)!;
+      // Retried retransmission is retry #1, NOT retry #2!
+      expect(session.retryCounts.get(0)).toBe(1);
 
       pipeline.dispose();
     });
