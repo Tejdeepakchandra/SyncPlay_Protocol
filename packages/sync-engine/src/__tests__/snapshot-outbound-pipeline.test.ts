@@ -3378,4 +3378,187 @@ describe('Phase 7.5 M4.2c — SnapshotOutboundPipeline & Send-Boundary Verificat
       }).toThrowError(/SnapshotOutboundPipeline has been disposed/);
     });
   });
+
+  // Phase 7.5 M4.2c-R6: Public Session-View Encapsulation & Attempt Immutability
+  describe('Phase 7.5 M4.2c-R6: Public Session-View Encapsulation & Attempt Immutability', () => {
+    it('E1-A: activeAttempts obtained from getTransfer() cannot be mutated to alter internal pipeline state', async () => {
+      const pipeline = createPipeline();
+      const transferId = generateUUID();
+
+      await pipeline.startTransfer({
+        transferId,
+        recipientPeerId: RECIPIENT_PEER_ID,
+        supplierPeerId: SUPPLIER_PEER_ID,
+        membershipEpoch: MEMBERSHIP_EPOCH,
+        sctpMaxMessageSize: 2144,
+        captureAndSerializeFn: () => createSerializedArtifact(5, 'r6-e1-a'),
+      });
+
+      const context = createContext(pipeline, transferId);
+      const [f0] = pipeline.handleChunkRequest(transferId, [0], context);
+
+      const session1 = pipeline.getTransfer(transferId)!;
+      const attemptEntry = session1.activeAttempts.get(0)!;
+      expect(attemptEntry.attemptToken).toBe(f0.attemptToken);
+
+      // Attempt to modify attemptToken, messageId, and isRetransmission:
+      expect(() => {
+        (attemptEntry as any).attemptToken = 'MUTATED_TOKEN';
+      }).toThrowError(TypeError);
+
+      expect(() => {
+        (attemptEntry as any).messageId = 'MUTATED_MSG_ID';
+      }).toThrowError(TypeError);
+
+      expect(() => {
+        (attemptEntry as any).isRetransmission = true;
+      }).toThrowError(TypeError);
+
+      // Re-read session to confirm internal data remains unchanged
+      const session2 = pipeline.getTransfer(transferId)!;
+      expect(session2.activeAttempts.get(0)!.attemptToken).toBe(f0.attemptToken);
+      expect(session2.activeAttempts.get(0)!.messageId).toBe(f0.message.messageId);
+      expect(session2.activeAttempts.get(0)!.isRetransmission).toBe(false);
+
+      pipeline.dispose();
+    });
+
+    it('E1-B: activeAttempts obtained from getActiveTransfers() cannot be mutated to alter internal state', async () => {
+      const pipeline = createPipeline();
+      const transferId = generateUUID();
+
+      await pipeline.startTransfer({
+        transferId,
+        recipientPeerId: RECIPIENT_PEER_ID,
+        supplierPeerId: SUPPLIER_PEER_ID,
+        membershipEpoch: MEMBERSHIP_EPOCH,
+        sctpMaxMessageSize: 2144,
+        captureAndSerializeFn: () => createSerializedArtifact(5, 'r6-e1-b'),
+      });
+
+      const context = createContext(pipeline, transferId);
+      const [f0] = pipeline.handleChunkRequest(transferId, [0], context);
+
+      const activeList = pipeline.getActiveTransfers();
+      const session = activeList.find((s) => s.transferId === transferId)!;
+      const attemptEntry = session.activeAttempts.get(0)!;
+
+      expect(() => {
+        (attemptEntry as any).attemptToken = 'MUTATED_VIA_ACTIVE';
+      }).toThrowError(TypeError);
+
+      const sessionFresh = pipeline.getTransfer(transferId)!;
+      expect(sessionFresh.activeAttempts.get(0)!.attemptToken).toBe(f0.attemptToken);
+
+      pipeline.dispose();
+    });
+
+    it('E1-C: defensive-copy identity: repeated session reads return distinct object instances', async () => {
+      const pipeline = createPipeline();
+      const transferId = generateUUID();
+
+      await pipeline.startTransfer({
+        transferId,
+        recipientPeerId: RECIPIENT_PEER_ID,
+        supplierPeerId: SUPPLIER_PEER_ID,
+        membershipEpoch: MEMBERSHIP_EPOCH,
+        sctpMaxMessageSize: 2144,
+        captureAndSerializeFn: () => createSerializedArtifact(5, 'r6-e1-c'),
+      });
+
+      const context = createContext(pipeline, transferId);
+      const [f0] = pipeline.handleChunkRequest(transferId, [0], context);
+
+      const session1 = pipeline.getTransfer(transferId)!;
+      const session2 = pipeline.getTransfer(transferId)!;
+
+      // Map containers are distinct instances
+      expect(session1.activeAttempts).not.toBe(session2.activeAttempts);
+      // Value objects are distinct instances
+      const attempt1 = session1.activeAttempts.get(0)!;
+      const attempt2 = session2.activeAttempts.get(0)!;
+      expect(attempt1).not.toBe(attempt2);
+      expect(attempt1).toEqual(attempt2);
+
+      // Mutating session1's Map does not mutate session2's Map or internal state
+      (session1.activeAttempts as Map<number, any>).clear();
+      expect(session1.activeAttempts.size).toBe(0);
+      expect(session2.activeAttempts.size).toBe(1);
+
+      const session3 = pipeline.getTransfer(transferId)!;
+      expect(session3.activeAttempts.size).toBe(1);
+      expect(session3.activeAttempts.get(0)!.attemptToken).toBe(f0.attemptToken);
+
+      pipeline.dispose();
+    });
+
+    it('E1-D: legitimate callbacks succeed and maintain exact accounting after external mutation attempts', async () => {
+      const pipeline = createPipeline({ maxRetriesPerChunk: 3 });
+      const transferId = generateUUID();
+
+      await pipeline.startTransfer({
+        transferId,
+        recipientPeerId: RECIPIENT_PEER_ID,
+        supplierPeerId: SUPPLIER_PEER_ID,
+        membershipEpoch: MEMBERSHIP_EPOCH,
+        sctpMaxMessageSize: 2144,
+        captureAndSerializeFn: () => createSerializedArtifact(5, 'r6-e1-d'),
+      });
+
+      const context = createContext(pipeline, transferId);
+      const [f0] = pipeline.handleChunkRequest(transferId, [0], context);
+
+      const session = pipeline.getTransfer(transferId)!;
+      const attempt = session.activeAttempts.get(0)!;
+
+      // Attempt to tamper with attemptToken
+      try {
+        (attempt as any).attemptToken = 'FAKE_TOKEN';
+      } catch {
+        // Expected TypeError
+      }
+
+      // Handoff success with legitimate original token must succeed
+      pipeline.handleHandoffSuccess(transferId, 0, f0.message.messageId, f0.attemptToken, context);
+
+      const postSuccess = pipeline.getTransfer(transferId)!;
+      expect(postSuccess.handedOffAttempts.has(f0.attemptToken)).toBe(true);
+      expect(postSuccess.inflightChunks.has(0)).toBe(true);
+      expect(postSuccess.retryCounts.get(0)).toBeUndefined(); // 0 retries consumed on initial
+
+      // Network retransmission requested
+      const [retransmit] = pipeline.handleChunkRequest(transferId, [0], context);
+      expect(retransmit.message.messageId).not.toBe(f0.message.messageId);
+      expect(pipeline.getTransfer(transferId)!.retryCounts.get(0)).toBe(1);
+
+      pipeline.dispose();
+    });
+
+    it('E1-E: regression coverage: offerMessage is frozen and cannot be mutated externally', async () => {
+      const pipeline = createPipeline();
+      const transferId = generateUUID();
+
+      await pipeline.startTransfer({
+        transferId,
+        recipientPeerId: RECIPIENT_PEER_ID,
+        supplierPeerId: SUPPLIER_PEER_ID,
+        membershipEpoch: MEMBERSHIP_EPOCH,
+        sctpMaxMessageSize: 2144,
+        captureAndSerializeFn: () => createSerializedArtifact(5, 'r6-e1-e'),
+      });
+
+      const session = pipeline.getTransfer(transferId)!;
+      expect(session.offerMessage).toBeDefined();
+
+      expect(() => {
+        (session.offerMessage as any).messageId = 'MUTATED_OFFER_MSG';
+      }).toThrowError(TypeError);
+
+      expect(() => {
+        (session.offerMessage!.payload as any).totalChunks = 999;
+      }).toThrowError(TypeError);
+
+      pipeline.dispose();
+    });
+  });
 });

@@ -190,7 +190,7 @@ export interface OutboundTransferSession {
   readonly transmittedChunks: ReadonlySet<number>;
   readonly retryCounts: ReadonlyMap<number, number>;
   readonly confirmedRetries: ReadonlyMap<number, number>;
-  readonly activeAttempts: ReadonlyMap<number, { messageId: string; attemptSeq: number; attemptToken: string; isRetransmission: boolean }>;
+  readonly activeAttempts: ReadonlyMap<number, Readonly<{ messageId: string; attemptSeq: number; attemptToken: string; isRetransmission: boolean }>>;
   readonly handedOffAttempts: ReadonlySet<string>;
   readonly failedAttempts: ReadonlySet<string>;
   readonly offerMessage?: ProtocolMessage<SnapshotOfferPayload>;
@@ -255,7 +255,7 @@ interface InternalTransferRecord {
   readonly handedOffChunks: Set<number>;
   readonly handedOffAttempts: Set<string>;
   readonly failedAttempts: Set<string>;
-  readonly activeAttempts: Map<number, { messageId: string; attemptSeq: number; attemptToken: string; isRetransmission: boolean }>;
+  readonly activeAttempts: Map<number, Readonly<{ messageId: string; attemptSeq: number; attemptToken: string; isRetransmission: boolean }>>;
   readonly attemptCounters: Map<number, number>;
   readonly retryCounts: Map<number, number>;
   readonly confirmedRetries: Map<number, number>;
@@ -739,7 +739,7 @@ export class SnapshotOutboundPipeline {
       record.state = 'PREPARED';
 
       // Format initial SNAPSHOT_OFFER message
-      record.offerMessage = SnapshotOutboundPipeline.createOfferMessage(producer, {
+      record.offerMessage = Object.freeze(SnapshotOutboundPipeline.createOfferMessage(producer, {
         transferId: params.transferId,
         supplierPeerId: params.supplierPeerId,
         recipientPeerId: params.recipientPeerId,
@@ -747,7 +747,7 @@ export class SnapshotOutboundPipeline {
         connectionGeneration: record.connectionGeneration,
         snapshotFrontier: record.snapshotFrontier,
         maxLogicalTimestamp: record.maxLogicalTimestamp,
-      });
+      }));
 
       return this.#toSessionView(record);
     } catch (err) {
@@ -934,7 +934,13 @@ export class SnapshotOutboundPipeline {
       });
 
       // Rule 3: Track active attempt using at least (transferId, chunkIndex, messageId)
-      record.activeAttempts.set(chunkIndex, { messageId, attemptSeq, attemptToken, isRetransmission });
+      const attemptRecord = Object.freeze({
+        messageId,
+        attemptSeq,
+        attemptToken,
+        isRetransmission,
+      });
+      record.activeAttempts.set(chunkIndex, attemptRecord);
       record.inflightChunks.add(chunkIndex);
       results.push(attemptFrame);
     }
@@ -1439,10 +1445,23 @@ export class SnapshotOutboundPipeline {
       transmittedChunks: new Set(record.transmittedChunks),
       retryCounts: new Map(record.retryCounts),
       confirmedRetries: new Map(record.confirmedRetries),
-      activeAttempts: new Map(record.activeAttempts),
+      activeAttempts: new Map(
+        Array.from(record.activeAttempts.entries()).map(([chunkIndex, attempt]) => [
+          chunkIndex,
+          Object.freeze({ ...attempt }),
+        ])
+      ),
       handedOffAttempts: new Set(record.handedOffAttempts),
       failedAttempts: new Set(record.failedAttempts),
-      offerMessage: record.offerMessage,
+      offerMessage: record.offerMessage
+        ? Object.freeze({
+            ...record.offerMessage,
+            payload: Object.freeze({
+              ...record.offerMessage.payload,
+              snapshotFrontier: Object.freeze({ ...record.offerMessage.payload.snapshotFrontier }),
+            }),
+          })
+        : undefined,
       failureReason: record.failureReason,
       failureDetail: record.failureDetail,
       isTerminal: this.#isTerminalState(record.state),
