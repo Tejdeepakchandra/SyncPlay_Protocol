@@ -10,7 +10,10 @@
  * - Coordinates sequential snapshot preparation via SnapshotPreparationQueue (concurrency admission <= 2).
  * - Manages explicit artifact lease lifecycle: retains lease across final-chunk production and
  *   retransmissions; guarantees release on completion, cancellation, timeout, or failure.
- * - Enforces bounded in-flight transmission window (default W = 4) and bounded per-chunk retry limits.
+ * - Enforces bounded in-flight transmission window (default W = 4) and deterministic retry limits.
+ * - Enforces strict capability-gated AuthenticatedRecipientContext fencing on all remote operations:
+ *   validates recipientPeerId, sessionId, membershipEpoch, and connectionGeneration.
+ * - Provides bounded, idempotent handoff-failure handling to prevent stranded in-flight reservations.
  * - Guarantees terminal state machine transitions (PREPARING, PREPARED, ACTIVE, WAITING_ACK,
  *   COMPLETED, ABORTED, CANCELLED, TIMED_OUT) with immunity to late or stale callbacks.
  */
@@ -49,6 +52,60 @@ function generateUUID(): string {
     const v = c === 'x' ? r : (r & 0x3) | 0x8;
     return v.toString(16);
   });
+}
+
+/**
+ * Capability held by trusted transport adapter / composition root.
+ * Required to register unforgeable AuthenticatedRecipientContext instances.
+ */
+export interface OutboundTransportCapability {
+  readonly authority: string;
+  readonly sessionId: string;
+  readonly token: string;
+}
+
+/**
+ * Creates an authorized OutboundTransportCapability for trusted transport adapter initialization.
+ */
+export function createOutboundTransportCapability(
+  authority: string,
+  sessionId: string,
+  token?: string
+): OutboundTransportCapability {
+  if (!authority || typeof authority !== 'string') {
+    throw new SyncEngineError('INVALID_ARGUMENT', 'authority must be a non-empty string');
+  }
+  if (!sessionId || typeof sessionId !== 'string') {
+    throw new SyncEngineError('INVALID_ARGUMENT', 'sessionId must be a non-empty string');
+  }
+  return Object.freeze({
+    authority,
+    sessionId,
+    token: token ?? `outbound-cap-${sessionId}-${Math.random().toString(36).slice(2)}-${Date.now()}`,
+  });
+}
+
+/**
+ * Authenticated recipient context derived strictly from authenticated transport connection state.
+ * Validated against transfer records to enforce recipient, session, epoch, and generation fencing.
+ */
+export interface AuthenticatedRecipientContext {
+  readonly transferId: string;
+  readonly recipientPeerId: string;
+  readonly sessionId: string;
+  readonly membershipEpoch: number;
+  readonly connectionGeneration: number;
+}
+
+/**
+ * Parameters for registering an inbound recipient context.
+ */
+export interface InboundRecipientContextParams {
+  readonly transferId: string;
+  readonly recipientPeerId: string;
+  readonly sessionId: string;
+  readonly membershipEpoch: number;
+  readonly connectionGeneration: number;
 }
 
 /**
@@ -121,6 +178,7 @@ export interface OutboundTransferSession {
   readonly nominalChunkSizeBytes: number;
   readonly acknowledgedChunks: ReadonlySet<number>;
   readonly inflightChunks: ReadonlySet<number>;
+  readonly transmittedChunks: ReadonlySet<number>;
   readonly retryCounts: ReadonlyMap<number, number>;
   readonly offerMessage?: ProtocolMessage<SnapshotOfferPayload>;
   readonly failureReason?: SnapshotAbortReason;
@@ -132,6 +190,7 @@ export interface OutboundTransferSession {
  * Configuration options for SnapshotOutboundPipeline.
  */
 export interface OutboundPipelineConfig {
+  readonly transportCapability?: OutboundTransportCapability;
   readonly preparationQueue?: SnapshotPreparationQueue;
   readonly maxActiveTransfers?: number;
   readonly slidingWindowSize?: number;
@@ -179,16 +238,33 @@ interface InternalTransferRecord {
   failureDetail?: string;
   readonly acknowledgedChunks: Set<number>;
   readonly inflightChunks: Set<number>;
+  readonly transmittedChunks: Set<number>;
   readonly retryCounts: Map<number, number>;
   readonly preparedFrames: Map<number, ProducedChunkMessage>;
+  readonly chunkMessageIds: Map<number, string>;
   leaseHeld: boolean;
   timeoutTimer?: ReturnType<typeof setTimeout> | undefined;
 }
 
 /**
+ * Creates an authenticated recipient transport context registered with the target outbound pipeline.
+ * Requires the authorized OutboundTransportCapability held by the trusted transport adapter.
+ */
+export function createAuthenticatedRecipientContext(
+  pipeline: SnapshotOutboundPipeline,
+  params: InboundRecipientContextParams,
+  capability: OutboundTransportCapability
+): AuthenticatedRecipientContext {
+  if (!pipeline || !(pipeline instanceof SnapshotOutboundPipeline)) {
+    throw new SyncEngineError('INVALID_ARGUMENT', 'Valid SnapshotOutboundPipeline instance is required');
+  }
+  return pipeline.registerInboundRecipientContext(params, capability);
+}
+
+/**
  * Orchestrator for outbound state recovery transfers.
  * Integrates SnapshotPreparationQueue, SnapshotSerializer, and SnapshotChunkProducer
- * into a bounded, deterministic, lifecycle-safe pipeline.
+ * into a bounded, deterministic, lifecycle-safe, capability-fenced pipeline.
  */
 export class SnapshotOutboundPipeline {
   public static readonly DEFAULT_MAX_ACTIVE_TRANSFERS = 2;
@@ -406,6 +482,8 @@ export class SnapshotOutboundPipeline {
   // Instance-Based Outbound Transfer Pipeline Orchestrator
   // ─────────────────────────────────────────────────────────────
 
+  readonly #authorizedCapability?: OutboundTransportCapability;
+  readonly #validRecipientContexts = new WeakSet<AuthenticatedRecipientContext>();
   readonly #preparationQueue: SnapshotPreparationQueue;
   readonly #maxActiveTransfers: number;
   readonly #slidingWindowSize: number;
@@ -417,6 +495,9 @@ export class SnapshotOutboundPipeline {
   readonly #transfers = new Map<string, InternalTransferRecord>();
 
   constructor(config: OutboundPipelineConfig = {}) {
+    this.#authorizedCapability = config.transportCapability
+      ? Object.freeze(config.transportCapability)
+      : undefined;
     this.#preparationQueue = config.preparationQueue ?? new SnapshotPreparationQueue();
     this.#maxActiveTransfers = config.maxActiveTransfers ?? SnapshotOutboundPipeline.DEFAULT_MAX_ACTIVE_TRANSFERS;
     this.#slidingWindowSize = config.slidingWindowSize ?? SnapshotOutboundPipeline.DEFAULT_SLIDING_WINDOW_SIZE;
@@ -427,6 +508,72 @@ export class SnapshotOutboundPipeline {
 
   public get isDisposed(): boolean {
     return this.#isDisposed;
+  }
+
+  /**
+   * Registers an unforgeable, authenticated recipient context bound to transport parameters.
+   * Requires the authorized OutboundTransportCapability.
+   */
+  public registerInboundRecipientContext(
+    params: InboundRecipientContextParams,
+    capability: OutboundTransportCapability
+  ): AuthenticatedRecipientContext {
+    this.#assertNotDisposed();
+
+    if (
+      !this.#authorizedCapability ||
+      !capability ||
+      capability !== this.#authorizedCapability
+    ) {
+      throw new SyncEngineError(
+        'UNAUTHORIZED',
+        'Recipient context registration requires authorized OutboundTransportCapability'
+      );
+    }
+
+    if (!params || typeof params !== 'object') {
+      throw new SyncEngineError('INVALID_ARGUMENT', 'InboundRecipientContextParams is required');
+    }
+    if (!params.transferId || typeof params.transferId !== 'string') {
+      throw new SyncEngineError('INVALID_ARGUMENT', 'transferId must be a non-empty string');
+    }
+    if (!params.recipientPeerId || typeof params.recipientPeerId !== 'string') {
+      throw new SyncEngineError('INVALID_ARGUMENT', 'recipientPeerId must be a non-empty string');
+    }
+    if (!params.sessionId || typeof params.sessionId !== 'string') {
+      throw new SyncEngineError('INVALID_ARGUMENT', 'sessionId must be a non-empty string');
+    }
+    if (
+      typeof params.membershipEpoch !== 'number' ||
+      !Number.isInteger(params.membershipEpoch) ||
+      params.membershipEpoch < 0
+    ) {
+      throw new SyncEngineError(
+        'INVALID_ARGUMENT',
+        `Invalid membershipEpoch ${params.membershipEpoch}: must be non-negative integer`
+      );
+    }
+    if (
+      typeof params.connectionGeneration !== 'number' ||
+      !Number.isInteger(params.connectionGeneration) ||
+      params.connectionGeneration < 1
+    ) {
+      throw new SyncEngineError(
+        'INVALID_ARGUMENT',
+        `Invalid connectionGeneration ${params.connectionGeneration}: must be positive integer`
+      );
+    }
+
+    const context: AuthenticatedRecipientContext = Object.freeze({
+      transferId: params.transferId,
+      recipientPeerId: params.recipientPeerId,
+      sessionId: params.sessionId,
+      membershipEpoch: params.membershipEpoch,
+      connectionGeneration: params.connectionGeneration,
+    });
+
+    this.#validRecipientContexts.add(context);
+    return context;
   }
 
   /**
@@ -505,8 +652,10 @@ export class SnapshotOutboundPipeline {
       state: 'PREPARING',
       acknowledgedChunks: new Set(),
       inflightChunks: new Set(),
+      transmittedChunks: new Set(),
       retryCounts: new Map(),
       preparedFrames: new Map(),
+      chunkMessageIds: new Map(),
       leaseHeld: false,
     };
 
@@ -599,28 +748,34 @@ export class SnapshotOutboundPipeline {
 
   /**
    * Produces or retrieves prepared chunk frames for the requested chunk indices.
+   * Gated by AuthenticatedRecipientContext: enforces recipient peer, session, epoch, and generation fencing.
    * Enforces:
    * 1. Window bounds: number of concurrently retained in-flight frames <= slidingWindowSize.
-   * 2. Per-chunk retry bounding: aborts with RETRY_BUDGET_EXHAUSTED if maxRetries exceeded.
-   * 3. Send-boundary byte verification: aborts with TRANSPORT_LIMIT_EXCEEDED if frame overshoots.
-   * 4. Idempotent return of exact serializedJson string.
+   * 2. Per-chunk retry bounding: initial transmission does not consume retry budget;
+   *    retransmissions capped at maxRetriesPerChunk (aborts with RETRY_BUDGET_EXHAUSTED if exceeded).
+   * 3. Deterministic messageId preservation across retransmissions even after frame cache eviction.
+   * 4. Send-boundary byte verification: aborts with TRANSPORT_LIMIT_EXCEEDED if frame overshoots.
+   * 5. Idempotent return of exact serializedJson string.
    */
   public handleChunkRequest(
     transferId: string,
-    requestedChunkIndices: number[]
+    requestedChunkIndices: number[],
+    context: AuthenticatedRecipientContext
   ): ProducedChunkMessage[] {
     this.#assertNotDisposed();
 
     const record = this.#assertActiveTransfer(transferId);
-    const producer = record.producer!;
+    this.#validateContext(record, transferId, context);
 
     if (record.state === 'PREPARED') {
       record.state = 'ACTIVE';
     }
 
+    const producer = record.producer!;
     const results: ProducedChunkMessage[] = [];
+    const uniqueIndices = Array.from(new Set(requestedChunkIndices));
 
-    for (const chunkIndex of requestedChunkIndices) {
+    for (const chunkIndex of uniqueIndices) {
       if (!Number.isInteger(chunkIndex) || chunkIndex < 0 || chunkIndex >= producer.totalChunks) {
         throw new SyncEngineError(
           'INVALID_RANGE',
@@ -628,30 +783,38 @@ export class SnapshotOutboundPipeline {
         );
       }
 
-      // Check retry limits
-      const currentRetries = record.retryCounts.get(chunkIndex) ?? 0;
-      if (currentRetries >= this.#maxRetriesPerChunk) {
-        this.#terminate(
-          record,
-          'ABORTED',
-          `Retry limit (${this.#maxRetriesPerChunk}) exceeded for chunk ${chunkIndex}`,
-          'RETRY_BUDGET_EXHAUSTED'
-        );
-        throw new SyncEngineError(
-          'LOCAL_ABORT',
-          `Retry limit exceeded for chunk ${chunkIndex} in transfer ${transferId}`
-        );
+      if (record.acknowledgedChunks.has(chunkIndex)) {
+        throw new SyncEngineError('INVALID_STATE', `Chunk ${chunkIndex} is already acknowledged`);
       }
 
-      // Enforce in-flight sliding window capacity for new chunks
-      if (!record.inflightChunks.has(chunkIndex) && record.inflightChunks.size >= this.#slidingWindowSize) {
-        throw new SyncEngineError(
-          'LOCAL_ABORT',
-          `In-flight sliding window capacity (${this.#slidingWindowSize}) reached for transfer ${transferId}`
-        );
-      }
+      const isRetransmission = record.transmittedChunks.has(chunkIndex);
 
-      record.retryCounts.set(chunkIndex, currentRetries + 1);
+      if (isRetransmission) {
+        // Retransmission check: capped at maxRetriesPerChunk
+        const currentRetries = record.retryCounts.get(chunkIndex) ?? 0;
+        if (currentRetries >= this.#maxRetriesPerChunk) {
+          this.#terminate(
+            record,
+            'ABORTED',
+            `Retry budget (${this.#maxRetriesPerChunk}) exhausted for chunk ${chunkIndex}`,
+            'RETRY_BUDGET_EXHAUSTED'
+          );
+          throw new SyncEngineError(
+            'LOCAL_ABORT',
+            `Retry budget exhausted for chunk ${chunkIndex} in transfer ${transferId}`
+          );
+        }
+        record.retryCounts.set(chunkIndex, currentRetries + 1);
+      } else {
+        // Initial transmission check: enforce sliding window capacity
+        if (record.inflightChunks.size >= this.#slidingWindowSize) {
+          throw new SyncEngineError(
+            'LOCAL_ABORT',
+            `In-flight sliding window capacity (${this.#slidingWindowSize}) reached for transfer ${transferId}`
+          );
+        }
+        record.transmittedChunks.add(chunkIndex);
+      }
 
       // Re-use already prepared frame from sliding window cache if available
       let frame = record.preparedFrames.get(chunkIndex);
@@ -661,8 +824,16 @@ export class SnapshotOutboundPipeline {
           this.#pruneOldestPreparedFrame(record);
         }
 
+        // Maintain deterministic messageId across retransmissions even after cache eviction
+        let messageId = record.chunkMessageIds.get(chunkIndex);
+        if (!messageId) {
+          messageId = `msg-${generateUUID()}`;
+          record.chunkMessageIds.set(chunkIndex, messageId);
+        }
+
         try {
           frame = producer.produceChunk(chunkIndex, {
+            messageId,
             connectionGeneration: record.connectionGeneration,
           });
         } catch (err) {
@@ -693,11 +864,16 @@ export class SnapshotOutboundPipeline {
 
   /**
    * Handles chunk delivery acknowledgement from the recipient.
+   * Gated by AuthenticatedRecipientContext: enforces recipient peer, session, epoch, and generation fencing.
    * Evicts the delivered frame from the sliding window cache to free memory.
    * If all chunks are acknowledged, transitions to COMPLETED and releases all leases.
    * Stale/late acknowledgements on already completed/terminated transfers are ignored.
    */
-  public handleChunkAck(transferId: string, chunkIndex: number): void {
+  public handleChunkAck(
+    transferId: string,
+    chunkIndex: number,
+    context: AuthenticatedRecipientContext
+  ): void {
     const record = this.#transfers.get(transferId);
     if (!record) {
       // Stale or unknown transfer: safely ignore late ACK
@@ -707,6 +883,8 @@ export class SnapshotOutboundPipeline {
       // Transfer already terminated: ignore late ACK without resurrecting
       return;
     }
+
+    this.#validateContext(record, transferId, context);
 
     if (
       !Number.isInteger(chunkIndex) ||
@@ -742,22 +920,74 @@ export class SnapshotOutboundPipeline {
   }
 
   /**
+   * Handles transport handoff failure reported by the transport layer.
+   * Releases the in-flight reservation for the failed chunk, reopening the window.
+   * Does NOT mark the chunk acknowledged, does NOT dispose artifact or leases,
+   * and preserves cached frame for subsequent retransmission.
+   */
+  public handleHandoffFailure(
+    transferId: string,
+    chunkIndex: number,
+    context: AuthenticatedRecipientContext
+  ): void {
+    this.#assertNotDisposed();
+
+    const record = this.#transfers.get(transferId);
+    if (!record || this.#isTerminalState(record.state)) {
+      return;
+    }
+
+    this.#validateContext(record, transferId, context);
+
+    if (
+      !Number.isInteger(chunkIndex) ||
+      chunkIndex < 0 ||
+      chunkIndex >= (record.producer?.totalChunks ?? 0)
+    ) {
+      throw new SyncEngineError(
+        'INVALID_RANGE',
+        `Handoff failure chunkIndex ${chunkIndex} is out of bounds`
+      );
+    }
+
+    // If chunk was already acknowledged, handoff failure cannot un-acknowledge it
+    if (record.acknowledgedChunks.has(chunkIndex)) {
+      return;
+    }
+
+    // Release in-flight reservation
+    if (record.inflightChunks.has(chunkIndex)) {
+      record.inflightChunks.delete(chunkIndex);
+
+      // If waiting for ACK and in-flight count dropped below window, return to ACTIVE
+      if (record.state === 'WAITING_ACK' && record.inflightChunks.size < this.#slidingWindowSize) {
+        record.state = 'ACTIVE';
+      }
+    }
+  }
+
+  /**
    * Handles remote peer rejection/abort of the transfer.
+   * Gated by AuthenticatedRecipientContext: enforces recipient peer, session, epoch, and generation fencing.
    */
   public handleRemoteAbort(
     transferId: string,
     reason: SnapshotAbortReason,
+    context: AuthenticatedRecipientContext,
     detail?: string
   ): void {
     const record = this.#transfers.get(transferId);
     if (!record || this.#isTerminalState(record.state)) {
       return;
     }
+
+    this.#validateContext(record, transferId, context);
+
     this.#terminate(record, 'ABORTED', detail ?? `Remote abort: ${reason}`, reason);
   }
 
   /**
-   * Cancels an active or pending outbound transfer.
+   * Cancels an active or pending outbound transfer locally.
    * If pending in the preparation queue, cancels the queue item.
    * If active, transitions to CANCELLED and disposes the producer and leases.
    */
@@ -823,6 +1053,49 @@ export class SnapshotOutboundPipeline {
       throw new SyncEngineError('INVALID_STATE', `Transfer ${transferId} producer is not initialized`);
     }
     return record;
+  }
+
+  #validateContext(
+    record: InternalTransferRecord,
+    transferId: string,
+    context: AuthenticatedRecipientContext
+  ): void {
+    if (!context || typeof context !== 'object') {
+      throw new SyncEngineError('UNAUTHORIZED', 'Authenticated recipient context is required');
+    }
+    if (!this.#validRecipientContexts.has(context)) {
+      throw new SyncEngineError('UNAUTHORIZED', 'Provided recipient context is not registered or authenticated');
+    }
+    if (context.transferId !== transferId || context.transferId !== record.transferId) {
+      throw new SyncEngineError(
+        'UNAUTHORIZED',
+        `Context transferId '${context.transferId}' does not match transfer '${transferId}'`
+      );
+    }
+    if (context.recipientPeerId !== record.recipientPeerId) {
+      throw new SyncEngineError(
+        'UNAUTHORIZED',
+        `Authenticated peer '${context.recipientPeerId}' does not match transfer recipient '${record.recipientPeerId}'`
+      );
+    }
+    if (record.artifact && context.sessionId !== record.artifact.sessionId) {
+      throw new SyncEngineError(
+        'INVALID_ARGUMENT',
+        `Context sessionId '${context.sessionId}' does not match artifact sessionId '${record.artifact.sessionId}'`
+      );
+    }
+    if (context.membershipEpoch !== record.membershipEpoch) {
+      throw new SyncEngineError(
+        'REJECTED_OBSOLETE_EPOCH',
+        `Context membershipEpoch ${context.membershipEpoch} does not match transfer epoch ${record.membershipEpoch}`
+      );
+    }
+    if (context.connectionGeneration !== record.connectionGeneration) {
+      throw new SyncEngineError(
+        'UNAUTHORIZED',
+        `Context connectionGeneration ${context.connectionGeneration} does not match transfer generation ${record.connectionGeneration}`
+      );
+    }
   }
 
   #isTerminalState(state: OutboundTransferState): boolean {
@@ -949,6 +1222,7 @@ export class SnapshotOutboundPipeline {
       nominalChunkSizeBytes: producer?.nominalChunkSizeBytes ?? 0,
       acknowledgedChunks: new Set(record.acknowledgedChunks),
       inflightChunks: new Set(record.inflightChunks),
+      transmittedChunks: new Set(record.transmittedChunks),
       retryCounts: new Map(record.retryCounts),
       offerMessage: record.offerMessage,
       failureReason: record.failureReason,

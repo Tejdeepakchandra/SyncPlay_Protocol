@@ -165,8 +165,13 @@ export type {
 
 export {
   SnapshotOutboundPipeline,
+  createOutboundTransportCapability,
+  createAuthenticatedRecipientContext,
 } from './recovery/snapshot-outbound-pipeline.js';
 export type {
+  OutboundTransportCapability,
+  AuthenticatedRecipientContext,
+  InboundRecipientContextParams,
   OutboundOfferContext,
   OutboundChunkContext,
   OutboundChunkResult,
