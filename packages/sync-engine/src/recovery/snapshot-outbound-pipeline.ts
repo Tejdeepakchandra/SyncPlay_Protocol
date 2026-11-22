@@ -239,6 +239,11 @@ interface InternalTransferRecord {
   readonly acknowledgedChunks: Set<number>;
   readonly inflightChunks: Set<number>;
   readonly transmittedChunks: Set<number>;
+  readonly handedOffChunks: Set<number>;
+  readonly handedOffAttempts: Set<string>;
+  readonly failedAttempts: Set<string>;
+  readonly activeAttempts: Map<number, { messageId: string; attemptSeq: number; attemptToken: string }>;
+  readonly attemptCounters: Map<number, number>;
   readonly retryCounts: Map<number, number>;
   readonly preparedFrames: Map<number, ProducedChunkMessage>;
   readonly chunkMessageIds: Map<number, string>;
@@ -653,6 +658,11 @@ export class SnapshotOutboundPipeline {
       acknowledgedChunks: new Set(),
       inflightChunks: new Set(),
       transmittedChunks: new Set(),
+      handedOffChunks: new Set(),
+      handedOffAttempts: new Set(),
+      failedAttempts: new Set(),
+      activeAttempts: new Map(),
+      attemptCounters: new Map(),
       retryCounts: new Map(),
       preparedFrames: new Map(),
       chunkMessageIds: new Map(),
@@ -787,10 +797,17 @@ export class SnapshotOutboundPipeline {
         throw new SyncEngineError('INVALID_STATE', `Chunk ${chunkIndex} is already acknowledged`);
       }
 
+      const currentMessageId = record.chunkMessageIds.get(chunkIndex);
+      const isFailedLocalAttempt =
+        currentMessageId !== undefined && record.failedAttempts.has(currentMessageId);
+
+      // A request is a network retransmission if this chunk was already transmitted
       const isRetransmission = record.transmittedChunks.has(chunkIndex);
 
+      let messageId: string;
+
       if (isRetransmission) {
-        // Retransmission check: capped at maxRetriesPerChunk
+        // Retransmission check: capped at maxRetriesPerChunk (Rule 9)
         const currentRetries = record.retryCounts.get(chunkIndex) ?? 0;
         if (currentRetries >= this.#maxRetriesPerChunk) {
           this.#terminate(
@@ -805,30 +822,43 @@ export class SnapshotOutboundPipeline {
           );
         }
         record.retryCounts.set(chunkIndex, currentRetries + 1);
+
+        if (isFailedLocalAttempt) {
+          // Rule 5: Failed local handoff preserves messageId for next local attempt
+          messageId = currentMessageId!;
+          record.failedAttempts.delete(messageId);
+        } else {
+          // Rule 7: Subsequent network retransmission receives a new messageId
+          messageId = `msg-${generateUUID()}`;
+          record.chunkMessageIds.set(chunkIndex, messageId);
+        }
       } else {
         // Initial transmission check: enforce sliding window capacity
-        if (record.inflightChunks.size >= this.#slidingWindowSize) {
+        if (!record.inflightChunks.has(chunkIndex) && record.inflightChunks.size >= this.#slidingWindowSize) {
           throw new SyncEngineError(
             'LOCAL_ABORT',
             `In-flight sliding window capacity (${this.#slidingWindowSize}) reached for transfer ${transferId}`
           );
         }
+
+        if (isFailedLocalAttempt) {
+          // Rule 5: Failed local handoff preserves messageId for next local attempt
+          messageId = currentMessageId!;
+          record.failedAttempts.delete(messageId);
+        } else {
+          // Initial transmission attempt: allocate initial messageId
+          messageId = `msg-${generateUUID()}`;
+          record.chunkMessageIds.set(chunkIndex, messageId);
+        }
         record.transmittedChunks.add(chunkIndex);
       }
 
-      // Re-use already prepared frame from sliding window cache if available
+      // Re-use already prepared frame from sliding window cache if available and matching messageId
       let frame = record.preparedFrames.get(chunkIndex);
-      if (!frame) {
+      if (!frame || frame.message.messageId !== messageId) {
         // Enforce sliding window capacity: evict oldest unacknowledged non-in-flight frame if needed
-        if (record.preparedFrames.size >= this.#slidingWindowSize) {
+        if (!record.preparedFrames.has(chunkIndex) && record.preparedFrames.size >= this.#slidingWindowSize) {
           this.#pruneOldestPreparedFrame(record);
-        }
-
-        // Maintain deterministic messageId across retransmissions even after cache eviction
-        let messageId = record.chunkMessageIds.get(chunkIndex);
-        if (!messageId) {
-          messageId = `msg-${generateUUID()}`;
-          record.chunkMessageIds.set(chunkIndex, messageId);
         }
 
         try {
@@ -851,8 +881,23 @@ export class SnapshotOutboundPipeline {
         record.preparedFrames.set(chunkIndex, frame);
       }
 
+      // Rule 1: handleChunkRequest() must return the exact messageId associated with the returned frame
+      const attemptSeq = (record.attemptCounters.get(chunkIndex) ?? 0) + 1;
+      record.attemptCounters.set(chunkIndex, attemptSeq);
+      const attemptToken = `${messageId}:${attemptSeq}`;
+
+      // Return attempt-bound ProducedChunkMessage descriptor
+      const attemptFrame: ProducedChunkMessage = Object.freeze({
+        ...frame,
+        messageId,
+        attemptSeq,
+        attemptToken,
+      });
+
+      // Rule 3: Track active attempt using at least (transferId, chunkIndex, messageId)
+      record.activeAttempts.set(chunkIndex, { messageId, attemptSeq, attemptToken });
       record.inflightChunks.add(chunkIndex);
-      results.push(frame);
+      results.push(attemptFrame);
     }
 
     if (record.inflightChunks.size >= this.#slidingWindowSize) {
@@ -904,9 +949,11 @@ export class SnapshotOutboundPipeline {
 
     record.acknowledgedChunks.add(chunkIndex);
     record.inflightChunks.delete(chunkIndex);
+    record.activeAttempts.delete(chunkIndex);
 
     // Evict delivered frame from sliding window cache immediately to bound memory
     record.preparedFrames.delete(chunkIndex);
+    record.chunkMessageIds.delete(chunkIndex);
 
     // If waiting for ACK and in-flight count dropped below window, return to ACTIVE
     if (record.state === 'WAITING_ACK' && record.inflightChunks.size < this.#slidingWindowSize) {
@@ -920,21 +967,107 @@ export class SnapshotOutboundPipeline {
   }
 
   /**
-   * Handles transport handoff failure reported by the transport layer.
-   * Releases the in-flight reservation for the failed chunk, reopening the window.
-   * Does NOT mark the chunk acknowledged, does NOT dispose artifact or leases,
-   * and preserves cached frame for subsequent retransmission.
+   * Handles successful transport handoff reported by the transport layer.
+   * Confirms that the message entered the local DataChannel send buffer.
+   * Gated by AuthenticatedRecipientContext and attempt messageId.
+   * Does NOT claim remote receipt or acknowledge the chunk (Rule 6, 10).
    */
-  public handleHandoffFailure(
+  public handleHandoffSuccess(
     transferId: string,
     chunkIndex: number,
-    context: AuthenticatedRecipientContext
+    messageId: string,
+    context: AuthenticatedRecipientContext,
+    attemptToken?: string | number
   ): void {
     this.#assertNotDisposed();
 
     const record = this.#transfers.get(transferId);
     if (!record || this.#isTerminalState(record.state)) {
       return;
+    }
+
+    this.#validateContext(record, transferId, context);
+
+    if (
+      !Number.isInteger(chunkIndex) ||
+      chunkIndex < 0 ||
+      chunkIndex >= (record.producer?.totalChunks ?? 0)
+    ) {
+      throw new SyncEngineError(
+        'INVALID_RANGE',
+        `Handoff success chunkIndex ${chunkIndex} is out of bounds`
+      );
+    }
+
+    if (record.acknowledgedChunks.has(chunkIndex)) {
+      return;
+    }
+
+    const active = record.activeAttempts.get(chunkIndex);
+    if (!active) {
+      return;
+    }
+    if (active.messageId !== messageId) {
+      // Stale or duplicate callback for an older or mismatched attempt: NO-OP (Rule 4, 8)
+      return;
+    }
+    if (
+      attemptToken !== undefined &&
+      attemptToken !== active.attemptToken &&
+      attemptToken !== active.attemptSeq
+    ) {
+      return;
+    }
+
+    // Record entry into local send buffer (Rule 6, 10)
+    record.handedOffAttempts.add(messageId);
+    record.handedOffChunks.add(chunkIndex);
+  }
+
+  /**
+   * Handles transport handoff failure reported by the transport layer.
+   * Releases the in-flight reservation for the failed chunk, reopening the window.
+   * Does NOT mark the chunk acknowledged, does NOT dispose artifact or leases,
+   * and preserves cached frame for subsequent local re-attempt (Rules 4, 5, 8, 9).
+   */
+  public handleHandoffFailure(
+    transferId: string,
+    chunkIndex: number,
+    messageId: string,
+    context: AuthenticatedRecipientContext,
+    attemptToken?: string | number
+  ): void;
+  public handleHandoffFailure(
+    transferId: string,
+    chunkIndex: number,
+    context: AuthenticatedRecipientContext
+  ): void;
+  public handleHandoffFailure(
+    transferId: string,
+    chunkIndex: number,
+    messageIdOrContext: string | AuthenticatedRecipientContext,
+    maybeContext?: AuthenticatedRecipientContext,
+    attemptToken?: string | number
+  ): void {
+    this.#assertNotDisposed();
+
+    const record = this.#transfers.get(transferId);
+    if (!record || this.#isTerminalState(record.state)) {
+      return;
+    }
+
+    let messageId: string | undefined;
+    let context: AuthenticatedRecipientContext;
+
+    if (typeof messageIdOrContext === 'string') {
+      messageId = messageIdOrContext;
+      if (!maybeContext || typeof maybeContext !== 'object') {
+        throw new SyncEngineError('UNAUTHORIZED', 'Authenticated recipient context is required');
+      }
+      context = maybeContext;
+    } else {
+      context = messageIdOrContext;
+      messageId = undefined;
     }
 
     this.#validateContext(record, transferId, context);
@@ -955,14 +1088,39 @@ export class SnapshotOutboundPipeline {
       return;
     }
 
+    const active = record.activeAttempts.get(chunkIndex);
+
+    // Rule 4 & 8: A callback whose messageId does not match the active attempt must be a strict no-op.
+    if (messageId !== undefined) {
+      if (!active || active.messageId !== messageId) {
+        return;
+      }
+      if (
+        attemptToken !== undefined &&
+        attemptToken !== active.attemptToken &&
+        attemptToken !== active.attemptSeq
+      ) {
+        return;
+      }
+    } else {
+      // Legacy 3-arg call fallback
+      if (!active) {
+        return;
+      }
+      messageId = active.messageId;
+    }
+
+    // Mark attempt as failed locally and remove from active attempt tracking
+    record.activeAttempts.delete(chunkIndex);
+    record.failedAttempts.add(messageId);
+
     // Release in-flight reservation
     if (record.inflightChunks.has(chunkIndex)) {
       record.inflightChunks.delete(chunkIndex);
 
-      // Roll back transmission marking or retry count if this attempt failed local handoff
+      // Roll back retry count if this attempt was a retransmission that failed local handoff (Rule 9)
       const currentRetries = record.retryCounts.get(chunkIndex);
       if (currentRetries !== undefined && currentRetries > 0) {
-        // Failed retransmission handoff: roll back the incremented retry count
         if (currentRetries <= 1) {
           record.retryCounts.delete(chunkIndex);
         } else {
