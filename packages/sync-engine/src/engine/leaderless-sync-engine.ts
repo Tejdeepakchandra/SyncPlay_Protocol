@@ -86,6 +86,24 @@ interface MutableStats {
   listenerErrorCount: number;
 }
 
+export interface EngineCoreDiagnosticSnapshot {
+  readonly stateVersion: number;
+  readonly playbackStatus: 'paused' | 'playing';
+  readonly anchorPositionMs: number;
+  readonly anchorLocalTimestamp: number;
+  readonly playbackRate: number;
+  readonly currentEpoch: number;
+  readonly logicalClock: number;
+  readonly localOriginSequence: number;
+  readonly lastAppliedEventId: string | undefined;
+  readonly replicationFrontier: Readonly<Record<string, number>>;
+  readonly localFrontier: Readonly<Record<string, number>>;
+  readonly baseSnapshotFrontier: Readonly<Record<string, number>>;
+  readonly pendingQueueSize: number;
+  readonly logSize: number;
+  readonly isRecoveryActive: boolean;
+}
+
 export interface EpochTransitionCapability {
   readonly authority: string;
   readonly sessionId: string;
@@ -106,6 +124,29 @@ export function createEpochTransitionCapability(
     token:
       token ??
       `epoch-cap-${sessionId}-${Math.random().toString(36).slice(2)}-${Date.now()}`,
+  });
+}
+
+export interface RecoveryInstallationCapability {
+  readonly authority: string;
+  readonly sessionId: string;
+  readonly token: string;
+}
+
+/**
+ * Creates an authorized RecoveryInstallationCapability for trusted recovery coordinator initialization.
+ */
+export function createRecoveryInstallationCapability(
+  authority: string,
+  sessionId: string,
+  token?: string,
+): RecoveryInstallationCapability {
+  return Object.freeze({
+    authority,
+    sessionId,
+    token:
+      token ??
+      `recovery-install-cap-${sessionId}-${Math.random().toString(36).slice(2)}-${Date.now()}`,
   });
 }
 
@@ -633,6 +674,8 @@ export interface LeaderlessSyncEngineConfig extends SyncEngineConfig {
   readonly epochCapability?: EpochTransitionCapability;
   readonly transportCapability?: TransportRegistrationCapability;
   readonly supplierCapability?: TransportRegistrationCapability;
+  readonly recoveryCapability?: RecoveryInstallationCapability;
+  readonly recoveryInstallationCapability?: RecoveryInstallationCapability;
 }
 
 export class LeaderlessSyncEngine implements SyncEngine {
@@ -656,6 +699,7 @@ export class LeaderlessSyncEngine implements SyncEngine {
   private readonly compactionManager = new CompactionManager();
   private readonly authorizedEpochCapability?: EpochTransitionCapability;
   private readonly authorizedTransportCapability?: TransportRegistrationCapability;
+  private readonly authorizedRecoveryCapability?: RecoveryInstallationCapability;
   private readonly validSupplierContexts = new WeakSet<AuthenticatedSupplierContext>();
   private readonly validRequesterContexts = new WeakSet<AuthenticatedRequesterContext>();
   private antiEntropyManager?: IAntiEntropyManager;
@@ -705,6 +749,11 @@ export class LeaderlessSyncEngine implements SyncEngine {
       ? Object.freeze(transportCap)
       : undefined;
 
+    const recoveryCap = config.recoveryInstallationCapability ?? config.recoveryCapability;
+    this.authorizedRecoveryCapability = recoveryCap
+      ? Object.freeze(recoveryCap)
+      : undefined;
+
     const logCapacity = config.logCapacity ?? 256;
     this.logCapacity = logCapacity;
     this.conflictResolver = new ConflictResolver();
@@ -733,6 +782,7 @@ export class LeaderlessSyncEngine implements SyncEngine {
     this.core.playbackState = val;
     this.core.state = val;
     this.core.stateVersion = val.stateVersion;
+    this.core.lastAppliedEventId = val.lastAppliedEvent?.logicalEventId;
   }
 
   private get baseSnapshot(): PlaybackState {
@@ -785,10 +835,27 @@ export class LeaderlessSyncEngine implements SyncEngine {
 
   // ── Recovery & Single-Root Atomic Installer Hooks ─────────────
   /**
-   * Returns current sealed engine core state for read-only inspection or assertions.
+   * Returns an immutable diagnostic snapshot with detached defensive copies.
+   * Operational class instances and internal collection references are not exposed.
    */
-  public get coreState(): Readonly<EngineCoreState> {
-    return this.core;
+  public getDiagnosticCoreSnapshot(): EngineCoreDiagnosticSnapshot {
+    return Object.freeze({
+      stateVersion: this.core.stateVersion,
+      playbackStatus: this.core.playbackState.status,
+      anchorPositionMs: this.core.playbackState.anchorPositionMs,
+      anchorLocalTimestamp: this.core.playbackState.anchorLocalTimestamp,
+      playbackRate: this.core.playbackState.playbackRate,
+      currentEpoch: this.core.currentEpoch,
+      logicalClock: this.core.clockManager.clock,
+      localOriginSequence: this.core.localOriginSequence,
+      lastAppliedEventId: this.core.lastAppliedEventId,
+      replicationFrontier: Object.freeze({ ...this.core.replicationVector }),
+      localFrontier: Object.freeze({ ...this.core.localCausalContext }),
+      baseSnapshotFrontier: Object.freeze({ ...this.core.baseSnapshotFrontier }),
+      pendingQueueSize: this.core.pendingQueue.size,
+      logSize: this.core.operationLog.size,
+      isRecoveryActive: this.recoveryActive,
+    });
   }
 
   /**
@@ -806,16 +873,33 @@ export class LeaderlessSyncEngine implements SyncEngine {
   }
 
   /**
-   * Single-root atomic state replacement in 1 synchronous reference assignment:
+   * Capability-gated single-root atomic state replacement in 1 synchronous reference assignment:
    *   this.core = candidateCore;
-   * CANNOT throw under run-to-completion. Suppresses immediate listener notifications during recovery.
+   * Requires authorized RecoveryInstallationCapability matching exact object identity.
+   * Rejects calls after engine disposal or with malformed candidates.
    */
-  public replaceCoreStateAtomic(candidate: EngineCoreState): void {
+  public replaceCoreStateAtomic(
+    candidate: EngineCoreState,
+    capability: RecoveryInstallationCapability,
+  ): void {
+    if (this.disposed) {
+      throw new SyncEngineError('ENGINE_DISPOSED', 'Cannot replace core state on disposed engine');
+    }
+    if (
+      !this.authorizedRecoveryCapability ||
+      !capability ||
+      capability !== this.authorizedRecoveryCapability
+    ) {
+      throw new SyncEngineError(
+        'UNAUTHORIZED',
+        'Atomic core state replacement requires authorized RecoveryInstallationCapability',
+      );
+    }
     if (!candidate || typeof candidate !== 'object') {
       throw new SyncEngineError('INVALID_ARGUMENT', 'Candidate core state must be a non-null object');
     }
-    if (this.disposed) {
-      throw new SyncEngineError('ENGINE_DISPOSED', 'Cannot replace core state on disposed engine');
+    if (!candidate.operationLog || !candidate.clockManager || !candidate.pendingQueue) {
+      throw new SyncEngineError('INVALID_CANDIDATE_ROOT', 'Candidate state root is malformed');
     }
 
     // Irreversible synchronous reference replacement under JavaScript run-to-completion semantics
@@ -2399,7 +2483,7 @@ export class LeaderlessSyncEngine implements SyncEngine {
     });
 
     // Single synchronous atomic root replacement
-    this.replaceCoreStateAtomic(candidateCore);
+    this.core = candidateCore;
 
     const decision: EngineDecision = {
       accepted: true,

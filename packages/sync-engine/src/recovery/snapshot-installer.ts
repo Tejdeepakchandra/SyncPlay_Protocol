@@ -29,6 +29,7 @@ import {
   type EngineCoreState,
   createEngineCoreState,
 } from './engine-core-state.js';
+import type { RecoveryInstallationCapability } from '../engine/leaderless-sync-engine.js';
 
 /**
  * Snapshot candidate eligibility classifications per approved M4.3-R2 / M4.3-R4 specifications.
@@ -195,14 +196,27 @@ export interface SnapshotValidationResult {
 }
 
 /**
- * Fully constructed, ready-to-swap EngineCoreState container from Stage 2.
+ * Options for staging candidate snapshot installation.
+ */
+export interface SnapshotStageOptions {
+  readonly currentLogicalClock?: number;
+  readonly currentLocalOriginSequence?: number;
+  readonly now?: number;
+  readonly reducerFn?: (state: PlaybackState, op: StoredOperation) => PlaybackState;
+}
+
+/**
+ * Opaque, immutable handle representing a staged snapshot installation.
+ * The candidate EngineCoreState and its operational collections are held in private
+ * installer storage and cannot be mutated by external callers.
  */
 export interface StagedSnapshotInstallation {
-  readonly payload: StateSnapshotPayloadV2;
-  readonly canonicalDigest: string;
+  readonly handleId: string;
+  readonly sessionId: string;
   readonly targetEpoch: number;
-  readonly targetFrontier: Record<string, number>;
-  readonly candidateCore: EngineCoreState;
+  readonly targetFrontier: Readonly<Record<string, number>>;
+  readonly canonicalDigest: string;
+  readonly maxLogicalTimestamp: number;
 }
 
 /**
@@ -237,13 +251,17 @@ export interface ISnapshotInstaller {
   stage(
     validationResult: SnapshotValidationResult,
     engineConfig: ResolvedSyncEngineConfig,
-    now?: number,
-    reducerFn?: (state: PlaybackState, op: StoredOperation) => PlaybackState,
+    optionsOrNow?: SnapshotStageOptions | number,
+    legacyReducerFn?: (state: PlaybackState, op: StoredOperation) => PlaybackState,
   ): StagedSnapshotInstallation;
 
   commitAtomic(
-    engine: { replaceCoreStateAtomic: (candidate: EngineCoreState) => void; isDisposed?: boolean },
+    engine: {
+      replaceCoreStateAtomic: (candidate: EngineCoreState, capability: RecoveryInstallationCapability) => void;
+      isDisposed?: boolean;
+    },
     staged: StagedSnapshotInstallation,
+    capability: RecoveryInstallationCapability,
   ): SnapshotInstallationReport;
 }
 
@@ -251,6 +269,7 @@ export interface ISnapshotInstaller {
  * Four-stage atomic snapshot installer for Phase 7.5 M4.3b.
  */
 export class SnapshotInstaller implements ISnapshotInstaller {
+  private readonly stagedRoots = new WeakMap<StagedSnapshotInstallation, EngineCoreState>();
   /**
    * STAGE 1: Pure out-of-band validation.
    * Performs JSON parsing, schema checks, RFC 8785 digest verification,
@@ -402,14 +421,15 @@ export class SnapshotInstaller implements ISnapshotInstaller {
   /**
    * STAGE 2: Pre-construct candidate EngineCoreState and all sub-objects out-of-band.
    * All potentially throwing operations (checkpoint ingestion, allocations) execute here.
-   * Seals the candidate core (Object.seal) and releases creator references upon completion.
+   * Preserves Lamport clock and local origin sequence monotonicity.
+   * Encapsulates candidate core in private storage and returns an opaque, immutable handle.
    * Modifies ZERO engine state.
    */
   public stage(
     validationResult: SnapshotValidationResult,
     engineConfig: ResolvedSyncEngineConfig,
-    now?: number,
-    reducerFn?: (state: PlaybackState, op: StoredOperation) => PlaybackState,
+    optionsOrNow?: SnapshotStageOptions | number,
+    legacyReducerFn?: (state: PlaybackState, op: StoredOperation) => PlaybackState,
   ): StagedSnapshotInstallation {
     if (!validationResult.valid || !validationResult.parsedPayload) {
       throw new SyncEngineError(
@@ -419,7 +439,48 @@ export class SnapshotInstaller implements ISnapshotInstaller {
     }
 
     const payload = validationResult.parsedPayload;
-    const anchorNow = now ?? Date.now();
+
+    let anchorNow: number;
+    let currentClock = 0;
+    let currentSeq = 0;
+    let reducer = legacyReducerFn;
+
+    if (typeof optionsOrNow === 'object' && optionsOrNow !== null) {
+      if (optionsOrNow.currentLogicalClock !== undefined) {
+        if (
+          typeof optionsOrNow.currentLogicalClock !== 'number' ||
+          !Number.isInteger(optionsOrNow.currentLogicalClock) ||
+          optionsOrNow.currentLogicalClock < 0
+        ) {
+          throw new SyncEngineError(
+            'INVALID_ARGUMENT',
+            `currentLogicalClock must be a non-negative integer, got: ${optionsOrNow.currentLogicalClock}`,
+          );
+        }
+        currentClock = optionsOrNow.currentLogicalClock;
+      }
+      if (optionsOrNow.currentLocalOriginSequence !== undefined) {
+        if (
+          typeof optionsOrNow.currentLocalOriginSequence !== 'number' ||
+          !Number.isInteger(optionsOrNow.currentLocalOriginSequence) ||
+          optionsOrNow.currentLocalOriginSequence < 0
+        ) {
+          throw new SyncEngineError(
+            'INVALID_ARGUMENT',
+            `currentLocalOriginSequence must be a non-negative integer, got: ${optionsOrNow.currentLocalOriginSequence}`,
+          );
+        }
+        currentSeq = optionsOrNow.currentLocalOriginSequence;
+      }
+      anchorNow = optionsOrNow.now ?? Date.now();
+      if (optionsOrNow.reducerFn) {
+        reducer = optionsOrNow.reducerFn;
+      }
+    } else if (typeof optionsOrNow === 'number') {
+      anchorNow = optionsOrNow;
+    } else {
+      anchorNow = Date.now();
+    }
 
     // 1. Construct candidate PlaybackState
     const rawState = payload.state as Partial<PlaybackState>;
@@ -438,15 +499,16 @@ export class SnapshotInstaller implements ISnapshotInstaller {
       }),
     });
 
-    // 2. Construct candidate LogicalClockManager
-    const candidateClockManager = new LogicalClockManager(payload.maxLogicalTimestamp);
+    // 2. Construct candidate LogicalClockManager preserving Lamport monotonicity
+    const effectiveClock = Math.max(currentClock, payload.maxLogicalTimestamp);
+    const candidateClockManager = new LogicalClockManager(effectiveClock);
 
     // 3. Construct candidate OrderedOperationLog
     const logCapacity = (engineConfig as unknown as { logCapacity?: number }).logCapacity ?? 256;
     const candidateLog = new OrderedOperationLog(
       logCapacity,
       importedState,
-      reducerFn ?? ((s) => s),
+      reducer ?? ((s) => s),
     );
     candidateLog.reset(importedState, payload.snapshotFrontier);
 
@@ -484,7 +546,11 @@ export class SnapshotInstaller implements ISnapshotInstaller {
     const candidateLocalCausalContext: Record<string, number> = { ...payload.snapshotFrontier };
     const candidateBaseFrontier: Record<string, number> = { ...payload.snapshotFrontier };
 
-    // 6. Assemble and seal candidate EngineCoreState
+    // 6. Preserve local origin sequence monotonicity: max(currentSeq, snapshotFrontier[localPeerId])
+    const localPeerFrontierSeq = payload.snapshotFrontier[engineConfig.localPeerId] ?? 0;
+    const effectiveOriginSequence = Math.max(currentSeq, localPeerFrontierSeq);
+
+    // 7. Assemble and seal candidate EngineCoreState
     const candidateCore = createEngineCoreState({
       playbackState: importedState,
       baseSnapshot: importedState,
@@ -494,50 +560,70 @@ export class SnapshotInstaller implements ISnapshotInstaller {
       pendingQueue: candidatePendingQueue,
       replicationVector: candidateReplicationVector,
       localCausalContext: candidateLocalCausalContext,
-      localOriginSequence: 0,
+      localOriginSequence: effectiveOriginSequence,
       currentEpoch: payload.membershipEpoch,
       lastAppliedEventId: `snap-${payload.snapshotId}`,
       stateVersion: importedState.stateVersion,
     });
 
-    return {
-      payload,
-      canonicalDigest: validationResult.computedDigest ?? payload.sha256Digest,
+    // 8. Create opaque, immutable staged handle
+    const handle: StagedSnapshotInstallation = Object.freeze({
+      handleId: `staged-${payload.snapshotId}-${Math.random().toString(36).slice(2, 9)}`,
+      sessionId: payload.sessionId,
       targetEpoch: payload.membershipEpoch,
-      targetFrontier: { ...payload.snapshotFrontier },
-      candidateCore,
-    };
+      targetFrontier: Object.freeze({ ...payload.snapshotFrontier }),
+      canonicalDigest: validationResult.computedDigest ?? payload.sha256Digest,
+      maxLogicalTimestamp: payload.maxLogicalTimestamp,
+    });
+
+    this.stagedRoots.set(handle, candidateCore);
+    return handle;
   }
 
   /**
-   * STAGE 3: Irreversible Synchronous Atomic Commit Point.
-   * Replaces engine state root in a single synchronous reference assignment:
-   *   engine.replaceCoreStateAtomic(staged.candidateCore);
-   * CANNOT throw under run-to-completion. Drops creator aliases post-handoff.
+   * STAGE 3: Capability-Gated Irreversible Synchronous Atomic Commit Point.
+   * Extracts candidate root from private installer storage and executes:
+   *   engine.replaceCoreStateAtomic(candidateCore, capability);
+   * CANNOT throw under run-to-completion once capability is verified.
+   * Immediately consumes the staged handle so it cannot be reused.
    */
   public commitAtomic(
-    engine: { replaceCoreStateAtomic: (candidate: EngineCoreState) => void; isDisposed?: boolean },
+    engine: {
+      replaceCoreStateAtomic: (candidate: EngineCoreState, capability: RecoveryInstallationCapability) => void;
+      isDisposed?: boolean;
+    },
     staged: StagedSnapshotInstallation,
+    capability: RecoveryInstallationCapability,
   ): SnapshotInstallationReport {
-    if (!staged || !staged.candidateCore) {
-      throw new SyncEngineError('INVALID_ARGUMENT', 'StagedSnapshotInstallation contains no candidate core state');
+    if (!staged || typeof staged !== 'object') {
+      throw new SyncEngineError('INVALID_ARGUMENT', 'StagedSnapshotInstallation must be a non-null object');
+    }
+    if (!capability) {
+      throw new SyncEngineError('UNAUTHORIZED', 'commitAtomic requires an authorized RecoveryInstallationCapability');
     }
     if (engine.isDisposed) {
       throw new SyncEngineError('ENGINE_DISPOSED', 'Cannot commit snapshot to a disposed engine');
     }
 
+    const candidateCore = this.stagedRoots.get(staged);
+    if (!candidateCore) {
+      throw new SyncEngineError(
+        'INVALID_STAGED_HANDLE',
+        'Staged snapshot handle is invalid, forged, or has already been consumed',
+      );
+    }
+
+    // Immediately consume handle to prevent re-commit or reuse
+    this.stagedRoots.delete(staged);
+
     const startTime = performance.now();
 
-    // The single synchronous atomic root replacement:
-    engine.replaceCoreStateAtomic(staged.candidateCore);
+    // The single synchronous atomic root replacement, capability gated:
+    engine.replaceCoreStateAtomic(candidateCore, capability);
 
     const installedEpoch = staged.targetEpoch;
     const installedFrontier = { ...staged.targetFrontier };
-    const installedMaxLogicalTimestamp = staged.payload.maxLogicalTimestamp;
-
-    // Explicit creator dereferencing: drop reference so installer holds no alias to the live root
-    (staged as { candidateCore: unknown }).candidateCore = null;
-
+    const installedMaxLogicalTimestamp = staged.maxLogicalTimestamp;
     const commitDurationMs = performance.now() - startTime;
 
     return {

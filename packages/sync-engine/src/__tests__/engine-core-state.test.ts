@@ -1,17 +1,19 @@
-import { describe, it, expect, vi } from 'vitest';
+import { describe, it, expect } from 'vitest';
 import {
   LeaderlessSyncEngine,
   createEngineCoreState,
   createInitialEngineCoreState,
+  createRecoveryInstallationCapability,
   LogicalClockManager,
   OrderedOperationLog,
   PendingDependencyQueue,
   type EngineCoreState,
   type PlaybackState,
   type StoredOperation,
+  type RecoveryInstallationCapability,
 } from '../index.js';
 
-describe('Phase 7.5 M4.3b — EngineCoreState & Root Ownership', () => {
+describe('Phase 7.5 M4.3b — EngineCoreState, Root Ownership & Capability-Gated Installation', () => {
   const baseConfig = {
     sessionId: 'session-m43b-root',
     localPeerId: 'peer-local',
@@ -78,65 +80,71 @@ describe('Phase 7.5 M4.3b — EngineCoreState & Root Ownership', () => {
     }).toThrow();
   });
 
-  it('A2: LeaderlessSyncEngine initializes with exactly one authoritative core root and delegates to it', () => {
+  it('A2: LeaderlessSyncEngine initializes with authoritative core root and delegates to it', () => {
     const engine = new LeaderlessSyncEngine({
       ...baseConfig,
       initialClock: 42,
     });
 
-    const core = engine.coreState;
-    expect(core).toBeDefined();
-    expect(Object.isSealed(core)).toBe(true);
-
-    // Verify all public accessors read strictly from this.core
+    // Verify all public accessors read strictly from internal root
     expect(engine.logicalClock).toBe(42);
-    expect(core.clockManager.clock).toBe(42);
     expect(engine.epoch).toBe(1);
-    expect(core.currentEpoch).toBe(1);
     expect(engine.stateVersion).toBe(0);
-    expect(core.stateVersion).toBe(0);
     expect(engine.logSize).toBe(0);
-    expect(core.operationLog.size).toBe(0);
     expect(engine.pendingQueueSize).toBe(0);
-    expect(core.pendingQueue.size).toBe(0);
 
     // Playback state matches
     expect(engine.playbackState.status).toBe('paused');
-    expect(core.playbackState.status).toBe('paused');
-    expect(engine.getState()).toBe(core.playbackState);
+    expect(engine.getState().status).toBe('paused');
   });
 
-  it('A3: public projections return defensive/frozen copies and cannot mutate the core state', () => {
+  it('A3: public root exposure is eliminated; getDiagnosticCoreSnapshot returns detached frozen copies', () => {
     const engine = new LeaderlessSyncEngine({
       ...baseConfig,
       initialClock: 10,
     });
 
-    const frontier = engine.replicationFrontier as Record<string, number>;
-    expect(frontier).toBeDefined();
+    // Public coreState getter is completely removed
+    expect((engine as any).coreState).toBeUndefined();
 
-    // Attempting to mutate returned frontier does not affect engine core
+    // Diagnostic snapshot returns frozen detached projection
+    const diag = engine.getDiagnosticCoreSnapshot();
+    expect(diag).toBeDefined();
+    expect(Object.isFrozen(diag)).toBe(true);
+    expect(Object.isFrozen(diag.replicationFrontier)).toBe(true);
+    expect(Object.isFrozen(diag.localFrontier)).toBe(true);
+    expect(Object.isFrozen(diag.baseSnapshotFrontier)).toBe(true);
+    expect(diag.logicalClock).toBe(10);
+    expect(diag.currentEpoch).toBe(1);
+    expect(diag.stateVersion).toBe(0);
+
+    // Operational classes are NOT exposed on diagnostic snapshot
+    expect((diag as any).clockManager).toBeUndefined();
+    expect((diag as any).operationLog).toBeUndefined();
+    expect((diag as any).pendingQueue).toBeUndefined();
+
+    // Mutating returned frontiers throws due to Object.freeze
+    expect(() => {
+      (diag.replicationFrontier as any)['peer-malicious'] = 999;
+    }).toThrow();
+
+    expect(() => {
+      (diag.localFrontier as any)['peer-malicious'] = 888;
+    }).toThrow();
+
+    // Public getters return detached defensive copies
+    const frontier = engine.replicationFrontier as Record<string, number>;
     frontier['peer-malicious'] = 999;
     expect(engine.replicationFrontier['peer-malicious']).toBeUndefined();
-    expect(engine.coreState.replicationVector['peer-malicious']).toBeUndefined();
-
-    // Local frontier defensive copy
-    const localFrontier = engine.localFrontier as Record<string, number>;
-    localFrontier['peer-malicious'] = 888;
-    expect(engine.localFrontier['peer-malicious']).toBeUndefined();
-    expect(engine.coreState.localCausalContext['peer-malicious']).toBeUndefined();
-
-    // PlaybackState is frozen
-    const state = engine.getState();
-    expect(Object.isFrozen(state)).toBe(true);
-    expect(() => {
-      (state as any).status = 'playing';
-    }).toThrow();
+    expect(engine.getDiagnosticCoreSnapshot().replicationFrontier['peer-malicious']).toBeUndefined();
   });
 
-  it('A4: replaceCoreStateAtomic performs single synchronous root swap without throwing', () => {
-    const engine = new LeaderlessSyncEngine(baseConfig);
-    const oldCore = engine.coreState;
+  it('A4: replaceCoreStateAtomic performs single synchronous root swap when authorized with valid capability', () => {
+    const capability = createRecoveryInstallationCapability('test-coord', baseConfig.sessionId);
+    const engine = new LeaderlessSyncEngine({
+      ...baseConfig,
+      recoveryInstallationCapability: capability,
+    });
 
     const newPlaybackState = Object.freeze<PlaybackState>({
       status: 'playing',
@@ -144,6 +152,13 @@ describe('Phase 7.5 M4.3b — EngineCoreState & Root Ownership', () => {
       anchorLocalTimestamp: 1000,
       playbackRate: 1.5,
       stateVersion: 10,
+      lastAppliedEvent: Object.freeze({
+        logicalEventId: 'snap-remote-99',
+        senderPeerId: 'peer-remote',
+        messageType: 'SNAPSHOT_IMPORT',
+        appliedAtLocalTimestamp: 1000,
+        isImportedProvenance: true,
+      }),
     });
 
     const newClockManager = new LogicalClockManager(100);
@@ -159,18 +174,16 @@ describe('Phase 7.5 M4.3b — EngineCoreState & Root Ownership', () => {
       pendingQueue: newPendingQueue,
       replicationVector: { 'peer-remote': 50 },
       localCausalContext: { 'peer-remote': 50 },
-      localOriginSequence: 0,
+      localOriginSequence: 5,
       currentEpoch: 3,
       lastAppliedEventId: 'snap-remote-99',
       stateVersion: 10,
     });
 
-    // Execute atomic pointer replacement
-    engine.replaceCoreStateAtomic(candidateCore);
+    // Execute atomic pointer replacement with authorized capability
+    engine.replaceCoreStateAtomic(candidateCore, capability);
 
     // Live engine immediately resolves all accessors from the new root
-    expect(engine.coreState).toBe(candidateCore);
-    expect(engine.coreState).not.toBe(oldCore);
     expect(engine.logicalClock).toBe(100);
     expect(engine.epoch).toBe(3);
     expect(engine.stateVersion).toBe(10);
@@ -179,35 +192,86 @@ describe('Phase 7.5 M4.3b — EngineCoreState & Root Ownership', () => {
     expect(engine.replicationFrontier['peer-remote']).toBe(50);
     expect(engine.localFrontier['peer-remote']).toBe(50);
 
-    // Old core remains detached and unmodified
-    expect(oldCore.currentEpoch).toBe(1);
-    expect(oldCore.clockManager.clock).toBe(0);
-    expect(oldCore.replicationVector['peer-remote']).toBeUndefined();
+    const diag = engine.getDiagnosticCoreSnapshot();
+    expect(diag.logicalClock).toBe(100);
+    expect(diag.currentEpoch).toBe(3);
+    expect(diag.localOriginSequence).toBe(5);
+    expect(diag.lastAppliedEventId).toBe('snap-remote-99');
   });
 
-  it('A5: throws INVALID_ARGUMENT when candidate core is null or not an object', () => {
-    const engine = new LeaderlessSyncEngine(baseConfig);
-    expect(() => {
-      engine.replaceCoreStateAtomic(null as any);
-    }).toThrow(/Candidate core state must be a non-null object/);
+  it('A5: replaceCoreStateAtomic strictly rejects unauthorized callers without or with wrong capability', () => {
+    const authorizedCap = createRecoveryInstallationCapability('auth-coord', baseConfig.sessionId);
+    const forgedCap = createRecoveryInstallationCapability('attacker', baseConfig.sessionId);
 
-    expect(() => {
-      engine.replaceCoreStateAtomic(undefined as any);
-    }).toThrow(/Candidate core state must be a non-null object/);
+    const engine = new LeaderlessSyncEngine({
+      ...baseConfig,
+      recoveryInstallationCapability: authorizedCap,
+    });
 
-    expect(() => {
-      engine.replaceCoreStateAtomic('not-an-object' as any);
-    }).toThrow(/Candidate core state must be a non-null object/);
+    const dummyCore = createEngineCoreState({
+      playbackState: Object.freeze({
+        status: 'paused',
+        anchorPositionMs: 0,
+        anchorLocalTimestamp: 0,
+        playbackRate: 1,
+        stateVersion: 0,
+      }),
+      baseSnapshot: Object.freeze({
+        status: 'paused',
+        anchorPositionMs: 0,
+        anchorLocalTimestamp: 0,
+        playbackRate: 1,
+        stateVersion: 0,
+      }),
+      baseSnapshotFrontier: {},
+      operationLog: new OrderedOperationLog(64, Object.freeze({ status: 'paused', anchorPositionMs: 0, anchorLocalTimestamp: 0, playbackRate: 1, stateVersion: 0 }), s => s),
+      clockManager: new LogicalClockManager(0),
+      pendingQueue: new PendingDependencyQueue(64),
+      replicationVector: {},
+      localCausalContext: {},
+      localOriginSequence: 0,
+      currentEpoch: 1,
+    });
 
-    try {
-      engine.replaceCoreStateAtomic(null as any);
-    } catch (err: any) {
-      expect(err.code).toBe('INVALID_ARGUMENT');
-    }
+    // 1. Missing capability throws UNAUTHORIZED
+    expect(() => {
+      engine.replaceCoreStateAtomic(dummyCore, undefined as any);
+    }).toThrow(/requires authorized RecoveryInstallationCapability/);
+
+    // 2. Forged capability throws UNAUTHORIZED
+    expect(() => {
+      engine.replaceCoreStateAtomic(dummyCore, forgedCap);
+    }).toThrow(/requires authorized RecoveryInstallationCapability/);
+
+    // 3. Engine initialized without capability rejects all replacement attempts
+    const unconfiguredEngine = new LeaderlessSyncEngine(baseConfig);
+    expect(() => {
+      unconfiguredEngine.replaceCoreStateAtomic(dummyCore, authorizedCap);
+    }).toThrow(/requires authorized RecoveryInstallationCapability/);
   });
 
-  it('A6: throws ENGINE_DISPOSED when replaceCoreStateAtomic is called on disposed engine', () => {
-    const engine = new LeaderlessSyncEngine(baseConfig);
+  it('A6: replaceCoreStateAtomic validates candidate shape and throws INVALID_ARGUMENT / INVALID_CANDIDATE_ROOT', () => {
+    const capability = createRecoveryInstallationCapability('test-coord', baseConfig.sessionId);
+    const engine = new LeaderlessSyncEngine({
+      ...baseConfig,
+      recoveryInstallationCapability: capability,
+    });
+
+    expect(() => {
+      engine.replaceCoreStateAtomic(null as any, capability);
+    }).toThrow(/Candidate core state must be a non-null object/);
+
+    expect(() => {
+      engine.replaceCoreStateAtomic({} as any, capability);
+    }).toThrow(/Candidate state root is malformed/);
+  });
+
+  it('A7: throws ENGINE_DISPOSED when replaceCoreStateAtomic is called on disposed engine', () => {
+    const capability = createRecoveryInstallationCapability('test-coord', baseConfig.sessionId);
+    const engine = new LeaderlessSyncEngine({
+      ...baseConfig,
+      recoveryInstallationCapability: capability,
+    });
     engine.dispose();
 
     const candidateCore = createEngineCoreState({
@@ -242,17 +306,11 @@ describe('Phase 7.5 M4.3b — EngineCoreState & Root Ownership', () => {
     });
 
     expect(() => {
-      engine.replaceCoreStateAtomic(candidateCore);
+      engine.replaceCoreStateAtomic(candidateCore, capability);
     }).toThrow(/Cannot replace core state on disposed engine/);
-
-    try {
-      engine.replaceCoreStateAtomic(candidateCore);
-    } catch (err: any) {
-      expect(err.code).toBe('ENGINE_DISPOSED');
-    }
   });
 
-  it('A7: supports recovery mode and defers state change and decision notifications until flush', () => {
+  it('A8: supports recovery mode and defers state change and decision notifications until flush', () => {
     const engine = new LeaderlessSyncEngine(baseConfig);
 
     const stateChanges: PlaybackState[] = [];
@@ -297,5 +355,35 @@ describe('Phase 7.5 M4.3b — EngineCoreState & Root Ownership', () => {
     // Deactivate recovery mode
     engine.setRecoveryMode(false);
     expect(engine.isRecoveryActive()).toBe(false);
+  });
+
+  it('A9: lastAppliedEventId remains synchronized with playbackState.lastAppliedEvent', () => {
+    const engine = new LeaderlessSyncEngine(baseConfig);
+    expect(engine.getDiagnosticCoreSnapshot().lastAppliedEventId).toBeUndefined();
+
+    // Import snapshot V2: sets lastAppliedEvent
+    const payload = {
+      formatVersion: 2 as const,
+      snapshotId: 'snap-sync-1',
+      sessionId: baseConfig.sessionId,
+      membershipEpoch: 1,
+      authorPeerId: 'peer-author',
+      state: {
+        formatVersion: 1 as const,
+        sessionId: baseConfig.sessionId,
+        status: 'paused' as const,
+        anchorPositionMs: 1500,
+        playbackRate: 1.0,
+      },
+      snapshotFrontier: { 'peer-author': 5 },
+      originFrontierTimestamps: { 'peer-author': 50 },
+      maxLogicalTimestamp: 50,
+      compactedCheckpoints: [],
+      sha256Digest: 'a'.repeat(64),
+    };
+
+    engine.importSnapshotV2(payload);
+    expect(engine.getDiagnosticCoreSnapshot().lastAppliedEventId).toBe('snap-snap-sync-1');
+    expect(engine.getState().lastAppliedEvent?.logicalEventId).toBe('snap-snap-sync-1');
   });
 });

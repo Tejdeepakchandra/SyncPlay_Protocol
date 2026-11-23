@@ -4,6 +4,7 @@ import {
   evaluateSnapshotEligibility,
   LeaderlessSyncEngine,
   computeSnapshotDigestV2,
+  createRecoveryInstallationCapability,
   type StateSnapshotPayloadV2,
   type PlaybackState,
 } from '../index.js';
@@ -300,11 +301,9 @@ describe('Phase 7.5 M4.3b — SnapshotInstaller & Eligibility', () => {
     });
   });
 
-  describe('Stage 2 — Staging Candidate Core State', () => {
-    it('B7: pre-constructs sealed candidate EngineCoreState without mutating engine', async () => {
+  describe('Stage 2 — Staging Candidate Core State & Monotonicity Preservation', () => {
+    it('B7: pre-constructs candidate in private storage and returns opaque, frozen handle', async () => {
       const engine = new LeaderlessSyncEngine(baseConfig);
-      const initialRoot = engine.coreState;
-
       const installer = new SnapshotInstaller();
       const payload = createValidPayload({
         snapshotFrontier: { 'peer-author': 25 },
@@ -321,20 +320,26 @@ describe('Phase 7.5 M4.3b — SnapshotInstaller & Eligibility', () => {
       const staged = installer.stage(
         validation,
         (engine as any).config,
-        12345,
-        engine.getReducerFunction(),
+        {
+          currentLogicalClock: 0,
+          currentLocalOriginSequence: 0,
+          now: 12345,
+          reducerFn: engine.getReducerFunction(),
+        },
       );
 
-      // Verify staged candidate core
-      expect(staged.candidateCore).toBeDefined();
-      expect(Object.isSealed(staged.candidateCore)).toBe(true);
-      expect(staged.candidateCore.clockManager.clock).toBe(250);
-      expect(staged.candidateCore.replicationVector['peer-author']).toBe(25);
-      expect(staged.candidateCore.playbackState.anchorPositionMs).toBe(3000);
-      expect(staged.candidateCore.playbackState.anchorLocalTimestamp).toBe(12345);
+      // Verify staged handle is opaque and frozen
+      expect(staged.handleId).toBeDefined();
+      expect(staged.targetEpoch).toBe(1);
+      expect(staged.targetFrontier['peer-author']).toBe(25);
+      expect(staged.maxLogicalTimestamp).toBe(250);
+      expect(Object.isFrozen(staged)).toBe(true);
+      expect(Object.isFrozen(staged.targetFrontier)).toBe(true);
 
-      // Verify ZERO engine mutation occurred during staging
-      expect(engine.coreState).toBe(initialRoot);
+      // Candidate core is NOT exposed on handle
+      expect((staged as any).candidateCore).toBeUndefined();
+
+      // Zero engine mutation occurred during staging
       expect(engine.logicalClock).toBe(0);
       expect(engine.replicationFrontier['peer-author']).toBeUndefined();
     });
@@ -351,7 +356,7 @@ describe('Phase 7.5 M4.3b — SnapshotInstaller & Eligibility', () => {
       }).toThrow(/Cannot stage invalid snapshot validation result/);
     });
 
-    it('B9: caller mutations on source snapshot payload after staging do not affect candidate core', async () => {
+    it('B9: mutations on source snapshot payload or handle targetFrontier do not affect candidate', async () => {
       const engine = new LeaderlessSyncEngine(baseConfig);
       const installer = new SnapshotInstaller();
 
@@ -362,23 +367,185 @@ describe('Phase 7.5 M4.3b — SnapshotInstaller & Eligibility', () => {
       });
 
       const validation = await installer.validate(payload, 1, {});
-      const staged = installer.stage(validation, (engine as any).config, 1000, engine.getReducerFunction());
+      const staged = installer.stage(validation, (engine as any).config, {
+        currentLogicalClock: 0,
+        currentLocalOriginSequence: 0,
+        now: 1000,
+        reducerFn: engine.getReducerFunction(),
+      });
 
-      // Attempt mutating the payload
+      // Attempt mutating the source payload
       payload.snapshotFrontier['peer-author'] = 9999;
       payload.state.anchorPositionMs = 8888;
 
-      // Candidate core vectors and state remain encapsulated and unchanged
-      expect(staged.candidateCore.replicationVector['peer-author']).toBe(30);
-      expect(staged.candidateCore.playbackState.anchorPositionMs).toBe(3000);
+      // Handle target frontier remains unmutated
+      expect(staged.targetFrontier['peer-author']).toBe(30);
+
+      // Attempt mutating staged.targetFrontier throws because it is Object.freeze'd
+      expect(() => {
+        (staged.targetFrontier as any)['peer-author'] = 7777;
+      }).toThrow();
+    });
+
+    it('C10: preserves Lamport clock monotonicity: max(L_local, maxLogicalTimestamp)', async () => {
+      const installer = new SnapshotInstaller();
+      const capability = createRecoveryInstallationCapability('test', baseConfig.sessionId);
+      const payload = createValidPayload({
+        snapshotFrontier: { 'peer-author': 20 },
+        originFrontierTimestamps: { 'peer-author': 100 },
+        maxLogicalTimestamp: 100,
+      });
+
+      const validation = await installer.validate(payload, 1, {});
+
+      // Case 1: Local clock 500 > Snapshot clock 100 -> candidate must be 500 (NOT regressed to 100!)
+      const engineA = new LeaderlessSyncEngine({
+        ...baseConfig,
+        initialClock: 500,
+        recoveryInstallationCapability: capability,
+      });
+      const stagedA = installer.stage(validation, (engineA as any).config, {
+        currentLogicalClock: engineA.logicalClock,
+        currentLocalOriginSequence: 0,
+      });
+      installer.commitAtomic(engineA, stagedA, capability);
+      expect(engineA.logicalClock).toBe(500);
+
+      // Case 2: Local clock 50 < Snapshot clock 100 -> candidate advances to 100
+      const engineB = new LeaderlessSyncEngine({
+        ...baseConfig,
+        initialClock: 50,
+        recoveryInstallationCapability: capability,
+      });
+      const stagedB = installer.stage(validation, (engineB as any).config, {
+        currentLogicalClock: engineB.logicalClock,
+        currentLocalOriginSequence: 0,
+      });
+      installer.commitAtomic(engineB, stagedB, capability);
+      expect(engineB.logicalClock).toBe(100);
+
+      // Case 3: Equal clocks 100 == 100 -> unchanged 100 (no +1 increment on snapshot install)
+      const engineC = new LeaderlessSyncEngine({
+        ...baseConfig,
+        initialClock: 100,
+        recoveryInstallationCapability: capability,
+      });
+      const stagedC = installer.stage(validation, (engineC as any).config, {
+        currentLogicalClock: engineC.logicalClock,
+        currentLocalOriginSequence: 0,
+      });
+      installer.commitAtomic(engineC, stagedC, capability);
+      expect(engineC.logicalClock).toBe(100);
+    });
+
+    it('C11: validates currentLogicalClock and rejects invalid clock values', async () => {
+      const installer = new SnapshotInstaller();
+      const payload = createValidPayload();
+      const validation = await installer.validate(payload, 1, {});
+
+      expect(() => {
+        installer.stage(validation, baseConfig as any, {
+          currentLogicalClock: -5,
+          currentLocalOriginSequence: 0,
+        });
+      }).toThrow(/currentLogicalClock must be a non-negative integer/);
+
+      expect(() => {
+        installer.stage(validation, baseConfig as any, {
+          currentLogicalClock: 3.14,
+          currentLocalOriginSequence: 0,
+        });
+      }).toThrow(/currentLogicalClock must be a non-negative integer/);
+    });
+
+    it('S1: preserves local origin sequence counter: max(S_local, V_snapshot[localPeerId])', async () => {
+      const installer = new SnapshotInstaller();
+      const capability = createRecoveryInstallationCapability('test', baseConfig.sessionId);
+
+      // Case 1: Local sequence 15 > snapshot local frontier 10 -> preserves 15
+      const payloadA = createValidPayload({
+        snapshotFrontier: { 'peer-author': 20, [baseConfig.localPeerId]: 10 },
+        originFrontierTimestamps: { 'peer-author': 200, [baseConfig.localPeerId]: 100 },
+        maxLogicalTimestamp: 200,
+      });
+      const validationA = await installer.validate(payloadA, 1, {});
+      const engineA = new LeaderlessSyncEngine({
+        ...baseConfig,
+        recoveryInstallationCapability: capability,
+      });
+      const stagedA = installer.stage(validationA, (engineA as any).config, {
+        currentLogicalClock: 0,
+        currentLocalOriginSequence: 15,
+      });
+      installer.commitAtomic(engineA, stagedA, capability);
+      expect(engineA.getDiagnosticCoreSnapshot().localOriginSequence).toBe(15);
+
+      // Case 2: Snapshot contains higher local sequence 20 > current local 10 -> advances to 20
+      const payloadB = createValidPayload({
+        snapshotFrontier: { 'peer-author': 20, [baseConfig.localPeerId]: 20 },
+        originFrontierTimestamps: { 'peer-author': 200, [baseConfig.localPeerId]: 200 },
+        maxLogicalTimestamp: 200,
+      });
+      const validationB = await installer.validate(payloadB, 1, {});
+      const engineB = new LeaderlessSyncEngine({
+        ...baseConfig,
+        recoveryInstallationCapability: capability,
+      });
+      const stagedB = installer.stage(validationB, (engineB as any).config, {
+        currentLogicalClock: 0,
+        currentLocalOriginSequence: 10,
+      });
+      installer.commitAtomic(engineB, stagedB, capability);
+      expect(engineB.getDiagnosticCoreSnapshot().localOriginSequence).toBe(20);
+
+      // Case 3: Snapshot does NOT contain local peer -> preserves local sequence 12
+      const payloadC = createValidPayload({
+        snapshotFrontier: { 'peer-author': 20 },
+        originFrontierTimestamps: { 'peer-author': 200 },
+        maxLogicalTimestamp: 200,
+      });
+      const validationC = await installer.validate(payloadC, 1, {});
+      const engineC = new LeaderlessSyncEngine({
+        ...baseConfig,
+        recoveryInstallationCapability: capability,
+      });
+      const stagedC = installer.stage(validationC, (engineC as any).config, {
+        currentLogicalClock: 0,
+        currentLocalOriginSequence: 12,
+      });
+      installer.commitAtomic(engineC, stagedC, capability);
+      expect(engineC.getDiagnosticCoreSnapshot().localOriginSequence).toBe(12);
+    });
+
+    it('S2: validates currentLocalOriginSequence and rejects negative or non-integer values', async () => {
+      const installer = new SnapshotInstaller();
+      const payload = createValidPayload();
+      const validation = await installer.validate(payload, 1, {});
+
+      expect(() => {
+        installer.stage(validation, baseConfig as any, {
+          currentLogicalClock: 0,
+          currentLocalOriginSequence: -1,
+        });
+      }).toThrow(/currentLocalOriginSequence must be a non-negative integer/);
+
+      expect(() => {
+        installer.stage(validation, baseConfig as any, {
+          currentLogicalClock: 0,
+          currentLocalOriginSequence: 4.5,
+        });
+      }).toThrow(/currentLocalOriginSequence must be a non-negative integer/);
     });
   });
 
-  describe('Stage 3 — Atomic Commit Point & Stale Reference Safety', () => {
-    it('D1: commits installation via single synchronous root replacement and dereferences creator alias', async () => {
-      const engine = new LeaderlessSyncEngine(baseConfig);
+  describe('Stage 3 — Capability-Gated Atomic Commit & Handle Safety', () => {
+    it('D1: commits installation via single synchronous root replacement with authorized capability', async () => {
+      const capability = createRecoveryInstallationCapability('coord', baseConfig.sessionId);
+      const engine = new LeaderlessSyncEngine({
+        ...baseConfig,
+        recoveryInstallationCapability: capability,
+      });
       const installer = new SnapshotInstaller();
-      const oldRoot = engine.coreState;
 
       const payload = createValidPayload({
         snapshotFrontier: { 'peer-remote': 50 },
@@ -390,11 +557,15 @@ describe('Phase 7.5 M4.3b — SnapshotInstaller & Eligibility', () => {
       });
 
       const validation = await installer.validate(payload, 1, {});
-      const staged = installer.stage(validation, (engine as any).config, 2000, engine.getReducerFunction());
-      const candidateCore = staged.candidateCore;
+      const staged = installer.stage(validation, (engine as any).config, {
+        currentLogicalClock: 0,
+        currentLocalOriginSequence: 0,
+        now: 2000,
+        reducerFn: engine.getReducerFunction(),
+      });
 
-      // Commit
-      const report = installer.commitAtomic(engine, staged);
+      // Commit with authorized capability
+      const report = installer.commitAtomic(engine, staged, capability);
 
       expect(report.success).toBe(true);
       expect(report.installedEpoch).toBe(1);
@@ -402,22 +573,85 @@ describe('Phase 7.5 M4.3b — SnapshotInstaller & Eligibility', () => {
       expect(report.installedMaxLogicalTimestamp).toBe(500);
       expect(typeof report.commitDurationMs).toBe('number');
 
-      // Live engine root is now candidateCore
-      expect(engine.coreState).toBe(candidateCore);
+      // Live engine state updated
       expect(engine.logicalClock).toBe(500);
       expect(engine.replicationFrontier['peer-remote']).toBe(50);
-
-      // Creator alias is explicitly dropped to prevent memory leaks / retained external mutations
-      expect(staged.candidateCore).toBeNull();
-
-      // Old root remains completely detached
-      expect(oldRoot.clockManager.clock).toBe(0);
-      expect(oldRoot.replicationVector['peer-remote']).toBeUndefined();
+      expect(engine.playbackState.anchorPositionMs).toBe(3000);
     });
 
-    it('D2: validation failure leaves existing engine root 100% unchanged', async () => {
+    it('D2: rejects commit when capability is missing or unauthorized', async () => {
+      const authorizedCap = createRecoveryInstallationCapability('coord', baseConfig.sessionId);
+      const forgedCap = createRecoveryInstallationCapability('attacker', baseConfig.sessionId);
+      const engine = new LeaderlessSyncEngine({
+        ...baseConfig,
+        recoveryInstallationCapability: authorizedCap,
+      });
+      const installer = new SnapshotInstaller();
+
+      const payload = createValidPayload();
+      const validation = await installer.validate(payload, 1, {});
+      const staged = installer.stage(validation, (engine as any).config);
+
+      // Missing capability
+      expect(() => {
+        installer.commitAtomic(engine, staged, undefined as any);
+      }).toThrow(/requires an authorized RecoveryInstallationCapability/);
+
+      // Forged capability
+      expect(() => {
+        installer.commitAtomic(engine, staged, forgedCap);
+      }).toThrow(/requires authorized RecoveryInstallationCapability/);
+
+      // Active engine remains completely untouched
+      expect(engine.logicalClock).toBe(0);
+      expect(engine.replicationFrontier['peer-author']).toBeUndefined();
+    });
+
+    it('D3: rejects forged staged handle with INVALID_STAGED_HANDLE', () => {
+      const capability = createRecoveryInstallationCapability('coord', baseConfig.sessionId);
+      const engine = new LeaderlessSyncEngine({
+        ...baseConfig,
+        recoveryInstallationCapability: capability,
+      });
+      const installer = new SnapshotInstaller();
+
+      const forgedHandle = Object.freeze({
+        handleId: 'forged-handle-999',
+        sessionId: baseConfig.sessionId,
+        targetEpoch: 1,
+        targetFrontier: {},
+        canonicalDigest: 'fake',
+        maxLogicalTimestamp: 100,
+      });
+
+      expect(() => {
+        installer.commitAtomic(engine, forgedHandle, capability);
+      }).toThrow(/Staged snapshot handle is invalid, forged, or has already been consumed/);
+    });
+
+    it('D4: rejects double-commit / reusing an already consumed staged handle', async () => {
+      const capability = createRecoveryInstallationCapability('coord', baseConfig.sessionId);
+      const engine = new LeaderlessSyncEngine({
+        ...baseConfig,
+        recoveryInstallationCapability: capability,
+      });
+      const installer = new SnapshotInstaller();
+
+      const payload = createValidPayload();
+      const validation = await installer.validate(payload, 1, {});
+      const staged = installer.stage(validation, (engine as any).config);
+
+      // First commit succeeds
+      installer.commitAtomic(engine, staged, capability);
+
+      // Second commit with same handle throws INVALID_STAGED_HANDLE
+      expect(() => {
+        installer.commitAtomic(engine, staged, capability);
+      }).toThrow(/Staged snapshot handle is invalid, forged, or has already been consumed/);
+    });
+
+    it('D5: validation failure leaves existing engine root 100% unchanged', async () => {
       const engine = new LeaderlessSyncEngine(baseConfig);
-      const initialRoot = engine.coreState;
       const installer = new SnapshotInstaller();
 
       // Incomparable payload
@@ -436,14 +670,13 @@ describe('Phase 7.5 M4.3b — SnapshotInstaller & Eligibility', () => {
       expect(validation.valid).toBe(false);
       expect(validation.eligibility?.eligibility).toBe('INCOMPARABLE');
 
-      // Engine root is completely untouched
-      expect(engine.coreState).toBe(initialRoot);
+      // Engine is completely untouched
+      expect(engine.logicalClock).toBe(0);
       expect(engine.replicationFrontier['peer-author']).toBeUndefined();
     });
 
-    it('D3: post-commit listener exceptions do not roll back or corrupt committed state root', () => {
+    it('D6: post-commit listener exceptions do not roll back or corrupt committed state root', () => {
       const engine = new LeaderlessSyncEngine(baseConfig);
-      const installer = new SnapshotInstaller();
 
       // Register a failing listener
       engine.onStateChange(() => {
@@ -463,6 +696,24 @@ describe('Phase 7.5 M4.3b — SnapshotInstaller & Eligibility', () => {
       expect(engine.replicationFrontier['peer-remote']).toBe(60);
       expect(engine.logicalClock).toBe(600);
       expect(engine.playbackState.anchorPositionMs).toBe(3000);
+    });
+
+    it('D7: throws ENGINE_DISPOSED when committing to disposed engine', async () => {
+      const capability = createRecoveryInstallationCapability('coord', baseConfig.sessionId);
+      const engine = new LeaderlessSyncEngine({
+        ...baseConfig,
+        recoveryInstallationCapability: capability,
+      });
+      engine.dispose();
+
+      const installer = new SnapshotInstaller();
+      const payload = createValidPayload();
+      const validation = await installer.validate(payload, 1, {});
+      const staged = installer.stage(validation, (engine as any).config);
+
+      expect(() => {
+        installer.commitAtomic(engine, staged, capability);
+      }).toThrow(/Cannot commit snapshot to a disposed engine/);
     });
   });
 });

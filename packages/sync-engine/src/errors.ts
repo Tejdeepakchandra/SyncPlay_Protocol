@@ -47,7 +47,8 @@ export type SyncEngineErrorCode =
   | 'SNAPSHOT_INSTALLATION_FAILED'
   | 'SNAPSHOT_INELIGIBLE'
   | 'ENGINE_DISPOSED'
-  | 'INVALID_CANDIDATE_ROOT';
+  | 'INVALID_CANDIDATE_ROOT'
+  | 'INVALID_STAGED_HANDLE';
 
 export class SyncEngineError extends Error {
   public readonly code: SyncEngineErrorCode;

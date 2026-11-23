@@ -79,6 +79,7 @@ export {
   createSupplierContextRegistrationCapability,
   createAuthenticatedSupplierContext,
   createAuthenticatedRequesterContext,
+  createRecoveryInstallationCapability,
   TrustedTransportAdapter,
 } from './engine/leaderless-sync-engine.js';
 export type {
@@ -88,6 +89,8 @@ export type {
   SupplierContextRegistrationCapability,
   AuthenticatedSupplierContext,
   AuthenticatedRequesterContext,
+  RecoveryInstallationCapability,
+  EngineCoreDiagnosticSnapshot,
 } from './engine/leaderless-sync-engine.js';
 
 // ── Phase 7 Distributed Ordering & Conflict Components ───────
@@ -291,6 +294,7 @@ export type {
   SnapshotEligibilityResult,
   EvaluateSnapshotEligibilityParams,
   SnapshotValidationResult,
+  SnapshotStageOptions,
   StagedSnapshotInstallation,
   SnapshotInstallationReport,
   SnapshotInstallerValidateOptions,
