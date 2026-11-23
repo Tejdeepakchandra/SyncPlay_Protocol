@@ -36,7 +36,14 @@ export type SyncEngineErrorCode =
   | 'INVALID_RANGE'
   | 'INVALID_STATE'
   | 'PARTITION_ERROR'
-  | 'TRANSPORT_LIMIT_EXCEEDED';
+  | 'TRANSPORT_LIMIT_EXCEEDED'
+  | 'INVALID_STATE_TRANSITION'
+  | 'QUARANTINE_OVERFLOW'
+  | 'FUTURE_EPOCH_OVERFLOW'
+  | 'REJECTED_INVALID'
+  | 'REJECTED_RECOVERING'
+  | 'REJECTED_DEGRADED'
+  | 'UNRESOLVED_FUTURE_EPOCH';
 
 export class SyncEngineError extends Error {
   public readonly code: SyncEngineErrorCode;

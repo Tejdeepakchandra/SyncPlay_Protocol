@@ -226,3 +226,49 @@ export type {
   InboundTransportCapability,
 } from './recovery/inbound-custody.js';
 
+// ── Phase 7.5 M4.3a Recovery State & Generational Quarantine ─────
+export {
+  RecoveryStateMachine,
+} from './recovery/recovery-state-machine.js';
+export type {
+  RecoveryState,
+  RecoverySubstate,
+  RecoveryStateListener,
+  RecoverySubstateListener,
+} from './recovery/recovery-state-machine.js';
+
+export {
+  QuarantineBuffer,
+  MAX_QUARANTINE_OPERATIONS,
+  MAX_QUARANTINE_TOTAL_BYTES,
+  MAX_QUARANTINE_EVENT_BYTES,
+  QUARANTINE_WARNING_THRESHOLD_BYTES,
+} from './recovery/quarantine-buffer.js';
+export type {
+  QuarantinedOperation,
+  QuarantineDrainResult,
+  QuarantineBufferConfig,
+} from './recovery/quarantine-buffer.js';
+
+export {
+  FutureEpochBuffer,
+  MAX_FUTURE_EPOCH_OPERATIONS,
+  MAX_FUTURE_EPOCH_BYTES,
+  MAX_FUTURE_EPOCH_EVENT_BYTES,
+  DEFAULT_EPOCH_CONVERGENCE_GRACE_MS,
+} from './recovery/future-epoch-buffer.js';
+export type {
+  FutureEpochBufferConfig,
+} from './recovery/future-epoch-buffer.js';
+
+export {
+  RecoveryAdmissionController,
+} from './recovery/recovery-admission-controller.js';
+export type {
+  LocalAdmissionResult,
+  RemoteAdmissionAction,
+  RemoteAdmissionResult,
+  RecoveryAdmissionControllerConfig,
+} from './recovery/recovery-admission-controller.js';
+
+
