@@ -65,6 +65,28 @@ export interface RecoveryAdmissionControllerConfig {
   readonly nowFn?: () => number;
 }
 
+interface InboundCandidateMessage {
+  readonly originPeerId?: string;
+  readonly senderPeerId?: string;
+  readonly originSequenceNumber?: number;
+  readonly logicalTimestamp?: number;
+  readonly membershipEpoch?: number;
+}
+
+interface InboundCandidateClock {
+  readonly originPeerId?: string;
+  readonly sequenceNumber?: number;
+  readonly logicalTimestamp?: number;
+  readonly membershipEpoch?: number;
+}
+
+interface InboundCandidateEvent {
+  readonly message?: InboundCandidateMessage;
+  readonly clock?: InboundCandidateClock;
+  readonly issuerPeerId?: string;
+  readonly membershipEpoch?: number;
+}
+
 export class RecoveryAdmissionController {
   public readonly stateMachine: RecoveryStateMachine;
   public readonly quarantineBuffer: QuarantineBuffer;
@@ -172,15 +194,15 @@ export class RecoveryAdmissionController {
       };
     }
 
-    const eventRecord = event as unknown as Record<string, unknown>;
-    const message = eventRecord.message as Record<string, unknown> | undefined;
-    const clock = eventRecord.clock as Record<string, unknown> | undefined;
+    const candidate = event as unknown as InboundCandidateEvent;
+    const message = candidate.message;
+    const clock = candidate.clock;
 
     const originPeerId =
       (typeof message?.originPeerId === 'string' && message.originPeerId.trim()) ||
       (typeof message?.senderPeerId === 'string' && message.senderPeerId.trim()) ||
       (typeof clock?.originPeerId === 'string' && clock.originPeerId.trim()) ||
-      (typeof eventRecord.issuerPeerId === 'string' && eventRecord.issuerPeerId.trim()) ||
+      (typeof candidate.issuerPeerId === 'string' && candidate.issuerPeerId.trim()) ||
       '';
 
     const rawSeq =
@@ -194,7 +216,7 @@ export class RecoveryAdmissionController {
     const rawEpoch =
       message?.membershipEpoch ??
       clock?.membershipEpoch ??
-      eventRecord.membershipEpoch;
+      candidate.membershipEpoch;
     const membershipEpoch =
       typeof rawEpoch === 'number' && Number.isInteger(rawEpoch) ? rawEpoch : null;
 
