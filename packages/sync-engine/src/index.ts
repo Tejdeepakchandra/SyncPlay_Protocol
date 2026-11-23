@@ -180,3 +180,49 @@ export type {
   OutboundPipelineConfig,
   StartTransferParams,
 } from './recovery/snapshot-outbound-pipeline.js';
+
+export {
+  SnapshotInboundPipeline,
+  DEFAULT_SLIDING_WINDOW_SIZE,
+  DEFAULT_CHUNK_TIMEOUT_MS,
+  DEFAULT_OVERALL_TIMEOUT_MS,
+  DEFAULT_MAX_RETRIES_PER_CHUNK,
+  DEFAULT_MAX_TRANSFER_RETRIES,
+  DEFAULT_MAX_TRANSFER_CONTEXT_TRANSITIONS,
+  DEFAULT_MAX_LOCAL_REDISPATCH_ATTEMPTS,
+  MAX_EVIDENCE_RECORDS,
+} from './recovery/snapshot-inbound-pipeline.js';
+export type {
+  InboundChunkState,
+  AttemptLifecycleState,
+  AcceptedEvidenceStatus,
+  AcceptedAttemptRecord,
+  ChunkEvidenceHistory,
+  OutboundMessageType,
+  OutboundHandoffRequest,
+  InboundTransferState,
+  InboundTransferSession,
+  SnapshotTransferResult,
+  InboundPipelineConfig,
+  SupplierContextLifecycleState,
+} from './recovery/snapshot-inbound-pipeline.js';
+
+export {
+  CandidateOfferRegistry,
+  MAX_OFFER_CANDIDATES,
+  CANDIDATE_OFFER_TTL_MS,
+} from './recovery/candidate-offer-registry.js';
+export type {
+  CandidateOfferEntry,
+  CandidateMatchQuery,
+  AddCandidateResult,
+} from './recovery/candidate-offer-registry.js';
+
+export {
+  createInboundTransportCapability,
+  assertInboundTransportCapability,
+} from './recovery/inbound-custody.js';
+export type {
+  InboundTransportCapability,
+} from './recovery/inbound-custody.js';
+
