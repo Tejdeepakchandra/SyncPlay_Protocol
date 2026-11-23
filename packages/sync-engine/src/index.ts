@@ -271,4 +271,31 @@ export type {
   RecoveryAdmissionControllerConfig,
 } from './recovery/recovery-admission-controller.js';
 
+// ── Phase 7.5 M4.3b Single-Root Engine State & Atomic Installer ──
+export {
+  createEngineCoreState,
+  createInitialEngineCoreState,
+} from './recovery/engine-core-state.js';
+export type {
+  EngineCoreState,
+  CreateEngineCoreStateParams,
+  InitialEngineCoreStateConfig,
+} from './recovery/engine-core-state.js';
+
+export {
+  SnapshotInstaller,
+  evaluateSnapshotEligibility,
+} from './recovery/snapshot-installer.js';
+export type {
+  SnapshotEligibility,
+  SnapshotEligibilityResult,
+  EvaluateSnapshotEligibilityParams,
+  SnapshotValidationResult,
+  StagedSnapshotInstallation,
+  SnapshotInstallationReport,
+  SnapshotInstallerValidateOptions,
+  ISnapshotInstaller,
+} from './recovery/snapshot-installer.js';
+
+
 

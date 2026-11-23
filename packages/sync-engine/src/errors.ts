@@ -43,7 +43,11 @@ export type SyncEngineErrorCode =
   | 'REJECTED_INVALID'
   | 'REJECTED_RECOVERING'
   | 'REJECTED_DEGRADED'
-  | 'UNRESOLVED_FUTURE_EPOCH';
+  | 'UNRESOLVED_FUTURE_EPOCH'
+  | 'SNAPSHOT_INSTALLATION_FAILED'
+  | 'SNAPSHOT_INELIGIBLE'
+  | 'ENGINE_DISPOSED'
+  | 'INVALID_CANDIDATE_ROOT';
 
 export class SyncEngineError extends Error {
   public readonly code: SyncEngineErrorCode;

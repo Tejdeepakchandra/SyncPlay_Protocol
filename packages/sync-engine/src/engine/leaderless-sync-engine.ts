@@ -68,8 +68,13 @@ import type { PeerMesh, InboundMessage, PeerStatus, SendResult } from '@syncplay
 import { compareDigests } from '../replication/replication-comparator.js';
 import type { DigestComparisonResult, IAntiEntropyManager, AntiEntropyCallbacks } from '../replication/types.js';
 import { INTERNAL_DIGEST_ACCESS_TOKEN, type InternalDigestAccessToken } from './custody.js';
+import {
+  type EngineCoreState,
+  createEngineCoreState,
+  createInitialEngineCoreState,
+} from '../recovery/engine-core-state.js';
 
-export type { InternalDigestAccessToken };
+export type { InternalDigestAccessToken, EngineCoreState };
 
 interface MutableStats {
   eventsReceivedCount: number;
@@ -633,21 +638,20 @@ export interface LeaderlessSyncEngineConfig extends SyncEngineConfig {
 export class LeaderlessSyncEngine implements SyncEngine {
   private readonly config: ResolvedSyncEngineConfig;
   private readonly clock: Clock;
+  private readonly logCapacity: number;
 
-  private state: PlaybackState;
-  private baseSnapshot: PlaybackState;
-  private baseSnapshotFrontier: Record<string, number> = {};
+  // Single Authoritative State Root (Phase 7.5 M4.3b)
+  private core: EngineCoreState;
+
   private lastDecision?: EngineDecision;
   private disposed = false;
+  private recoveryActive = false;
+  private readonly deferredStateChanges: PlaybackState[] = [];
+  private readonly deferredDecisions: EngineDecision[] = [];
 
-  private readonly clockManager: LogicalClockManager;
-  private readonly operationLog: OrderedOperationLog;
-  private readonly pendingQueue: PendingDependencyQueue;
   private readonly conflictResolver: ConflictResolver;
 
-  // Causal vectors
-  private readonly localCausalContext: Record<string, number> = {};
-  private readonly replicationVector: Record<string, number> = {};
+  // External / Non-authoritative metadata
   private readonly peerGenerations = new Map<string, number>();
   private readonly compactionManager = new CompactionManager();
   private readonly authorizedEpochCapability?: EpochTransitionCapability;
@@ -655,8 +659,6 @@ export class LeaderlessSyncEngine implements SyncEngine {
   private readonly validSupplierContexts = new WeakSet<AuthenticatedSupplierContext>();
   private readonly validRequesterContexts = new WeakSet<AuthenticatedRequesterContext>();
   private antiEntropyManager?: IAntiEntropyManager;
-  private localOriginSequence = 0;
-  private currentEpoch = 1;
 
   private readonly stateChangeListeners = new Set<StateChangeListener>();
   private readonly decisionListeners = new Set<DecisionListener>();
@@ -694,9 +696,6 @@ export class LeaderlessSyncEngine implements SyncEngine {
       stateVersion: 0,
     });
 
-    this.state = initialState;
-    this.baseSnapshot = initialState;
-
     this.authorizedEpochCapability = config.epochCapability
       ? Object.freeze(config.epochCapability)
       : undefined;
@@ -707,14 +706,181 @@ export class LeaderlessSyncEngine implements SyncEngine {
       : undefined;
 
     const logCapacity = config.logCapacity ?? 256;
-    this.clockManager = new LogicalClockManager(config.initialClock ?? 0);
+    this.logCapacity = logCapacity;
+    this.conflictResolver = new ConflictResolver();
+
     const reducerFn = (state: PlaybackState, op: StoredOperation): PlaybackState => {
       const reducerContext = this.getReducerContext();
       return this.conflictResolver.reduce(state, op, this.clock.now(), reducerContext).nextState;
     };
-    this.operationLog = new OrderedOperationLog(logCapacity, initialState, reducerFn);
-    this.pendingQueue = new PendingDependencyQueue(logCapacity);
-    this.conflictResolver = new ConflictResolver();
+
+    this.core = createInitialEngineCoreState({
+      initialState,
+      logCapacity,
+      initialClock: config.initialClock ?? 0,
+      reducerFn,
+      LogicalClockManagerClass: LogicalClockManager,
+      OrderedOperationLogClass: OrderedOperationLog,
+      PendingDependencyQueueClass: PendingDependencyQueue,
+    });
+  }
+
+  // ── Authoritative State Accessors (Single Root Delegation) ─────
+  private get state(): PlaybackState {
+    return this.core.playbackState;
+  }
+  private set state(val: PlaybackState) {
+    this.core.playbackState = val;
+    this.core.state = val;
+    this.core.stateVersion = val.stateVersion;
+  }
+
+  private get baseSnapshot(): PlaybackState {
+    return this.core.baseSnapshot;
+  }
+  private set baseSnapshot(val: PlaybackState) {
+    this.core.baseSnapshot = val;
+  }
+
+  private get baseSnapshotFrontier(): Record<string, number> {
+    return this.core.baseSnapshotFrontier;
+  }
+  private set baseSnapshotFrontier(val: Record<string, number>) {
+    this.core.baseSnapshotFrontier = val;
+  }
+
+  private get operationLog(): OrderedOperationLog {
+    return this.core.operationLog;
+  }
+
+  private get clockManager(): LogicalClockManager {
+    return this.core.clockManager;
+  }
+
+  private get pendingQueue(): PendingDependencyQueue {
+    return this.core.pendingQueue;
+  }
+
+  private get replicationVector(): Record<string, number> {
+    return this.core.replicationVector;
+  }
+
+  private get localCausalContext(): Record<string, number> {
+    return this.core.localCausalContext;
+  }
+
+  private get localOriginSequence(): number {
+    return this.core.localOriginSequence;
+  }
+  private set localOriginSequence(val: number) {
+    this.core.localOriginSequence = val;
+  }
+
+  private get currentEpoch(): number {
+    return this.core.currentEpoch;
+  }
+  private set currentEpoch(val: number) {
+    this.core.currentEpoch = val;
+  }
+
+  // ── Recovery & Single-Root Atomic Installer Hooks ─────────────
+  /**
+   * Returns current sealed engine core state for read-only inspection or assertions.
+   */
+  public get coreState(): Readonly<EngineCoreState> {
+    return this.core;
+  }
+
+  /**
+   * Public accessor for stateVersion.
+   */
+  public get stateVersion(): number {
+    return this.core.stateVersion;
+  }
+
+  /**
+   * Public accessor for playbackState.
+   */
+  public get playbackState(): Readonly<PlaybackState> {
+    return this.core.playbackState;
+  }
+
+  /**
+   * Single-root atomic state replacement in 1 synchronous reference assignment:
+   *   this.core = candidateCore;
+   * CANNOT throw under run-to-completion. Suppresses immediate listener notifications during recovery.
+   */
+  public replaceCoreStateAtomic(candidate: EngineCoreState): void {
+    if (!candidate || typeof candidate !== 'object') {
+      throw new SyncEngineError('INVALID_ARGUMENT', 'Candidate core state must be a non-null object');
+    }
+    if (this.disposed) {
+      throw new SyncEngineError('ENGINE_DISPOSED', 'Cannot replace core state on disposed engine');
+    }
+
+    // Irreversible synchronous reference replacement under JavaScript run-to-completion semantics
+    this.core = candidate;
+  }
+
+  /**
+   * Queries whether recovery mode is currently active on the engine.
+   */
+  public isRecoveryActive(): boolean {
+    return this.recoveryActive;
+  }
+
+  /**
+   * Sets recovery mode on the engine to enforce local input rejection and listener buffering.
+   */
+  public setRecoveryMode(active: boolean): void {
+    this.recoveryActive = active;
+  }
+
+  /**
+   * Flushes deferred state change and decision notifications after Stage 4 drain completes.
+   * Executes individual listener calls in try/catch to ensure reentrancy safety.
+   */
+  public flushDeferredNotifications(): void {
+    if (this.disposed) return;
+
+    // Coalesced state change notification
+    if (this.deferredStateChanges.length > 0) {
+      const finalState = this.deferredStateChanges[this.deferredStateChanges.length - 1];
+      this.deferredStateChanges.length = 0;
+      if (finalState) {
+        this.mutableStats.stateChangeNotificationsCount++;
+        for (const listener of this.stateChangeListeners) {
+          try {
+            listener(finalState);
+          } catch {
+            this.mutableStats.listenerErrorCount++;
+          }
+        }
+      }
+    }
+
+    // Sequentially deferred decisions
+    while (this.deferredDecisions.length > 0) {
+      const decision = this.deferredDecisions.shift()!;
+      this.mutableStats.decisionNotificationsCount++;
+      for (const listener of this.decisionListeners) {
+        try {
+          listener(undefined as any, decision);
+        } catch {
+          this.mutableStats.listenerErrorCount++;
+        }
+      }
+    }
+  }
+
+  /**
+   * Returns a reducer function bound to current engine configuration for out-of-band candidate staging.
+   */
+  public getReducerFunction(): (state: PlaybackState, op: StoredOperation) => PlaybackState {
+    return (state: PlaybackState, op: StoredOperation): PlaybackState => {
+      const reducerContext = this.getReducerContext();
+      return this.conflictResolver.reduce(state, op, this.clock.now(), reducerContext).nextState;
+    };
   }
 
   public get isDisposed(): boolean {
@@ -1902,12 +2068,16 @@ export class LeaderlessSyncEngine implements SyncEngine {
     this.state = nextState;
 
     if (stateChanged) {
-      this.mutableStats.stateChangeNotificationsCount++;
-      for (const listener of this.stateChangeListeners) {
-        try {
-          listener(this.state);
-        } catch {
-          this.mutableStats.listenerErrorCount++;
+      if (this.recoveryActive) {
+        this.deferredStateChanges.push(this.state);
+      } else {
+        this.mutableStats.stateChangeNotificationsCount++;
+        for (const listener of this.stateChangeListeners) {
+          try {
+            listener(this.state);
+          } catch {
+            this.mutableStats.listenerErrorCount++;
+          }
         }
       }
     }
@@ -1929,6 +2099,10 @@ export class LeaderlessSyncEngine implements SyncEngine {
   }
 
   private notifyDecision(event: AnyControlSyncEvent, decision: EngineDecision): void {
+    if (this.recoveryActive) {
+      this.deferredDecisions.push(decision);
+      return;
+    }
     this.mutableStats.decisionNotificationsCount++;
     for (const listener of this.decisionListeners) {
       try {
@@ -2127,14 +2301,18 @@ export class LeaderlessSyncEngine implements SyncEngine {
     };
 
     this.mutableStats.eventsAppliedCount++;
-    this.mutableStats.stateChangeNotificationsCount++;
     this.lastDecision = decision;
 
-    for (const listener of this.stateChangeListeners) {
-      try {
-        listener(this.state);
-      } catch {
-        this.mutableStats.listenerErrorCount++;
+    if (this.recoveryActive) {
+      this.deferredStateChanges.push(this.state);
+    } else {
+      this.mutableStats.stateChangeNotificationsCount++;
+      for (const listener of this.stateChangeListeners) {
+        try {
+          listener(this.state);
+        } catch {
+          this.mutableStats.listenerErrorCount++;
+        }
       }
     }
 
@@ -2143,24 +2321,23 @@ export class LeaderlessSyncEngine implements SyncEngine {
 
   /**
    * Phase 7 snapshot import adhering to exact Lamport and causal recovery rules.
+   * Leverages single-root atomic candidate construction and synchronous replacement (M4.3b).
    */
   public importSnapshotV2(snapshot: StateSnapshotPayloadV2): EngineDecision {
     const now = this.clock.now();
 
     // 1. Reseed Lamport clock: L = max(L_local, maxLogicalTimestamp) (without +1)
-    this.clockManager.reseed(snapshot.maxLogicalTimestamp);
+    const newClock = Math.max(this.clockManager.clock, snapshot.maxLogicalTimestamp);
+    const candidateClockManager = new LogicalClockManager(newClock);
 
     // 2. Initialize local causal context and replication vector to snapshot frontier
-    for (const key of Object.keys(this.localCausalContext)) {
-      delete this.localCausalContext[key];
-    }
-    for (const key of Object.keys(this.replicationVector)) {
-      delete this.replicationVector[key];
-    }
+    const candidateReplicationVector: Record<string, number> = {};
+    const candidateLocalCausalContext: Record<string, number> = {};
+    const candidateBaseFrontier: Record<string, number> = {};
     for (const [peer, seq] of Object.entries(snapshot.snapshotFrontier)) {
-      this.localCausalContext[peer] = seq;
-      this.replicationVector[peer] = seq;
-      this.baseSnapshotFrontier[peer] = seq;
+      candidateLocalCausalContext[peer] = seq;
+      candidateReplicationVector[peer] = seq;
+      candidateBaseFrontier[peer] = seq;
     }
 
     // 3. Update playback state and reset log to new base
@@ -2180,14 +2357,17 @@ export class LeaderlessSyncEngine implements SyncEngine {
       }),
     });
 
-    this.state = importedState;
-    this.baseSnapshot = importedState;
-    this.operationLog.reset(importedState, snapshot.snapshotFrontier);
-    this.pendingQueue.clear();
+    const candidateLog = new OrderedOperationLog(
+      this.logCapacity,
+      importedState,
+      this.getReducerFunction(),
+    );
+    candidateLog.reset(importedState, snapshot.snapshotFrontier);
+    const candidateQueue = new PendingDependencyQueue(this.logCapacity);
 
     // 4. Ingest compacted checkpoints after log reset
     for (const cp of snapshot.compactedCheckpoints) {
-      this.operationLog.setCompactedCheckpoint(
+      candidateLog.setCompactedCheckpoint(
         cp.originPeerId,
         cp.sequenceNumber,
         cp.logicalTimestamp,
@@ -2198,10 +2378,28 @@ export class LeaderlessSyncEngine implements SyncEngine {
     // Also ingest frontier timestamps if not already present in compactedCheckpoints
     for (const [peer, seq] of Object.entries(snapshot.snapshotFrontier)) {
       const ts = snapshot.originFrontierTimestamps[peer];
-      if (ts !== undefined && this.operationLog.getCompactedCheckpoint(peer, seq) === undefined) {
-        this.operationLog.setCompactedCheckpoint(peer, seq, ts, '');
+      if (ts !== undefined && candidateLog.getCompactedCheckpoint(peer, seq) === undefined) {
+        candidateLog.setCompactedCheckpoint(peer, seq, ts, '');
       }
     }
+
+    const candidateCore = createEngineCoreState({
+      playbackState: importedState,
+      baseSnapshot: importedState,
+      baseSnapshotFrontier: candidateBaseFrontier,
+      operationLog: candidateLog,
+      clockManager: candidateClockManager,
+      pendingQueue: candidateQueue,
+      replicationVector: candidateReplicationVector,
+      localCausalContext: candidateLocalCausalContext,
+      localOriginSequence: this.localOriginSequence,
+      currentEpoch: snapshot.membershipEpoch ?? this.currentEpoch,
+      lastAppliedEventId: `snap-${snapshot.snapshotId}`,
+      stateVersion: importedState.stateVersion,
+    });
+
+    // Single synchronous atomic root replacement
+    this.replaceCoreStateAtomic(candidateCore);
 
     const decision: EngineDecision = {
       accepted: true,
@@ -2211,14 +2409,18 @@ export class LeaderlessSyncEngine implements SyncEngine {
     };
 
     this.mutableStats.eventsAppliedCount++;
-    this.mutableStats.stateChangeNotificationsCount++;
     this.lastDecision = decision;
 
-    for (const listener of this.stateChangeListeners) {
-      try {
-        listener(this.state);
-      } catch {
-        this.mutableStats.listenerErrorCount++;
+    if (this.recoveryActive) {
+      this.deferredStateChanges.push(this.state);
+    } else {
+      this.mutableStats.stateChangeNotificationsCount++;
+      for (const listener of this.stateChangeListeners) {
+        try {
+          listener(this.state);
+        } catch {
+          this.mutableStats.listenerErrorCount++;
+        }
       }
     }
 
