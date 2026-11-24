@@ -53,14 +53,19 @@ export interface QuarantinedOperation {
  * Summary metrics of a quarantine drain execution.
  */
 export interface QuarantineDrainResult {
-  readonly totalOperations: number;
+  readonly batchSize: number;
   readonly appliedCount: number;
-  readonly acceptedPendingCount: number;
-  readonly discardedMalformedEpoch: number;
-  readonly discardedObsoleteEpoch: number;
-  readonly discardedAlreadyApplied: number;
-  readonly bufferedFutureEpoch: number;
-  readonly drainDurationMs: number;
+  readonly pendingCount: number;
+  readonly discardedCount: number;
+  readonly haltedOnCapacity: boolean;
+  readonly haltedOnError?: string;
+  readonly totalOperations?: number;
+  readonly acceptedPendingCount?: number;
+  readonly discardedMalformedEpoch?: number;
+  readonly discardedObsoleteEpoch?: number;
+  readonly discardedAlreadyApplied?: number;
+  readonly bufferedFutureEpoch?: number;
+  readonly drainDurationMs?: number;
 }
 
 export class QuarantineBuffer {

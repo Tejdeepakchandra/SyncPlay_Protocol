@@ -73,8 +73,10 @@ import {
   createEngineCoreState,
   createInitialEngineCoreState,
 } from '../recovery/engine-core-state.js';
+import type { QuarantinedOperation } from '../recovery/quarantine-buffer.js';
+import type { DestinationAcceptanceReceipt } from '../recovery/quarantine-drainer.js';
 
-export type { InternalDigestAccessToken, EngineCoreState };
+export type { InternalDigestAccessToken, EngineCoreState, DestinationAcceptanceReceipt };
 
 interface MutableStats {
   eventsReceivedCount: number;
@@ -965,6 +967,161 @@ export class LeaderlessSyncEngine implements SyncEngine {
       const reducerContext = this.getReducerContext();
       return this.conflictResolver.reduce(state, op, this.clock.now(), reducerContext).nextState;
     };
+  }
+
+  /**
+   * Evaluates an in-flight quarantined operation during Stage 4 drain.
+   * Confirms destination acceptance or returns explicit typed receipt.
+   * Advancing replication vector occurs strictly upon first successful reduction into log.
+   */
+  public admitDrainedOperation(op: QuarantinedOperation): DestinationAcceptanceReceipt {
+    if (this.disposed) {
+      throw new SyncEngineError('ENGINE_DISPOSED', 'Cannot admit drained operation on disposed engine');
+    }
+
+    const originPeerId = op.originPeerId;
+    const originSeq = op.sequenceNumber;
+    const epoch = op.membershipEpoch;
+    const now = this.clock.now();
+
+    const message = op.event.message;
+    const logicalEventId = message.logicalEventId;
+    const senderPeerId = message.senderPeerId ?? originPeerId;
+    const messageType = message.messageType;
+    const logicalTimestamp = message.logicalTimestamp ?? 0;
+    const causalContext = (message.causalContext as Record<string, number> | undefined) ?? {};
+    const payload = message.payload;
+
+    if (!logicalEventId || typeof logicalEventId !== 'string' || !logicalEventId.trim()) {
+      return {
+        status: 'TERMINALLY_REJECTED',
+        vectorAdvanced: false,
+        error: 'Remote event missing logicalEventId',
+      };
+    }
+
+    // 1. Strict epoch fencing
+    if (epoch < this.currentEpoch) {
+      return {
+        status: 'TERMINALLY_REJECTED',
+        vectorAdvanced: false,
+        error: `Event from obsolete epoch ${epoch} < ${this.currentEpoch}`,
+      };
+    }
+    if (epoch > this.currentEpoch) {
+      return {
+        status: 'TERMINALLY_REJECTED',
+        vectorAdvanced: false,
+        error: `Event from unestablished future epoch ${epoch} > ${this.currentEpoch}`,
+      };
+    }
+
+    // 2. Base snapshot frontier check (already covered by snapshot base)
+    const baseFrontier = this.baseSnapshotFrontier[originPeerId] ?? 0;
+    if (originSeq <= baseFrontier) {
+      return {
+        status: 'ALREADY_REPRESENTED',
+        vectorAdvanced: false,
+      };
+    }
+
+    // 3. Replication vector check (already contiguous in log)
+    const haveSeq = this.replicationVector[originPeerId] ?? 0;
+    if (originSeq <= haveSeq) {
+      return {
+        status: 'ALREADY_OWNED_DUPLICATE',
+        vectorAdvanced: false,
+      };
+    }
+
+    // 4. Duplicate checks in log and pending queue
+    if (this.operationLog.get(logicalEventId) || this.operationLog.getOperationAt(originPeerId, originSeq)) {
+      return {
+        status: 'ALREADY_OWNED_DUPLICATE',
+        vectorAdvanced: false,
+      };
+    }
+    if (
+      this.pendingQueue.has(logicalEventId) ||
+      this.pendingQueue.getAll().some((o) => o.originPeerId === originPeerId && o.originSequenceNumber === originSeq)
+    ) {
+      return {
+        status: 'ALREADY_OWNED_DUPLICATE',
+        vectorAdvanced: false,
+      };
+    }
+
+    // 5. Causal dependency satisfaction check
+    let missingDep = false;
+    if (originSeq !== haveSeq + 1) {
+      missingDep = true;
+    }
+    for (const [depOrigin, reqSeq] of Object.entries(causalContext)) {
+      const currentDepSeq = this.replicationVector[depOrigin] ?? 0;
+      if (reqSeq > currentDepSeq) {
+        missingDep = true;
+        break;
+      }
+    }
+
+    const storedOp: StoredOperation = {
+      logicalEventId,
+      originPeerId,
+      senderPeerId,
+      membershipEpoch: epoch,
+      messageType: messageType as any,
+      logicalTimestamp,
+      originSequenceNumber: originSeq,
+      causalContext: { ...causalContext },
+      appliedAtMonotonic: now,
+      payload,
+    };
+
+    if (missingDep) {
+      try {
+        this.pendingQueue.enqueue(storedOp);
+        return {
+          status: 'ACCEPTED_PENDING',
+          vectorAdvanced: false,
+          reason: 'MISSING_DEPENDENCY',
+        };
+      } catch (err) {
+        if (err instanceof SyncEngineError && err.code === 'REJECTED_CAPACITY') {
+          return {
+            status: 'CAPACITY_REJECTED',
+            vectorAdvanced: false,
+            currentQueueSize: this.pendingQueue.size,
+            maxCapacity: this.logCapacity,
+          };
+        }
+        throw err;
+      }
+    }
+
+    // 6. Dependencies satisfied: admit operation into operationLog and reduce
+    this.admitOperation(storedOp, undefined, now, 'REPAIR_BATCH');
+    return {
+      status: 'ACCEPTED_REDUCED',
+      vectorAdvanced: true,
+      newSequence: originSeq,
+    };
+  }
+
+  /**
+   * Queries whether the engine already holds the specified operation across its
+   * base snapshot frontier, operation log, or pending dependency queue.
+   */
+  public hasOperation(originPeerId: string, sequenceNumber: number): boolean {
+    if (sequenceNumber <= (this.baseSnapshotFrontier[originPeerId] ?? 0)) {
+      return true;
+    }
+    if (this.operationLog.getOperationAt(originPeerId, sequenceNumber)) {
+      return true;
+    }
+    if (this.pendingQueue.getAll().some((o) => o.originPeerId === originPeerId && o.originSequenceNumber === sequenceNumber)) {
+      return true;
+    }
+    return false;
   }
 
   public get isDisposed(): boolean {

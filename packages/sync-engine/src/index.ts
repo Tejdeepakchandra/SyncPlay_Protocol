@@ -301,5 +301,31 @@ export type {
   ISnapshotInstaller,
 } from './recovery/snapshot-installer.js';
 
+// ── Phase 7.5 M4.3c Recovery Coordinator & Quarantine Drainer ────
+export {
+  QuarantineDrainer,
+} from './recovery/quarantine-drainer.js';
+export type {
+  DrainedOperationState,
+  DestinationAcceptanceStatus,
+  DrainedInFlightRecord,
+  DestinationAcceptanceReceipt,
+  IDrainDestination,
+  IQuarantineDrainer,
+  QuarantineDrainerConfig,
+} from './recovery/quarantine-drainer.js';
+
+export {
+  RecoveryCoordinator,
+} from './recovery/recovery-coordinator.js';
+export type {
+  RecoveryFailureReason,
+  RecoveryMetrics,
+  RecoveryCoordinatorCallbacks,
+  RecoveryCoordinatorConfig,
+  IRecoveryCoordinator,
+} from './recovery/recovery-coordinator.js';
+
+
 
 
