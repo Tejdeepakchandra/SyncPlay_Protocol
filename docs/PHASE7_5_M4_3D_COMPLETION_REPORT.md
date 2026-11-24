@@ -173,23 +173,24 @@ TOTAL: Clean compilation across all 6 workspaces with code 0.
 | Path | Purpose | Lines of Code | Status |
 |---|---|:---:|:---:|
 | `packages/sync-engine/src/__tests__/recovery-acceptance-matrix.test.ts` | 36-Scenario Acceptance Matrix Suite (Scenarios 1–36) | 1,188 | Remediated & Passing |
-| `packages/sync-engine/src/__tests__/recovery-multi-peer-integration.test.ts` | Multi-Peer Simulation & Stress Suite (Scenarios MP1–MP6) | 948 | Remediated & Passing |
-| `docs/PHASE7_5_M4_3D_COMPLETION_REPORT.md` | Formal Milestone Completion Report | ~380 | Complete |
+| `packages/sync-engine/src/__tests__/recovery-multi-peer-integration.test.ts` | Multi-Peer Simulation & Stress Suite (Scenarios MP1–MP6) | 1,028 | Remediated (Step 3) & Passing |
+| `docs/PHASE7_5_M4_3D_COMPLETION_REPORT.md` | Formal Milestone Completion Report | ~400 | Complete |
 | `docs/PHASE7_5_M4_3D_STEP2_COMPLETION_REPORT.md` | Step 2 Findings Remediation Report | ~280 | Complete |
+| `docs/PHASE7_5_M4_3D_STEP3_COMPLETION_REPORT.md` | Step 3 Production-Orchestration Integration Report | ~280 | Complete |
 
 ---
 
 ## 8. Conclusion & Sign-Off Recommendation
 
-Sub-Milestone **Phase 7.5 M4.3d** has achieved 100% verification across all 36 architectural acceptance scenarios and all 6 multi-peer integration scenarios with zero regressions, zero production source modifications in Step 2, and zero diff against frozen baselines.
+Sub-Milestone **Phase 7.5 M4.3d** has achieved 100% verification across all 36 architectural acceptance scenarios and all 6 multi-peer integration scenarios with zero regressions, zero production source modifications across Steps 2 & 3, and zero diff against frozen baselines.
 
-All 7 audit findings (A through G) have been thoroughly remediated:
+Following the Step 2 audit findings, Step 3 established genuine production pipeline and compaction orchestration integration:
 - **Finding A (MP4):** 500 operations partitioned across 3 independent remote origins with round-robin interleaving and causal preservation.
 - **Finding B (S19):** Default `RecoveryCoordinator` constructor wires autonomous 5s epoch grace period expiration into `DEGRADED` (`UNRESOLVED_FUTURE_EPOCH`).
 - **Finding C (S24):** Count, aggregate byte (64 KiB), and individual (4 KiB) bounds enforced via `coordinator.interceptRemoteEvent()`.
 - **Finding D (S35):** Genuine cooperative validation rejection (missing `logicalEventId`) clears in-flight record and permits subsequent drain.
-- **Finding E (MP2):** Real log compaction at frontier 300 triggers anti-entropy `OUTSIDE_REMOTE_HORIZON` (`requiresSnapshotRecovery: true`) and full catch-up.
-- **Finding F (MP1):** Full outbound serialization, chunking, wire framing, and inbound assembly pipeline verified before snapshot installation.
-- **Finding G (MP3):** Multi-chunk transfer failover preserves bit-for-bit received chunks, evicts crashed supplier, rejects stale chunks, and completes from promoted candidate.
+- **Finding E / Step 3 (MP2):** Real safe compaction workflow via `captureMembershipView()`, `calculateCompactionFrontier('MEMBERSHIP_SAFE')`, and `executeCompaction()` triggers anti-entropy `OUTSIDE_REMOTE_HORIZON` (`requiresSnapshotRecovery: true`) and full catch-up.
+- **Finding F / Step 3 (MP1):** Real bidirectional transfer pipeline integration using `SnapshotOutboundPipeline` on supplier and `SnapshotInboundPipeline` on receiver, preserving wire message framing and executing atomic recovery installation.
+- **Finding G / Step 3 (MP3):** Active multi-chunk transfer failover orchestrated entirely through `SnapshotInboundPipeline.handleSupplierDisconnected()`, preserving chunks, rejecting stale chunks, and completing transfer from promoted Candidate C.
 
 Phase 7.5 M4.3d is now **COMPLETE — READY FOR INDEPENDENT AUDIT**.

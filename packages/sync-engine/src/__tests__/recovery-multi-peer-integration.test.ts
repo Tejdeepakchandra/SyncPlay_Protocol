@@ -23,16 +23,23 @@ import {
   SnapshotSerializer,
   SnapshotChunkProducer,
   ChunkAssembler,
+  SnapshotOutboundPipeline,
+  SnapshotInboundPipeline,
   createRecoveryInstallationCapability,
   createInboundTransportCapability,
+  createOutboundTransportCapability,
+  createAuthenticatedRecipientContext,
   computeSnapshotDigestV2,
   SyncEngineError,
   type StateSnapshotPayloadV2,
   type SnapshotOfferPayload,
+  type SnapshotRequestPayload,
   type QuarantinedOperation,
   type AuthenticatedSupplierContext,
+  type OutboundHandoffRequest,
+  type SnapshotTransferResult,
 } from '../index.js';
-import { PROTOCOL_VERSION } from '@syncplay/protocol';
+import { PROTOCOL_VERSION, MessageType, type ProtocolMessage } from '@syncplay/protocol';
 import type { AnyControlSyncEvent } from '@syncplay/control-events';
 
 describe('Phase 7.5 M4.3d — Multi-Peer Recovery Integration (MP1–MP6)', () => {
@@ -237,71 +244,137 @@ describe('Phase 7.5 M4.3d — Multi-Peer Recovery Integration (MP1–MP6)', () =
     // Peer-4 joins late with 0 state
     const p4 = createEngine('peer-4');
     const coord4 = createCoordinator(p4.engine, p4.capability);
+    coord4.triggerRecovery('peer-2', 'Late join catch-up');
 
     expect(p4.engine.replicationFrontier).toEqual({});
     expect(p4.engine.logicalClock).toBe(0);
 
     // Export active snapshot from peer-2
     const rawSnapshot = p2.engine.exportSnapshotV2('snap-late-join-001');
-
-    // Wire framing: serialize state via SnapshotSerializer
     const artifact = SnapshotSerializer.serialize(rawSnapshot);
     expect(artifact.totalSizeBytes).toBeGreaterThan(0);
     expect(artifact.sha256Digest).toBe(rawSnapshot.sha256Digest);
 
-    // Chunking: produce wire chunk messages via SnapshotChunkProducer
-    const transferId = '11111111-2222-4333-8444-555555555555';
-    const producer = new SnapshotChunkProducer(artifact, {
-      nominalChunkSizeBytes: 256,
-      transferId,
-      allowSctpFallback: true,
-    });
-    const totalChunks = producer.totalChunks;
-    expect(totalChunks).toBeGreaterThan(1);
+    // Setup SnapshotOutboundPipeline on Supplier Peer-2
+    const outboundCap = createOutboundTransportCapability(SESSION_ID, 'peer-2');
+    const outboundPipeline = new SnapshotOutboundPipeline({ transportCapability: outboundCap });
+    cleanupFns.push(() => outboundPipeline.dispose());
 
-    // Inbound assembly: feed chunks to ChunkAssembler on Peer-4
-    const assembler = new ChunkAssembler();
-    assembler.initTransfer({
-      transferId,
-      sessionId: SESSION_ID,
-      snapshotId: rawSnapshot.snapshotId,
-      totalChunks,
-      totalSizeBytes: artifact.totalSizeBytes,
-      nominalChunkSizeBytes: 256,
-      expectedSha256Digest: artifact.sha256Digest,
+    // Setup SnapshotInboundPipeline on Receiving Peer-4
+    let completedResult: SnapshotTransferResult | undefined;
+    const emittedRequests: OutboundHandoffRequest[] = [];
+    const inboundCap = createInboundTransportCapability(SESSION_ID, 'peer-4');
+    const inboundPipeline = new SnapshotInboundPipeline({
+      transportCapability: inboundCap,
+      onTransferComplete: async (result) => {
+        completedResult = result;
+        const payload: StateSnapshotPayloadV2 = {
+          ...result.snapshot,
+          sha256Digest: result.sha256Digest,
+        };
+        await coord4.executeRecoveryWithSnapshot(payload);
+      },
+      onEmitMessage: async (handoff) => {
+        emittedRequests.push(handoff);
+      },
+    });
+    cleanupFns.push(() => inboundPipeline.dispose());
+
+    // Register authenticated supplier context on Peer-4 inbound pipeline
+    const supplierCtx = inboundPipeline.registerSupplierContext('peer-2', 1, 65536, inboundCap, 1);
+
+    // Step 1: Supplier Peer-2 initiates outbound transfer session and generates initial offer
+    const initTransferId = '00000000-0000-4000-8000-000000000001';
+    const initSession = await outboundPipeline.startTransfer({
+      transferId: initTransferId,
+      recipientPeerId: 'peer-4',
       supplierPeerId: 'peer-2',
       membershipEpoch: 1,
       connectionGeneration: 1,
+      sctpMaxMessageSize: 65536,
+      artifact,
+    });
+    expect(initSession.offerMessage).toBeDefined();
+
+    // Step 2: Receiving Peer-4 processes the offer through SnapshotInboundPipeline
+    const offerRes = inboundPipeline.handleOffer(initSession.offerMessage!, supplierCtx);
+    expect(offerRes.admitted).toBe(true);
+    expect(offerRes.role).toBe('ACTIVE');
+
+    // Step 3: Peer-4 starts inbound transfer, emitting SNAPSHOT_REQUEST
+    await inboundPipeline.startTransfer();
+    expect(emittedRequests.length).toBeGreaterThan(0);
+    const reqHandoff = emittedRequests[0];
+    expect(reqHandoff.messageType).toBe('SNAPSHOT_REQUEST');
+
+    const session = inboundPipeline.getActiveSession()!;
+    const transferId = session.transferId;
+    expect(transferId).toBeDefined();
+    expect(session.supplierPeerId).toBe('peer-2');
+
+    // Step 4: Supplier Peer-2 receives chunk request for active transferId
+    outboundPipeline.cancelTransfer(initTransferId);
+    const activeOutbound = await outboundPipeline.startTransfer({
+      transferId,
+      recipientPeerId: 'peer-4',
+      supplierPeerId: 'peer-2',
+      membershipEpoch: 1,
+      connectionGeneration: 1,
+      sctpMaxMessageSize: 65536,
+      artifact,
     });
 
-    for (let i = 0; i < totalChunks; i++) {
-      const chunkResult = producer.produceChunk(i, { supplierPeerId: 'peer-2' });
-      expect(chunkResult.ok).toBe(true);
-      expect(chunkResult.payload.chunkSha256).toBe(producer.slices[i]!.chunkSha256);
+    const recipientCtx = createAuthenticatedRecipientContext(
+      outboundPipeline,
+      {
+        transferId,
+        recipientPeerId: 'peer-4',
+        sessionId: SESSION_ID,
+        membershipEpoch: 1,
+        connectionGeneration: 1,
+      },
+      outboundCap,
+    );
 
-      const ingestResult = assembler.ingestChunk(chunkResult.payload);
-      expect(ingestResult.ok).toBe(true);
+    const reqPayload = reqHandoff.message.payload as SnapshotRequestPayload;
+    const preparedChunks = outboundPipeline.handleChunkRequest(
+      transferId,
+      reqPayload.missingChunkIndices ?? [0],
+      recipientCtx,
+    );
+    expect(preparedChunks.length).toBe(activeOutbound.totalChunks);
+
+    // Step 5: Deliver chunks through bidirectional pipelines
+    for (const chunk of preparedChunks) {
+      // Local handoff on outbound pipeline
+      outboundPipeline.handleHandoffSuccess(
+        transferId,
+        chunk.payload.chunkIndex,
+        chunk.messageId,
+        chunk.attemptToken,
+        recipientCtx,
+      );
+
+      // Request handoff confirmation on inbound pipeline
+      inboundPipeline.handleHandoffSuccess(
+        transferId,
+        chunk.payload.chunkIndex,
+        reqHandoff.message.messageId,
+        `token-${chunk.payload.chunkIndex}`,
+        supplierCtx,
+      );
+
+      // Inbound reception and ingestion
+      const chunkRes = await inboundPipeline.handleChunk(chunk.message, supplierCtx);
+      expect(chunkRes.accepted).toBe(true);
+
+      // Delivery acknowledgement on outbound pipeline
+      outboundPipeline.handleChunkAck(transferId, chunk.payload.chunkIndex, recipientCtx);
     }
-    expect(assembler.isComplete()).toBe(true);
 
-    const finalizeResult = assembler.finalizeAssembly();
-    expect(finalizeResult.ok).toBe(true);
-    if (!finalizeResult.ok) throw new Error('Assembly finalization failed');
-    expect(finalizeResult.snapshot.sha256Digest).toBe(rawSnapshot.sha256Digest);
-
-    // Deserialize assembled wire buffer to StateSnapshotPayloadV2
-    const assembledJson = new TextDecoder().decode(finalizeResult.snapshot.buffer);
-    const assembledPreimage = JSON.parse(assembledJson);
-    const assembledPayload: StateSnapshotPayloadV2 = {
-      ...assembledPreimage,
-      sha256Digest: finalizeResult.snapshot.sha256Digest,
-    };
-    expect(assembledPayload.snapshotId).toBe('snap-late-join-001');
-
-    // Peer-4 executes recovery with the assembled snapshot
-    await coord4.executeRecoveryWithSnapshot(assembledPayload);
-
-    // Verification: peer-4 state matches active playback state and frontier
+    // Verification:
+    // Transfer completed, snapshot installed through RecoveryCoordinator
+    expect(completedResult).toBeDefined();
     expect(coord4.state).toBe('ACTIVE');
     expect(p4.engine.isRecoveryActive()).toBe(false);
     expect(p4.engine.playbackState.status).toBe('playing');
@@ -311,8 +384,7 @@ describe('Phase 7.5 M4.3d — Multi-Peer Recovery Integration (MP1–MP6)', () =
     expect(p4.engine.baseSnapshotFrontier).toEqual({ 'peer-1': 1, 'peer-2': 1, 'peer-3': 1 });
     expect(p4.engine.logicalClock).toBeGreaterThanOrEqual(3);
 
-    // Peer-4 can now participate in live replication
-    // Peer-1 emits sequence 2 at ts 4 (declaring immediate predecessor peer-1: 1 and peer-3: 1)
+    // Peer-4 participates in live replication
     const evt4 = makeRemoteSyncEvent('peer-1', 2, 4, { 'peer-1': 1, 'peer-3': 1 }, 'PAUSE', 35000);
     p4.engine.receive(evt4);
 
@@ -344,9 +416,18 @@ describe('Phase 7.5 M4.3d — Multi-Peer Recovery Integration (MP1–MP6)', () =
     }
     expect(pA.engine.replicationFrontier['peer-A']).toBe(300);
 
-    // Real log compaction: Peer-A compacts log history at frontier 300
-    const prunedCount = pA.engine.operationLog.compactAtFrontier({ 'peer-A': 300 });
-    expect(prunedCount).toBeGreaterThan(0);
+    // Production safe-compaction workflow via LeaderlessSyncEngine & CompactionManager:
+    // Peer-B is offline/disconnected. The connected peer descriptor set is empty.
+    const view = pA.engine.captureMembershipView([]);
+    const candidate = pA.engine.calculateCompactionFrontier('MEMBERSHIP_SAFE', view);
+    expect(candidate.eligible).toBe(true);
+    expect(candidate.frontier).toEqual({ 'peer-A': 300 });
+
+    const execResult = pA.engine.executeCompaction(candidate, []);
+    expect(execResult.committed).toBe(true);
+    // Compaction pruned all 256 operations held within the ring buffer capacity
+    expect(execResult.prunedCount).toBe(256);
+    expect(pA.engine.operationLog.size).toBe(0);
     expect(pA.engine.operationLog.getBaseSnapshotFrontier()['peer-A']).toBe(300);
 
     // Returning Peer-B initiates anti-entropy digest evaluation against Peer-A
@@ -392,12 +473,9 @@ describe('Phase 7.5 M4.3d — Multi-Peer Recovery Integration (MP1–MP6)', () =
   // ═══════════════════════════════════════════════════════════════════════════
 
   it('M4.3d-MP3: Supplier Crash During Transfer: registry evicts crashed supplier and fails over', async () => {
-    let simulatedTime = 100000;
-    const registry = new CandidateOfferRegistry(() => simulatedTime);
-    cleanupFns.push(() => registry.dispose());
-
     const pA = createEngine('peer-A');
     const coordA = createCoordinator(pA.engine, pA.capability);
+    coordA.triggerRecovery('peer-B', 'Supplier failover test');
 
     // Canonical snapshot payload offered by both candidate suppliers
     const snapshotPayload = createValidSnapshotPayload({
@@ -410,156 +488,158 @@ describe('Phase 7.5 M4.3d — Multi-Peer Recovery Integration (MP1–MP6)', () =
         { originPeerId: 'peer-B', sequenceNumber: 40, logicalTimestamp: 400 },
       ],
     });
-    const artifact = SnapshotSerializer.serialize(snapshotPayload);
-    const nominalChunkSizeBytes = Math.max(256, Math.ceil(artifact.totalSizeBytes / 2));
 
-    const transferIdB = '00000000-0000-4000-8000-00000000000b';
-    const transferIdC = '00000000-0000-4000-8000-00000000000c';
+    const artifactB = SnapshotSerializer.serialize(snapshotPayload);
+    const artifactC = SnapshotSerializer.serialize(snapshotPayload);
+    const nominalChunkSizeBytes = Math.max(256, Math.ceil(artifactB.totalSizeBytes / 2));
 
-    // Chunk producers for supplier B and supplier C
-    const producerB = new SnapshotChunkProducer(artifact, {
-      nominalChunkSizeBytes,
-      transferId: transferIdB,
-      allowSctpFallback: true,
+    let completedResult: SnapshotTransferResult | undefined;
+    const emittedRequests: OutboundHandoffRequest[] = [];
+    const inboundCap = createInboundTransportCapability(SESSION_ID, 'peer-A');
+    const inboundPipeline = new SnapshotInboundPipeline({
+      transportCapability: inboundCap,
+      onTransferComplete: async (result) => {
+        completedResult = result;
+        const payload: StateSnapshotPayloadV2 = {
+          ...result.snapshot,
+          sha256Digest: result.sha256Digest,
+        };
+        await coordA.executeRecoveryWithSnapshot(payload);
+      },
+      onEmitMessage: async (handoff) => {
+        emittedRequests.push(handoff);
+      },
     });
-    expect(producerB.totalChunks).toBe(2);
+    cleanupFns.push(() => inboundPipeline.dispose());
 
-    const producerC = new SnapshotChunkProducer(artifact, {
-      nominalChunkSizeBytes,
-      transferId: transferIdC,
-      allowSctpFallback: true,
-    });
-    expect(producerC.totalChunks).toBe(2);
+    // Register supplier contexts with unforgeable transport capability
+    const ctxB = inboundPipeline.registerSupplierContext('peer-B', 1, 65536, inboundCap, 1);
+    const ctxC = inboundPipeline.registerSupplierContext('peer-C', 1, 65536, inboundCap, 1);
 
     // Two candidates offer the identical snapshot:
-    // Peer-B offers snapshot (ranked 1st)
-    // Peer-C offers snapshot (ranked 2nd)
-    const offerB: SnapshotOfferPayload = {
-      offerId: '00000000-0000-4000-8000-000000000001',
+    // Peer-B offers snapshot (admitted as ACTIVE)
+    // Peer-C offers snapshot (admitted as CANDIDATE in CandidateOfferRegistry)
+    const offerMsgB: ProtocolMessage<SnapshotOfferPayload> = {
+      protocolVersion: PROTOCOL_VERSION,
+      messageType: MessageType.SNAPSHOT_OFFER,
       sessionId: SESSION_ID,
+      senderPeerId: 'peer-B',
       membershipEpoch: 1,
-      supplierPeerId: 'peer-B',
-      snapshotId: 'snap-failover-40',
-      authorPeerId: 'peer-B',
-      snapshotFrontier: { 'peer-B': 40 },
-      maxLogicalTimestamp: 400,
-      totalSizeBytes: artifact.totalSizeBytes,
-      totalChunks: 2,
-      nominalChunkSizeBytes,
-      sha256Digest: artifact.sha256Digest,
+      messageId: 'msg-offer-b',
+      payload: {
+        offerId: '00000000-0000-4000-8000-000000000001',
+        sessionId: SESSION_ID,
+        membershipEpoch: 1,
+        supplierPeerId: 'peer-B',
+        snapshotId: 'snap-failover-40',
+        authorPeerId: 'peer-B',
+        snapshotFrontier: { 'peer-B': 40 },
+        maxLogicalTimestamp: 400,
+        totalSizeBytes: artifactB.totalSizeBytes,
+        totalChunks: 2,
+        nominalChunkSizeBytes,
+        sha256Digest: artifactB.sha256Digest,
+      },
     };
 
-    const offerC: SnapshotOfferPayload = {
-      offerId: '00000000-0000-4000-8000-000000000002',
+    const offerMsgC: ProtocolMessage<SnapshotOfferPayload> = {
+      protocolVersion: PROTOCOL_VERSION,
+      messageType: MessageType.SNAPSHOT_OFFER,
       sessionId: SESSION_ID,
+      senderPeerId: 'peer-C',
       membershipEpoch: 1,
-      supplierPeerId: 'peer-C',
-      snapshotId: 'snap-failover-40',
-      authorPeerId: 'peer-B',
-      snapshotFrontier: { 'peer-B': 40 },
-      maxLogicalTimestamp: 400,
-      totalSizeBytes: artifact.totalSizeBytes,
-      totalChunks: 2,
-      nominalChunkSizeBytes,
-      sha256Digest: artifact.sha256Digest,
+      messageId: 'msg-offer-c',
+      payload: {
+        offerId: '00000000-0000-4000-8000-000000000002',
+        sessionId: SESSION_ID,
+        membershipEpoch: 1,
+        supplierPeerId: 'peer-C',
+        snapshotId: 'snap-failover-40',
+        authorPeerId: 'peer-B',
+        snapshotFrontier: { 'peer-B': 40 },
+        maxLogicalTimestamp: 400,
+        totalSizeBytes: artifactC.totalSizeBytes,
+        totalChunks: 2,
+        nominalChunkSizeBytes,
+        sha256Digest: artifactC.sha256Digest,
+      },
     };
 
-    const ctxB: AuthenticatedSupplierContext = Object.freeze({
-      supplierPeerId: 'peer-B',
-      connectionGeneration: 1,
-    });
-    const ctxC: AuthenticatedSupplierContext = Object.freeze({
-      supplierPeerId: 'peer-C',
-      connectionGeneration: 1,
-    });
+    const resB = inboundPipeline.handleOffer(offerMsgB, ctxB);
+    expect(resB.admitted).toBe(true);
+    expect(resB.role).toBe('ACTIVE');
 
-    registry.addCandidate(offerB, ctxB, simulatedTime);
-    registry.addCandidate(offerC, ctxC, simulatedTime);
+    const resC = inboundPipeline.handleOffer(offerMsgC, ctxC);
+    expect(resC.admitted).toBe(true);
+    expect(resC.role).toBe('CANDIDATE');
 
-    expect(registry.size).toBe(2);
-    expect(registry.getCandidate('peer-B')).toBeDefined();
-    expect(registry.getCandidate('peer-C')).toBeDefined();
+    // Start transfer with Supplier B
+    await inboundPipeline.startTransfer();
+    expect(emittedRequests.length).toBeGreaterThan(0);
+    const session = inboundPipeline.getActiveSession()!;
+    const transferId = session.transferId;
+    expect(session.supplierPeerId).toBe('peer-B');
 
-    // Active transfer begins with Supplier B
-    const assembler = new ChunkAssembler();
-    assembler.initTransfer({
-      transferId: transferIdB,
-      sessionId: SESSION_ID,
-      snapshotId: 'snap-failover-40',
-      totalChunks: 2,
-      totalSizeBytes: artifact.totalSizeBytes,
+    // Supplier B produces chunk 0
+    inboundPipeline.handleHandoffSuccess(
+      transferId,
+      0,
+      emittedRequests[0].message.messageId,
+      'attempt-0',
+      ctxB,
+    );
+    const producerB = new SnapshotChunkProducer(artifactB, {
       nominalChunkSizeBytes,
-      expectedSha256Digest: artifact.sha256Digest,
-      supplierPeerId: 'peer-B',
-      membershipEpoch: 1,
-      connectionGeneration: 1,
+      transferId,
+      allowSctpFallback: true,
     });
-
-    // Chunk 0 arrives from Supplier B and is accepted
     const chunk0B = producerB.produceChunk(0, { supplierPeerId: 'peer-B' });
-    const res0 = assembler.ingestChunk(chunk0B.payload);
-    expect(res0.ok).toBe(true);
-    expect(assembler.getReceivedChunkIndices()).toEqual([0]);
-    expect(assembler.getMissingChunkIndices()).toEqual([1]);
+    const ingest0 = await inboundPipeline.handleChunk(chunk0B.message, ctxB);
+    expect(ingest0.accepted).toBe(true);
+    expect(session.receivedChunks.has(0)).toBe(true);
+    expect(session.missingChunks.has(1)).toBe(true);
 
-    // Supplier Peer-B crashes / disconnects during transfer
-    // Registry evicts crashed supplier B
-    const removed = registry.evict('peer-B');
-    expect(removed).toBe(true);
-    expect(registry.size).toBe(1);
-    expect(registry.getCandidate('peer-B')).toBeUndefined();
+    // Supplier Peer-B crashes / disconnects during transfer -> trigger production failover
+    const failoverResult = await inboundPipeline.handleSupplierDisconnected(ctxB, inboundCap);
+    expect(failoverResult.failoverSuccess).toBe(true);
 
-    // Registry promotes candidate Peer-C
-    const failoverCandidate = registry.getCandidate('peer-C');
-    expect(failoverCandidate).toBeDefined();
-    expect(failoverCandidate!.offer.supplierPeerId).toBe('peer-C');
+    // Verify inbound pipeline orchestrates seamless failover to Supplier C:
+    const sessionAfter = inboundPipeline.getActiveSession()!;
+    expect(sessionAfter.supplierPeerId).toBe('peer-C');
+    expect(sessionAfter.receivedChunks.has(0)).toBe(true); // Chunk 0 preserved across failover!
+    expect(sessionAfter.missingChunks.has(1)).toBe(true); // Chunk 1 scheduled for C!
+    expect(sessionAfter.sessionId).toBe(SESSION_ID);
+    expect(sessionAfter.snapshotId).toBe('snap-failover-40');
+    expect(sessionAfter.expectedSha256Digest).toBe(artifactB.sha256Digest);
+    expect(sessionAfter.totalSizeBytes).toBe(artifactB.totalSizeBytes);
+    expect(sessionAfter.totalChunks).toBe(2);
 
-    // Assembler executes seamless failover to Peer-C
-    const failoverRes = assembler.prepareForFailover({
-      transferId: transferIdC,
-      supplierPeerId: 'peer-C',
-      membershipEpoch: 1,
-      connectionGeneration: 1,
-      snapshotId: 'snap-failover-40',
-      expectedSha256Digest: artifact.sha256Digest,
-      totalChunks: 2,
-      totalSizeBytes: artifact.totalSizeBytes,
+    // Stale chunk from crashed Supplier B arrives -> REJECTED (inactive supplier context)
+    const chunk1B = producerB.produceChunk(1, { supplierPeerId: 'peer-B' });
+    const staleRes = await inboundPipeline.handleChunk(chunk1B.message, ctxB);
+    expect(staleRes.accepted).toBe(false);
+
+    // Supplier C produces chunk 1 for active transferId
+    const failoverReq = emittedRequests[emittedRequests.length - 1];
+    inboundPipeline.handleHandoffSuccess(
+      transferId,
+      1,
+      failoverReq.message.messageId,
+      'attempt-1',
+      ctxC,
+    );
+    const producerC = new SnapshotChunkProducer(artifactC, {
       nominalChunkSizeBytes,
+      transferId,
+      allowSctpFallback: true,
     });
-    expect(failoverRes.ok).toBe(true);
-    expect(failoverRes.retainedChunks).toBe(1);
-    expect(assembler.getReceivedChunkIndices()).toEqual([0]);
-    expect(assembler.getMissingChunkIndices()).toEqual([1]);
-
-    // Stale chunk from crashed Supplier B arrives -> REJECTED with IDENTITY_MISMATCH
-    const staleChunk1B = producerB.produceChunk(1, { supplierPeerId: 'peer-B' });
-    const staleRes = assembler.ingestChunk(staleChunk1B.payload);
-    expect(staleRes.ok).toBe(false);
-    if (!staleRes.ok) {
-      expect(staleRes.reason).toBe('IDENTITY_MISMATCH');
-    }
-
-    // Remaining chunk 1 arrives from new Supplier C -> ACCEPTED and completes assembly
     const chunk1C = producerC.produceChunk(1, { supplierPeerId: 'peer-C' });
-    const freshRes = assembler.ingestChunk(chunk1C.payload);
-    expect(freshRes.ok).toBe(true);
-    expect(assembler.isComplete()).toBe(true);
+    const freshRes = await inboundPipeline.handleChunk(chunk1C.message, ctxC);
+    expect(freshRes.accepted).toBe(true);
+    expect(freshRes.completed).toBe(true);
 
-    const finalizeResult = assembler.finalizeAssembly();
-    expect(finalizeResult.ok).toBe(true);
-    if (!finalizeResult.ok) throw new Error('Assembly finalization failed');
-    expect(finalizeResult.snapshot.sha256Digest).toBe(artifact.sha256Digest);
-
-    // Install assembled snapshot into coordinator
-    const assembledJson = new TextDecoder().decode(finalizeResult.snapshot.buffer);
-    const assembledPreimage = JSON.parse(assembledJson);
-    const assembledPayload: StateSnapshotPayloadV2 = {
-      ...assembledPreimage,
-      sha256Digest: finalizeResult.snapshot.sha256Digest,
-    };
-    await coordA.executeRecoveryWithSnapshot(assembledPayload);
-
-    // Verification: Peer-A is active with snapshot installed
+    // Verification: Snapshot installed into coordinator, Peer-A transitions to ACTIVE
+    expect(completedResult).toBeDefined();
     expect(coordA.state).toBe('ACTIVE');
     expect(pA.engine.replicationFrontier['peer-B']).toBe(40);
     expect(pA.engine.baseSnapshotFrontier['peer-B']).toBe(40);
