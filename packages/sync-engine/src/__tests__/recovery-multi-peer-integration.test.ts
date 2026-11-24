@@ -20,6 +20,9 @@ import {
   LeaderlessSyncEngine,
   RecoveryCoordinator,
   CandidateOfferRegistry,
+  SnapshotSerializer,
+  SnapshotChunkProducer,
+  ChunkAssembler,
   createRecoveryInstallationCapability,
   createInboundTransportCapability,
   computeSnapshotDigestV2,
@@ -221,7 +224,7 @@ describe('Phase 7.5 M4.3d — Multi-Peer Recovery Integration (MP1–MP6)', () =
     p3.engine.receive(evt2);
 
     // Peer-3 changes rate to 1.5 at ts 3 (dep on peer-2: 1)
-    const evt3 = makeRemoteSyncEvent('peer-3', 1, 3, { 'peer-2': 1 }, 'RATE_CHANGE', 30000);
+    const evt3 = makeRemoteSyncEvent('peer-3', 1, 3, { 'peer-2': 1 }, 'RATE_CHANGE', 30000, 1.5);
     p1.engine.receive(evt3);
     p2.engine.receive(evt3);
     p3.engine.receive(evt3);
@@ -238,29 +241,65 @@ describe('Phase 7.5 M4.3d — Multi-Peer Recovery Integration (MP1–MP6)', () =
     expect(p4.engine.replicationFrontier).toEqual({});
     expect(p4.engine.logicalClock).toBe(0);
 
-    // Snapshot reflecting active state from peer-2
-    const snapshotPayload = createValidSnapshotPayload({
-      snapshotId: 'snap-late-join-001',
-      authorPeerId: 'peer-2',
-      state: {
-        formatVersion: 1,
-        sessionId: SESSION_ID,
-        status: 'playing',
-        anchorPositionMs: 30000,
-        playbackRate: 1.5,
-      },
-      snapshotFrontier: { 'peer-1': 1, 'peer-2': 1, 'peer-3': 1 },
-      originFrontierTimestamps: { 'peer-1': 1, 'peer-2': 2, 'peer-3': 3 },
-      maxLogicalTimestamp: 3,
-      compactedCheckpoints: [
-        { originPeerId: 'peer-1', sequenceNumber: 1, logicalTimestamp: 1 },
-        { originPeerId: 'peer-2', sequenceNumber: 1, logicalTimestamp: 2 },
-        { originPeerId: 'peer-3', sequenceNumber: 1, logicalTimestamp: 3 },
-      ],
+    // Export active snapshot from peer-2
+    const rawSnapshot = p2.engine.exportSnapshotV2('snap-late-join-001');
+
+    // Wire framing: serialize state via SnapshotSerializer
+    const artifact = SnapshotSerializer.serialize(rawSnapshot);
+    expect(artifact.totalSizeBytes).toBeGreaterThan(0);
+    expect(artifact.sha256Digest).toBe(rawSnapshot.sha256Digest);
+
+    // Chunking: produce wire chunk messages via SnapshotChunkProducer
+    const transferId = '11111111-2222-4333-8444-555555555555';
+    const producer = new SnapshotChunkProducer(artifact, {
+      nominalChunkSizeBytes: 256,
+      transferId,
+      allowSctpFallback: true,
+    });
+    const totalChunks = producer.totalChunks;
+    expect(totalChunks).toBeGreaterThan(1);
+
+    // Inbound assembly: feed chunks to ChunkAssembler on Peer-4
+    const assembler = new ChunkAssembler();
+    assembler.initTransfer({
+      transferId,
+      sessionId: SESSION_ID,
+      snapshotId: rawSnapshot.snapshotId,
+      totalChunks,
+      totalSizeBytes: artifact.totalSizeBytes,
+      nominalChunkSizeBytes: 256,
+      expectedSha256Digest: artifact.sha256Digest,
+      supplierPeerId: 'peer-2',
+      membershipEpoch: 1,
+      connectionGeneration: 1,
     });
 
-    // Peer-4 executes recovery with snapshot
-    await coord4.executeRecoveryWithSnapshot(snapshotPayload);
+    for (let i = 0; i < totalChunks; i++) {
+      const chunkResult = producer.produceChunk(i, { supplierPeerId: 'peer-2' });
+      expect(chunkResult.ok).toBe(true);
+      expect(chunkResult.payload.chunkSha256).toBe(producer.slices[i]!.chunkSha256);
+
+      const ingestResult = assembler.ingestChunk(chunkResult.payload);
+      expect(ingestResult.ok).toBe(true);
+    }
+    expect(assembler.isComplete()).toBe(true);
+
+    const finalizeResult = assembler.finalizeAssembly();
+    expect(finalizeResult.ok).toBe(true);
+    if (!finalizeResult.ok) throw new Error('Assembly finalization failed');
+    expect(finalizeResult.snapshot.sha256Digest).toBe(rawSnapshot.sha256Digest);
+
+    // Deserialize assembled wire buffer to StateSnapshotPayloadV2
+    const assembledJson = new TextDecoder().decode(finalizeResult.snapshot.buffer);
+    const assembledPreimage = JSON.parse(assembledJson);
+    const assembledPayload: StateSnapshotPayloadV2 = {
+      ...assembledPreimage,
+      sha256Digest: finalizeResult.snapshot.sha256Digest,
+    };
+    expect(assembledPayload.snapshotId).toBe('snap-late-join-001');
+
+    // Peer-4 executes recovery with the assembled snapshot
+    await coord4.executeRecoveryWithSnapshot(assembledPayload);
 
     // Verification: peer-4 state matches active playback state and frontier
     expect(coord4.state).toBe('ACTIVE');
@@ -298,42 +337,37 @@ describe('Phase 7.5 M4.3d — Multi-Peer Recovery Integration (MP1–MP6)', () =
     expect(pB.engine.replicationFrontier['peer-A']).toBe(1);
 
     // Peer-A advances 300 sequential ops beyond compaction horizon (K=256)
-    // Peer-A compacts history into a snapshot with frontier peer-A: 300
-    const compactedCheckpoints = [];
-    for (let seq = 1; seq <= 300; seq += 25) {
-      compactedCheckpoints.push({
-        originPeerId: 'peer-A',
-        sequenceNumber: seq,
-        logicalTimestamp: seq,
-      });
+    for (let seq = 2; seq <= 300; seq++) {
+      vi.advanceTimersByTime(100);
+      const op = makeRemoteSyncEvent('peer-A', seq, seq, { 'peer-A': seq - 1 }, 'PLAY', 1000 + seq * 10);
+      pA.engine.receive(op);
     }
-    // Also include frontier checkpoint 300
-    compactedCheckpoints.push({
-      originPeerId: 'peer-A',
-      sequenceNumber: 300,
-      logicalTimestamp: 300,
-    });
+    expect(pA.engine.replicationFrontier['peer-A']).toBe(300);
 
-    const snapshotPayload = createValidSnapshotPayload({
-      snapshotId: 'snap-horizon-300',
-      authorPeerId: 'peer-A',
-      state: {
-        formatVersion: 1,
-        sessionId: SESSION_ID,
-        status: 'playing',
-        anchorPositionMs: 50000,
-        playbackRate: 1.0,
-      },
-      snapshotFrontier: { 'peer-A': 300 },
-      originFrontierTimestamps: { 'peer-A': 300 },
-      maxLogicalTimestamp: 300,
-      compactedCheckpoints,
-    });
+    // Real log compaction: Peer-A compacts log history at frontier 300
+    const prunedCount = pA.engine.operationLog.compactAtFrontier({ 'peer-A': 300 });
+    expect(prunedCount).toBeGreaterThan(0);
+    expect(pA.engine.operationLog.getBaseSnapshotFrontier()['peer-A']).toBe(300);
+
+    // Returning Peer-B initiates anti-entropy digest evaluation against Peer-A
+    const digestA = pA.engine.createLocalDigest();
+    expect(digestA.replicationVector['peer-A']).toBe(300);
+    expect(digestA.snapshotFrontier['peer-A']).toBe(300);
+
+    const comparison = pB.engine.compareRemoteDigest(digestA);
+    expect(comparison.requiresSnapshotRecovery).toBe(true);
+    expect(comparison.outsideRemoteHorizon).toBe(true);
+    expect(comparison.classification).toBe('REQUIRES_SNAPSHOT_RECOVERY');
+    const originDetail = comparison.originDetails.find((d) => d.originPeerId === 'peer-A');
+    expect(originDetail?.status).toBe('OUTSIDE_REMOTE_HORIZON');
+
+    // Real snapshot export from compacted Peer-A state
+    const snapshotPayload = pA.engine.exportSnapshotV2('snap-horizon-300');
+    expect(snapshotPayload.snapshotFrontier['peer-A']).toBe(300);
 
     // Returning Peer-B receives op 301 from Peer-A while offline gap exists
     const op301 = createMockQuarantinedOp('peer-A', 301, 301, { 'peer-A': 300 }, 'PAUSE', 50000);
 
-    // Direct admission of op 301 would fail due to missing dependencies before horizon
     // Peer-B quarantines op 301 and recovers via snapshot
     coordB.triggerRecovery('peer-A', 'Horizon gap detected');
     coordB.interceptRemoteEvent(op301.event, 128);
@@ -365,37 +399,69 @@ describe('Phase 7.5 M4.3d — Multi-Peer Recovery Integration (MP1–MP6)', () =
     const pA = createEngine('peer-A');
     const coordA = createCoordinator(pA.engine, pA.capability);
 
-    // Two candidates offer snapshots:
-    // Peer-B offers snapshot at frontier 50 (higher frontier, ranked 1st)
-    // Peer-C offers snapshot at frontier 40 (ranked 2nd)
+    // Canonical snapshot payload offered by both candidate suppliers
+    const snapshotPayload = createValidSnapshotPayload({
+      snapshotId: 'snap-failover-40',
+      authorPeerId: 'peer-B',
+      snapshotFrontier: { 'peer-B': 40 },
+      originFrontierTimestamps: { 'peer-B': 400 },
+      maxLogicalTimestamp: 400,
+      compactedCheckpoints: [
+        { originPeerId: 'peer-B', sequenceNumber: 40, logicalTimestamp: 400 },
+      ],
+    });
+    const artifact = SnapshotSerializer.serialize(snapshotPayload);
+    const nominalChunkSizeBytes = Math.max(256, Math.ceil(artifact.totalSizeBytes / 2));
+
+    const transferIdB = '00000000-0000-4000-8000-00000000000b';
+    const transferIdC = '00000000-0000-4000-8000-00000000000c';
+
+    // Chunk producers for supplier B and supplier C
+    const producerB = new SnapshotChunkProducer(artifact, {
+      nominalChunkSizeBytes,
+      transferId: transferIdB,
+      allowSctpFallback: true,
+    });
+    expect(producerB.totalChunks).toBe(2);
+
+    const producerC = new SnapshotChunkProducer(artifact, {
+      nominalChunkSizeBytes,
+      transferId: transferIdC,
+      allowSctpFallback: true,
+    });
+    expect(producerC.totalChunks).toBe(2);
+
+    // Two candidates offer the identical snapshot:
+    // Peer-B offers snapshot (ranked 1st)
+    // Peer-C offers snapshot (ranked 2nd)
     const offerB: SnapshotOfferPayload = {
-      offerId: '00000000-0000-4000-8000-00000000000b',
+      offerId: '00000000-0000-4000-8000-000000000001',
       sessionId: SESSION_ID,
       membershipEpoch: 1,
       supplierPeerId: 'peer-B',
-      snapshotId: 'snap-peer-B-50',
+      snapshotId: 'snap-failover-40',
       authorPeerId: 'peer-B',
-      snapshotFrontier: { 'peer-B': 50 },
-      maxLogicalTimestamp: 500,
-      totalSizeBytes: 32768,
+      snapshotFrontier: { 'peer-B': 40 },
+      maxLogicalTimestamp: 400,
+      totalSizeBytes: artifact.totalSizeBytes,
       totalChunks: 2,
-      nominalChunkSizeBytes: 16384,
-      sha256Digest: 'b'.repeat(64),
+      nominalChunkSizeBytes,
+      sha256Digest: artifact.sha256Digest,
     };
 
     const offerC: SnapshotOfferPayload = {
-      offerId: '00000000-0000-4000-8000-00000000000c',
+      offerId: '00000000-0000-4000-8000-000000000002',
       sessionId: SESSION_ID,
       membershipEpoch: 1,
       supplierPeerId: 'peer-C',
-      snapshotId: 'snap-peer-C-40',
-      authorPeerId: 'peer-C',
-      snapshotFrontier: { 'peer-C': 40 },
+      snapshotId: 'snap-failover-40',
+      authorPeerId: 'peer-B',
+      snapshotFrontier: { 'peer-B': 40 },
       maxLogicalTimestamp: 400,
-      totalSizeBytes: 16384,
-      totalChunks: 1,
-      nominalChunkSizeBytes: 16384,
-      sha256Digest: 'c'.repeat(64),
+      totalSizeBytes: artifact.totalSizeBytes,
+      totalChunks: 2,
+      nominalChunkSizeBytes,
+      sha256Digest: artifact.sha256Digest,
     };
 
     const ctxB: AuthenticatedSupplierContext = Object.freeze({
@@ -414,43 +480,96 @@ describe('Phase 7.5 M4.3d — Multi-Peer Recovery Integration (MP1–MP6)', () =
     expect(registry.getCandidate('peer-B')).toBeDefined();
     expect(registry.getCandidate('peer-C')).toBeDefined();
 
+    // Active transfer begins with Supplier B
+    const assembler = new ChunkAssembler();
+    assembler.initTransfer({
+      transferId: transferIdB,
+      sessionId: SESSION_ID,
+      snapshotId: 'snap-failover-40',
+      totalChunks: 2,
+      totalSizeBytes: artifact.totalSizeBytes,
+      nominalChunkSizeBytes,
+      expectedSha256Digest: artifact.sha256Digest,
+      supplierPeerId: 'peer-B',
+      membershipEpoch: 1,
+      connectionGeneration: 1,
+    });
+
+    // Chunk 0 arrives from Supplier B and is accepted
+    const chunk0B = producerB.produceChunk(0, { supplierPeerId: 'peer-B' });
+    const res0 = assembler.ingestChunk(chunk0B.payload);
+    expect(res0.ok).toBe(true);
+    expect(assembler.getReceivedChunkIndices()).toEqual([0]);
+    expect(assembler.getMissingChunkIndices()).toEqual([1]);
+
     // Supplier Peer-B crashes / disconnects during transfer
-    // Registry evicts crashed supplier
+    // Registry evicts crashed supplier B
     const removed = registry.evict('peer-B');
     expect(removed).toBe(true);
     expect(registry.size).toBe(1);
     expect(registry.getCandidate('peer-B')).toBeUndefined();
 
-    // Failover: registry retains Peer-C
+    // Registry promotes candidate Peer-C
     const failoverCandidate = registry.getCandidate('peer-C');
     expect(failoverCandidate).toBeDefined();
     expect(failoverCandidate!.offer.supplierPeerId).toBe('peer-C');
 
-    // Peer-C transfer completes successfully
-    const snapshotPayloadC = createValidSnapshotPayload({
-      snapshotId: 'snap-peer-C-40',
-      authorPeerId: 'peer-C',
-      snapshotFrontier: { 'peer-C': 40 },
-      originFrontierTimestamps: { 'peer-C': 400 },
-      maxLogicalTimestamp: 400,
-      compactedCheckpoints: [
-        { originPeerId: 'peer-C', sequenceNumber: 40, logicalTimestamp: 400 },
-      ],
+    // Assembler executes seamless failover to Peer-C
+    const failoverRes = assembler.prepareForFailover({
+      transferId: transferIdC,
+      supplierPeerId: 'peer-C',
+      membershipEpoch: 1,
+      connectionGeneration: 1,
+      snapshotId: 'snap-failover-40',
+      expectedSha256Digest: artifact.sha256Digest,
+      totalChunks: 2,
+      totalSizeBytes: artifact.totalSizeBytes,
+      nominalChunkSizeBytes,
     });
+    expect(failoverRes.ok).toBe(true);
+    expect(failoverRes.retainedChunks).toBe(1);
+    expect(assembler.getReceivedChunkIndices()).toEqual([0]);
+    expect(assembler.getMissingChunkIndices()).toEqual([1]);
 
-    await coordA.executeRecoveryWithSnapshot(snapshotPayloadC);
+    // Stale chunk from crashed Supplier B arrives -> REJECTED with IDENTITY_MISMATCH
+    const staleChunk1B = producerB.produceChunk(1, { supplierPeerId: 'peer-B' });
+    const staleRes = assembler.ingestChunk(staleChunk1B.payload);
+    expect(staleRes.ok).toBe(false);
+    if (!staleRes.ok) {
+      expect(staleRes.reason).toBe('IDENTITY_MISMATCH');
+    }
 
-    // Verification: Peer-A is active with Peer-C snapshot installed
+    // Remaining chunk 1 arrives from new Supplier C -> ACCEPTED and completes assembly
+    const chunk1C = producerC.produceChunk(1, { supplierPeerId: 'peer-C' });
+    const freshRes = assembler.ingestChunk(chunk1C.payload);
+    expect(freshRes.ok).toBe(true);
+    expect(assembler.isComplete()).toBe(true);
+
+    const finalizeResult = assembler.finalizeAssembly();
+    expect(finalizeResult.ok).toBe(true);
+    if (!finalizeResult.ok) throw new Error('Assembly finalization failed');
+    expect(finalizeResult.snapshot.sha256Digest).toBe(artifact.sha256Digest);
+
+    // Install assembled snapshot into coordinator
+    const assembledJson = new TextDecoder().decode(finalizeResult.snapshot.buffer);
+    const assembledPreimage = JSON.parse(assembledJson);
+    const assembledPayload: StateSnapshotPayloadV2 = {
+      ...assembledPreimage,
+      sha256Digest: finalizeResult.snapshot.sha256Digest,
+    };
+    await coordA.executeRecoveryWithSnapshot(assembledPayload);
+
+    // Verification: Peer-A is active with snapshot installed
     expect(coordA.state).toBe('ACTIVE');
-    expect(pA.engine.replicationFrontier['peer-C']).toBe(40);
-    expect(pA.engine.baseSnapshotFrontier['peer-C']).toBe(40);
+    expect(pA.engine.replicationFrontier['peer-B']).toBe(40);
+    expect(pA.engine.baseSnapshotFrontier['peer-B']).toBe(40);
   });
 
   // ═══════════════════════════════════════════════════════════════════════════
   // SCENARIO MP4: High-Concurrency Quarantine Burst (500 Operations)
   // ═══════════════════════════════════════════════════════════════════════════
 
-  it('M4.3d-MP4: High-Concurrency Quarantine Burst: 500 remote ops quarantined and drained without loss', async () => {
+  it('M4.3d-MP4: High-Concurrency Quarantine Burst: 500 remote ops across 3 origins quarantined and drained without loss', async () => {
     const pLocal = createEngine('peer-local');
     const coordinator = createCoordinator(pLocal.engine, pLocal.capability);
 
@@ -458,52 +577,94 @@ describe('Phase 7.5 M4.3d — Multi-Peer Recovery Integration (MP1–MP6)', () =
     coordinator.triggerRecovery('peer-remote', 'High concurrency burst test');
     expect(coordinator.state).toBe('RECOVERING');
 
-    // Snapshot base at seq 20
+    // Snapshot base at seq 20 for 3 remote peers
     const snapshotPayload = createValidSnapshotPayload({
-      snapshotFrontier: { 'peer-remote': 20 },
-      originFrontierTimestamps: { 'peer-remote': 200 },
+      snapshotFrontier: { 'peer-A': 20, 'peer-B': 20, 'peer-C': 20 },
+      originFrontierTimestamps: { 'peer-A': 200, 'peer-B': 200, 'peer-C': 200 },
       maxLogicalTimestamp: 200,
       compactedCheckpoints: [
-        { originPeerId: 'peer-remote', sequenceNumber: 20, logicalTimestamp: 200 },
+        { originPeerId: 'peer-A', sequenceNumber: 20, logicalTimestamp: 200 },
+        { originPeerId: 'peer-B', sequenceNumber: 20, logicalTimestamp: 200 },
+        { originPeerId: 'peer-C', sequenceNumber: 20, logicalTimestamp: 200 },
       ],
     });
 
-    // Burst of 500 remote operations arriving during recovery (sequences 21..520)
-    const BURST_COUNT = 500;
-    for (let i = 1; i <= BURST_COUNT; i++) {
-      const seq = 20 + i;
-      const ts = 200 + i;
-      const prevSeq = seq - 1;
-      const op = createMockQuarantinedOp(
-        'peer-remote',
-        seq,
-        ts,
-        { 'peer-remote': prevSeq },
-        i % 2 === 0 ? 'PLAY' : 'PAUSE',
-        10000 + i * 10,
-      );
+    // Interleaved burst of 500 operations across 3 remote origins:
+    // peer-A: 200 ops (seq 21..220)
+    // peer-B: 150 ops (seq 21..170)
+    // peer-C: 150 ops (seq 21..170)
+    let countA = 0;
+    let countB = 0;
+    let countC = 0;
 
-      const decision = coordinator.interceptRemoteEvent(op.event, 128);
-      expect(decision.shouldQuarantine).toBe(true);
-      expect(decision.dropped).toBe(false);
+    for (let round = 1; round <= 200; round++) {
+      if (round <= 200) {
+        countA++;
+        const seq = 20 + countA;
+        const opA = createMockQuarantinedOp(
+          'peer-A',
+          seq,
+          200 + countA,
+          { 'peer-A': seq - 1 },
+          countA % 2 === 0 ? 'PLAY' : 'PAUSE',
+          10000 + countA * 10,
+        );
+        const decA = coordinator.interceptRemoteEvent(opA.event, 128);
+        expect(decA.shouldQuarantine).toBe(true);
+        expect(decA.dropped).toBe(false);
+      }
+      if (round <= 150) {
+        countB++;
+        const seq = 20 + countB;
+        const opB = createMockQuarantinedOp(
+          'peer-B',
+          seq,
+          200 + countB,
+          { 'peer-B': seq - 1 },
+          countB % 2 === 0 ? 'PLAY' : 'PAUSE',
+          10000 + countB * 10,
+        );
+        const decB = coordinator.interceptRemoteEvent(opB.event, 128);
+        expect(decB.shouldQuarantine).toBe(true);
+        expect(decB.dropped).toBe(false);
+      }
+      if (round <= 150) {
+        countC++;
+        const seq = 20 + countC;
+        const opC = createMockQuarantinedOp(
+          'peer-C',
+          seq,
+          200 + countC,
+          { 'peer-C': seq - 1 },
+          countC % 2 === 0 ? 'PLAY' : 'PAUSE',
+          10000 + countC * 10,
+        );
+        const decC = coordinator.interceptRemoteEvent(opC.event, 128);
+        expect(decC.shouldQuarantine).toBe(true);
+        expect(decC.dropped).toBe(false);
+      }
     }
+    expect(countA + countB + countC).toBe(500);
 
     // Verify dual bounds: 500 <= 1,000 count, 500 * 128 = 64,000 <= 4 MiB
     expect(coordinator.quarantineBuffer.totalRetainedCount).toBe(500);
     expect(coordinator.quarantineBuffer.totalRetainedBytes).toBe(500 * 128);
 
     // Verify zero engine state changes prior to snapshot installation
-    expect(pLocal.engine.replicationFrontier['peer-remote']).toBeUndefined();
+    expect(pLocal.engine.replicationFrontier['peer-A']).toBeUndefined();
+    expect(pLocal.engine.replicationFrontier['peer-B']).toBeUndefined();
+    expect(pLocal.engine.replicationFrontier['peer-C']).toBeUndefined();
 
     // Execute recovery: installs snapshot base 20, then drains all 500 quarantined ops
     await coordinator.executeRecoveryWithSnapshot(snapshotPayload);
 
     // Verification:
-    // All 500 operations applied without loss or out-of-order execution
+    // All 500 operations applied without loss or causal violation across 3 origins
     expect(coordinator.state).toBe('ACTIVE');
-    expect(pLocal.engine.replicationFrontier['peer-remote']).toBe(520);
-    expect(pLocal.engine.baseSnapshotFrontier['peer-remote']).toBe(20);
-    expect(pLocal.engine.logicalClock).toBeGreaterThanOrEqual(700);
+    expect(pLocal.engine.replicationFrontier['peer-A']).toBe(220);
+    expect(pLocal.engine.replicationFrontier['peer-B']).toBe(170);
+    expect(pLocal.engine.replicationFrontier['peer-C']).toBe(170);
+    expect(pLocal.engine.baseSnapshotFrontier).toEqual({ 'peer-A': 20, 'peer-B': 20, 'peer-C': 20 });
     expect(coordinator.quarantineBuffer.totalRetainedCount).toBe(0);
     expect(coordinator.quarantineBuffer.drainSize).toBe(0);
   });

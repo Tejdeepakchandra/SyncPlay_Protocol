@@ -696,12 +696,18 @@ describe('Phase 7.5 M4.3d — 36-Scenario Recovery Acceptance Matrix', () => {
       expect(coordinator.futureEpochBuffer.totalCount).toBe(1);
       expect(coordinator.futureEpochBuffer.hasActiveTimer(2)).toBe(true);
 
-      // Advance clock past 5s grace period
+      // Advance clock past 5s grace period - autonomous degradation triggered via onGraceExpired
       await vi.advanceTimersByTimeAsync(5001);
 
-      coordinator.abortRecovery('FUTURE_EPOCH_OVERFLOW', 'Epoch grace period expired');
       expect(coordinator.state).toBe('DEGRADED');
-      expect(degradedReason).toBe('FUTURE_EPOCH_OVERFLOW');
+      expect(degradedReason).toBe('UNRESOLVED_FUTURE_EPOCH');
+      expect(coordinator.futureEpochBuffer.totalCount).toBe(0);
+
+      // Subsequent current-epoch events are dropped / rejected while degraded
+      const nextOp = createMockQuarantinedOp(REMOTE_PEER_A, 2, 20);
+      const postDegraded = coordinator.interceptRemoteEvent(nextOp.event, 128);
+      expect(postDegraded.shouldQuarantine).toBe(false);
+      expect(postDegraded.dropped).toBe(true);
     });
 
     it('M4.3d-S20: Future-epoch buffer overflow beyond 100 ops fails closed with DEGRADED', () => {
@@ -788,22 +794,75 @@ describe('Phase 7.5 M4.3d — 36-Scenario Recovery Acceptance Matrix', () => {
       expect(engine.isDisposed).toBe(true);
     });
 
-    it('M4.3d-S24: Quarantine overflow beyond 1,000 ops triggers clean transition to DEGRADED', () => {
-      coordinator = new RecoveryCoordinator({ engine, capability });
+    it('M4.3d-S24: Quarantine buffer bounds enforce count, byte, and individual limits via coordinator admission', () => {
+      // Subcase 1: Count overflow beyond 1,000 ops
+      let degradedReason1: string | undefined;
+      coordinator = new RecoveryCoordinator({
+        engine,
+        capability,
+        callbacks: {
+          onRecoveryDegraded: (reason) => {
+            degradedReason1 = reason;
+          },
+        },
+      });
       coordinator.triggerRecovery(REMOTE_PEER_A, 'Trigger');
 
-      // Enqueue 1,000 ops
       for (let i = 1; i <= 1000; i++) {
-        coordinator.quarantineBuffer.enqueue(createMockQuarantinedOp(REMOTE_PEER_A, i, i));
+        const op = createMockQuarantinedOp(REMOTE_PEER_A, i, i);
+        const decision = coordinator.interceptRemoteEvent(op.event, 128);
+        expect(decision.shouldQuarantine).toBe(true);
       }
       expect(coordinator.quarantineBuffer.totalRetainedCount).toBe(1000);
 
-      // 1,001st op breaches limit
       const op1001 = createMockQuarantinedOp(REMOTE_PEER_A, 1001, 1001);
-      expect(() => coordinator.quarantineBuffer.enqueue(op1001)).toThrow(/limit reached/);
-
-      coordinator.abortRecovery('QUARANTINE_OVERFLOW', 'Buffer full');
+      expect(() => coordinator.interceptRemoteEvent(op1001.event, 128)).toThrow(SyncEngineError);
       expect(coordinator.state).toBe('DEGRADED');
+      expect(degradedReason1).toBe('QUARANTINE_OVERFLOW');
+      expect(coordinator.quarantineBuffer.totalRetainedCount).toBe(1000);
+
+      // Subcase 2: Aggregate byte overflow with configured buffer (64 KiB)
+      let degradedReason2: string | undefined;
+      const smallBuffer = new QuarantineBuffer({ maxTotalBytes: 65536, maxOperations: 1000 });
+      const coord2 = new RecoveryCoordinator({
+        engine,
+        capability,
+        quarantineBuffer: smallBuffer,
+        callbacks: {
+          onRecoveryDegraded: (reason) => {
+            degradedReason2 = reason;
+          },
+        },
+      });
+      coord2.triggerRecovery(REMOTE_PEER_A, 'Trigger byte overflow test');
+
+      // 16 ops of 4096 bytes = 65,536 bytes
+      for (let i = 1; i <= 16; i++) {
+        const op = createMockQuarantinedOp(REMOTE_PEER_A, 2000 + i, 2000 + i);
+        const decision = coord2.interceptRemoteEvent(op.event, 4096);
+        expect(decision.shouldQuarantine).toBe(true);
+      }
+      expect(coord2.quarantineBuffer.totalRetainedCount).toBe(16);
+      expect(coord2.quarantineBuffer.totalRetainedBytes).toBe(65536);
+
+      // 17th op of 4096 bytes breaches byte capacity (N=16 <= 1000)
+      const op17 = createMockQuarantinedOp(REMOTE_PEER_A, 2017, 2017);
+      expect(() => coord2.interceptRemoteEvent(op17.event, 4096)).toThrow(SyncEngineError);
+      expect(coord2.state).toBe('DEGRADED');
+      expect(degradedReason2).toBe('QUARANTINE_OVERFLOW');
+      expect(coord2.quarantineBuffer.totalRetainedCount).toBe(16);
+      expect(coord2.quarantineBuffer.totalRetainedBytes).toBe(65536);
+      coord2.dispose();
+
+      // Subcase 3: Individual event cap (4,097 B > 4,096 B cap)
+      const coord3 = new RecoveryCoordinator({ engine, capability });
+      coord3.triggerRecovery(REMOTE_PEER_A, 'Trigger individual cap test');
+      const oversizedOp = createMockQuarantinedOp(REMOTE_PEER_A, 3001, 3001);
+      const decision3 = coord3.interceptRemoteEvent(oversizedOp.event, 4097);
+      expect(decision3.shouldQuarantine).toBe(false);
+      expect(decision3.dropped).toBe(true);
+      expect(coord3.quarantineBuffer.totalRetainedCount).toBe(0);
+      coord3.dispose();
     });
 
     it('M4.3d-S25: Repair timeout after partial drain halts reconciliation in DEGRADED', async () => {
@@ -1044,8 +1103,11 @@ describe('Phase 7.5 M4.3d — 36-Scenario Recovery Acceptance Matrix', () => {
 
       const mockDest: IDrainDestination = {
         admitDrainedOperation: (op) => {
-          if (op.sequenceNumber === 1) {
-            return { status: 'TERMINALLY_REJECTED', reason: 'Invalid signature' };
+          if (!op.event.message.logicalEventId || op.sequenceNumber === 1) {
+            return {
+              status: 'TERMINALLY_REJECTED',
+              reason: 'Remote event missing logicalEventId',
+            };
           }
           admitted.push(op.sequenceNumber);
           return { status: 'ACCEPTED_REDUCED', vectorAdvanced: true, newSequence: op.sequenceNumber };
@@ -1055,12 +1117,18 @@ describe('Phase 7.5 M4.3d — 36-Scenario Recovery Acceptance Matrix', () => {
       const buffer = new QuarantineBuffer();
       const drainer = new QuarantineDrainer({ destination: mockDest, quarantineBuffer: buffer });
 
-      buffer.enqueue(createMockQuarantinedOp(REMOTE_PEER_A, 1, 1));
-      buffer.enqueue(createMockQuarantinedOp(REMOTE_PEER_A, 2, 2));
+      // Op 1 has missing logicalEventId -> terminally rejected under cooperative validation
+      const op1 = createMockQuarantinedOp(REMOTE_PEER_A, 1, 1);
+      (op1.event.message as any).logicalEventId = '';
+      buffer.enqueue(op1);
+
+      // Op 2 is fully valid
+      const op2 = createMockQuarantinedOp(REMOTE_PEER_A, 2, 2);
+      buffer.enqueue(op2);
       buffer.swapDrainBatch();
 
       const result = await drainer.drainBatch();
-      // Op 1 was discarded, op 2 was applied
+      // Op 1 was terminally rejected and discarded, op 2 was applied cleanly
       expect(result.discardedCount).toBe(1);
       expect(result.appliedCount).toBe(1);
       expect(drainer.inFlightRecord).toBeNull();

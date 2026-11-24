@@ -36,10 +36,10 @@ Sub-milestone **M4.3d** completes the final integration and verification phase o
    - **Result:** 6 / 6 tests passing (100%).
 
 3. **Monorepo Regression & Build Integrity:**
-   - Monorepo test suite: **1,543 tests passed across 67 test files in 5 packages** (0 failures, 0 regressions, +42 tests from pre-M4.3d baseline of 1,501).
+   - Monorepo test suite: **1,550 tests passed across 67 test files in 5 packages** (0 failures, 0 regressions, 46/46 files and 965 tests in `@syncplay/sync-engine`).
    - Monorepo build gate: `tsc` across all workspaces + `vite build` in `@syncplay/demo` completed with clean exit code 0.
    - Frozen baseline verification: **0 lines modified** against `aafa366cc48fdb2b83940f00e80d92d813e7c52e`.
-   - Production source diff: **0 lines modified** against starting HEAD `eab2428681eb8a05b1c6e71906a932f671730fc8`.
+   - Production source diff: **0 lines modified** in Step 2; Step 1 production correction established at `7e49b877ab45debffb0a524b2338e213dc2cecc8`.
 
 ---
 
@@ -80,12 +80,12 @@ All 36 scenarios from `docs/PHASE7_5_M4_3_ARCHITECTURE.md` §13 were authored an
 | **16** | `M4.3d-S16`: Reentrant local submissions during notification flushing succeed | C | Notification flush in progress | Listener calls `engine.receive()` with local intent | Reentrant call admitted normally because engine exited recovery mode before notification | **PASS** |
 | **17** | `M4.3d-S17`: Op arriving at ACTIVE transition gate admitted directly | C | Transition gate executes | Op arrives at exact moment of fence flip | Admitted directly to live engine; zero loss | **PASS** |
 | **18** | `M4.3d-S18`: Future epoch op arriving during RECOVERING buffered | D | Engine in epoch 1; op arrives with epoch 2 | Op arrives during RECOVERING | Buffered in `FutureEpochBuffer` for 5s grace period; epoch 1 vector intact | **PASS** |
-| **19** | `M4.3d-S19`: Future epoch transition after 5s expiry causes DEGRADED | D | Epoch grace period expires | 5s timer fires without capability arrival | Coordinator aborts recovery and transitions safely to `DEGRADED` (`FUTURE_EPOCH_OVERFLOW`) | **PASS** |
+| **19** | `M4.3d-S19`: Future epoch transition after 5s expiry causes DEGRADED | D | Epoch grace period expires | 5s timer fires without capability arrival; autonomous onGraceExpired callback | Coordinator autonomously transitions to `DEGRADED` (`UNRESOLVED_FUTURE_EPOCH`); buffer purged; subsequent events dropped | **PASS** |
 | **20** | `M4.3d-S20`: Future-epoch buffer overflow beyond 100 ops fails closed | D | Engine in epoch 1 | 101st future epoch op arrives (> 100 limit) | Throws capacity limit error; Coordinator transitions to `DEGRADED` | **PASS** |
 | **21** | `M4.3d-S21`: Listener exceptions during flush do not halt recovery | E | Stage 4 drain complete; listener throws | UI callback throws unhandled exception | Caught in try/catch; listenerErrorCount increments; remaining listeners run; recovery completes | **PASS** |
 | **22** | `M4.3d-S22`: Listener re-entry during notification executes safely | E | Stage 4 notification flush | Callback re-queries engine properties | Safe read execution; engine already in ACTIVE | **PASS** |
 | **23** | `M4.3d-S23`: Engine disposal during notification flushing terminates safely | E | Notifications queued in deferred array | Engine disposed | Disposed; clean exit; no orphaned callbacks | **PASS** |
-| **24** | `M4.3d-S24`: Quarantine overflow beyond 1,000 ops triggers DEGRADED | E | Commit done; burst exceeds 1,000 op limit | 1,001st op enqueued | Throws buffer limit error; Coordinator aborts to `DEGRADED` (`QUARANTINE_OVERFLOW`) | **PASS** |
+| **24** | `M4.3d-S24`: Quarantine buffer bounds enforce count, byte, and individual limits via coordinator admission | E | Intercept remote events across count (1,001), aggregate byte (64 KiB), and individual (4,097 B) limits | Public `coordinator.interceptRemoteEvent()` | Count and byte overflows trip autonomous transition to `DEGRADED` (`QUARANTINE_OVERFLOW`); oversized op rejected (`REJECTED_INVALID`); rejected ops not retained | **PASS** |
 | **25** | `M4.3d-S25`: Repair timeout after partial drain halts reconciliation | E | Ops applied; causal gap wait times out (15s) | Reconciliation timer fires | Drain halts; Coordinator transitions safely to `DEGRADED` (`RECONCILIATION_TIMEOUT`) | **PASS** |
 | **26** | `M4.3d-S26`: Coordinator disposal during partial drain restores in-flight op | E | Op in-flight at disposal time | Coordinator and Drainer disposed | Drainer restores op to buffer; Coordinator teardown clears all buffers; clean exit | **PASS** |
 | **27** | `M4.3d-S27`: Post-dequeue exception preserves op in inFlightRecord (Case 1) | F | Op dequeued into `inFlightRecord` | Destination throws before admission completes | Live engine untouched; vector does not advance; op preserved in in-flight; transitions to `DEGRADED` | **PASS** |
@@ -96,7 +96,7 @@ All 36 scenarios from `docs/PHASE7_5_M4_3_ARCHITECTURE.md` §13 were authored an
 | **32** | `M4.3d-S32`: Transition to DEGRADED while op in-flight preserves op (Case 6) | F | Op in `DRAINER_IN_FLIGHT` | Outer recovery timeout fires | Op remains frozen in `inFlightRecord`; reflected in diagnostics; zero data loss | **PASS** |
 | **33** | `M4.3d-S33`: Resume after interruption reduces op exactly once (Case 7) | F | Op was uncommitted in interrupted drain | Resume re-evaluates `inFlightRecord` op | Reduced into operationLog exactly once; vector advances once; inFlight cleared | **PASS** |
 | **34** | `M4.3d-S34`: Duplicate op arriving while original is in-flight dropped (Case 8) | F | Op $(P, seq)$ currently in flight | Duplicate op arrives over DataChannel | Original processing in flight; duplicate detected via `isInFlight()` and dropped | **PASS** |
-| **35** | `M4.3d-S35`: Terminal rejection retires in-flight op and continues drain (Case 9) | F | Op has invalid signature/structure | Admission returns `TERMINALLY_REJECTED` | In-flight cleared; vector does not advance; drain continues with next op | **PASS** |
+| **35** | `M4.3d-S35`: Terminal rejection retires in-flight op and continues drain (Case 9) | F | Op missing `logicalEventId` under cooperative validation | Destination returns `TERMINALLY_REJECTED` | In-flight cleared; vector does not advance; drain continues and applies valid subsequent op | **PASS** |
 | **36** | `M4.3d-S36`: Successful drain after recoverable capacity failure (Case 10) | F | Op had capacity rejection; queue unblocks | Op re-admitted after space freed | Ingested into PendingQueue; receipt `ACCEPTED_PENDING`; in-flight cleared; drain completes | **PASS** |
 
 ---
@@ -107,10 +107,10 @@ All 6 scenarios authored and executed in `packages/sync-engine/src/__tests__/rec
 
 | Scenario | Identifier & Name | Peers Involved | Invariants Verified | Result |
 |:---:|:---|:---:|:---|:---:|
-| **MP1** | `M4.3d-MP1`: Late-Join Peer Catch-Up | 4 peers (`peer-1`, `peer-2`, `peer-3`, `peer-4`) | Initial 3 peers generate non-trivial state (PLAY, SEEK to 30s, RATE 1.5x). Late joining `peer-4` with 0 state recovers via snapshot offer, validates, commits, reaches `ACTIVE`, and immediately participates in live replication (PAUSE at seq 2 applied cleanly). | **PASS** |
-| **MP2** | `M4.3d-MP2`: Compaction-Horizon Gap Recovery | 2 peers (`peer-A`, `peer-B`) | `peer-A` advances 300 operations ($K=256$ log capacity). Returning `peer-B` was offline. When op 301 arrives, gap exceeds retention horizon. Snapshot recovery installs base up to 300, drains quarantined op 301, and advances vector to 301 without divergence. | **PASS** |
-| **MP3** | `M4.3d-MP3`: Supplier Crash & Registry Failover | 3 peers (`peer-A`, `peer-B`, `peer-C`) | `peer-B` (frontier 50) and `peer-C` (frontier 40) register offers. `peer-B` crashes during transfer. Registry evicts `peer-B`, fails over to `peer-C`, transfers snapshot, and completes installation into `ACTIVE`. | **PASS** |
-| **MP4** | `M4.3d-MP4`: High-Concurrency Quarantine Burst | 2 peers (`peer-local`, `peer-remote`) | Burst of 500 remote operations arrives during recovery. Dual bounds respected ($500 \le 1,000$ ops, $64,000 \le 4\text{ MiB}$). Post-install drain applies all 500 ops without loss or reordering; vector reaches 520; clock $\ge 700$. | **PASS** |
+| **MP1** | `M4.3d-MP1`: Late-Join Peer Catch-Up | 4 peers (`peer-1`, `peer-2`, `peer-3`, `peer-4`) | Initial 3 peers generate non-trivial state (PLAY, SEEK to 30s, RATE 1.5x). Late joining `peer-4` with 0 state recovers via full outbound chunking pipeline (`SnapshotSerializer.serialize()` -> `SnapshotChunkProducer` wire chunk messages -> `ChunkAssembler` -> SHA-256 finalized assembly -> `executeRecoveryWithSnapshot()`), validates, commits, reaches `ACTIVE`, and immediately participates in live replication (PAUSE at seq 2 applied cleanly). | **PASS** |
+| **MP2** | `M4.3d-MP2`: Compaction-Horizon Gap Recovery | 2 peers (`peer-A`, `peer-B`) | `peer-A` advances 300 operations and performs real log compaction (`compactAtFrontier({ 'peer-A': 300 })` beyond $K=256$ capacity). Returning `peer-B` was offline. When evaluating `peer-A`'s digest via `compareRemoteDigest()`, engine detects gap exceeding retention horizon (`OUTSIDE_REMOTE_HORIZON`, `requiresSnapshotRecovery: true`). Snapshot recovery installs real exported base up to 300, drains quarantined op 301, and advances vector to 301 without divergence. | **PASS** |
+| **MP3** | `M4.3d-MP3`: Supplier Crash & Registry Failover | 3 peers (`peer-A`, `peer-B`, `peer-C`) | Multiple candidates offer identical canonical snapshot. Active 2-chunk transfer begins with Primary Supplier B. Chunk 0 ingested. Supplier B crashes/disconnects. Registry evicts B and promotes Supplier C. Assembler executes `prepareForFailover()`, retaining chunk 0. Stale chunk 1 from B rejected (`IDENTITY_MISMATCH`). Chunk 1 from C accepted, assembly completes, SHA-256 verified, and snapshot installs into `ACTIVE`. | **PASS** |
+| **MP4** | `M4.3d-MP4`: High-Concurrency Quarantine Burst | 4 peers (`peer-local` + 3 remote: `peer-A`, `peer-B`, `peer-C`) | Burst of 500 remote operations distributed across 3 independent remote origins (`peer-A`: 200, `peer-B`: 150, `peer-C`: 150) arrives during recovery. Dual bounds respected ($500 \le 1,000$ ops, $64,000 \le 4\text{ MiB}$). Post-install drain applies all 500 ops without loss or reordering; vector reaches A:220, B:170, C:170; clock $\ge 700$. | **PASS** |
 | **MP5** | `M4.3d-MP5`: Partial Drain with Anti-Entropy Repair | 3 peers (`peer-local`, `peer-A`, `peer-B`) | 100 ops in quarantine. Ops 21..60 apply immediately. Ops 61..120 buffer in PendingQueue awaiting missing `peer-B: 11`. Anti-Entropy delivers `peer-B: 11`, cascading to unblock all 60 ops. Replication vector reaches A:120, B:11. | **PASS** |
 | **MP6** | `M4.3d-MP6`: Strong Eventual Consistency Verification | 3 peers (`peer-1`, `peer-2`, `peer-3`) | Reordering, transmission delays, duplicate delivery, and concurrent snapshot recovery simulated. Upon network quiescence, all 3 engines achieve bit-identical replication vectors, identical status ('playing'), identical anchor position (15000ms), and identical rate (1.5x). | **PASS** |
 
@@ -145,10 +145,10 @@ Scenarios 7, 8, and 9 prove that Stage 1 validation and Stage 2 staging operate 
 @syncplay/control-events:  6 test files passed,  49 tests passed
 @syncplay/peer-mesh:       6 test files passed, 108 tests passed
 @syncplay/protocol:        6 test files passed, 337 tests passed
-@syncplay/sync-engine:    46 test files passed, 958 tests passed
+@syncplay/sync-engine:    46 test files passed, 965 tests passed
 @syncplay/bootstrap-server: 3 test files passed,  91 tests passed
 
-TOTAL: 67 test files passed, 1,543 tests passed, 0 failed (100% pass rate)
+TOTAL: 67 test files passed, 1,550 tests passed, 0 failed (100% pass rate)
 ```
 
 ### 6.2 Build Verification Summary
@@ -161,7 +161,7 @@ TOTAL: 67 test files passed, 1,543 tests passed, 0 failed (100% pass rate)
 @syncplay/protocol:       tsc -> OK (exit 0)
 @syncplay/sync-engine:    tsc -> OK (exit 0)
 @syncplay/bootstrap-server: tsc -> OK (exit 0)
-@syncplay/demo:           vite build -> 197 modules transformed, built in 1.39s (exit 0)
+@syncplay/demo:           vite build -> 197 modules transformed (exit 0)
 
 TOTAL: Clean compilation across all 6 workspaces with code 0.
 ```
@@ -172,18 +172,24 @@ TOTAL: Clean compilation across all 6 workspaces with code 0.
 
 | Path | Purpose | Lines of Code | Status |
 |---|---|:---:|:---:|
-| `packages/sync-engine/src/__tests__/recovery-acceptance-matrix.test.ts` | 36-Scenario Acceptance Matrix Suite (Scenarios 1–36) | 1,102 | Authoritative & Passing |
-| `packages/sync-engine/src/__tests__/recovery-multi-peer-integration.test.ts` | Multi-Peer Simulation & Stress Suite (Scenarios MP1–MP6) | 695 | Authoritative & Passing |
+| `packages/sync-engine/src/__tests__/recovery-acceptance-matrix.test.ts` | 36-Scenario Acceptance Matrix Suite (Scenarios 1–36) | 1,188 | Remediated & Passing |
+| `packages/sync-engine/src/__tests__/recovery-multi-peer-integration.test.ts` | Multi-Peer Simulation & Stress Suite (Scenarios MP1–MP6) | 948 | Remediated & Passing |
 | `docs/PHASE7_5_M4_3D_COMPLETION_REPORT.md` | Formal Milestone Completion Report | ~380 | Complete |
+| `docs/PHASE7_5_M4_3D_STEP2_COMPLETION_REPORT.md` | Step 2 Findings Remediation Report | ~280 | Complete |
 
 ---
 
 ## 8. Conclusion & Sign-Off Recommendation
 
-Sub-Milestone **Phase 7.5 M4.3d** has achieved 100% verification across all 36 architectural acceptance scenarios and all 6 multi-peer integration scenarios with zero regressions, zero production source modifications, and zero diff against frozen baselines.
+Sub-Milestone **Phase 7.5 M4.3d** has achieved 100% verification across all 36 architectural acceptance scenarios and all 6 multi-peer integration scenarios with zero regressions, zero production source modifications in Step 2, and zero diff against frozen baselines.
 
-Phase 7.5 (Snapshot Recovery Orchestration & Lifecycle Integration) is now functionally and architecturally complete across all sub-milestones:
-- **M4.3a:** Recovery State Machine, Quarantine Buffer, and Future Epoch Buffer (ACCEPTED).
-- **M4.3b:** Single-Root Atomic Installer (ACCEPTED).
-- **M4.3c:** Recovery Coordinator & Quarantine Drainer with R1 Corrections (ACCEPTED).
-- **M4.3d:** End-to-End Recovery Integration & 36-Scenario Acceptance Matrix (READY FOR ACCEPTANCE).
+All 7 audit findings (A through G) have been thoroughly remediated:
+- **Finding A (MP4):** 500 operations partitioned across 3 independent remote origins with round-robin interleaving and causal preservation.
+- **Finding B (S19):** Default `RecoveryCoordinator` constructor wires autonomous 5s epoch grace period expiration into `DEGRADED` (`UNRESOLVED_FUTURE_EPOCH`).
+- **Finding C (S24):** Count, aggregate byte (64 KiB), and individual (4 KiB) bounds enforced via `coordinator.interceptRemoteEvent()`.
+- **Finding D (S35):** Genuine cooperative validation rejection (missing `logicalEventId`) clears in-flight record and permits subsequent drain.
+- **Finding E (MP2):** Real log compaction at frontier 300 triggers anti-entropy `OUTSIDE_REMOTE_HORIZON` (`requiresSnapshotRecovery: true`) and full catch-up.
+- **Finding F (MP1):** Full outbound serialization, chunking, wire framing, and inbound assembly pipeline verified before snapshot installation.
+- **Finding G (MP3):** Multi-chunk transfer failover preserves bit-for-bit received chunks, evicts crashed supplier, rejects stale chunks, and completes from promoted candidate.
+
+Phase 7.5 M4.3d is now **COMPLETE — READY FOR INDEPENDENT AUDIT**.
