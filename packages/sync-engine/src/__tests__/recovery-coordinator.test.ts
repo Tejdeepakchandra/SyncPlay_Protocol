@@ -783,4 +783,210 @@ describe('Phase 7.5 M4.3c — RecoveryCoordinator & Quarantine Drainer Master Or
       expect(metricsAfter.quarantinedApplied).toBe(1);
     });
   });
+
+  // ─────────────────────────────────────────────────────────────────────────────
+  // 8. M4.3c-R1 Adversarial Fencing, Drain Ownership & Handoff Ordering
+  // ─────────────────────────────────────────────────────────────────────────────
+  describe('M4.3c-R1 Adversarial Fencing, Drain Ownership & Handoff Ordering', () => {
+    it('R1_F1: blocks staging and commit if overall timeout fires during asynchronous validation', async () => {
+      coordinator = new RecoveryCoordinator({
+        engine,
+        capability,
+        overallRecoveryTimeoutMs: 1000,
+      });
+
+      let resolveValidation!: (val: any) => void;
+      const validationPromise = new Promise((resolve) => {
+        resolveValidation = resolve;
+      });
+
+      vi.spyOn(coordinator.snapshotInstaller, 'validate').mockImplementation(
+        () => validationPromise as any,
+      );
+      const stageSpy = vi.spyOn(coordinator.snapshotInstaller, 'stage');
+      const commitSpy = vi.spyOn(coordinator.snapshotInstaller, 'commitAtomic');
+
+      const payload = createValidSnapshotPayload();
+      const execPromise = coordinator.executeRecoveryWithSnapshot(payload);
+      execPromise.catch(() => {});
+
+      expect(coordinator.substate).toBe('VALIDATING');
+
+      // Trigger overall timeout
+      await vi.advanceTimersByTimeAsync(1001);
+
+      expect(coordinator.state).toBe('DEGRADED');
+
+      // Now validation resolves belatedly
+      resolveValidation({
+        valid: true,
+        parsedPayload: payload,
+      });
+
+      await expect(execPromise).rejects.toThrow();
+      expect(stageSpy).not.toHaveBeenCalled();
+      expect(commitSpy).not.toHaveBeenCalled();
+    });
+
+    it('R1_F2: blocks staging and commit if abortRecovery is called during validation', async () => {
+      coordinator = new RecoveryCoordinator({
+        engine,
+        capability,
+      });
+
+      let resolveValidation!: (val: any) => void;
+      const validationPromise = new Promise((resolve) => {
+        resolveValidation = resolve;
+      });
+
+      vi.spyOn(coordinator.snapshotInstaller, 'validate').mockImplementation(
+        () => validationPromise as any,
+      );
+      const stageSpy = vi.spyOn(coordinator.snapshotInstaller, 'stage');
+      const commitSpy = vi.spyOn(coordinator.snapshotInstaller, 'commitAtomic');
+
+      const payload = createValidSnapshotPayload();
+      const execPromise = coordinator.executeRecoveryWithSnapshot(payload);
+      execPromise.catch(() => {});
+
+      expect(coordinator.substate).toBe('VALIDATING');
+
+      // Explicit abort
+      coordinator.abortRecovery('APPLICATION_ABORT', 'Manual abort');
+      expect(coordinator.state).toBe('DEGRADED');
+
+      // Validation resolves
+      resolveValidation({
+        valid: true,
+        parsedPayload: payload,
+      });
+
+      await expect(execPromise).rejects.toThrow();
+      expect(stageSpy).not.toHaveBeenCalled();
+      expect(commitSpy).not.toHaveBeenCalled();
+    });
+
+    it('R1_F3: newer recovery attempt invalidates earlier attempt preventing stale commit', async () => {
+      coordinator = new RecoveryCoordinator({
+        engine,
+        capability,
+      });
+
+      let resolveValidation1!: (val: any) => void;
+      const validationPromise1 = new Promise((resolve) => {
+        resolveValidation1 = resolve;
+      });
+
+      const validateSpy = vi.spyOn(coordinator.snapshotInstaller, 'validate');
+      validateSpy.mockImplementationOnce(() => validationPromise1 as any);
+
+      const commitSpy = vi.spyOn(coordinator.snapshotInstaller, 'commitAtomic');
+
+      const payload1 = createValidSnapshotPayload({ snapshotId: 'snap-1' });
+      const execPromise1 = coordinator.executeRecoveryWithSnapshot(payload1);
+      execPromise1.catch(() => {});
+
+      const attempt1 = coordinator.currentAttemptId;
+      expect(attempt1).toBe(1);
+
+      // Abort attempt 1 and start attempt 2
+      coordinator.abortRecovery('APPLICATION_ABORT', 'Resetting');
+      expect(coordinator.state).toBe('DEGRADED');
+
+      coordinator.triggerRecovery('peer-remote-2', 'Attempt 2');
+      const attempt2 = coordinator.currentAttemptId;
+      expect(attempt2).toBe(3); // 1 (trigger) -> 2 (abort) -> 3 (trigger)
+
+      // Late resolution of attempt 1's validation
+      resolveValidation1({
+        valid: true,
+        parsedPayload: payload1,
+      });
+
+      await expect(execPromise1).rejects.toThrow();
+      expect(commitSpy).not.toHaveBeenCalled();
+    });
+
+    it('R1_F4: reconciliation loop halts immediately when timeout occurs during reconcileQuarantine', async () => {
+      coordinator = new RecoveryCoordinator({
+        engine,
+        capability,
+        reconciliationTimeoutMs: 5000,
+      });
+
+      let drainCount = 0;
+      let resolveDrain1!: (res: any) => void;
+      const drainPromise1 = new Promise((resolve) => {
+        resolveDrain1 = resolve;
+      });
+
+      vi.spyOn(coordinator.quarantineDrainer, 'drainBatch').mockImplementation(() => {
+        drainCount++;
+        if (drainCount === 1) {
+          return drainPromise1 as any;
+        }
+        return Promise.resolve({
+          batchSize: 1,
+          appliedCount: 1,
+          pendingCount: 0,
+          discardedCount: 0,
+          haltedOnCapacity: false,
+        });
+      });
+
+      const op1 = createMockRemoteOp(11, 101);
+      const op2 = createMockRemoteOp(12, 102);
+      coordinator.quarantineBuffer.enqueue(op1);
+      coordinator.quarantineBuffer.enqueue(op2);
+
+      const payload = createValidSnapshotPayload();
+      const execPromise = coordinator.executeRecoveryWithSnapshot(payload);
+      execPromise.catch(() => {});
+
+      // Advance clock past reconciliation timeout while drain 1 is in-flight
+      await vi.advanceTimersByTimeAsync(5001);
+      expect(coordinator.state).toBe('DEGRADED');
+
+      // Resolve drain 1
+      resolveDrain1({
+        batchSize: 1,
+        appliedCount: 1,
+        pendingCount: 0,
+        discardedCount: 0,
+        haltedOnCapacity: false,
+      });
+
+      await expect(execPromise).rejects.toThrow();
+      // Drain loop should NOT have executed batch 2
+      expect(drainCount).toBe(1);
+      // State machine should NOT have reached RESOLVING_GAPS
+      expect(coordinator.substate).not.toBe('RESOLVING_GAPS');
+    });
+
+    it('R1_F5: synchronous handoff guarantees observers of ACTIVE see engine.isRecoveryActive() === false', async () => {
+      let recoveryActiveInListener: boolean | null = null;
+      let stateTransitionObserved: string | null = null;
+
+      coordinator = new RecoveryCoordinator({
+        engine,
+        capability,
+        callbacks: {
+          onStateChange: (newState) => {
+            if (newState === 'ACTIVE') {
+              stateTransitionObserved = newState;
+              recoveryActiveInListener = engine.isRecoveryActive();
+            }
+          },
+        },
+      });
+
+      const payload = createValidSnapshotPayload();
+      await coordinator.executeRecoveryWithSnapshot(payload);
+
+      expect(stateTransitionObserved).toBe('ACTIVE');
+      expect(recoveryActiveInListener).toBe(false);
+      expect(coordinator.state).toBe('ACTIVE');
+      expect(engine.isRecoveryActive()).toBe(false);
+    });
+  });
 });

@@ -179,6 +179,24 @@ export class QuarantineDrainer implements IQuarantineDrainer {
       throw new SyncEngineError('INVALID_STATE', 'QuarantineDrainer is already draining a batch');
     }
 
+    // Guard against in-flight record overwrite: if an unresolved in-flight operation exists
+    // from a previous halted drain (e.g. CAPACITY_REJECTED or destination exception),
+    // resolve or restore it before dequeuing any new operation.
+    if (this._inFlightRecord !== null) {
+      const inFlightOp = this._inFlightRecord.operation;
+      if (
+        this.destination.hasOperation &&
+        this.destination.hasOperation(inFlightOp.originPeerId, inFlightOp.sequenceNumber)
+      ) {
+        // Destination already committed prior to interruption; release in-flight custody
+        this._inFlightRecord = null;
+      } else {
+        // Atomically restore the in-flight operation to the front of the drain queue
+        // so it is processed first before any newer operation.
+        this.restoreInFlightToQueue();
+      }
+    }
+
     this._isDraining = true;
 
     let appliedCount = 0;
@@ -272,6 +290,12 @@ export class QuarantineDrainer implements IQuarantineDrainer {
     | { status: 'HALTED_CAPACITY' }
     | { status: 'HALTED_ERROR'; error: string } {
     // Step 2: In-Flight Acquisition
+    if (this._inFlightRecord !== null) {
+      throw new SyncEngineError(
+        'INVALID_STATE',
+        'Cannot acquire in-flight custody: an in-flight operation already exists',
+      );
+    }
     this._inFlightRecord = {
       operation: op,
       dequeuedAtMs: this.nowFn(),
@@ -381,8 +405,17 @@ export class QuarantineDrainer implements IQuarantineDrainer {
     if (this._isDisposed) {
       return;
     }
+    // If an in-flight operation is still unresolved upon disposal,
+    // restore it to the quarantine queue so it is not silently dropped.
+    if (this._inFlightRecord !== null) {
+      try {
+        this.quarantineBuffer.unshiftDrain(this._inFlightRecord.operation);
+      } catch {
+        // Buffer may already be disposed
+      }
+      this._inFlightRecord = null;
+    }
     this._isDisposed = true;
     this._isDraining = false;
-    this._inFlightRecord = null;
   }
 }

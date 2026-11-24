@@ -112,6 +112,7 @@ export interface IRecoveryCoordinator {
   readonly substate: RecoverySubstate;
   readonly isDisposed: boolean;
   readonly inFlightRecord: DrainedInFlightRecord | null;
+  readonly currentAttemptId: number;
 
   start(): void;
   dispose(): void;
@@ -161,6 +162,7 @@ export class RecoveryCoordinator implements IRecoveryCoordinator {
   private readonly callbacks?: RecoveryCoordinatorCallbacks;
 
   private _isDisposed = false;
+  private activeAttemptId = 0;
   private overallTimer: ReturnType<typeof setTimeout> | null = null;
   private offerAwaitTimer: ReturnType<typeof setTimeout> | null = null;
   private reconciliationTimer: ReturnType<typeof setTimeout> | null = null;
@@ -241,6 +243,32 @@ export class RecoveryCoordinator implements IRecoveryCoordinator {
     return this.quarantineDrainer.inFlightRecord;
   }
 
+  public get currentAttemptId(): number {
+    return this.activeAttemptId;
+  }
+
+  /**
+   * Evaluates whether the specified recovery attempt remains authoritative and uninvalidated.
+   */
+  private isAttemptValid(attemptId: number, expectedState?: RecoveryState): boolean {
+    if (this._isDisposed) return false;
+    if (this.activeAttemptId !== attemptId) return false;
+    if (expectedState && this.stateMachine.state !== expectedState) return false;
+    return true;
+  }
+
+  /**
+   * Asserts that the specified recovery attempt is active, uninvalidated, and matches expected state.
+   */
+  private assertAttemptValid(attemptId: number, expectedState: RecoveryState, stage: string): void {
+    if (!this.isAttemptValid(attemptId, expectedState)) {
+      throw new SyncEngineError(
+        'DISPOSED',
+        `Recovery attempt ${attemptId} invalidated during ${stage} (current: ${this.activeAttemptId}, state: ${this.stateMachine.state}, disposed: ${this._isDisposed})`,
+      );
+    }
+  }
+
   private wireListeners(): void {
     this.stateMachine.onStateChange((newState, oldState, reason) => {
       try {
@@ -278,6 +306,7 @@ export class RecoveryCoordinator implements IRecoveryCoordinator {
       return;
     }
 
+    this.activeAttemptId += 1;
     this.clearTimers();
     this.recoveryStartMs = this.nowFn();
     this.transferStartMs = this.recoveryStartMs;
@@ -348,6 +377,9 @@ export class RecoveryCoordinator implements IRecoveryCoordinator {
       this.triggerRecovery('local', 'Snapshot execution initiated');
     }
 
+    const attemptId = this.activeAttemptId;
+    this.assertAttemptValid(attemptId, 'RECOVERING', 'pre-validation');
+
     this.transferEndMs = this.nowFn();
 
     // ── STAGE 1: VALIDATING ─────────────────────────────────────────
@@ -361,10 +393,13 @@ export class RecoveryCoordinator implements IRecoveryCoordinator {
         this.engine.replicationFrontier,
       );
     } catch (err) {
+      this.assertAttemptValid(attemptId, 'RECOVERING', 'post-validation-catch');
       const msg = err instanceof Error ? err.message : String(err);
       this.abortRecovery('PAYLOAD_CORRUPTED', msg);
       throw new SyncEngineError('SNAPSHOT_INSTALLATION_FAILED', `Snapshot validation exception: ${msg}`);
     }
+
+    this.assertAttemptValid(attemptId, 'RECOVERING', 'post-validation');
 
     if (!validation.valid || !validation.parsedPayload) {
       const reason = validation.errorReason ?? 'Snapshot validation failed';
@@ -373,6 +408,7 @@ export class RecoveryCoordinator implements IRecoveryCoordinator {
     }
 
     // ── STAGE 2: STAGING (COUNTER PRESERVATION INTEGRATION) ─────────
+    this.assertAttemptValid(attemptId, 'RECOVERING', 'pre-staging');
     this.stateMachine.setSubstate('STAGING');
 
     // Authoritative counter preservation from the target engine root:
@@ -394,12 +430,14 @@ export class RecoveryCoordinator implements IRecoveryCoordinator {
         },
       );
     } catch (err) {
+      this.assertAttemptValid(attemptId, 'RECOVERING', 'post-staging-catch');
       const msg = err instanceof Error ? err.message : String(err);
       this.abortRecovery('APPLICATION_ABORT', msg);
       throw err;
     }
 
     // ── STAGE 3: COMMITTING (ATOMIC STATE-ROOT REPLACEMENT) ──────────
+    this.assertAttemptValid(attemptId, 'RECOVERING', 'pre-committing');
     this.stateMachine.setSubstate('COMMITTING');
 
     let report: SnapshotInstallationReport;
@@ -407,12 +445,14 @@ export class RecoveryCoordinator implements IRecoveryCoordinator {
       // Passes the exact authorized RecoveryInstallationCapability held by this coordinator:
       report = this.snapshotInstaller.commitAtomic(this.engine, staged, this.capability);
     } catch (err) {
+      this.assertAttemptValid(attemptId, 'RECOVERING', 'post-committing-catch');
       const msg = err instanceof Error ? err.message : String(err);
       this.abortRecovery('APPLICATION_ABORT', msg);
       throw err;
     }
 
     // ── STAGE 4: RECONCILING & QUARANTINE DRAIN ──────────────────────
+    this.assertAttemptValid(attemptId, 'RECOVERING', 'pre-reconcile-transition');
     this.stateMachine.transition(
       'RECONCILING',
       'Snapshot installed successfully; reconciling quarantine',
@@ -443,7 +483,7 @@ export class RecoveryCoordinator implements IRecoveryCoordinator {
 
     // Execute quarantine drain
     try {
-      await Promise.race([this.reconcileQuarantine(), timeoutPromise]);
+      await Promise.race([this.reconcileQuarantine(attemptId), timeoutPromise]);
     } finally {
       if (timeoutTimer) {
         clearTimeout(timeoutTimer);
@@ -457,8 +497,16 @@ export class RecoveryCoordinator implements IRecoveryCoordinator {
 
     // ── SYNCHRONOUS HANDOFF TO ACTIVE ───────────────────────────────
     // Critical Section: executed in a single synchronous call frame without await
-    this.stateMachine.transition('ACTIVE', 'Recovery and reconciliation successfully completed', 'IDLE');
+    // Inverted ordering correction: setRecoveryMode(false) occurs BEFORE transition('ACTIVE')
+    // so any onStateChange listener observing ACTIVE sees engine.isRecoveryActive() === false.
+    this.assertAttemptValid(attemptId, 'RECONCILING', 'pre-active-handoff');
     this.engine.setRecoveryMode(false);
+    try {
+      this.stateMachine.transition('ACTIVE', 'Recovery and reconciliation successfully completed', 'IDLE');
+    } catch (err) {
+      this.engine.setRecoveryMode(true);
+      throw err;
+    }
 
     // Outside critical section:
     this.clearTimers();
@@ -478,13 +526,11 @@ export class RecoveryCoordinator implements IRecoveryCoordinator {
    * Drains the quarantine buffer through the QuarantineDrainer until completely empty.
    * Performs generational swaps if new operations arrived during drain passes.
    */
-  public async reconcileQuarantine(): Promise<QuarantineDrainResult> {
+  public async reconcileQuarantine(attemptId: number = this.activeAttemptId): Promise<QuarantineDrainResult> {
     if (this._isDisposed) {
       throw new SyncEngineError('ENGINE_DISPOSED', 'RecoveryCoordinator is disposed');
     }
-    if (this.stateMachine.state !== 'RECONCILING') {
-      throw new SyncEngineError('INVALID_STATE', `Cannot reconcile quarantine in state ${this.stateMachine.state}`);
-    }
+    this.assertAttemptValid(attemptId, 'RECONCILING', 'pre-reconcile-quarantine');
 
     let aggregatedApplied = 0;
     let aggregatedPending = 0;
@@ -492,9 +538,12 @@ export class RecoveryCoordinator implements IRecoveryCoordinator {
     let aggregatedBatchSize = 0;
 
     while (this.quarantineBuffer.size > 0 || this.quarantineBuffer.drainSize > 0) {
+      this.assertAttemptValid(attemptId, 'RECONCILING', 'loop-start');
       this.quarantineBuffer.swapDrainBatch();
 
       const result = await this.quarantineDrainer.drainBatch();
+      this.assertAttemptValid(attemptId, 'RECONCILING', 'post-drain-batch');
+
       aggregatedApplied += result.appliedCount;
       aggregatedPending += result.pendingCount;
       aggregatedDiscarded += result.discardedCount;
@@ -519,6 +568,7 @@ export class RecoveryCoordinator implements IRecoveryCoordinator {
       }
     }
 
+    this.assertAttemptValid(attemptId, 'RECONCILING', 'pre-resolving-gaps');
     this.stateMachine.setSubstate('RESOLVING_GAPS');
 
     return {
@@ -599,11 +649,20 @@ export class RecoveryCoordinator implements IRecoveryCoordinator {
    */
   public resetRecovery(initiatedBy: string): void {
     if (this._isDisposed) return;
+    this.activeAttemptId += 1;
     this.clearTimers();
 
-    if (this.stateMachine.state === 'RECOVERING' && this.stateMachine.canTransition('ACTIVE')) {
-      this.stateMachine.transition('ACTIVE', `Recovery reset by ${initiatedBy}`, 'IDLE');
+    if (
+      (this.stateMachine.state === 'RECOVERING' || this.stateMachine.state === 'RECONCILING') &&
+      this.stateMachine.canTransition('ACTIVE')
+    ) {
       this.engine.setRecoveryMode(false);
+      try {
+        this.stateMachine.transition('ACTIVE', `Recovery reset by ${initiatedBy}`, 'IDLE');
+      } catch (err) {
+        this.engine.setRecoveryMode(true);
+        throw err;
+      }
       this.engine.flushDeferredNotifications();
     }
   }
@@ -612,6 +671,7 @@ export class RecoveryCoordinator implements IRecoveryCoordinator {
    * Aborts active recovery attempt and transitions deterministically to DEGRADED.
    */
   public abortRecovery(reason: RecoveryFailureReason, errorOrMessage?: Error | string): void {
+    this.activeAttemptId += 1;
     this.clearTimers();
 
     const msg =
@@ -697,6 +757,7 @@ export class RecoveryCoordinator implements IRecoveryCoordinator {
       return;
     }
     this._isDisposed = true;
+    this.activeAttemptId += 1;
     this.clearTimers();
 
     this.quarantineDrainer.dispose();

@@ -421,4 +421,95 @@ describe('Phase 7.5 M4.3c — QuarantineDrainer & DRAINER_IN_FLIGHT Protocol', (
     expect(engine.hasOperation('peer-remote', 2)).toBe(true);
     expect(engine.hasOperation('peer-remote', 3)).toBe(false);
   });
+
+  it('D11: preserves in-flight operation across subsequent drainBatch calls without overwrite', async () => {
+    const quarantineBuffer = new QuarantineBuffer();
+    let admitCount = 0;
+    const admittedOps: QuarantinedOperation[] = [];
+
+    const mockDestination: IDrainDestination = {
+      admitDrainedOperation: vi.fn((op: QuarantinedOperation): DestinationAcceptanceReceipt => {
+        admitCount++;
+        if (admitCount === 1) {
+          // First attempt: reject with CAPACITY_REJECTED to halt drain
+          return { status: 'CAPACITY_REJECTED' };
+        }
+        // Subsequent attempts: accept
+        admittedOps.push(op);
+        return {
+          status: 'ACCEPTED_REDUCED',
+          vectorAdvanced: true,
+          newSequence: op.sequenceNumber,
+        };
+      }),
+      hasOperation: (peerId: string, seq: number) => {
+        return admittedOps.some(o => o.originPeerId === peerId && o.sequenceNumber === seq);
+      },
+    };
+
+    const drainer = new QuarantineDrainer({
+      destination: mockDestination,
+      quarantineBuffer,
+    });
+
+    const op1 = createMockQuarantinedOp('peer-1', 1);
+    const op2 = createMockQuarantinedOp('peer-1', 2);
+    quarantineBuffer.enqueue(op1);
+    quarantineBuffer.enqueue(op2);
+    quarantineBuffer.swapDrainBatch();
+
+    // First drain: processes op1 -> CAPACITY_REJECTED -> halts with in-flight record retained
+    const result1 = await drainer.drainBatch();
+    expect(result1.haltedOnCapacity).toBe(true);
+    expect(drainer.inFlightRecord).not.toBeNull();
+    expect(drainer.inFlightRecord?.operation.sequenceNumber).toBe(1);
+
+    // Second drain: must NOT overwrite op1 with op2; op1 is restored and processed first
+    const result2 = await drainer.drainBatch();
+    expect(result2.appliedCount).toBe(2);
+    expect(drainer.inFlightRecord).toBeNull();
+    expect(admittedOps.map(o => o.sequenceNumber)).toEqual([1, 2]);
+  });
+
+  it('D12: processSingleOperation throws INVALID_STATE if in-flight custody is already held', () => {
+    const quarantineBuffer = new QuarantineBuffer();
+    const mockDestination: IDrainDestination = {
+      admitDrainedOperation: () => ({ status: 'CAPACITY_REJECTED' }),
+    };
+
+    const drainer = new QuarantineDrainer({
+      destination: mockDestination,
+      quarantineBuffer,
+    });
+
+    const op1 = createMockQuarantinedOp('peer-1', 1);
+    const op2 = createMockQuarantinedOp('peer-1', 2);
+
+    drainer.processSingleOperation(op1);
+    expect(drainer.inFlightRecord).not.toBeNull();
+
+    expect(() => drainer.processSingleOperation(op2)).toThrow(/Cannot acquire in-flight custody/);
+  });
+
+  it('D13: dispose restores unresolved in-flight operation to quarantine buffer without data loss', () => {
+    const quarantineBuffer = new QuarantineBuffer();
+    const mockDestination: IDrainDestination = {
+      admitDrainedOperation: () => ({ status: 'CAPACITY_REJECTED' }),
+    };
+
+    const drainer = new QuarantineDrainer({
+      destination: mockDestination,
+      quarantineBuffer,
+    });
+
+    const op1 = createMockQuarantinedOp('peer-1', 1);
+    drainer.processSingleOperation(op1);
+    expect(drainer.inFlightRecord).not.toBeNull();
+
+    drainer.dispose();
+    expect(drainer.inFlightRecord).toBeNull();
+    // Verify op1 was restored to drain queue
+    expect(quarantineBuffer.drainSize).toBe(1);
+    expect(quarantineBuffer.shiftDrain()?.sequenceNumber).toBe(1);
+  });
 });
