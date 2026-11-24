@@ -14,6 +14,7 @@ import {
   type StateSnapshotPayloadV2,
   type SnapshotOfferPayload,
   type QuarantinedOperation,
+  SyncEngineError,
 } from '../index.js';
 import type { AnyControlSyncEvent } from '@syncplay/control-events';
 
@@ -987,6 +988,280 @@ describe('Phase 7.5 M4.3c — RecoveryCoordinator & Quarantine Drainer Master Or
       expect(recoveryActiveInListener).toBe(false);
       expect(coordinator.state).toBe('ACTIVE');
       expect(engine.isRecoveryActive()).toBe(false);
+    });
+  });
+
+  describe('Phase 7.5 Targeted Production Corrections — Autonomous Degradation & Epoch Expiry', () => {
+    it('Correction A1: default coordinator construction passes configured grace period and autonomously degrades on expiry', async () => {
+      let degradedReason: string | undefined;
+      let degradedError: Error | undefined;
+
+      // 1. Default coordinator construction WITHOUT custom futureEpochBuffer
+      coordinator = new RecoveryCoordinator({
+        engine,
+        capability,
+        epochConvergenceGraceMs: 3000,
+        callbacks: {
+          onRecoveryDegraded: (reason, err) => {
+            degradedReason = reason;
+            degradedError = err;
+          },
+        },
+      });
+
+      // Verify default buffer inherited configured grace period
+      expect(coordinator.futureEpochBuffer.gracePeriodMs).toBe(3000);
+
+      coordinator.triggerRecovery('peer-remote', 'Testing epoch grace timeout');
+      expect(coordinator.state).toBe('RECOVERING');
+
+      // Intercept future-epoch operation (epoch 2 while engine is in epoch 1)
+      const futureOp = createMockRemoteOp(1, 10, {}, 'peer-remote');
+      (futureOp.event as any).membershipEpoch = 2;
+      (futureOp.event.message as any).membershipEpoch = 2;
+
+      const interceptRes = coordinator.interceptRemoteEvent(futureOp.event, 128);
+      expect(interceptRes.shouldQuarantine).toBe(false);
+      expect(coordinator.futureEpochBuffer.totalCount).toBe(1);
+      expect(coordinator.futureEpochBuffer.hasActiveTimer(2)).toBe(true);
+
+      // Advance clock past the 3,000ms grace period WITHOUT calling abortRecovery() manually
+      await vi.advanceTimersByTimeAsync(3001);
+
+      // Invariants:
+      // 1. Coordinator autonomously transitioned to DEGRADED
+      expect(coordinator.state).toBe('DEGRADED');
+      // 2. Reason is architecture-mandated UNRESOLVED_FUTURE_EPOCH
+      expect(degradedReason).toBe('UNRESOLVED_FUTURE_EPOCH');
+      expect(degradedError?.message).toContain('Future epoch grace period expired for epoch 2');
+      // 3. Expired operations purged from buffer
+      expect(coordinator.futureEpochBuffer.totalCount).toBe(0);
+      expect(coordinator.futureEpochBuffer.hasOperation('peer-remote', 1)).toBe(false);
+
+      // 4. Subsequent operations are rejected under degraded-state contract
+      const nextOp = createMockRemoteOp(2, 11);
+      const nextIntercept = coordinator.interceptRemoteEvent(nextOp.event, 128);
+      expect(nextIntercept.shouldQuarantine).toBe(false);
+      expect(nextIntercept.dropped).toBe(true);
+      expect(coordinator.quarantineBuffer.totalRetainedCount).toBe(0);
+    });
+
+    it('Correction A2: stale expiry callback cannot corrupt a terminated or disposed coordinator', async () => {
+      let degradeCount = 0;
+      coordinator = new RecoveryCoordinator({
+        engine,
+        capability,
+        epochConvergenceGraceMs: 2000,
+        callbacks: {
+          onRecoveryDegraded: () => {
+            degradeCount++;
+          },
+        },
+      });
+
+      coordinator.triggerRecovery('peer-remote', 'Trigger');
+      const futureOp = createMockRemoteOp(1, 10, {}, 'peer-remote');
+      (futureOp.event as any).membershipEpoch = 2;
+      (futureOp.event.message as any).membershipEpoch = 2;
+      coordinator.interceptRemoteEvent(futureOp.event, 128);
+
+      // Terminal disposal before grace timer fires
+      coordinator.dispose();
+      expect(coordinator.futureEpochBuffer.isDisposed).toBe(true);
+      expect(coordinator.futureEpochBuffer.totalCount).toBe(0);
+
+      // Advance timer: callback must not throw or alter disposed state
+      await vi.advanceTimersByTimeAsync(3000);
+      expect(degradeCount).toBe(0);
+    });
+
+    it('Correction A3: stale expiry callback after existing DEGRADED state preserves original failure reason', async () => {
+      let degradedReason: string | undefined;
+      coordinator = new RecoveryCoordinator({
+        engine,
+        capability,
+        epochConvergenceGraceMs: 4000,
+        callbacks: {
+          onRecoveryDegraded: (reason) => {
+            degradedReason = reason;
+          },
+        },
+      });
+
+      coordinator.triggerRecovery('peer-remote', 'Trigger');
+      const futureOp = createMockRemoteOp(1, 10, {}, 'peer-remote');
+      (futureOp.event as any).membershipEpoch = 2;
+      (futureOp.event.message as any).membershipEpoch = 2;
+      coordinator.interceptRemoteEvent(futureOp.event, 128);
+
+      // Coordinator degrades earlier due to overall timeout or other reason
+      coordinator.abortRecovery('OVERALL_RECOVERY_TIMEOUT', 'Early timeout');
+      expect(coordinator.state).toBe('DEGRADED');
+      expect(degradedReason).toBe('OVERALL_RECOVERY_TIMEOUT');
+
+      // Now grace period expires later
+      await vi.advanceTimersByTimeAsync(5000);
+
+      // Reason must remain OVERALL_RECOVERY_TIMEOUT (not overwritten by UNRESOLVED_FUTURE_EPOCH)
+      expect(coordinator.state).toBe('DEGRADED');
+      expect(degradedReason).toBe('OVERALL_RECOVERY_TIMEOUT');
+    });
+
+    it('Correction B1: public interceptRemoteEvent autonomously degrades on quarantine overflow and rethrows', () => {
+      let degradedReason: string | undefined;
+      // Configure quarantine buffer with maxTotalBytes = 1000
+      const smallBuffer = new QuarantineBuffer({ maxTotalBytes: 1000 });
+      coordinator = new RecoveryCoordinator({
+        engine,
+        capability,
+        quarantineBuffer: smallBuffer,
+        callbacks: {
+          onRecoveryDegraded: (reason) => {
+            degradedReason = reason;
+          },
+        },
+      });
+
+      coordinator.triggerRecovery('peer-remote', 'Trigger');
+      expect(coordinator.state).toBe('RECOVERING');
+
+      // Admit 600 bytes
+      const op1 = createMockRemoteOp(1, 10);
+      const res1 = coordinator.interceptRemoteEvent(op1.event, 600);
+      expect(res1.shouldQuarantine).toBe(true);
+      expect(coordinator.quarantineBuffer.totalRetainedBytes).toBe(600);
+      expect(coordinator.quarantineBuffer.totalRetainedCount).toBe(1);
+
+      // Enqueue 500 bytes (600 + 500 = 1100 > 1000 limit) through public interceptRemoteEvent
+      const op2 = createMockRemoteOp(2, 20);
+      let caughtError: unknown;
+      try {
+        coordinator.interceptRemoteEvent(op2.event, 500);
+      } catch (err) {
+        caughtError = err;
+      }
+
+      // 1. Original SyncEngineError rethrown unchanged
+      expect(caughtError).toBeInstanceOf(SyncEngineError);
+      expect((caughtError as SyncEngineError).code).toBe('QUARANTINE_OVERFLOW');
+      expect((caughtError as SyncEngineError).message).toContain('byte capacity reached');
+
+      // 2. Coordinator autonomously transitioned to DEGRADED
+      expect(coordinator.state).toBe('DEGRADED');
+      expect(degradedReason).toBe('QUARANTINE_OVERFLOW');
+
+      // 3. Rejected op was not retained and retained accounting is consistent
+      expect(coordinator.quarantineBuffer.totalRetainedBytes).toBe(600);
+      expect(coordinator.quarantineBuffer.totalRetainedCount).toBe(1);
+      expect(coordinator.quarantineBuffer.hasOperation('peer-remote', 2)).toBe(false);
+    });
+
+    it('Correction B2: public interceptRemoteEvent autonomously degrades on future epoch buffer overflow', () => {
+      let degradedReason: string | undefined;
+      const smallFutureBuffer = new FutureEpochBuffer({ maxOperations: 1 });
+      coordinator = new RecoveryCoordinator({
+        engine,
+        capability,
+        futureEpochBuffer: smallFutureBuffer,
+        callbacks: {
+          onRecoveryDegraded: (reason) => {
+            degradedReason = reason;
+          },
+        },
+      });
+
+      coordinator.triggerRecovery('peer-remote', 'Trigger');
+
+      // Op 1 admitted
+      const op1 = createMockRemoteOp(1, 10);
+      (op1.event as any).membershipEpoch = 2;
+      (op1.event.message as any).membershipEpoch = 2;
+      coordinator.interceptRemoteEvent(op1.event, 100);
+      expect(coordinator.futureEpochBuffer.totalCount).toBe(1);
+
+      // Op 2 breaches count limit of 1
+      const op2 = createMockRemoteOp(2, 20);
+      (op2.event as any).membershipEpoch = 2;
+      (op2.event.message as any).membershipEpoch = 2;
+
+      let caughtError: unknown;
+      try {
+        coordinator.interceptRemoteEvent(op2.event, 100);
+      } catch (err) {
+        caughtError = err;
+      }
+
+      expect(caughtError).toBeInstanceOf(SyncEngineError);
+      expect((caughtError as SyncEngineError).code).toBe('FUTURE_EPOCH_OVERFLOW');
+      expect(coordinator.state).toBe('DEGRADED');
+      expect(degradedReason).toBe('FUTURE_EPOCH_OVERFLOW');
+      expect(coordinator.futureEpochBuffer.totalCount).toBe(1);
+    });
+
+    it('Correction B3: unrelated admission errors propagate unchanged and do NOT cause overflow degradation', () => {
+      let degradeFired = false;
+      coordinator = new RecoveryCoordinator({
+        engine,
+        capability,
+        callbacks: {
+          onRecoveryDegraded: () => {
+            degradeFired = true;
+          },
+        },
+      });
+
+      coordinator.triggerRecovery('peer-remote', 'Trigger');
+      expect(coordinator.state).toBe('RECOVERING');
+
+      // Simulate an unexpected non-overflow runtime error inside admissionController
+      vi.spyOn(coordinator.admissionController, 'interceptRemoteEvent').mockImplementation(() => {
+        throw new TypeError('Unexpected JSON buffer decode error');
+      });
+
+      const op = createMockRemoteOp(1, 10);
+      expect(() => coordinator.interceptRemoteEvent(op.event, 100)).toThrow(TypeError);
+      expect(() => coordinator.interceptRemoteEvent(op.event, 100)).toThrow('Unexpected JSON buffer decode error');
+
+      // Must NOT degrade on unrelated errors
+      expect(degradeFired).toBe(false);
+      expect(coordinator.state).toBe('RECOVERING');
+    });
+
+    it('Correction B4: repeated overflow after degradation preserves original failure reason', () => {
+      let degradationCallCount = 0;
+      let lastReason: string | undefined;
+
+      const smallBuffer = new QuarantineBuffer({ maxOperations: 1 });
+      coordinator = new RecoveryCoordinator({
+        engine,
+        capability,
+        quarantineBuffer: smallBuffer,
+        callbacks: {
+          onRecoveryDegraded: (reason) => {
+            degradationCallCount++;
+            lastReason = reason;
+          },
+        },
+      });
+
+      coordinator.triggerRecovery('peer-remote', 'Trigger');
+
+      // Pre-degrade with a different reason
+      coordinator.abortRecovery('OVERALL_RECOVERY_TIMEOUT', 'Initial timeout');
+      expect(coordinator.state).toBe('DEGRADED');
+      expect(degradationCallCount).toBe(1);
+      expect(lastReason).toBe('OVERALL_RECOVERY_TIMEOUT');
+
+      // Fill buffer to max
+      const op1 = createMockRemoteOp(1, 10);
+      smallBuffer.enqueue(op1);
+
+      // When in DEGRADED, admission controller returns REJECTED_DEGRADED rather than enqueuing
+      const op2 = createMockRemoteOp(2, 20);
+      const res = coordinator.interceptRemoteEvent(op2.event, 100);
+      expect(res.dropped).toBe(true);
+      expect(degradationCallCount).toBe(1);
+      expect(lastReason).toBe('OVERALL_RECOVERY_TIMEOUT');
     });
   });
 });

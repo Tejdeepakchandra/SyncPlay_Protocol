@@ -203,7 +203,14 @@ export class RecoveryCoordinator implements IRecoveryCoordinator {
 
     this.stateMachine = config.stateMachine ?? new RecoveryStateMachine('ACTIVE', 'IDLE');
     this.quarantineBuffer = config.quarantineBuffer ?? new QuarantineBuffer();
-    this.futureEpochBuffer = config.futureEpochBuffer ?? new FutureEpochBuffer();
+    this.futureEpochBuffer =
+      config.futureEpochBuffer ??
+      new FutureEpochBuffer({
+        gracePeriodMs: this.epochConvergenceGraceMs,
+        onGraceExpired: (targetEpoch) => {
+          this.handleFutureEpochGraceExpired(targetEpoch);
+        },
+      });
 
     this.admissionController =
       config.admissionController ??
@@ -600,11 +607,22 @@ export class RecoveryCoordinator implements IRecoveryCoordinator {
       return { shouldQuarantine: false, dropped: true, duplicate: true };
     }
 
-    const result = this.admissionController.interceptRemoteEvent(
-      event,
-      rawSerializedLength,
-      this.engine.epoch,
-    );
+    let result: RemoteAdmissionResult;
+    try {
+      result = this.admissionController.interceptRemoteEvent(
+        event,
+        rawSerializedLength,
+        this.engine.epoch,
+      );
+    } catch (err) {
+      if (err instanceof SyncEngineError) {
+        const failureReason = this.mapOverflowErrorCodeToFailureReason(err.code);
+        if (failureReason) {
+          this.abortRecovery(failureReason, err.message);
+        }
+      }
+      throw err;
+    }
 
     // Quarantine warning threshold check
     if (
@@ -671,6 +689,10 @@ export class RecoveryCoordinator implements IRecoveryCoordinator {
    * Aborts active recovery attempt and transitions deterministically to DEGRADED.
    */
   public abortRecovery(reason: RecoveryFailureReason, errorOrMessage?: Error | string): void {
+    if (this._isDisposed || !this.stateMachine.canTransition('DEGRADED')) {
+      return;
+    }
+
     this.activeAttemptId += 1;
     this.clearTimers();
 
@@ -679,9 +701,7 @@ export class RecoveryCoordinator implements IRecoveryCoordinator {
         ? errorOrMessage.message
         : (errorOrMessage ?? reason);
 
-    if (this.stateMachine.canTransition('DEGRADED')) {
-      this.stateMachine.transition('DEGRADED', msg, 'IDLE');
-    }
+    this.stateMachine.transition('DEGRADED', msg, 'IDLE');
 
     try {
       this.callbacks?.onRecoveryDegraded?.(
@@ -690,6 +710,27 @@ export class RecoveryCoordinator implements IRecoveryCoordinator {
       );
     } catch {
       // Exception isolation
+    }
+  }
+
+  private handleFutureEpochGraceExpired(targetEpoch: number): void {
+    if (this._isDisposed || !this.stateMachine.canTransition('DEGRADED')) {
+      return;
+    }
+    this.abortRecovery(
+      'UNRESOLVED_FUTURE_EPOCH',
+      `Future epoch grace period expired for epoch ${targetEpoch}`,
+    );
+  }
+
+  private mapOverflowErrorCodeToFailureReason(code: string): RecoveryFailureReason | null {
+    switch (code) {
+      case 'QUARANTINE_OVERFLOW':
+        return 'QUARANTINE_OVERFLOW';
+      case 'FUTURE_EPOCH_OVERFLOW':
+        return 'FUTURE_EPOCH_OVERFLOW';
+      default:
+        return null;
     }
   }
 
