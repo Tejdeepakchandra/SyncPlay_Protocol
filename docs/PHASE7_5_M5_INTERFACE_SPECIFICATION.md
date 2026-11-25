@@ -1,6 +1,6 @@
 # Phase 7.5 Milestone M5 — Interface Specification
 
-**Status:** APPROVED ARCHITECTURAL SPECIFICATION (MILESTONE M5.0-R15 AMENDED)
+**Status:** APPROVED ARCHITECTURAL SPECIFICATION (MILESTONE M5.0-R16 AMENDED)
 **Date:** 2026-11-25
 **Authoritative Starting Baseline:** `40b11fdafcd247c7a289723f90ec0e2029c94f64` (Phase 7.5 M4.3d Formally Accepted)
 **Accepted Baselines:** M4.3c (`eab2428`), M4.3b (`f3c29b6`), Approved Architecture (`2bb117c`), Frozen M4.2d (`aafa366`)
@@ -531,7 +531,7 @@ export type RemoteAdmissionDecision =
 
 ---
 
-### 3.3 Terminal Quarantine Archive Governance, Atomic Retirement & Export Contracts (R12-A–R12-D, R13-A–R13-D, R14-A–R14-E, R15-A–R15-G)
+### 3.3 Terminal Quarantine Archive Governance, Atomic Retirement & Export Contracts (R12-A–R12-D, R13-A–R13-D, R14-A–R14-E, R15-A–R15-G, R16-A–R16-D)
 
 ```typescript
 // ── Module Branding & Custody Symbols [PROPOSED — M5.1] ─────────────────────
@@ -553,12 +553,28 @@ export interface CompositeOperationIdentity {
 }
 
 /**
- * Returns deterministic length-prefixed canonical string representation:
- * opid:${originPeerId.length}:${originPeerId}/${sequenceNumber}/${membershipEpoch}/${logicalEventId.length}:${logicalEventId}
+ * Returns deterministic length-prefixed canonical string representation with UTF-8 byte lengths:
+ * opid:${originPeerIdBytes}:${originPeerId}/${sequenceNumber}/${membershipEpoch}/${logicalEventIdBytes}:${logicalEventId}
  * Example: opid:6:peer-A/42/1/10:evt_9a8b7c
  */
 export function canonicalOperationIdentityKey(id: CompositeOperationIdentity): string {
-  return `opid:${id.originPeerId.length}:${id.originPeerId}/${id.sequenceNumber}/${id.membershipEpoch}/${id.logicalEventId.length}:${id.logicalEventId}`;
+  if (!Number.isSafeInteger(id.sequenceNumber) || id.sequenceNumber <= 0) {
+    throw new SyncEngineError('INVALID_IDENTITY', `Invalid sequenceNumber: ${id.sequenceNumber}`);
+  }
+  if (!Number.isSafeInteger(id.membershipEpoch) || id.membershipEpoch < 0) {
+    throw new SyncEngineError('INVALID_IDENTITY', `Invalid membershipEpoch: ${id.membershipEpoch}`);
+  }
+  if (!id.originPeerId || typeof id.originPeerId !== 'string' || !id.originPeerId.trim()) {
+    throw new SyncEngineError('INVALID_IDENTITY', 'originPeerId must be a non-empty string');
+  }
+  if (!id.logicalEventId || typeof id.logicalEventId !== 'string' || !id.logicalEventId.trim()) {
+    throw new SyncEngineError('INVALID_IDENTITY', 'logicalEventId must be a non-empty string');
+  }
+
+  const peerIdBytes = new TextEncoder().encode(id.originPeerId).length;
+  const eventIdBytes = new TextEncoder().encode(id.logicalEventId).length;
+
+  return `opid:${peerIdBytes}:${id.originPeerId}/${id.sequenceNumber}/${id.membershipEpoch}/${eventIdBytes}:${id.logicalEventId}`;
 }
 
 // ── Reset Attempt Lifecycle Tracking Types [PROPOSED — M5.1] ────────────────
@@ -601,12 +617,32 @@ export interface TerminalQuarantineEntry {
   readonly archivedAtMs: number;
 }
 
+export interface ArchiveReservationRecord {
+  readonly reservationId: string;
+  readonly reservedCount: number;
+  readonly reservedBytes: number;
+  readonly archiveGeneration: number;
+  readonly createdAtMs: number;
+  readonly expiresAtMs: number;
+}
+
 export interface TerminalArchiveCoreState {
   readonly entries: ReadonlyArray<TerminalQuarantineEntry>;
   readonly committedTransactions: ReadonlyMap<string, QuarantineRetirementTransactionRecord>;
+  readonly activeReservations: ReadonlyMap<string, ArchiveReservationRecord>;
   readonly totalBytes: number;
   readonly size: number;
   readonly archiveGeneration: number;
+}
+
+export interface QuarantineBufferCoreState {
+  readonly activeQueue: ReadonlyArray<QuarantinedOperation>;
+  readonly drainBatch: ReadonlyArray<QuarantinedOperation>;
+  readonly identityIndex: ReadonlyMap<string, number>;
+  readonly activeBytes: number;
+  readonly drainBytes: number;
+  readonly generationId: number;
+  readonly drainGenerationId: number | null;
 }
 
 // ── Quarantine Retirement Transaction Types [PROPOSED — M5.1] ───────────────
@@ -700,8 +736,7 @@ export interface ITerminalQuarantineArchive {
 
   /**
    * Pre-reserves archive entry count and byte capacity against current archive generation.
-   * Throws SyncEngineError('CAPACITY_INSUFFICIENT') if limits would be breached.
-   * Throws SyncEngineError('GENERATION_MISMATCH') if expectedGeneration !== archiveGeneration.
+   * Linearized via candidate-root swap into activeReservations in TerminalArchiveCoreState.
    */
   reserveCapacity(
     entryCount: number,
@@ -711,6 +746,7 @@ export interface ITerminalQuarantineArchive {
 
   /**
    * Cancels active reservation and releases reserved capacity.
+   * Atomically removes reservation from activeReservations via candidate-root swap.
    */
   cancelReservation(
     reservationId: string,
@@ -719,10 +755,9 @@ export interface ITerminalQuarantineArchive {
 
   /**
    * Idempotently commits a staged retirement batch under retirementTransactionId.
-   * Checks committed transaction record first; if matching digest exists, returns
-   * existing receipt immediately without requiring active reservation.
-   * Only if absent, validates reservation, constructs candidate root, and publishes
-   * via single synchronous pointer replacement.
+   * Inverted validation ordering: checks committed transactions first.
+   * Linearization point: atomic reference swap of TerminalArchiveCoreState
+   * updates entries, committedTransactions, totalBytes, size, and consumes reservation together.
    */
   commitRetirementBatch(
     retirementTransactionId: string,
@@ -773,8 +808,8 @@ export interface ITerminalQuarantineArchive {
 export interface IQuarantineBufferRetirementExtension {
   /**
    * Atomically retires a set of committed composite identities under Option A.
-   * All identities must exist in buffer; constructs candidate state privately
-   * and publishes via single atomic reference swap.
+   * All identities must exist in buffer; constructs candidate QuarantineBufferCoreState
+   * privately and publishes via single atomic reference swap.
    * Throws RETIREMENT_SOURCE_MISMATCH if any identity is missing (zero buffer mutation).
    */
   retireCommittedBatch(

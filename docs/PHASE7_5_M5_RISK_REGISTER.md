@@ -1,6 +1,6 @@
 # Phase 7.5 Milestone M5 — Risk Register
 
-**Status:** APPROVED ARCHITECTURAL SPECIFICATION (MILESTONE M5.0-R15 AMENDED)
+**Status:** APPROVED ARCHITECTURAL SPECIFICATION (MILESTONE M5.0-R16 AMENDED)
 **Date:** 2026-11-25
 **Authoritative Starting Baseline:** `40b11fdafcd247c7a289723f90ec0e2029c94f64` (Phase 7.5 M4.3d Formally Accepted)
 **Accepted Baselines:** M4.3c (`eab2428`), M4.3b (`f3c29b6`), Approved Architecture (`2bb117c`), Frozen M4.2d (`aafa366`)
@@ -69,7 +69,7 @@ Milestone M5 integrates the recovery subsystem directly into `LeaderlessSyncEngi
 
 ---
 
-### R-M5-04: Quarantine Memory Exhaustion Under High-Concurrency Bursts (Closing R2-H2, R2-H3, R3-01, R3-04, R4-01, R13-D, R14-A, R15-G)
+### R-M5-04: Quarantine Memory Exhaustion Under High-Concurrency Bursts (Closing R2-H2, R2-H3, R3-01, R3-04, R4-01, R13-D, R14-A, R15-G, R16-A, R16-D)
 - **Root Cause:** While catching up across a 4 MB snapshot over a high-latency link, active peers continue broadcasting live operations. A malicious or high-throughput peer could flood the recovering node with events, causing OOM.
 - **Architectural Impact:** Browser tab crash or engine heap exhaustion.
 - **Mitigation Strategy:**
@@ -101,7 +101,7 @@ Milestone M5 integrates the recovery subsystem directly into `LeaderlessSyncEngi
 
 ---
 
-### R-M5-06: Drain-Arrival Concurrency Race
+### R-M5-06: Drain-Arrival Concurrency Race (Closing R16-C, R16-D)
 - **Root Cause:** While `QuarantineDrainer` is draining pass 1, new remote events arrive over the network.
 - **Architectural Impact:** Race conditions between dequeuing and enqueuing, or operations drained out of order.
 - **Mitigation Strategy:**
@@ -110,6 +110,7 @@ Milestone M5 integrates the recovery subsystem directly into `LeaderlessSyncEngi
   - **Iterative Drain:** Coordinator executes subsequent drain passes until all generations are cleared.
 - **Automated Verification Control:** Multi-peer concurrency tests in `recovery-engine-integration.test.ts` verify zero dropped or duplicated events during concurrent drain.
 
+  - **Physical Custody Separation & Full Identity Matching (R16-C, R16-D):** Operations in flight are held strictly in QuarantineDrainer._inFlightRecord ({\text{in-flight}} \le 1$) and physically removed from QuarantineBuffer.drainBatch. Step 6 settlement barrier verifies empty in-flight slot ({\text{in-flight}} == 0$) before retirement begins. Index hits in QuarantineBuffer verify all 4 composite identity fields, preventing identity collisions.
 ---
 
 ### R-M5-07: Stale Timer Callbacks Post-Abort or Post-Disposal (Closing R2-H4)
@@ -125,7 +126,7 @@ Milestone M5 integrates the recovery subsystem directly into `LeaderlessSyncEngi
 
 ---
 
-### R-M5-08: Ambiguous Lifecycle Ownership, Package Boundary, Reset Failures & Teardown Leaks (Closing F5, R2-H5, R3-07, R6-02, R7-02, R8-01, R8-05, R9-07, R10-01, R11-B, R11-C, R11-D, R12-A–R12-D, R13-A–R13-E, R14-A–R14-E, R15-A–R15-G)
+### R-M5-08: Ambiguous Lifecycle Ownership, Package Boundary, Reset Failures & Teardown Leaks (Closing F5, R2-H5, R3-07, R6-02, R7-02, R8-01, R8-05, R9-07, R10-01, R11-B, R11-C, R11-D, R12-A–R12-D, R13-A–R13-E, R14-A–R14-E, R15-A–R15-G, R16-A–R16-D)
 - **Root Cause:** Unclear lifecycle ownership where active timers retain the coordinator, improper capability checks allow unauthorized replacement, or administrative reset operations fail partway through without failure-atomic cleanup.
 - **Architectural Impact:** Retained background processes, hanging test suites, unauthorized core state replacement, or inconsistent partial state exposed after failed reset.
 - **Mitigation Strategy:**
