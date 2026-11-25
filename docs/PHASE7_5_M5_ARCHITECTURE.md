@@ -1,6 +1,6 @@
 # Phase 7.5 Milestone M5 — Engine Runtime Recovery Integration Architecture
 
-**Status:** APPROVED ARCHITECTURAL SPECIFICATION (MILESTONE M5.0-R11 AMENDED)
+**Status:** APPROVED ARCHITECTURAL SPECIFICATION (MILESTONE M5.0-R12 AMENDED)
 **Date:** 2026-11-25
 **Authoritative Starting Baseline:** `40b11fdafcd247c7a289723f90ec0e2029c94f64` (Phase 7.5 M4.3d Formally Accepted)
 **Accepted Baselines:** M4.3c (`eab2428`), M4.3b (`f3c29b6`), Approved Architecture (`2bb117c`), Frozen M4.2d (`aafa366`)
@@ -94,7 +94,7 @@ To preserve exact capability custody and single-attachment guarantees without cl
    - **Failure During Engine Construction:** If engine initialization throws after `bindEngine()` has run (e.g. invalid configuration or constructor failure), engine construction unwinds; the engine reference is never published, and the partially constructed engine is reclaimed by garbage collection. An externally injected coordinator bound during a failed constructor call cannot be safely reused and must be discarded.
    - **Engine Disposal:** Invoking `engine.dispose()` invokes `coordinator.dispose()`. Calling `replaceCoreStateAtomic` on a disposed engine throws `SyncEngineError('ENGINE_DISPOSED')`, effectively dead-ending the capability even if a reference is retained externally.
 
-#### 2.1.2 Drain Admission Context Capabilities: Unforgeable Provenance & Package-Boundary Contract (Closing R6-01, R7-01, R8-05, R9-07, R10-01, R10-03, R11-A, R11-B)
+#### 2.1.2 Drain Admission Context Capabilities: Unforgeable Provenance & Package-Boundary Contract (Closing R6-01, R7-01, R8-05, R9-07, R10-01, R10-03, R11-A, R11-B, R12-C)
 A typed string (`'LOCAL_REPLAY' | 'REPAIR_BATCH'`) is a declaration of context, not proof of provenance: any caller can supply a string. To prevent accidental trust escalation where untrusted remote operations bypass arrival-rate limits and clock-inflation checks, post-snapshot drain admission is capability-gated:
 
 ```typescript
@@ -234,7 +234,7 @@ export type RemoteAdmissionDecision =
    - **Contract Clarity:** `REJECTED_CAPACITY` is a declared `EngineDecision.code` emitted by the engine, NOT a variant of `RemoteAdmissionDecision`.
    - For local user actions (`receiveLocal` / `submit`), local inputs **do throw** `SyncEngineError('REJECTED_DEGRADED')` synchronously.
 
-### 3.4 Administrative Recovery Reset Semantics, Concurrent Reset Serialization, Custody Resolution & Atomic Admission (Closing R6-02, R7-02, R8-01–R8-05, R9-01–R9-06, R10-01–R10-04, R11-A–R11-D)
+### 3.4 Administrative Recovery Reset Semantics, Multi-Stage Retirement Transaction, Barrier Reconciliation & Archive Governance (Closing R6-02, R7-02, R8-01–R8-05, R9-01–R9-06, R10-01–R10-04, R11-A–R11-D, R12-A–R12-D)
 
 `resetRecovery()` exists strictly as an administrative recovery reset, NOT as a general-purpose escape hatch to clear degradation while leaving incomplete or corrupted state in place.
 
@@ -242,116 +242,186 @@ export type RemoteAdmissionDecision =
 - `resetRecovery(capability, resetAction)` is allowed **strictly from the `DEGRADED` state** (`this.stateMachine.state === 'DEGRADED'`). Calling it from `ACTIVE`, `RECOVERING`, `RECONCILING`, or `DISPOSED` throws `SyncEngineError('INVALID_STATE')`.
 - Requires an authorized `RecoveryInstallationCapability` checked via strict object-reference identity (`capability === this.authorizedRecoveryCapability`). Unauthorized invocations throw `SyncEngineError('UNAUTHORIZED')`.
 
-#### 2. Safe Reset Actions, Concurrent Serialization & Settlement Failure Semantics
-
-`resetRecovery()` supports two explicit reset actions:
-
-1. **`PURGE_AND_RETRY` (Autonomous Clean Retry, Concurrent Reset Serialization, Strict Custody & Settlement Barrier — Closing R8-01, R8-02, R9-01–R9-05, R10-01, R10-02, R10-03, R11-A, R11-B, R11-C, R11-D):**
-   - **Monotonic Attempt Sequence Fencing:** Before initiating retry actions, the coordinator increments the attempt counter: `const newAttemptId = ++this.currentAttemptId;`. All pending asynchronous recovery workflows (chunk arrivals, transfer callbacks, timeout timers, and discovery responses) check `attemptId === this.currentAttemptId`; any frame or timer belonging to a prior attempt is dropped immediately as a stale no-op.
-   - **Concurrent Reset Serialization & Shared Settlement Barrier (R9-01):**
-     If two or more administrative reset requests arrive while an asynchronous drain operation is actively pending (e.g., Attempt 1 has operation A in flight, Reset A starts Attempt 2 and awaits settlement, and Reset B arrives before settlement and starts Attempt 3):
-     1. **Monotonic Sequence Increment:** Each reset call increments `this.currentAttemptId` (`Attempt 2`, then `Attempt 3`).
-     2. **Shared Settlement Barrier:** Both reset continuations await the single underlying drain settlement barrier (`await this.quarantineDrainer.drainSettledBarrier()`).
-     3. **Post-Settlement Attempt Re-Validation:** When the settlement barrier resolves, **every waiting reset continuation immediately re-checks its attempt ID and lifecycle state:**
-        ```typescript
-        if (myAttemptId !== this.currentAttemptId || this.stateMachine.state !== 'RECOVERING') {
-          return; // Stale earlier reset continuation aborted immediately
-        }
-        ```
-        Only the newest authorized attempt (`myAttemptId === this.currentAttemptId`) proceeds to start recovery discovery and transfer. Earlier reset continuations are safely fenced out and cannot start draining or recovery work.
-     4. **Record Identity Safety:** When the stale in-flight drain operation settles, its continuation releases ONLY the exact record instance it owns (`if (this._inFlightRecord === staleRecord) this._inFlightRecord = null`), never releasing or mutating a newer record belonging to a subsequent attempt.
-   - **Asynchronous In-Flight Invalidation with Retained Ownership Slot (R8-01):**
-     Clearing `inFlightRecord = null` while an asynchronous drain operation is actively executing does NOT cancel the underlying Promise, undo an already accepted operation, or guarantee that a second drain cannot begin. To guarantee that $N_{\text{in-flight}} \le 1$ remains strictly true across reset boundaries:
-     1. When `resetRecovery('PURGE_AND_RETRY')` is invoked, `quarantineDrainer` inspects whether an operation is currently in flight (`this._inFlightRecord !== null`).
-     2. If an in-flight operation exists, its record is flagged as invalidated (`this._inFlightRecord.invalidated = true`).
-     3. **The in-flight ownership slot is RETAINED** ($N_{\text{in-flight}} = 1$); the drainer does NOT clear the record or allow new operations to be dequeued.
-     4. `PURGE_AND_RETRY` executes an asynchronous drain settlement barrier: it awaits or latches settlement of the pending in-flight operation (`await this.quarantineDrainer.drainSettledBarrier()`). No new drain operation can begin until the pending operation settles.
-     5. When the stale asynchronous drain continuation settles (resolves or rejects), it detects `invalidated === true`. It performs zero state mutation, releases the retained in-flight ownership slot (`this._inFlightRecord = null`, $N_{\text{in-flight}} \to 0$), and signals the settlement barrier.
-     6. Only after the ownership slot is completely empty ($N_{\text{in-flight}} = 0$) can the newest recovery attempt dequeue and drain operations.
-   - **Separation of Attempt Invalidation from Permanent Operation Rejection (R11-A):**
-     Attempt-scoped invalidation (`STALE_ATTEMPT_FENCED`) is NOT a permanent operation rejection. The operation's payload was not evaluated and remains uncommitted. To avoid semantic contradictions and eliminate string-parsing control flow, M5 introduces a distinct typed receipt variant:
+#### 2. Safe Reset Actions, Monotonic Attempt Advance & Concurrent Reset Serialization
+- **Monotonic Attempt Sequence Fencing:** Every invocation of `resetRecovery(capability, resetAction)` increments the monotonic attempt counter: `const newAttemptId = ++this.currentAttemptId;`. All pending asynchronous recovery workflows (chunk arrivals, transfer callbacks, timeout timers, discovery responses, and drain continuations) check `attemptId === this.currentAttemptId`; any frame, timer, or callback belonging to a prior attempt is dropped immediately as a stale no-op.
+- **Concurrent Reset Serialization & Shared Settlement Barrier (R9-01):**
+  If two or more administrative reset requests arrive while an asynchronous drain operation is actively pending (e.g., Attempt 1 has operation A in flight, Reset A starts Attempt 2 and awaits settlement, and Reset B arrives before settlement and starts Attempt 3):
+  1. Each reset call increments `this.currentAttemptId` (`Attempt 2`, then `Attempt 3`).
+  2. Both reset continuations await the single underlying drain settlement barrier (`await this.quarantineDrainer.drainSettledBarrier()`).
+  3. When the settlement barrier resolves, **every waiting reset continuation immediately re-checks its attempt ID and lifecycle state:**
      ```typescript
-     | {
-         readonly status: 'ATTEMPT_INVALIDATED';
-         readonly vectorAdvanced: false;
-         readonly attemptId: number;
-         readonly reason: 'STALE_ATTEMPT_FENCED' | 'COORDINATOR_NOT_RECONCILING';
-       }
+     if (myAttemptId !== this.currentAttemptId || this.stateMachine.state !== 'RECOVERING') {
+       return; // Stale earlier reset continuation aborted immediately
+     }
      ```
-     - `ATTEMPT_INVALIDATED`: Indicates attempt-level invalidation (cancelled or superseded recovery attempt). The drainer routes the operation back to `QuarantineBuffer` via `quarantineBuffer.unshiftDrain(op)` for evaluation under a subsequent attempt.
-     - `TERMINALLY_REJECTED`: Reserved strictly for permanent payload/epoch validation failures (e.g. `'MISSING_LOGICAL_EVENT_ID'`, `'OBSOLETE_EPOCH'`, `'MALFORMED_PAYLOAD'`). The drainer routes the operation to `TerminalQuarantineArchive`.
-     - `CAPACITY_REJECTED`: Indicates destination queue backpressure. The drainer routes the operation back to `QuarantineBuffer` via `unshiftDrain(op)` and halts the drain pass.
-   - **Receipt-Outcome Ownership & Vector Matrix (R11-A):**
+     Only the newest authorized attempt (`myAttemptId === this.currentAttemptId`) proceeds to start recovery discovery and transfer. Earlier continuations abort with zero side-effects.
+  4. When the stale in-flight drain operation settles, its continuation releases ONLY the exact record instance it owns (`if (this._inFlightRecord === staleRecord) this._inFlightRecord = null`), never releasing or mutating a newer record belonging to a subsequent attempt.
 
-     | Receipt Outcome | Status Classification | Vector Advanced? | Destination Core Mutated? | Next Custody Holder | Drainer Next Action |
-     |---|---|---|---|---|---|
-     | `ACCEPTED_REDUCED` | Successful Admission | Yes | Yes (Log + Vector + State) | `EngineCoreState.operationLog` | Releases in-flight slot ($N_{\text{in-flight}} \to 0$); continues drain |
-     | `ACCEPTED_PENDING` | Missing Dependency | No | Yes (Pending Queue) | `EngineCoreState.pendingQueue` | Releases in-flight slot ($N_{\text{in-flight}} \to 0$); continues drain |
-     | `ALREADY_REPRESENTED` | Deduplicated (Frontier) | No | No (Covered by base) | None (Retired) | Releases in-flight slot ($N_{\text{in-flight}} \to 0$); continues drain |
-     | `ALREADY_OWNED_DUPLICATE`| Deduplicated (Log) | No | No (Present in log) | None (Retired) | Releases in-flight slot ($N_{\text{in-flight}} \to 0$); continues drain |
-     | `ATTEMPT_INVALIDATED` | Attempt Fenced (M5 New) | No | No (Zero mutation) | `QuarantineBuffer` (head via `unshiftDrain`) | Releases slot after acknowledged transfer; preserves op for next attempt |
-     | `CAPACITY_REJECTED` | Transient Backpressure | No | No (Zero mutation) | `QuarantineBuffer` (head via `unshiftDrain`) | Releases slot after acknowledged transfer; halts drain (`HALTED_CAPACITY`) |
-     | `TERMINALLY_REJECTED` | Permanent Validation Failure | No | No (Zero mutation) | `TerminalQuarantineArchive` | Releases slot after acknowledged archive; continues drain |
+#### 3. Complete 10-Step Lifecycle Sequence for Administrative Reset & Barrier Reconciliation (R12-B)
 
-   - **Terminal Archive Overflow & Fail-Closed Custody Semantics (R11-C):**
-     `TerminalQuarantineArchive` has a strict hard capacity bound of `MAX_TERMINAL_ARCHIVE_SIZE = 500` entries.
-     1. **No Silent Eviction Rule:** The archive NEVER evicts or overwrites previously archived entries. Silent circular overwriting is strictly prohibited to preserve complete forensic auditability.
-     2. **Custody Transfer Failure Invariant:** If `terminalArchive.size >= MAX_TERMINAL_ARCHIVE_SIZE`, or if `terminalArchive.archive(entry)` throws an exception, this is classified as an unrecoverable **Custody-Transfer Failure**:
-        - The in-flight slot `this._inFlightRecord` is **NOT** released ($N_{\text{in-flight}} = 1$ is retained).
-        - The drain pass halts immediately with `HALTED_ERROR` (`HALTED_ARCHIVE_OVERFLOW`).
-        - The coordinator transitions fail-closed to `DEGRADED` (`TERMINAL_ARCHIVE_OVERFLOW`).
-        - No unbounded secondary queue or silent dropping is permitted as a workaround.
-     3. **Archive Reclamation:** Capacity can be reclaimed strictly through an explicit, capability-authorized administrative export operation (`coordinator.exportAndClearTerminalArchive(capability)`), which exports the diagnostic records for out-of-band audit before clearing.
-   - **Watchdog Timeout vs. Settlement vs. Custody Release (R9-04, R10-02):**
-     The 5-second settlement barrier timeout (`SETTLEMENT_BARRIER_TIMEOUT_MS = 5000`) does NOT cancel a Promise and does not imply cancellation. The specification explicitly distinguishes three separate events:
-     1. **Event 1: Watchdog Timeout (5s elapsed without settlement):**
-        - The coordinator stops waiting for the settlement barrier and transitions fail-closed to `DEGRADED` (`DRAIN_HANG_TIMEOUT`).
-        - The in-flight slot is NOT forcefully overwritten; notification deferral remains locked; live mutations remain rejected.
-     2. **Event 2: Underlying Operation Settlement:**
-        - The asynchronous operation actually finishes (resolves or rejects) on the event loop.
-        - Mandatory attempt-ID fencing at `admitDrainedOperation()` checks `attemptId === currentAttemptId`. Because the attempt timed out and degraded, the attempt ID is stale, and the operation receives `ATTEMPT_INVALIDATED` with **zero engine state mutation**.
-        - Any other side effects in the asynchronous drain task (network broadcasts, peer responses, timers) are guarded by `isAttemptValid(attemptId)` and suppressed, rendering late settlement completely inert.
-     3. **Event 3: Ownership Release & Custody Resolution:**
-        - Occurs strictly **after** Event 2 completes settlement and custody is transferred and acknowledged (per R10-01/R11-A).
-        - Only then is `this._inFlightRecord = null` set, and the drain settlement barrier resolved.
-     - **Drain Barrier Invariant:** After a watchdog timeout, the in-flight slot remains owned until actual settlement. No new drain pass can EVER begin while an operation from an earlier attempt remains unsettled.
-   - **Candidate Isolation, Deep Immutability & Capability-Gated Commit (R11-B):**
-     `Object.seal()` prevents property addition/deletion on the container, but does NOT prevent mutation of nested objects (`operationLog`, `clockManager`, `pendingQueue`, `replicationVector`, `localCausalContext`). To guarantee absolute exception atomicity and prevent partial commits:
-     1. **Required Future M5.1 Invariant:** Candidate staging must enforce strict reference disjointness. Every mutable nested structure modified during staging must be newly allocated or copy-on-write cloned. Staging functions must NEVER mutate any object reachable from the current authoritative `this.core`.
-     2. **Side-Effect Free Staging (Phase 1):** Causal checks, Lamport validation, and SMR reduction dry-run execute purely against candidate instances. If staging fails or throws, active `this.core` remains completely pristine.
-     3. **Pre-Commit Fencing & CAS Verification:** Immediately before replacement, the commit asserts:
-        - Attempt identity: `attemptId === this.coordinator.currentAttemptId` and `this.coordinator.state === 'RECONCILING'`.
-        - Expected root verification: `this.core === expectedPriorRoot` (CAS-style reference check ensuring no concurrent task replaced the root during staging).
-        - Capability authorization: `capability === this.authorizedRecoveryCapability`.
-     4. **Atomic Linearization Point (Phase 2):** Synchronous root pointer swap:
-        ```typescript
-        this.core = candidateCore;
-        ```
-        Commits all 12 core state fields simultaneously in 1 call frame. Zero fallible mutations may execute after this assignment as part of the logical commit.
-     5. **Post-Commit Encapsulation:** Candidate structures are encapsulated inside the engine boundary; no external SDK consumer retains writable references.
-   - **Reset-Policy Quarantine Fate Matrix (R11-D):**
+To reconcile asynchronous settlement with the mandatory settlement barrier and clean-reset commit, the protocol specifies an authoritative 10-step lifecycle sequence:
 
-     | Reset Strategy | In-Flight Un-linearized Operation Fate | QuarantineBuffer Pending Operations Fate | Already-Linearized Log Operations Fate | When Can Draining Resume? |
-     |---|---|---|---|---|
-     | **`PURGE_AND_RETRY`** | Receives `ATTEMPT_INVALIDATED`; restored to head of `QuarantineBuffer` via `unshiftDrain(op)` | Retained in buffer custody; re-evaluated against new recovery attempt | Retained in `operationLog`; deduplicated during retry (`ALREADY_REPRESENTED` / `ALREADY_OWNED_DUPLICATE`) | Only after settlement barrier resolves, slot is empty ($N_{\text{in-flight}} = 0$), and new attempt enters `RECONCILING` |
-     | **`REINITIALIZE_CLEAN`** | If settles post-commit: rejected with `ATTEMPT_INVALIDATED`; permanently retired without state mutation | All pending operations permanently retired to `TerminalQuarantineArchive` (`REINITIALIZE_CLEAN_PURGED`); never replayed into clean baseline | Entire engine root replaced with clean baseline anchor via `replaceCoreStateAtomic`; prior log discarded | Pre-reset quarantine is permanently retired; live operation ingestion begins fresh in `ACTIVE` state |
+1. **Step 1: Administrative Reset Requested:** Invocation of `resetRecovery(capability, resetAction)` strictly from `DEGRADED`.
+2. **Step 2: Attempt Invalidation & Monotonic Counter Advance:** `newAttemptId = ++this.currentAttemptId`. All prior attempt timers, transfer pipelines, and callbacks are fenced.
+3. **Step 3: Pre-Commit Drainer Fencing:** Drainer flags `_inFlightRecord.invalidated = true` (if an operation is in flight). Drainer prohibits any new dequeue ($N_{\text{in-flight}} \le 1$).
+4. **Step 4: Mandatory Settlement Barrier Execution:** Coordinator awaits `await this.quarantineDrainer.drainSettledBarrier()`. The coordinator actively awaits settlement of any in-flight drain step.
+   - **Watchdog Timeout Invariant:** The settlement barrier is guarded by `SETTLEMENT_BARRIER_TIMEOUT_MS = 5000`. A timeout is NOT cancellation: it does not cancel the underlying Promise and does NOT clear the in-flight slot. If the barrier times out, the coordinator remains/enters `DEGRADED` (`DRAIN_HANG_TIMEOUT`), the in-flight slot remains owned ($N_{\text{in-flight}} = 1$), and the clean baseline is **NOT** committed!
+5. **Step 5: In-Flight Operation Settlement & Custody Resolution:** The underlying asynchronous operation actually resolves or rejects on the JavaScript event loop.
+   - Mandatory attempt-ID fencing at `admitDrainedOperation` validates `attemptId === coordinator.currentAttemptId`. Because the attempt was fenced/invalidated, the engine returns typed receipt `ATTEMPT_INVALIDATED` (`STALE_ATTEMPT_FENCED`) with **zero engine state mutation**!
+   - In-flight custody is resolved: unshifted back to `QuarantineBuffer` head via `unshiftDrain(op)`.
+   - In-flight slot is released: `this._inFlightRecord = null` ($N_{\text{in-flight}} \to 0$).
+6. **Step 6: Settlement Barrier Resolution:** The barrier promise resolves. The in-flight slot is verified empty ($N_{\text{in-flight}} == 0$). No new drain pass can begin until barrier resolution.
+7. **Step 7: Quarantine Retirement Transaction (Multi-Stage Atomic Batch — R12-A):** Under `REINITIALIZE_CLEAN`, the multi-stage retirement transaction executes (pre-reservation, staging, batch commit to `TerminalQuarantineArchive`, acknowledged quarantine clear). Under `PURGE_AND_RETRY`, operations remain in `QuarantineBuffer` for the new attempt.
+8. **Step 8: State Replacement (Irrevocable Single Root Pointer Replacement):** Under `REINITIALIZE_CLEAN`, `engine.replaceCoreStateAtomic(cleanBaseline, capability)` executes single synchronous root-pointer replacement. Under `PURGE_AND_RETRY`, the existing log is preserved.
+9. **Step 9: Lifecycle Transition:** Under `REINITIALIZE_CLEAN`, `engine.setRecoveryMode(false)` and coordinator transitions to `ACTIVE`. Under `PURGE_AND_RETRY`, coordinator resets to `RECOVERING` under `newAttemptId`, maintaining `setRecoveryMode(true)`.
+10. **Step 10: Notification Release:** Under `REINITIALIZE_CLEAN`, `engine.flushDeferredNotifications()` dispatches deferred notifications via non-throwing dispatch (delivering 0 notifications if none were enqueued).
 
-   - **Buffer & Queue Purge under PURGE_AND_RETRY:**
-     Quarantined operations in `QuarantineBuffer` are retained for the next attempt. Incomplete reconciliation state and `stashedLocalQueue` are reset. `deferredStateChanges` and `deferredDecisions` are permanently purged. Coordinator resets to `RECOVERING` under `newAttemptId`, maintaining `engine.setRecoveryMode(true)`.
+##### Reconciliation of the Three Settlement Timing Cases (R12-B)
+| Case | Lifecycle Occurrence | Protocol Mandated Behavior |
+|---|---|---|
+| **Case 1: Operation unsettled when reset requested** | In-flight drain step pending during `resetRecovery` call | Fences old attempt; awaits `drainSettledBarrier()`; preserves in-flight slot until actual settlement; proceeds only after barrier resolves and $N_{\text{in-flight}} = 0$. |
+| **Case 2: Operation settles before clean-baseline commit** | In-flight drain step settles at Step 5 while barrier is awaited | Receives `ATTEMPT_INVALIDATED`; unshifted back into `QuarantineBuffer`; included in complete Step 7 retirement set before committing clean baseline. |
+| **Case 3: Decoupled callback continuation resumes post-commit** | Asynchronous transport/logging callbacks resume after Step 8 commit | Attempt ID and lifecycle guards check `myAttemptId === currentAttemptId` and `state === 'RECONCILING'`; any late callback mutation or external side-effect is suppressed as inert. |
 
-2. **`REINITIALIZE_CLEAN` (Administrative Baseline Restoration & Clean Notification Contract — Closing R8-03, R8-04, R9-06, R10-04, R11-D):**
-   - Used when the application session decides to restart from a known clean genesis state or agreed anchor snapshot rather than continuing peer recovery.
-   - **Strict 5-Step M4.3c Completion Order:**
-     1. **Stale Notification Purge (R9-06):** Before any state replacement, all stale deferred notifications accumulated during previous failed attempts are permanently discarded (`this.deferredStateChanges.length = 0; this.deferredDecisions.length = 0;`).
-     2. **Capability-Gated Baseline Installation:** Atomically replace `EngineCoreState` with the clean baseline anchor via `engine.replaceCoreStateAtomic(cleanBaseline, capability)`. Under `REINITIALIZE_CLEAN`, this single-pointer swap resets `operationLog`, `state`, and `replicationVector` to clean genesis.
-     3. **Disengage Engine Recovery Mode (R10-04):**
-        Invoke `engine.setRecoveryMode(false)`. Operational notification deferral is disengaged.
-     4. **Transition Coordinator to ACTIVE:** Advance authoritative lifecycle state via `stateMachine.transition('ACTIVE', ...)`.
-     5. **Flush Clean Baseline Notification (Non-Throwing Dispatch — R8-04, R10-04):**
-        Invoke `engine.flushDeferredNotifications()` via non-throwing dispatch (isolated listener try/catch).
-   - **Zero-Notification Clarification (R10-04, R11-D):**
-     In existing accepted source (`leaderless-sync-engine.ts:883-960`), neither `replaceCoreStateAtomic` nor `setRecoveryMode(false)` pushes to `deferredStateChanges`. Therefore, Step 5 may deliver **zero notifications** unless an explicit clean baseline state change notification is specifically enqueued by caller or implementation. No clean baseline notification is guaranteed to exist automatically.
-   - **Observer Boundary Invariant:** No notification is EVER delivered to external listeners before Step 4 reaches `ACTIVE` and recovery mode is `false`. If pre-ACTIVE steps fail, recovery mode is restored, deferred notifications are never flushed, and the engine halts in `DEGRADED`.
+#### 4. Multi-Stage Atomic Retirement Transaction for `REINITIALIZE_CLEAN` (R12-A)
+
+A fundamental capacity mismatch exists between `QuarantineBuffer` (`MAX_QUARANTINE_OPERATIONS = 1000`, `MAX_QUARANTINE_TOTAL_BYTES = 4 MiB`) and `TerminalQuarantineArchive` (`MAX_TERMINAL_ARCHIVE_ENTRIES = 500`, `MAX_TERMINAL_ARCHIVE_TOTAL_BYTES = 2 MiB`). A quarantine buffer containing e.g. 800 operations cannot be transferred into an archive with only 400 free entries.
+
+To prevent partial retirement, data loss, or silent eviction, `REINITIALIZE_CLEAN` executes an **Atomic Multi-Stage Reservation and Staged Batch Commit Transaction**:
+
+1. **Stage 1: Retirement Set Discovery & Size Calculation (Non-Destructive):**
+   - Inspects all operations currently in `QuarantineBuffer` (both active generation and any detached drain generation) + any un-linearized in-flight operation.
+   - Computes:
+     - `requiredEntryCount = quarantineBuffer.totalRetainedCount` (including in-flight if restored).
+     - `requiredTotalBytes = quarantineBuffer.totalRetainedBytes` (sum of exact `serializedByteLength`).
+   - Queries available archive capacity:
+     - `availableEntries = MAX_TERMINAL_ARCHIVE_ENTRIES - terminalArchive.size`.
+     - `availableBytes = MAX_TERMINAL_ARCHIVE_TOTAL_BYTES - terminalArchive.totalBytes`.
+2. **Stage 2: Capacity Verification & Pre-Reservation Guard:**
+   - Evaluates: `requiredEntryCount <= availableEntries` AND `requiredTotalBytes <= availableBytes`.
+   - **Fail-Closed Pre-Condition Enforcement:** If capacity is insufficient (either entry count or byte capacity):
+     - **DO NOT** partially retire the quarantine buffer!
+     - **DO NOT** commit the clean baseline!
+     - **DO NOT** release ownership of any operation!
+     - Preserves old engine root (`this.core` is untouched).
+     - Preserves complete quarantine ownership in `QuarantineBuffer`.
+     - Keeps recovery mode locked (`engine.setRecoveryMode(true)`).
+     - Keeps live inputs blocked (`REJECTED_DEGRADED`).
+     - Transitions/remains in `DEGRADED` with failure reason: `TERMINAL_ARCHIVE_CAPACITY_INSUFFICIENT` or `TERMINAL_ARCHIVE_BYTE_LIMIT_INSUFFICIENT` (diagnostics include required vs available entries and bytes).
+3. **Stage 3: Staged Archive Entry Construction & Atomic Batch Commit:**
+   - If capacity is sufficient, constructs detached array of `TerminalQuarantineEntry` objects with `rejectionStatus: 'REINITIALIZE_CLEAN_PURGED'`.
+   - Atomically inserts the entire batch into `TerminalQuarantineArchive` (`terminalArchive.archiveBatch(stagedBatch)`).
+4. **Stage 4: Acknowledged Quarantine Retirement:**
+   - Strictly **after** `archiveBatch()` confirms successful insertion:
+   - Clears `QuarantineBuffer` (`quarantineBuffer.clear()`).
+   - Ownership successfully transitions from `QuarantineBuffer` to `TerminalQuarantineArchive`.
+5. **Stage 5: Clean-Baseline Installation & Notification Release:**
+   - Executes Step 8 (`replaceCoreStateAtomic`), Step 9 (transition `ACTIVE`), and Step 10 (`flushDeferredNotifications`).
+
+##### Complete Retirement Failure Matrix (R12-A)
+| Failure Scenario | Engine Core State | QuarantineBuffer State | TerminalArchive State | Lifecycle Outcome |
+|---|---|---|---|---|
+| **Insufficient entry capacity** | Completely untouched | Retains all operations ($N$) | Untouched (no insertions) | Enters `DEGRADED` (`TERMINAL_ARCHIVE_CAPACITY_INSUFFICIENT`); live inputs blocked |
+| **Insufficient byte capacity** | Completely untouched | Retains all operations ($N$) | Untouched (no insertions) | Enters `DEGRADED` (`TERMINAL_ARCHIVE_BYTE_LIMIT_INSUFFICIENT`); live inputs blocked |
+| **Archive insertion exception** | Completely untouched | Retains all operations ($N$) | Uncommitted batch rolled back | Enters `DEGRADED` (`TERMINAL_ARCHIVE_INSERTION_FAILED`); live inputs blocked |
+| **Quarantine mutation during prep** | Completely untouched | Gated/frozen | Untouched | Stale transaction continuation aborts via monotonic attempt fencing |
+| **Attempt invalidated during prep** | Completely untouched | Retains all operations | Untouched | Continuation aborts immediately with zero side-effects |
+| **Process retry / re-submission** | Evaluated afresh | Intact | Intact | New attempt runs verification afresh; idempotent; zero duplicate archiving |
+| **Post-archive failure before clear** | Staged/Untouched | Retains buffer operations | Batch committed | Run-to-completion prevents failure in synchronous memory; recovery re-sync clears buffer |
+
+#### 5. Terminal Archive Administration Authority & Acknowledged Export (R12-C)
+
+To prevent permission escalation where diagnostic archive access authorizes engine root replacement, archive administration is separated into a dedicated proposed capability:
+
+```typescript
+// Declared in packages/sync-engine/src/recovery/terminal-archive-custody.ts [PROPOSED — M5.1]
+const TERMINAL_ARCHIVE_BRAND: unique symbol = Symbol('TERMINAL_ARCHIVE_BRAND');
+
+export interface TerminalArchiveAdministrationCapability {
+  readonly [TERMINAL_ARCHIVE_BRAND]: true;
+  readonly sessionId: string;
+  readonly authority: 'terminal-archive-administration';
+  readonly token: string;
+}
+```
+
+- **Strict Privilege Confinement:** `TerminalArchiveAdministrationCapability` authorizes ONLY archive inspection, export preparation, and export acknowledgement. It CANNOT authorize engine root replacement, snapshot staging/committing, recovery attempt creation, quarantine mutation, or playback-state changes.
+- **Safe Two-Stage Export Process:**
+  1. **Stage 1: Prepare Export (`prepareArchiveExport(capability): TerminalArchiveExportBatch`):**
+     - Produces an immutable, detached snapshot of all archived entries.
+     - Generates an `exportToken`, batch metadata, total entry count, total serialized bytes, and RFC 8785 SHA-256 batch digest.
+     - **Inviolable Invariant:** The archive is NOT cleared or mutated! Entries remain safely retained.
+  2. **Stage 2: Acknowledged Clear (`acknowledgeArchiveExport(exportToken, capability): boolean`):**
+     - Requires explicit authorized acknowledgement passing the `exportToken` and capability.
+     - Clears ONLY the exact entries covered by that export batch. Any entries added after export preparation are strictly preserved!
+     - If acknowledgement fails, times out, or throws: all archive entries remain safely retained.
+- **Protocol Preservation Boundary Statement:** The protocol guarantees custody preservation until explicit caller acknowledgement; it does not claim to verify external disk durability if the administrative caller's external storage subsystem fails after acknowledgement.
+- **Capability Custody:** Created at composition root, transferred privately to coordinator/administration harness via `AuthorizedArchiveCapabilities`, verified via exact object reference identity (`===`).
+
+#### 6. Strict Numeric Memory Bounds for Terminal Archive (R12-D)
+
+To prove bounded memory in mathematical distributed systems proofs, the terminal archive enforces strict numeric constants:
+
+| Metric | Explicit Hard Bound Constant | Value | Description |
+|---|---|---|---|
+| **Maximum Archive Entries** | `MAX_TERMINAL_ARCHIVE_ENTRIES` | 500 entries | Maximum number of retained dead-letter entries |
+| **Maximum Aggregate Bytes** | `MAX_TERMINAL_ARCHIVE_TOTAL_BYTES` | 2,097,152 bytes (2.0 MiB) | Maximum total serialized wire/payload bytes |
+| **Maximum Entry Wire Bytes** | `MAX_TERMINAL_ENTRY_BYTES` | 4,096 bytes (4.0 KiB) | Maximum serialized byte length per individual entry |
+| **Maximum Error String Length** | `MAX_TERMINAL_ERROR_LENGTH` | 512 characters | Truncation/rejection threshold for diagnostic error text |
+| **Maximum Reason String Length**| `MAX_TERMINAL_REASON_LENGTH` | 256 characters | Threshold for rejection reason descriptions |
+| **Maximum Peer Identifier Length**| `MAX_TERMINAL_PEER_ID_LENGTH` | 128 characters | Printable ASCII domain identifier limit |
+| **Maximum Event Identifier Length**| `MAX_TERMINAL_LOGICAL_EVENT_ID_LENGTH`| 128 characters | Domain identifier limit |
+
+##### Worst-Case Theoretical Memory Bound Calculation (R12-D)
+1. **Serialized Wire Payload Weight:**
+   $$	ext{Max Wire Bytes} = \min(500 	imes 4096, 2 	ext{ MiB}) = 2,048,000 	ext{ bytes} \le 2.0 	ext{ MiB}$$
+2. **V8 JavaScript Object Heap Overhead:**
+   - Per-entry object overhead: Container object (~64 bytes) + `QuarantinedOperation` envelope (~64 bytes) + numeric timestamp/epoch properties (~32 bytes).
+   - Bounded string references: `error` (max 512 chars, ~536 bytes UTF-16), `reason` (max 256 chars, ~280 bytes), `peerId` (max 128 chars, ~152 bytes), `logicalEventId` (max 128 chars, ~152 bytes).
+   - Total per-entry heap footprint: $\le 1.25 	ext{ KiB}$ object overhead + $4.0 	ext{ KiB}$ payload $pprox 5.25 	ext{ KiB}$.
+   - Worst-case total heap memory for 500 entries:
+     $$	ext{Max Heap Footprint} = 500 	imes 5.25 	ext{ KiB} pprox 2,625 	ext{ KiB} pprox 2.56 	ext{ MiB}$$
+3. **Oversized Entry & Capacity Behavior:**
+   - An entry exceeding `MAX_TERMINAL_ENTRY_BYTES` (4096) or string limits is treated as a **Custody-Transfer Failure**: identity fields are NOT truncated, in-flight slot is NOT released, and the coordinator enters `DEGRADED` (`TERMINAL_ENTRY_OVERSIZED`).
+   - Aggregate capacity breach enters `DEGRADED` (`TERMINAL_ARCHIVE_OVERFLOW`). No silent eviction.
+
+#### 7. Candidate Isolation, Deep Immutability & Capability-Gated Commit (R11-B)
+`Object.seal()` prevents property addition/deletion on the container, but does NOT prevent mutation of nested objects (`operationLog`, `clockManager`, `pendingQueue`, `replicationVector`, `localCausalContext`). To guarantee absolute exception atomicity and prevent partial commits:
+1. **Required Future M5.1 Invariant:** Candidate staging must enforce strict reference disjointness. Every mutable nested structure modified during staging must be newly allocated or copy-on-write cloned. Staging functions must NEVER mutate any object reachable from the current authoritative `this.core`.
+2. **Side-Effect Free Staging (Phase 1):** Causal checks, Lamport validation, and SMR reduction dry-run execute purely against candidate instances. If staging fails or throws, active `this.core` remains completely pristine.
+3. **Pre-Commit Fencing & CAS Verification:** Immediately before replacement, the commit asserts:
+   - Attempt identity: `attemptId === this.coordinator.currentAttemptId` and `this.coordinator.state === 'RECONCILING'`.
+   - Expected root verification: `this.core === expectedPriorRoot` (CAS-style reference check ensuring no concurrent task replaced the root during staging).
+   - Capability authorization: `capability === this.authorizedRecoveryCapability`.
+4. **Atomic Linearization Point (Phase 2):** Synchronous root pointer swap:
+   ```typescript
+   this.core = candidateCore;
+   ```
+   Commits all 12 core state fields simultaneously in 1 call frame. Zero fallible mutations may execute after this assignment as part of the logical commit.
+5. **Post-Commit Encapsulation:** Candidate structures are encapsulated inside the engine boundary; no external SDK consumer retains writable references.
+
+#### 8. Receipt-Outcome Ownership & Vector Matrix (R11-A)
+
+| Receipt Outcome | Status Classification | Vector Advanced? | Destination Core Mutated? | Next Custody Holder | Drainer Next Action |
+|---|---|---|---|---|---|
+| `ACCEPTED_REDUCED` | Successful Admission | Yes | Yes (Log + Vector + State) | `EngineCoreState.operationLog` | Releases in-flight slot ($N_{\text{in-flight}} \to 0$); continues drain |
+| `ACCEPTED_PENDING` | Missing Dependency | No | Yes (Pending Queue) | `EngineCoreState.pendingQueue` | Releases in-flight slot ($N_{\text{in-flight}} \to 0$); continues drain |
+| `ALREADY_REPRESENTED` | Deduplicated (Frontier) | No | No (Covered by base) | None (Retired) | Releases in-flight slot ($N_{\text{in-flight}} \to 0$); continues drain |
+| `ALREADY_OWNED_DUPLICATE`| Deduplicated (Log) | No | No (Present in log) | None (Retired) | Releases in-flight slot ($N_{\text{in-flight}} \to 0$); continues drain |
+| `ATTEMPT_INVALIDATED` | Attempt Fenced (M5 New) | No | No (Zero mutation) | `QuarantineBuffer` (head via `unshiftDrain`) | Releases slot after acknowledged transfer; preserves op for next attempt |
+| `CAPACITY_REJECTED` | Transient Backpressure | No | No (Zero mutation) | `QuarantineBuffer` (head via `unshiftDrain`) | Releases slot after acknowledged transfer; halts drain (`HALTED_CAPACITY`) |
+| `TERMINALLY_REJECTED` | Permanent Validation Failure | No | No (Zero mutation) | `TerminalQuarantineArchive` | Releases slot after acknowledged archive; continues drain |
+
+#### 9. Reset-Policy Quarantine Fate Matrix (R11-D, R12-A)
+
+| Reset Strategy | In-Flight Un-linearized Operation Fate | QuarantineBuffer Pending Operations Fate | Already-Linearized Log Operations Fate | When Can Draining Resume? |
+|---|---|---|---|---|
+| **`PURGE_AND_RETRY`** | Receives `ATTEMPT_INVALIDATED`; restored to head of `QuarantineBuffer` via `unshiftDrain(op)` | Retained in buffer custody; re-evaluated against new recovery attempt | Retained in `operationLog`; deduplicated during retry (`ALREADY_REPRESENTED` / `ALREADY_OWNED_DUPLICATE`) | Only after settlement barrier resolves, slot is empty ($N_{\text{in-flight}} = 0$), and new attempt enters `RECONCILING` |
+| **`REINITIALIZE_CLEAN`** | Settles at Step 5 prior to commit; restored to buffer; included in Step 7 atomic retirement transaction | All pending operations atomically committed to `TerminalQuarantineArchive` via Stage 3 transaction (`REINITIALIZE_CLEAN_PURGED`) | Entire engine root replaced with clean baseline anchor via `replaceCoreStateAtomic`; prior log discarded | Pre-reset quarantine is permanently retired; live operation ingestion begins fresh in `ACTIVE` state |
+
+#### 10. Clean Notification Contract & Zero-Notification Clarification (R10-04, R11-D)
+In existing accepted source (`leaderless-sync-engine.ts:883-960`), neither `replaceCoreStateAtomic` nor `setRecoveryMode(false)` pushes to `deferredStateChanges`. Therefore, Step 10 may deliver **zero notifications** unless an explicit clean baseline state change notification is specifically enqueued by caller or implementation. No clean baseline notification is guaranteed to exist automatically.
+- **Observer Boundary Invariant:** No notification is EVER delivered to external listeners before Step 9 reaches `ACTIVE` and recovery mode is `false`. If pre-ACTIVE steps fail, recovery mode is restored, deferred notifications are never flushed, and the engine halts in `DEGRADED`.
 
 ---
 

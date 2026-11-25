@@ -1,6 +1,6 @@
 # Phase 7.5 Milestone M5 — Risk Register
 
-**Status:** APPROVED ARCHITECTURAL SPECIFICATION (MILESTONE M5.0-R11 AMENDED)
+**Status:** APPROVED ARCHITECTURAL SPECIFICATION (MILESTONE M5.0-R12 AMENDED)
 **Date:** 2026-11-25
 **Authoritative Starting Baseline:** `40b11fdafcd247c7a289723f90ec0e2029c94f64` (Phase 7.5 M4.3d Formally Accepted)
 **Accepted Baselines:** M4.3c (`eab2428`), M4.3b (`f3c29b6`), Approved Architecture (`2bb117c`), Frozen M4.2d (`aafa366`)
@@ -125,7 +125,7 @@ Milestone M5 integrates the recovery subsystem directly into `LeaderlessSyncEngi
 
 ---
 
-### R-M5-08: Ambiguous Lifecycle Ownership, Package Boundary, Reset Failures & Teardown Leaks (Closing F5, R2-H5, R3-07, R6-02, R7-02, R8-01, R8-05, R9-07, R10-01, R11-B, R11-C, R11-D)
+### R-M5-08: Ambiguous Lifecycle Ownership, Package Boundary, Reset Failures & Teardown Leaks (Closing F5, R2-H5, R3-07, R6-02, R7-02, R8-01, R8-05, R9-07, R10-01, R11-B, R11-C, R11-D, R12-A, R12-C)
 - **Root Cause:** Unclear lifecycle ownership where active timers retain the coordinator, improper capability checks allow unauthorized replacement, or administrative reset operations fail partway through without failure-atomic cleanup.
 - **Architectural Impact:** Retained background processes, hanging test suites, unauthorized core state replacement, or inconsistent partial state exposed after failed reset.
 - **Mitigation Strategy:**
@@ -135,8 +135,10 @@ Milestone M5 integrates the recovery subsystem directly into `LeaderlessSyncEngi
   - **Failure-Atomic Reset Semantics (R6-02, R7-02):**
     - `PURGE_AND_RETRY`: monotonic attempt counter increment (`currentAttemptId++`) fences all async callbacks and timers from prior attempts; synchronous drainer reset cancels in-flight record ($N_{\text{in-flight}} \le 1$); notifications are permanently suppressed.
     - `REINITIALIZE_CLEAN`: strict 5-step M4.3c sequence; if any post-install step fails, catch block immediately restores `engine.setRecoveryMode(true)`, engine remains in `DEGRADED`, notifications are never flushed, and clean baseline swap remains irrevocable without rolling back to corrupt pre-reset root.
-  - **Unambiguous Custody Resolution & Archive Limits (R10-01, R11-C):** No operation disappears between buffer and in-flight ownership; rejected operations transferred to `TerminalQuarantineArchive` (capped at 500 entries without silent eviction; overflow degrades fail-closed) or restored to `QuarantineBuffer`.
-  - **Reset-Policy Quarantine Fate (R11-D):** `PURGE_AND_RETRY` preserves un-drained buffer ops for retry; `REINITIALIZE_CLEAN` permanently retires pre-reset buffer ops to `TerminalQuarantineArchive` (`REINITIALIZE_CLEAN_PURGED`), prohibiting silent replay into clean baseline.
+  - **Multi-Stage Retirement Transaction with Pre-Reservation (R12-A):** Resolves capacity mismatch between quarantine (1,000 ops / 4 MiB) and archive (500 entries / 2 MiB). Pre-verifies required entries/bytes against available archive capacity; insufficient capacity halts in `DEGRADED` without mutating engine core or buffer.
+  - **Dedicated Archive Administration Capability (R12-C):** `TerminalArchiveAdministrationCapability` separates diagnostic archive export/clear from engine root installation authority. 2-stage export (prepareExport produces detached snapshot without clearing; acknowledgeArchiveExport clears only confirmed entries).
+  - **Unambiguous Custody Resolution & Archive Limits (R10-01, R11-C, R12-D):** No operation disappears between buffer and in-flight ownership; rejected operations transferred to `TerminalQuarantineArchive` (500 entries / 2 MiB / 4 KiB max entry without silent eviction; overflow degrades fail-closed) or restored to `QuarantineBuffer`.
+  - **Reset-Policy Quarantine Fate (R11-D):** `PURGE_AND_RETRY` preserves un-drained buffer ops for retry; `REINITIALIZE_CLEAN` atomically commits pre-reset buffer ops to `TerminalQuarantineArchive` (`REINITIALIZE_CLEAN_PURGED`), prohibiting silent replay into clean baseline.
   - **Deterministic Disposal Propagation:** Calling `engine.dispose()` synchronously calls `this.recoveryCoordinator?.dispose()`.
   - Coordinator disposal is synchronous and idempotent: cancels all timers, clears all buffer queues, unregisters all callbacks, nullifies references, and marks `_isDisposed = true`.
 - **Automated Verification Control:** Teardown and reset failure tests in `recovery-lifecycle-binding.test.ts` verifying zero active timers, listener leaks, attempt fencing, and notification suppression post-failure.

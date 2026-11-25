@@ -1,6 +1,6 @@
 # Phase 7.5 Milestone M5 — Interface Specification
 
-**Status:** APPROVED ARCHITECTURAL SPECIFICATION (MILESTONE M5.0-R11 AMENDED)
+**Status:** APPROVED ARCHITECTURAL SPECIFICATION (MILESTONE M5.0-R12 AMENDED)
 **Date:** 2026-11-25
 **Authoritative Starting Baseline:** `40b11fdafcd247c7a289723f90ec0e2029c94f64` (Phase 7.5 M4.3d Formally Accepted)
 **Accepted Baselines:** M4.3c (`eab2428`), M4.3b (`f3c29b6`), Approved Architecture (`2bb117c`), Frozen M4.2d (`aafa366`)
@@ -446,12 +446,22 @@ export interface IRuntimeRecoveryCoordinator {
   ): void;
 
   /**
-   * Exports and clears the diagnostic terminal quarantine archive under authorized capability.
+   * Prepares a detached immutable export batch of the terminal quarantine archive.
+   * Does NOT clear or mutate the archive.
    * [PROPOSED — M5.1]
    */
-  exportAndClearTerminalArchive(
-    capability: RecoveryInstallationCapability,
-  ): readonly TerminalQuarantineEntry[];
+  prepareArchiveExport(
+    capability: TerminalArchiveAdministrationCapability,
+  ): TerminalArchiveExportBatch;
+
+  /**
+   * Acknowledges successful external receipt and clears the exported archive entries.
+   * [PROPOSED — M5.1]
+   */
+  acknowledgeArchiveExport(
+    exportToken: string,
+    capability: TerminalArchiveAdministrationCapability,
+  ): boolean;
 
   /** Disposes coordinator resources, timers, and listeners. Idempotent. */
   dispose(): void;
