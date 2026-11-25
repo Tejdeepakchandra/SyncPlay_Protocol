@@ -1,6 +1,6 @@
 # Phase 7.5 Milestone M5 — Engine Runtime Recovery Integration Architecture
 
-**Status:** APPROVED ARCHITECTURAL SPECIFICATION (MILESTONE M5.0-R16 AMENDED)
+**Status:** APPROVED ARCHITECTURAL SPECIFICATION (MILESTONE M5.0-R17 AMENDED)
 **Date:** 2026-11-25
 **Authoritative Starting Baseline:** `40b11fdafcd247c7a289723f90ec0e2029c94f64` (Phase 7.5 M4.3d Formally Accepted)
 **Accepted Baselines:** M4.3c (`eab2428`), M4.3b (`f3c29b6`), Approved Architecture (`2bb117c`), Frozen M4.2d (`aafa366`)
@@ -94,7 +94,7 @@ To preserve exact capability custody and single-attachment guarantees without cl
    - **Failure During Engine Construction:** If engine initialization throws after `bindEngine()` has run (e.g. invalid configuration or constructor failure), engine construction unwinds; the engine reference is never published, and the partially constructed engine is reclaimed by garbage collection. An externally injected coordinator bound during a failed constructor call cannot be safely reused and must be discarded.
    - **Engine Disposal:** Invoking `engine.dispose()` invokes `coordinator.dispose()`. Calling `replaceCoreStateAtomic` on a disposed engine throws `SyncEngineError('ENGINE_DISPOSED')`, effectively dead-ending the capability even if a reference is retained externally.
 
-#### 2.1.2 Drain Admission Context Capabilities: Unforgeable Provenance & Package-Boundary Contract (Closing R6-01, R7-01, R8-05, R9-07, R10-01, R10-03, R11-A, R11-B, R12-C, R13-A–R13-E, R14-A–R14-E, R15-A–R15-G, R16-A–R16-D)
+#### 2.1.2 Drain Admission Context Capabilities: Unforgeable Provenance & Package-Boundary Contract (Closing R6-01, R7-01, R8-05, R9-07, R10-01, R10-03, R11-A, R11-B, R12-C, R13-A–R13-E, R14-A–R14-E, R15-A–R15-G, R16-A–R16-D, R17-A–R17-C)
 A typed string (`'LOCAL_REPLAY' | 'REPAIR_BATCH'`) is a declaration of context, not proof of provenance: any caller can supply a string. To prevent accidental trust escalation where untrusted remote operations bypass arrival-rate limits and clock-inflation checks, post-snapshot drain admission is capability-gated:
 
 ```typescript
@@ -234,7 +234,7 @@ export type RemoteAdmissionDecision =
    - **Contract Clarity:** `REJECTED_CAPACITY` is a declared `EngineDecision.code` emitted by the engine, NOT a variant of `RemoteAdmissionDecision`.
    - For local user actions (`receiveLocal` / `submit`), local inputs **do throw** `SyncEngineError('REJECTED_DEGRADED')` synchronously.
 
-### 3.4 Administrative Recovery Reset Semantics, Canonical Entry Accounting, Composite Identity & Publication Atomicity (Closing R6-02, R7-02, R8-01–R8-05, R9-01–R9-06, R10-01–R10-04, R11-A–R11-D, R12-A–R12-D, R13-A–R13-E, R14-A–R14-E, R15-A–R15-G, R16-A–R16-D)
+### 3.4 Administrative Recovery Reset Semantics, Canonical Entry Accounting, Composite Identity & Publication Atomicity (Closing R6-02, R7-02, R8-01–R8-05, R9-01–R9-06, R10-01–R10-04, R11-A–R11-D, R12-A–R12-D, R13-A–R13-E, R14-A–R14-E, R15-A–R15-G, R16-A–R16-D, R17-A–R17-C)
 
 `resetRecovery()` exists strictly as an administrative recovery reset, NOT as a general-purpose escape hatch to clear degradation while leaving incomplete or corrupted state in place.
 
@@ -278,7 +278,7 @@ export type RemoteAdmissionDecision =
   5. The new attempt remains current, authorized, and non-terminal.
   A barrier resolution alone NEVER authorizes a reset continuation; continuation requires current attempt authorization.
 
-#### 3. Complete 10-Step Lifecycle Sequence for Administrative Reset (R12-B, R13-B, R13-E, R14-A, R14-C, R15-A–R15-E, R16-A–R16-D)
+#### 3. Complete 10-Step Lifecycle Sequence for Administrative Reset (R12-B, R13-B, R13-E, R14-A, R14-C, R15-A–R15-E, R16-A–R16-D, R17-A–R17-C)
 
 To reconcile asynchronous settlement with the settlement barrier, canonical entry accounting, transactional retirement, and clean-reset commit, the protocol specifies an authoritative 10-step sequence:
 
@@ -301,7 +301,7 @@ To reconcile asynchronous settlement with the settlement barrier, canonical entr
 6. **Step 6: Settlement Barrier Resolution:** The barrier promise resolves. The in-flight slot is verified empty ($N_{\text{in-flight}} == 0$).
    - If the attempt was previously latched as `TIMED_OUT` or `INVALIDATED`, continuation execution terminates immediately with zero side-effects.
    - If valid, coordinator transitions `attempt.status = 'SETTLED'`.
-7. **Step 7: Transactional Quarantine Ownership Transfer & Zero-Custody Verification (R13-A, R14-A, R14-B, R14-C, R15-A–R15-E, R16-A–R16-D):**
+7. **Step 7: Transactional Quarantine Ownership Transfer & Zero-Custody Verification (R13-A, R14-A, R14-B, R14-C, R15-A–R15-E, R16-A–R16-D, R17-A–R17-C):**
    - Under `REINITIALIZE_CLEAN`:
      - **Pre-Condition Check:** Step 6 has resolved and confirmed `quarantineDrainer.inFlightRecord === null` ($N_{\text{in-flight}} == 0$) and `quarantineDrainer.isDraining === false`. All uncommitted operations reside strictly within `QuarantineBuffer`.
      - **Atomic 11-Stage Retirement Execution:** Executes the 11-stage canonical retirement transaction (Section 3.4.4): discovers composite operation identities, validates length-prefixed keys with UTF-8 byte lengths, constructs detached `TerminalQuarantineEntry` records, measures canonical UTF-8 bytes using `TextEncoder`, pre-reserves capacity in `TerminalArchiveCoreState` (Option A), atomically commits the batch via candidate-root swap, and coordinates with `QuarantineBuffer` to retire the source operations under Option A.
@@ -316,7 +316,7 @@ To reconcile asynchronous settlement with the settlement barrier, canonical entr
 10. **Step 10: Notification Release:**
     - Under `REINITIALIZE_CLEAN`, `engine.flushDeferredNotifications()` dispatches deferred notifications via non-throwing dispatch (delivering 0 notifications if none were enqueued, preserving the zero-notification contract).
 
-#### 4. R16-D — Portable Composite Identity Encoding & Full-Identity Quarantine Matching, and R15-G — Portable Canonical Byte Ownership
+#### 4. R16-D — Portable Composite Identity Encoding & Full-Identity Quarantine Matching, and R17-B — Nested Records & Canonical Bytes
 
 ##### Source Grounding & Schema Reconciliation (R15-E, R16-D)
 In accepted source code (`packages/sync-engine/src/recovery/quarantine-buffer.ts:43-50, 167-172` and `packages/sync-engine/src/engine/leaderless-sync-engine.ts:982-995`), operation identity operates at two distinct layers:
@@ -385,20 +385,19 @@ In `QuarantineBuffer`, operations are indexed by the 2-field key `${op.originPee
    - If all 4 fields match: exact identity hit $\to$ processed idempotently.
    - If `originPeerId` and `sequenceNumber` match, but `membershipEpoch` or `logicalEventId` differ: **REJECTS FAIL-CLOSED** with `SyncEngineError('RETIREMENT_BATCH_CONFLICT')`. This collision signifies a divergent or split-brain payload attempting to retire under an existing sequence slot. Clean reset is immediately aborted, quarantine custody is retained, and zero operations are deleted.
 
-##### Portable Canonical Wire Byte Ownership (R15-G, R16-A)
-1. **Universal UTF-8 Byte Measurement:**
-   Byte measurement is strictly specified using the universal Web standard:
-   ```typescript
-   const wireByteLength = new TextEncoder().encode(canonicalJson).length;
-   ```
-2. **Private Canonical Wire Byte Ownership:**
-   `TerminalQuarantineEntry` privately owns the serialized canonical wire bytes as an immutable `Uint8Array`.
-   To prevent caller mutation, all queries, exports, and accessors return defensive detached copies:
-   ```typescript
-   const exposedBytes = new Uint8Array(entry.canonicalWireBytes);
-   ```
+##### Nested Records & Canonical Wire Byte Protection (R15-G, R16-A, R17-B)
+1. **Shallow vs. Deep Object Immutability:**
+   In JavaScript, `Object.freeze()` is strictly shallow: it prevents mutation of own properties of the target object, but does NOT freeze referenced nested objects. All nested plain records (such as `TerminalQuarantineEntry` and `QuarantineRetirementTransactionRecord`) are independently frozen before being placed into parent collections.
+2. **TypedArray Non-Freezability & Detached Copying (R17-B):**
+   Non-empty TypedArrays (`Uint8Array`) **cannot be frozen** via `Object.freeze()` (calling `Object.freeze()` on a non-empty `Uint8Array` throws a `TypeError: Cannot freeze array buffer views with elements` in strict mode in V8). TypedArrays are therefore managed as **private, encapsulated backing storage**:
+   - `TerminalQuarantineEntry` privately holds `canonicalWireBytes: Uint8Array`.
+   - Accessors, receipts, and export batches never expose this internal array directly; they return a fresh detached defensive clone:
+     ```typescript
+     const exposedBytes = new Uint8Array(entry.canonicalWireBytes);
+     ```
+   - Mutating `exposedBytes` modifies only the caller's copy; the archive's internal byte representation remains 100% unaltered.
 3. **Single Immutable Staged Representation:**
-   The exact byte length measurement, the SHA-256 digest computation (`crypto.subtle.digest('SHA-256', stagedBytes)`), and the bytes committed to `TerminalQuarantineArchive` are derived from the **exact same immutable staged `Uint8Array`**.
+   The exact byte length measurement (`new TextEncoder().encode(canonicalJson).length`), the SHA-256 digest computation (`crypto.subtle.digest('SHA-256', stagedBytes)`), and the bytes committed to `TerminalQuarantineArchive` are derived from the **exact same immutable staged `Uint8Array`**.
 4. **Strict 4,096-Byte Entry Boundary & Oversized Quarantining:**
    - Individual complete serialized entries cannot exceed 4,096 canonical wire bytes (`MAX_TERMINAL_ENTRY_SERIALIZED_BYTES = 4096`).
    - If an operation produces a complete terminal entry exceeding 4,096 bytes, it **CANNOT** be admitted to `TerminalQuarantineArchive`.
@@ -406,12 +405,12 @@ In `QuarantineBuffer`, operations are indexed by the 2-field key `${op.originPee
    - Oversized operations are **NEVER truncated, corrupted, or silently discarded**.
    - Dual archive bounds remain strictly enforced: max 500 entries (`MAX_TERMINAL_ARCHIVE_ENTRIES = 500`), max 2 MiB aggregate wire bytes (`MAX_TERMINAL_ARCHIVE_TOTAL_BYTES = 2097152`), max 4,096 bytes per entry (`MAX_TERMINAL_ENTRY_SERIALIZED_BYTES = 4096`).
 
-##### Authoritative 11-Stage Transaction Lifecycle (R14-A, R15-A–R15-G, R16-A–R16-D)
+##### Authoritative 11-Stage Transaction Lifecycle (R14-A, R15-A–R15-G, R16-A–R16-D, R17-A–R17-C)
 1. **Stage 1 (Quarantine Generation Freeze):** Coordinator freezes the current quarantine generation (`quarantineBuffer.freezeGeneration()`).
 2. **Stage 2 (Settle All In-Flight Work):** Confirms Step 6 settlement has completed: `quarantineDrainer.inFlightRecord === null` ($N_{\text{in-flight}} == 0$) and `quarantineDrainer.isDraining === false`. Restored in-flight operations are locked inside the frozen generation.
 3. **Stage 3 (Retirement Set Discovery):** Constructs an immutable snapshot of all operations in the frozen generation without mutating buffer ownership.
 4. **Stage 4 (Composite Identity & Metadata Validation):** Validates each operation's `CompositeOperationIdentity` (`sequenceNumber`, `originPeerId`, `membershipEpoch`, `logicalEventId`). Computes length-prefixed `canonicalOperationIdentityKey`. Conflicting records fail closed with `RETIREMENT_BATCH_CONFLICT`.
-5. **Stage 5 (Complete Detached Entry Construction):** Constructs complete detached `TerminalQuarantineEntry` records (`rejectionStatus: 'REINITIALIZE_CLEAN_PURGED'`), incorporating all envelope metadata.
+5. **Stage 5 (Complete Detached Entry Construction):** Constructs complete detached `TerminalQuarantineEntry` records (`rejectionStatus: 'REINITIALIZE_CLEAN_PURGED'`), shallow-freezing each record independently (`Object.freeze(entry)`).
 6. **Stage 6 (Canonical Serialization):** Canonically serializes each complete `TerminalQuarantineEntry` using RFC 8785 JCS (`canonicalEntryJson = canonicalize(entry)`).
 7. **Stage 7 (Portable UTF-8 Byte Measurement):** Measures exact wire bytes using `new TextEncoder().encode(canonicalEntryJson).length`. Asserts each entry $\le 4096$ bytes. Computes aggregate complete entry bytes $B_{\text{complete}} = \sum b_i$.
 8. **Stage 8 (Immutable Wire Bytes Packaging):** Encodes canonical JSON into private `Uint8Array` stored in `entry.canonicalWireBytes`.
@@ -419,25 +418,26 @@ In `QuarantineBuffer`, operations are indexed by the 2-field key `${op.originPee
 10. **Stage 10 (Candidate-Root Archive Commit - Option A):** Invokes `archive.commitRetirementBatch(retirementTxId, batchDigest, reservationId, stagedBatch)`. Atomically linearizes entry publication, transaction recording, and reservation consumption via single pointer replacement.
 11. **Stage 11 (Atomic Source Retirement & Dual Custody Verification):** Invokes `quarantineBuffer.retireCommittedBatch(operationIdentities, capability)` under Option A (atomic source retirement). Coordinator asserts BOTH `quarantineBuffer.totalRetainedCount === 0` AND `quarantineDrainer.inFlightRecord === null`.
 
-#### 5. R16-A — Candidate Root Exclusive Ownership, R16-B — Archive Reservation Linearization (Option A) & R16-C — Drainer Custody Reconciliation
+#### 5. R17-A — Published Map Encapsulation & Runtime Ownership, R16-B — Archive Reservation Linearization (Option A) & R16-C — Drainer Custody Reconciliation
 
-##### Candidate-Root Exclusive Ownership (R16-A)
-TypeScript compile-time annotations (`readonly`, `ReadonlyArray`, `ReadonlyMap`) are completely erased at runtime and provide zero runtime immutability against aliasing mutations. If a construction builder retains a mutable reference to an array or map and modifies it after publication, or if a public getter exposes a backing collection, the published root is corrupted.
+##### Published Map Encapsulation & Runtime Ownership Correction (R17-A)
+In ECMAScript, `Object.freeze(map)` on a JavaScript `Map` object only prevents adding, deleting, or reconfiguring properties on the Map instance wrapper itself. **It does NOT prevent mutating internal Map entries**: `Map.prototype.set()`, `delete()`, and `clear()` operate on the internal `[[MapData]]` slot and remain fully functional even when called on an `Object.freeze()`-ed Map!
 
-To guarantee true exclusive ownership, both `TerminalArchiveCoreState` and `QuarantineBufferCoreState` enforce the **Six Inviolable Exclusive Ownership Rules**:
+Therefore, claiming that `Object.freeze(map)` guarantees runtime immutability is technically false in JavaScript.
 
-1. **Builder Isolation:**
-   All candidate arrays and maps are allocated fresh in local lexical scope. Once publication occurs, builder references go out of scope and cannot be retained, exported, or mutated.
-2. **Runtime Deep & Shallow Freezing:**
-   Every candidate object (`candidateCore`, entry array, transaction map, reservation map) is explicitly passed through `Object.freeze()` before publication.
-3. **No Retained Construction Aliases:**
-   No mutable reference or construction handle survives beyond the publication turn.
-4. **Public Getter Isolation:**
-   Public getters (e.g. `archive.getEntries()`) return fresh defensive detached copies (`Object.freeze([...this._core.entries])`). Internal backing collections are never exposed to callers.
-5. **Canonical Wire Byte Accessor Cloning:**
-   `entry.canonicalWireBytes` returns a defensive detached copy (`new Uint8Array(entry.canonicalWireBytes)`). External mutation of the returned buffer cannot alter archived bytes.
-6. **Pre-Publication Invariant Verification:**
-   All validation, size checks, and allocations occur *prior* to publication. If any check throws, publication never happens.
+To establish defensible runtime immutability and complete encapsulation, the recovery architecture enforces the **Eight Rules of Map Ownership and Encapsulation**:
+
+1. **Private Implementation Details:** Backing `Map` instances are strictly private fields of the owning component (`_core.committedTransactions`, `_core.activeReservations`, `_core.identityIndex`).
+2. **Exclusive Root Ownership:** A published core state object exclusively owns its internal Map instances. No external component holds a reference to these maps.
+3. **Zero Backing Map Exposure:** No public getter, accessor, receipt, callback, or exported structure ever returns or leaks a backing Map reference.
+4. **Lexical Builder Isolation:** In every state transition, candidate maps are allocated fresh in local lexical scope (`const nextMap = new Map(...)`). Once the atomic pointer swap occurs, builder references go out of scope and cannot be retained, exported, or mutated.
+5. **No Post-Publication Mutation:** No method or continuation ever calls `.set()`, `.delete()`, or `.clear()` on a Map belonging to an already-published root.
+6. **Copy-on-Write (CoW) State Transitions:** Every state modification (reservation, cancellation, commit, export) constructs a fresh `Map` and a fresh candidate root object, publishing via a single reference assignment.
+7. **Failure Isolation:** If candidate construction, allocation, or validation throws, the authoritative published root remains 100% unaltered.
+8. **Safe Detached Public Read Operations:** Public read queries return safe representations:
+   - `archive.getTransaction(id)` returns a shallow-frozen record copy: `existingRecord ? Object.freeze({ ...existingRecord }) : undefined`.
+   - `archive.hasTransaction(id)` returns a primitive boolean.
+   - `archive.getEntries()` returns a shallow-frozen detached Array copy: `Object.freeze([...this._core.entries])`.
 
 ```typescript
 export interface TerminalArchiveCoreState {
@@ -519,25 +519,28 @@ commitRetirementBatch(
     throw new SyncEngineError('BATCH_BYTE_MISMATCH', 'Staged batch byte total does not match reservation');
   }
 
-  // 4. Assemble candidate maps with builder isolation
+  // 4. Assemble candidate maps with builder isolation (CoW)
   const nextReservations = new Map(this._core.activeReservations);
   nextReservations.delete(reservationId); // Linearized reservation consumption!
 
   const nextTransactions = new Map(this._core.committedTransactions);
-  nextTransactions.set(retirementTransactionId, Object.freeze({
+  const txRecord: QuarantineRetirementTransactionRecord = Object.freeze({
     transactionId: retirementTransactionId,
     outcome: 'COMMITTED',
     entryCount: stagedBatch.length,
     totalSerializedBytes: batchBytes,
     batchDigest,
     committedAtMs: Date.now(),
-  }));
+  });
+  nextTransactions.set(retirementTransactionId, txRecord);
 
   // 5. Construct candidate root and publish atomically
+  // The outer root object and entries array are shallow-frozen via Object.freeze().
+  // Maps are private encapsulated structures owned exclusively by the root (R17-A).
   const candidateCore: TerminalArchiveCoreState = Object.freeze({
     entries: Object.freeze([...this._core.entries, ...stagedBatch]),
-    committedTransactions: Object.freeze(nextTransactions),
-    activeReservations: Object.freeze(nextReservations),
+    committedTransactions: nextTransactions, // Private encapsulated Map
+    activeReservations: nextReservations,       // Private encapsulated Map
     totalBytes: this._core.totalBytes + batchBytes,
     size: this._core.size + stagedBatch.length,
     archiveGeneration: this._core.archiveGeneration + 1,
@@ -612,7 +615,7 @@ stateDiagram-v2
     ZeroCustody --> CleanActive: installCleanBaseline() -> ACTIVE
 ```
 
-##### Complete Transaction Failure Recovery Matrix (R14-C, R15-A–R15-G, R16-A–R16-D)
+##### Complete Transaction Failure Recovery Matrix (R14-C, R15-A–R15-G, R16-A–R16-D, R17-A–R17-C)
 
 | Failure Scenario | Engine State | QuarantineBuffer Custody | TerminalQuarantineArchive Custody | Coordinator Transaction State | Recovery Action |
 |:---|:---|:---|:---|:---|:---|
@@ -631,7 +634,7 @@ stateDiagram-v2
 
 **Hard Invariant:** Clean-root installation is strictly forbidden until every operation in the retirement set has unambiguous terminal custody and dual zero-custody verification confirms zero remaining operations in buffer and drainer.
 
-#### 6. R15-F — Export Lease, Generation-Independent Acknowledgement & Tombstone Governance (R16-A Aligned)
+#### 6. R15-F — Export Lease, Generation-Independent Acknowledgement & Tombstone Governance (R16-A, R17-A Aligned)
 
 ##### Dedicated Capability Contract
 Archive administration requires `TerminalArchiveAdministrationCapability` (`TERMINAL_ARCHIVE_BRAND`). Possession of `RecoveryInstallationCapability` does NOT grant archive export authority.
@@ -640,7 +643,7 @@ Archive administration requires `TerminalArchiveAdministrationCapability` (`TERM
 - `TerminalQuarantineArchive` enforces at most **one** active export lease at any time.
 - Calling `prepareArchiveExport()` while an unacknowledged lease exists is rejected with `SyncEngineError('ARCHIVE_EXPORT_IN_PROGRESS')`.
 
-##### Generation-Independent Export Acknowledgement (R15-F, R16-A)
+##### Generation-Independent Export Acknowledgement (R15-F, R16-A, R17-A)
 When an export batch is prepared at archive generation $G$, it captures an immutable snapshot of entries and assigns an `ArchiveExportLease`.
 If subsequent retirement transactions commit to the archive before export acknowledgement, the archive's internal generation advances to $G' > G$.
 

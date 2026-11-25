@@ -1,6 +1,6 @@
 # Phase 7.5 Milestone M5 — Interface Specification
 
-**Status:** APPROVED ARCHITECTURAL SPECIFICATION (MILESTONE M5.0-R16 AMENDED)
+**Status:** APPROVED ARCHITECTURAL SPECIFICATION (MILESTONE M5.0-R17 AMENDED)
 **Date:** 2026-11-25
 **Authoritative Starting Baseline:** `40b11fdafcd247c7a289723f90ec0e2029c94f64` (Phase 7.5 M4.3d Formally Accepted)
 **Accepted Baselines:** M4.3c (`eab2428`), M4.3b (`f3c29b6`), Approved Architecture (`2bb117c`), Frozen M4.2d (`aafa366`)
@@ -531,7 +531,7 @@ export type RemoteAdmissionDecision =
 
 ---
 
-### 3.3 Terminal Quarantine Archive Governance, Atomic Retirement & Export Contracts (R12-A–R12-D, R13-A–R13-D, R14-A–R14-E, R15-A–R15-G, R16-A–R16-D)
+### 3.3 Terminal Quarantine Archive Governance, Atomic Retirement & Export Contracts (R12-A–R12-D, R13-A–R13-D, R14-A–R14-E, R15-A–R15-G, R16-A–R16-D, R17-A–R17-C)
 
 ```typescript
 // ── Module Branding & Custody Symbols [PROPOSED — M5.1] ─────────────────────
@@ -609,7 +609,7 @@ export interface TerminalQuarantineEntry {
   readonly sequenceNumber: number;            // Monotonic sequence number
   readonly membershipEpoch: number;           // Membership configuration epoch
   readonly logicalEventId: string;            // Unique logical event identifier
-  readonly canonicalWireBytes: Uint8Array;    // Privately owned immutable canonical wire bytes (RFC 8785 UTF-8)
+  readonly canonicalWireBytes: Uint8Array;    // Private backing storage (RFC 8785 UTF-8); accessors return detached copies (R17-B)
   readonly byteLength: number;                // Exact byte length (new TextEncoder().encode(canonicalJson).length <= 4096)
   readonly rejectionStatus: TerminalRejectionStatus;
   readonly reason: string;
@@ -626,6 +626,14 @@ export interface ArchiveReservationRecord {
   readonly expiresAtMs: number;
 }
 
+/**
+ * Authoritative immutable candidate-root state for TerminalQuarantineArchive.
+ * Outer root object and entries array are shallow-frozen with Object.freeze().
+ * Backing Map instances (committedTransactions, activeReservations) are strictly
+ * private encapsulated structures owned exclusively by the root: they are never
+ * mutated post-publication, never exposed directly to external callers, and
+ * cannot be made immutable via Object.freeze(map) in JavaScript (R17-A).
+ */
 export interface TerminalArchiveCoreState {
   readonly entries: ReadonlyArray<TerminalQuarantineEntry>;
   readonly committedTransactions: ReadonlyMap<string, QuarantineRetirementTransactionRecord>;
@@ -635,6 +643,11 @@ export interface TerminalArchiveCoreState {
   readonly archiveGeneration: number;
 }
 
+/**
+ * Authoritative candidate-root state for QuarantineBuffer under Option A.
+ * Outer root object and queues are shallow-frozen with Object.freeze().
+ * identityIndex Map is privately encapsulated and never mutated post-publication (R17-A).
+ */
 export interface QuarantineBufferCoreState {
   readonly activeQueue: ReadonlyArray<QuarantinedOperation>;
   readonly drainBatch: ReadonlyArray<QuarantinedOperation>;

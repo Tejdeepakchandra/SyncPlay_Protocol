@@ -1,6 +1,6 @@
 # Phase 7.5 Milestone M5 — Implementation Roadmap
 
-**Status:** APPROVED ARCHITECTURAL SPECIFICATION (MILESTONE M5.0-R16 AMENDED)
+**Status:** APPROVED ARCHITECTURAL SPECIFICATION (MILESTONE M5.0-R17 AMENDED)
 **Date:** 2026-11-25
 **Authoritative Starting Baseline:** `40b11fdafcd247c7a289723f90ec0e2029c94f64` (Phase 7.5 M4.3d Formally Accepted)
 **Accepted Baselines:** M4.3c (`eab2428`), M4.3b (`f3c29b6`), Approved Architecture (`2bb117c`), Frozen M4.2d (`aafa366`)
@@ -34,7 +34,7 @@ flowchart TD
 
 ## 2. Sub-Milestone Detailed Specifications
 
-### Milestone M5.0: Runtime Integration Architecture Audit & Final Consistency Closure (Amended M5.0-R16)
+### Milestone M5.0: Runtime Integration Architecture Audit & Final Consistency Closure (Amended M5.0-R17)
 - **Role:** Independent Senior TypeScript Distributed-Systems Architect
 - **Status:** CURRENT MILESTONE (Planning Only)
 - **Objective:** Complete source audit, close review findings across R1 through R6, and author final consistent architecture specifications for M5.
@@ -49,7 +49,7 @@ flowchart TD
   - Qualify performance benchmark contract (Node.js LTS reference environment vs browser runtimes) and clarify young-gen / escape analysis allocation claims (R3-08).
   - Specify capability-gated trust context provenance (`DrainAdmissionContext = TrustedLocalReplayCapability | TrustedRepairBatchCapability`) verified via strict reference identity, eliminating caller-supplied string vulnerability and preventing accidental trust escalation (R6-01).
   - Enforce canonical ordering feasibility check against compacted snapshots ($L(A) > \text{snapshot.maxLogicalTimestamp}$ and $\forall p,\ L(A) > \text{originFrontierTimestamps}[p]$) and explicit incompatibility gate (`INCOMPATIBLE_COMPACTED_HISTORY` aborting to `DEGRADED`) to prevent SMR total-order inversion ($A \prec B$ hazard), preserving causal dependency validation (R5-02).
-  - Formalize candidate-root exclusive ownership across `TerminalArchiveCoreState` and `QuarantineBufferCoreState` with builder isolation, runtime freezing, and detached getter cloning (R16-A), Option A archive reservation linearization integrating `activeReservations` directly into the candidate root (R16-B), QuarantineBuffer and QuarantineDrainer physical custody separation, settlement barrier synchronization, and dual zero-custody verification (R16-C), and portable UTF-8 length-prefixed composite identity encoding (`opid:...`) with full 4-field verification on index hits (R16-D).
+  - Formalize published Map encapsulation across `TerminalArchiveCoreState` and `QuarantineBufferCoreState` under the Eight Rules of Map Ownership (distinguishing shallow `Object.freeze` from Map encapsulation, R17-A), private typed array storage with detached `Uint8Array` accessor cloning (R17-B), Option A archive reservation linearization integrating `activeReservations` directly into the candidate root (R16-B), QuarantineBuffer and QuarantineDrainer physical custody separation, settlement barrier synchronization, and dual zero-custody verification (R16-C), and portable UTF-8 length-prefixed composite identity encoding (`opid:...`) with full 4-field verification on index hits (R16-D).
   - Resolve `REINITIALIZE_CLEAN` exact notification ordering (Step 1 purges stale notifications; Step 2 installs clean baseline; Step 3 disengages recovery mode; Step 4 transitions coordinator to ACTIVE; Step 5 dispatches clean baseline notifications) and define non-throwing listener dispatch with isolated error handling, explicit irreversible external effect boundaries, and zero-notification delivery clarification (R8-03, R8-04, R9-06, R10-04, R11-D).
   - Formalize package boundary guarantee (`package.json` root `.` export only, prohibiting supported public package subpath imports of internal custody module), runtime shallow immutability (`Object.freeze`), private transfer bundle (`AuthorizedDrainCapabilities`), `bindEngine()` single-attachment composition root scope, and absence of capability getters (R6-01, R7-01, R8-05, R9-07).
   - Formalize capability custody and operation provenance distinction: capability grants admission authority, but payload provenance is strictly enforced (`stashedLocalQueue` exclusivity, prohibition of remote relabeling, and identity hash verification $H(op) == H(log)$) (R6-03, R7-03).
