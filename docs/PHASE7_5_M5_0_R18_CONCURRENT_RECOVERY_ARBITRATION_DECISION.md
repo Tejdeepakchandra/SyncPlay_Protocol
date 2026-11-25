@@ -1,33 +1,33 @@
-# Phase 7.5 M5.0-R18-R12 — Atomic Settlement-Obligation Publication and Linearization Terminology
+# Phase 7.5 M5.0-R18-R13 — Runtime Immutability, Pre-Publication Allocation and Root Ownership Closure
 **Concurrent Recovery Arbitration & Authoritative Settlement Architecture Decision**
 
 **Status:** PROPOSED ARCHITECTURAL AMENDMENT TO FROZEN M5.0 SPECIFICATIONS (DECISION DOCUMENT ONLY)
 **Author:** Principal TypeScript Distributed-Systems Architect and Recovery-Systems Auditor
-**Baseline Commit:** `c04e3596639933363024d91feb268aea63d1f0a7` (M5.0-R18-R11)
-**Direct Parent Commit:** `c04e3596639933363024d91feb268aea63d1f0a7`
-**Authorization Scope:** M5.0-R18-R12 is strictly a documentation-only architectural proposal. No production source code, tests, configuration, package exports, or frozen M5.0 specifications may be modified. Implementation of Milestone M5.1 remains **STRICTLY BLOCKED AND UNAUTHORIZED**.
+**Baseline Commit:** `6888dd346c74004d4e385b5eb03d91466c957aa9` (M5.0-R18-R12)
+**Direct Parent Commit:** `6888dd346c74004d4e385b5eb03d91466c957aa9`
+**Authorization Scope:** M5.0-R18-R13 is strictly a documentation-only architectural proposal. No production source code, tests, configuration, package exports, or frozen M5.0 specifications may be modified. Implementation of Milestone M5.1 remains **STRICTLY BLOCKED AND UNAUTHORIZED**.
 
 ---
 
-## 1. Problem Statement & R18-R12 Objectives
+## 1. Problem Statement & R18-R13 Objectives
 
-In Phase 7.5 Sub-Milestones M5.0-R18-R10 and R18-R11, we established an authoritative evidence model and defined an intermediate recovery state (`CUSTODY_RELEASED_BARRIER_PENDING`). However, the subsequent distributed-systems audit revealed that the transition into this intermediate state was described as a sequence of discrete object mutations (e.g. releasing drainer custody and then recording the settlement obligation in the coordinator's ledger).
+In Phase 7.5 Sub-Milestones M5.0-R18-R10 through R18-R12, we developed an authoritative evidence model and an atomic root-publication pattern (`this.#custodyRoot = candidateRoot`). However, a rigorous distributed-systems and JavaScript runtime audit identified six remaining architectural precision gaps:
 
-In an asynchronous distributed architecture running on a single-threaded JavaScript runtime, sequential property assignments across separate subsystem objects are **not atomic**. If an exception (such as memory exhaustion, unhandled rejection, or heap allocation failure) occurs between releasing custody and recording the obligation, or if another subsystem observes the drainer during this transition, the released operation could become unrecoverable or appear ownerless without an authoritative discoverable obligation.
+1. **Misconception of `Object.freeze()` on JavaScript Collections:** `Object.freeze()` on a `Map` or `Set` instance freezes only property additions/deletions on the instance object; it does **not** disable internal methods such as `Map.prototype.set`, `Map.prototype.delete`, or `Map.prototype.clear`. Calling `Object.freeze(new Map())` leaves the collection completely mutable at runtime. Furthermore, TypeScript's `ReadonlyMap<K, V>` is purely a compile-time type restriction that provides zero runtime protection.
+2. **Unclosed Mutable Aliases & Byte Buffer Vulnerabilities:** Internal and external caller-controlled references (e.g. `expectedOwner`, `preparedEvidence`, receipts, and byte array batch digests) could be mutated after validation if not defensively cloned on ingress and egress. `Uint8Array` views can be mutated in place even if the view object is frozen.
+3. **Post-Publication Allocation in Code Examples:** R18-R12's pseudocode performed `this.#custodyRoot = candidateRoot` followed by `return { releaseReceipt, obligation }`. Allocating the return object *after* the root replacement contradicted the claim of zero post-publication allocation. If memory allocation fails after publication, the root is updated but the caller receives an unhandled exception without receiving the return values.
+4. **Underspecified Generation Collision & Sequence Exhaustion:** The behavior when candidate generation $g$ is already occupied was not fully formalized, nor was safe-integer validation (`Number.MAX_SAFE_INTEGER`) specified to prevent sequence overflow.
+5. **Acquisition Serialization Contract:** While `drainNext()` was serialized, a uniform acquisition contract covering all custody-acquisition paths (recovery attempt admission, retries, resets) was not formalized to prevent check-then-acquire races across all entry points.
+6. **Clock Semantics Ambiguity:** Wall-clock timestamps (`Date.now()`) were mixed with elapsed duration measurements. Wall-clock regression (due to NTP sync or leap seconds) could corrupt duration calculations or fencing decisions if not decoupled from monotonic clocks.
 
-Furthermore, previous revisions conflated synchronous execution with atomicity and barrier resolution. Precise architectural boundaries require distinguishing three independent distributed-systems guarantees.
+### Core Architectural Guarantees Established in R18-R13:
 
-### Core Architectural Guarantees Established in R18-R12:
-
-1. **Inseparable Atomic Publication of Release & Settlement Obligation:** Custody release and the publication of its corresponding pending-settlement obligation are published via **one single synchronous reference replacement** of an authoritative root object (`this.#custodyRoot = candidateRoot`). The released state (`inFlightRecord: null`) can **never** become externally observable without its corresponding obligation already being discoverable in `pendingSettlementObligations`.
-2. **Complete Obligation Recovery Payload:** The published obligation encapsulates all six required recovery items: released custody state, 5-field owner identity, generation-scoped obligation identity, exact transaction/operation identities, barrier identity/generation, and pre-allocated release receipt evidence.
-3. **Strict Separation of Three Guarantees & Precise Terminology:**
-   - **Non-interleavable execution:** A synchronous execution segment containing zero `await` expressions, Promise continuations, or microtask yields.
-   - **Atomic publication:** The single synchronous assignment replacing the authoritative state root reference (`this.#custodyRoot = candidateRoot`), providing exception-atomic state transition.
-   - **Barrier linearization:** The definitive execution of `barrier.resolveWithEvidence(finalEvidence)`, permanently resolving the generation-scoped settlement barrier.
-4. **Exception Safety & Elimination of Impossible Rollback:** All fallible allocations, structural clonings, and validations are executed privately during a reversible preparation phase *prior* to publication. Once the atomic state reference is replaced, custody is released and the obligation is authoritative; the operation is **never** restored to the old in-flight slot.
-5. **Generation Fencing & Check-Then-Acquire Race Immunity:** Every path capable of acquiring, dequeuing, or replacing custody (`drainNext()`, recovery admission, retries) evaluates the authoritative pending-obligation ledger. The validation and in-flight installation occur within the same atomic root replacement, rendering check-then-acquire races mathematically impossible.
-6. **Future Deterministic Test Suite:** Codifies twenty-five deterministic test specifications for Sub-Milestone M5.1, explicitly covering atomic publication, obligation discoverability, check-then-acquire race immunity, and receipt security boundaries.
+- **True Runtime Immutability via `#private` Encapsulated Collections:** Replaces reliance on `Object.freeze(Map)` with an explicit runtime-immutable wrapper (`ImmutableMap`) backed by ECMAScript `#private` fields that throw on any mutation attempt.
+- **Complete Ingress/Egress Alias Closure:** Enforces defensive cloning of all tokens, receipts, and byte buffers (`Uint8Array`) on both ingress and egress, ensuring that callers cannot mutate published state.
+- **Strict Pre-Publication Allocation (Zero Post-Publication Allocation):** The complete return result (`publicationResult`) and all associated receipts are fully allocated and frozen *before* the authoritative root reference replacement. The successful return path performs zero post-publication allocations.
+- **Generation Collision Handling & Safe-Integer Fencing:** Occupied generations reject conflicting obligations with `GENERATION_COLLISION_OCCUPIED_BY_DIFFERENT_OBLIGATION` while permitting exact idempotent retries. Generations are validated via `Number.isSafeInteger()`, failing closed upon sequence exhaustion.
+- **Unified Acquisition Serialization Contract:** Enforces a 5-step serialized acquisition rule across all custody entry points, eliminating check-then-acquire races.
+- **Decoupled Clock Semantics:** Restricts wall-clock timestamps to diagnostic metadata and mandates monotonic clocks (`performance.now()` / `process.hrtime.bigint()`) for all elapsed-time measurements.
 
 ---
 
@@ -39,7 +39,7 @@ A correct recovery arbitration architecture must strictly distinguish three inde
 ┌─────────────────────────────────────────────────────────────────────────────┐
 │ 1. Administrative Attempt Ownership (Recovery Coordinator)                 │
 │    - Governed by monotonic recoveryAttemptId (e.g. Attempt 1 vs. Attempt 2).│
-│    - Fenced via Attempt Fencing Tokens and watchdog timers.                 │
+│    - Fenced via Attempt Fencing Tokens and monotonic watchdog timers.       │
 ├─────────────────────────────────────────────────────────────────────────────┤
 │ 2. Authoritative Custody Root (QuarantineDrainer & Custody Gate)            │
 │    - Governed by this.#custodyRoot (AuthoritativeCustodyRoot).              │
@@ -247,7 +247,7 @@ To eliminate reliance on implicit assumptions:
 
 ---
 
-## 9. Process Failure Model
+## 9. Process Failure Model & Clock Semantics
 
 The recovery architecture operates under a single-node, process-volatile failure model:
 
@@ -255,6 +255,11 @@ The recovery architecture operates under a single-node, process-volatile failure
 - Durability across process crashes is governed by persistent append-logs outside M5.0.
 - Single-threaded event loop execution guarantees that synchronous mutations within a turn cannot be interleaved by other JavaScript microtasks.
 - Asynchronous Promise settlement, timer events, and transport I/O interleave between execution turns.
+
+### Decoupled Clock Semantics:
+- **Diagnostic Wall-Clock Metadata:** Wall-clock timestamps (`Date.now()`, ISO-8601 strings) are purely diagnostic metadata. They **must never** determine causal ordering, attempt fencing, receipt validity, generation ordering, or settlement correctness.
+- **Monotonic Clocks for Durations & Fencing:** All elapsed durations, timeouts, and watchdog intervals must be measured using a monotonic clock source (`performance.now()` or `process.hrtime.bigint()`). Monotonic clocks are immune to NTP adjustments, system time shifts, and leap seconds.
+- **Duration Representation & Validation:** If elapsed duration cannot be determined (e.g. clock source error), the field is represented as `null`, and logged diagnostically; safety predicates never rely on elapsed duration values.
 
 ---
 
@@ -298,7 +303,7 @@ When an asynchronous network request or destination Promise fails or drops:
 
 ---
 
-## 12. Complete Custody Authorization, Receipt Boundary, Atomic Root Publication & Linearization
+## 12. Complete Custody Authorization, Receipt Boundary, Runtime Immutability & Pre-Publication Protocol
 
 ### 12.1 Five-Field Ownership Comparison & Equivalence Predicate
 
@@ -363,6 +368,7 @@ export interface ExecutionSettlementReceipt {
   readonly identity: CustodyOwnershipToken;
   readonly settlementType: 'FULFILLED' | 'REJECTED';
   readonly settledAtTimestamp: number;
+  readonly monotonicSettledMs: number;
   readonly errorDetails?: string;
 }
 
@@ -371,8 +377,9 @@ export interface ArchiveDispositionReceipt {
   readonly identity: CustodyOwnershipToken;
   readonly disposition: 'COMMITTED' | 'ABORTED_FENCED';
   readonly confirmedGeneration: number;
-  readonly archivedBatchDigest: string;
+  readonly archivedBatchDigest: string; // Hex string representation
   readonly arbitratedAtTimestamp: number;
+  readonly monotonicArbitratedMs: number;
 }
 ```
 
@@ -402,6 +409,7 @@ export interface SourceQuarantineRetirementReceipt {
   readonly sourceBufferDisjoint: true;
   readonly retiredOperationCount: number;
   readonly retiredTimestamp: number;
+  readonly monotonicRetiredMs: number;
 }
 
 // For ABORTED_FENCED transactions restored to source:
@@ -415,6 +423,7 @@ export interface RestoredToSourceReceipt {
   readonly sourceRetainsExclusiveOwnership: true;
   readonly accountedFor: true;
   readonly restoredTimestamp: number;
+  readonly monotonicRestoredMs: number;
 }
 
 // For ABORTED_FENCED transactions transferred to an authorized destination:
@@ -428,6 +437,7 @@ export interface TransferredToDestinationReceipt {
   readonly destinationExclusiveOwnershipAccepted: true;
   readonly accountedFor: true;
   readonly transferredTimestamp: number;
+  readonly monotonicTransferredMs: number;
 }
 
 export type AbortedFencedReconciliationReceipt =
@@ -456,8 +466,9 @@ export interface DrainerCustodyReleaseReceipt {
   readonly [DRAINER_RELEASE_BRAND]: true;
   readonly identity: CustodyOwnershipToken;
   readonly releasedCustodyGeneration: number;
-  readonly previousInFlightDurationMs: number;
+  readonly previousInFlightDurationMs: number | null;
   readonly releasedAtTimestamp: number;
+  readonly monotonicReleasedMs: number;
 }
 ```
 
@@ -558,14 +569,78 @@ To ensure mathematical precision across concurrent operations, the architecture 
 
 ---
 
-### 12.9 The Atomic Authoritative Custody Root Publication Protocol
+### 12.9 Runtime Immutability of Published Collections
 
-To eliminate the vulnerability where custody release and settlement obligation publication could become separated, both transitions are unified inside a single immutable root structure:
+In ECMAScript, calling `Object.freeze()` on a `Map` or `Set` instance freezes only properties on the object wrapper itself; it **does not** disable internal methods (`.set()`, `.delete()`, `.clear()`). Furthermore, TypeScript's `ReadonlyMap<K, V>` is purely a compile-time type restriction stripped during compilation.
+
+To achieve **actual runtime immutability**, all collections published by `AuthoritativeCustodyRoot` must use an encapsulated class backed by ECMAScript private fields:
+
+```typescript
+export class ImmutableMap<K, V> {
+  readonly #inner: Map<K, V>;
+
+  constructor(entries?: Iterable<readonly [K, V]>) {
+    this.#inner = new Map(entries);
+    Object.freeze(this);
+  }
+
+  get(key: K): V | undefined { return this.#inner.get(key); }
+  has(key: K): boolean { return this.#inner.has(key); }
+  get size(): number { return this.#inner.size; }
+  keys(): IterableIterator<K> { return this.#inner.keys(); }
+  values(): IterableIterator<V> { return this.#inner.values(); }
+  entries(): IterableIterator<[K, V]> { return this.#inner.entries(); }
+  forEach(callback: (value: V, key: K, map: this) => void): void {
+    this.#inner.forEach((v, k) => callback(v, k, this));
+  }
+  [Symbol.iterator](): IterableIterator<[K, V]> { return this.#inner.entries(); }
+
+  // Mutating methods explicitly throw at runtime:
+  set(): never { throw new TypeError('ImmutableMap cannot be mutated at runtime'); }
+  delete(): never { throw new TypeError('ImmutableMap cannot be mutated at runtime'); }
+  clear(): never { throw new TypeError('ImmutableMap cannot be mutated at runtime'); }
+}
+```
+
+Because `#inner` is completely private and mutating methods unconditionally throw, no caller can mutate published collections through any public or internal alias.
+
+#### Defensive Handling of Byte Arrays:
+For all byte arrays (e.g. batch digests, binary payloads):
+- **On Ingress:** Byte arrays must be copied via `new Uint8Array(callerBuffer.slice())`.
+- **On Egress:** Expose only immutable hex strings or fresh clones (`new Uint8Array(storedBuffer.slice())`).
+
+---
+
+### 12.10 Ingress and Egress Alias Closure
+
+To ensure that callers cannot mutate internal state after validation:
+
+1. **Ingress Token Normalization:** When `expectedOwner` is received, it is defensively copied:
+   ```typescript
+   function cloneAndFreezeOwnerToken(source: CustodyOwnershipToken): CustodyOwnershipToken {
+     return Object.freeze({
+       recoveryAttemptId: Number(source.recoveryAttemptId),
+       custodyGeneration: Number(source.custodyGeneration),
+       operationIdentity: String(source.operationIdentity),
+       transactionId: String(source.transactionId),
+       drainerOwnershipGeneration: Number(source.drainerOwnershipGeneration),
+     });
+   }
+   ```
+2. **Ingress Evidence Normalization:** Receipts passed in `preparedEvidence` are checked for private brands and defensively validated before inclusion in any candidate root.
+3. **Egress Deep Immutability:** All receipts, tokens, and root projections returned to callers are deeply frozen objects containing only primitives, immutable strings, or `ImmutableMap` instances.
+
+---
+
+### 12.11 The Preconstructed Inseparable Atomic Publication Protocol
+
+The root state structure is defined as:
 
 ```typescript
 export interface InFlightCustodyRecord {
   readonly token: CustodyOwnershipToken;
   readonly dequeuedAtTimestamp: number;
+  readonly monotonicDequeuedMs: number;
 }
 
 export type CustodyGateState =
@@ -590,105 +665,161 @@ export interface PendingSettlementObligation {
   readonly preparedArchiveReceipt: ArchiveDispositionReceipt;
   readonly preparedExecutionReceipt: ExecutionSettlementReceipt;
   readonly publishedAtTimestamp: number;
+  readonly monotonicPublishedMs: number;
 }
 
 export interface AuthoritativeCustodyRoot {
   readonly publishedGeneration: number;
   readonly inFlightRecord: InFlightCustodyRecord | null;
   readonly gateState: CustodyGateState;
-  readonly pendingSettlementObligations: ReadonlyMap<number, PendingSettlementObligation>;
-  readonly generationAuditHistory: ReadonlyMap<number, AuthoritativeSettlementEvidence>;
+  readonly pendingSettlementObligations: ImmutableMap<number, PendingSettlementObligation>;
+  readonly generationAuditHistory: ImmutableMap<number, AuthoritativeSettlementEvidence>;
+}
+
+export interface PublicationResult {
+  readonly releaseReceipt: DrainerCustodyReleaseReceipt;
+  readonly obligation: PendingSettlementObligation;
 }
 ```
 
-#### The Inseparable Atomic Publication Step:
+#### Preconstruction & Atomic Root Replacement:
+All objects, return results, and collection clones are fully allocated **before** the root reference is swapped:
+
 ```typescript
 public publishReleaseAndObligation(
   preparedEvidence: PreparedEvidenceContext,
   expectedOwner: CustodyOwnershipToken,
   barrierIdentity: string,
-): { releaseReceipt: DrainerCustodyReleaseReceipt; obligation: PendingSettlementObligation } {
+): PublicationResult {
   const currentRoot = this.#custodyRoot;
 
   // 1. Reversible Pre-Validation
-  if (!isEquivalentOwnerToken(currentRoot.inFlightRecord?.token ?? null, expectedOwner)) {
+  const safeOwner = cloneAndFreezeOwnerToken(expectedOwner);
+  if (!isEquivalentOwnerToken(currentRoot.inFlightRecord?.token ?? null, safeOwner)) {
     throw new Error('STALE_CUSTODY_RELEASE_REJECTED');
   }
 
-  // 2. Pre-Allocate Release Receipt (Zero Post-Publication Allocation)
+  // 2. Safe-Integer & Generation Collision Validation
+  const g = safeOwner.custodyGeneration;
+  if (!Number.isSafeInteger(g) || g >= Number.MAX_SAFE_INTEGER) {
+    throw new Error('GENERATION_SEQUENCE_EXHAUSTED');
+  }
+
+  if (currentRoot.pendingSettlementObligations.has(g)) {
+    const existing = currentRoot.pendingSettlementObligations.get(g)!;
+    if (
+      isEquivalentOwnerToken(existing.ownerToken, safeOwner) &&
+      existing.transactionId === safeOwner.transactionId &&
+      existing.operationIdentity === safeOwner.operationIdentity
+    ) {
+      // Idempotent retry: return pre-constructed result without root mutation
+      return Object.freeze({
+        releaseReceipt: existing.preAllocatedReleaseReceipt,
+        obligation: existing,
+      });
+    }
+    throw new Error('GENERATION_COLLISION_OCCUPIED_BY_DIFFERENT_OBLIGATION');
+  }
+
+  if (currentRoot.generationAuditHistory.has(g)) {
+    throw new Error('GENERATION_AUDIT_ALREADY_COMMITTED');
+  }
+
+  const nextPublishedGen = currentRoot.publishedGeneration + 1;
+  if (!Number.isSafeInteger(nextPublishedGen) || nextPublishedGen >= Number.MAX_SAFE_INTEGER) {
+    throw new Error('GENERATION_SEQUENCE_EXHAUSTED');
+  }
+
+  // 3. Pre-Allocate Release Receipt (Zero Post-Publication Allocation)
+  const monotonicNow = performance.now();
+  const previousInFlightMs = currentRoot.inFlightRecord
+    ? monotonicNow - currentRoot.inFlightRecord.monotonicDequeuedMs
+    : null;
+
   const releaseReceipt: DrainerCustodyReleaseReceipt = Object.freeze({
     [DRAINER_RELEASE_BRAND]: true,
-    identity: expectedOwner,
-    releasedCustodyGeneration: expectedOwner.custodyGeneration,
-    previousInFlightDurationMs: Date.now() - currentRoot.inFlightRecord!.dequeuedAtTimestamp,
+    identity: safeOwner,
+    releasedCustodyGeneration: safeOwner.custodyGeneration,
+    previousInFlightDurationMs: previousInFlightMs,
     releasedAtTimestamp: Date.now(),
+    monotonicReleasedMs: monotonicNow,
   });
 
-  // 3. Construct Complete Obligation Payload
+  // 4. Pre-Allocate Obligation Payload
   const obligation: PendingSettlementObligation = Object.freeze({
-    obligationId: `obl-${expectedOwner.custodyGeneration}-${Date.now()}`,
-    generation: expectedOwner.custodyGeneration,
+    obligationId: `obl-${safeOwner.custodyGeneration}-${Date.now()}`,
+    generation: safeOwner.custodyGeneration,
     barrierIdentity,
-    ownerToken: expectedOwner,
-    transactionId: expectedOwner.transactionId,
-    operationIdentity: expectedOwner.operationIdentity,
-    drainerOwnershipGeneration: expectedOwner.drainerOwnershipGeneration,
-    publishedCustodyGeneration: currentRoot.publishedGeneration + 1,
+    ownerToken: safeOwner,
+    transactionId: safeOwner.transactionId,
+    operationIdentity: safeOwner.operationIdentity,
+    drainerOwnershipGeneration: safeOwner.drainerOwnershipGeneration,
+    publishedCustodyGeneration: nextPublishedGen,
     preAllocatedReleaseReceipt: releaseReceipt,
     preparedReconciliationReceipt: preparedEvidence.custodyReconciliation,
     preparedArchiveReceipt: preparedEvidence.archiveDisposition,
     preparedExecutionReceipt: preparedEvidence.executionSettlement,
     publishedAtTimestamp: Date.now(),
+    monotonicPublishedMs: monotonicNow,
   });
 
-  // 4. Construct Immutable Candidate Root
-  const candidateObligations = new Map(currentRoot.pendingSettlementObligations);
-  candidateObligations.set(expectedOwner.custodyGeneration, obligation);
+  // 5. Pre-Construct Complete Candidate Collections & Root
+  const candidateObligations = new ImmutableMap([
+    ...currentRoot.pendingSettlementObligations.entries(),
+    [g, obligation],
+  ]);
 
   const candidateRoot: AuthoritativeCustodyRoot = Object.freeze({
-    publishedGeneration: currentRoot.publishedGeneration + 1,
+    publishedGeneration: nextPublishedGen,
     inFlightRecord: null, // Custody released!
     gateState: 'CUSTODY_RELEASED_BARRIER_PENDING',
-    pendingSettlementObligations: Object.freeze(candidateObligations),
+    pendingSettlementObligations: candidateObligations,
     generationAuditHistory: currentRoot.generationAuditHistory,
   });
 
-  // 5. THE ATOMIC PUBLICATION LINEARIZATION POINT:
+  // 6. PRE-CONSTRUCT COMPLETE RETURN RESULT OBJECT (Zero Post-Publication Allocation)
+  const publicationResult: PublicationResult = Object.freeze({
+    releaseReceipt,
+    obligation,
+  });
+
+  // 7. THE ATOMIC PUBLICATION LINEARIZATION POINT:
   this.#custodyRoot = candidateRoot;
 
-  return { releaseReceipt, obligation };
+  // 8. Infallible Return of Pre-Constructed Reference:
+  return publicationResult;
 }
 ```
 
-#### Observable Invariant:
-$$\forall \text{ observer } O,\;\; (O.\mathbf{inFlightRecord} === \mathbf{null}) \implies (\mathbf{pendingSettlementObligations}.\mathbf{has}(g) === \mathbf{true})$$
-A release can **never** become externally observable without its corresponding obligation already being discoverable in the authoritative published state.
+#### Application-Level Exception Safety Scope:
+This protocol guarantees **application-level exception safety**: any allocation or validation failure during Steps 1-6 throws before Step 7, leaving `this.#custodyRoot` 100% unmodified. It does **not** claim protection against catastrophic host termination (`SIGKILL`, physical power loss, or V8 engine crash), which is handled by WAL recovery in future persistence stages.
 
 ---
 
-### 12.10 Comprehensive Exception-Safety Matrix Across Publication Phases
+## 12.12 Generation Collision, Exact Idempotency & Safe-Integer Exhaustion
 
-| Execution Phase | Typical Operations | Exception Safety & Failure Behavior |
-| :--- | :--- | :--- |
-| **Phase 1: Pre-Publication Preparation** | Receipt validation, 5-field token checks, memory allocation (`new Map`, `Object.freeze`), candidate root construction. | **100% Reversible.** Any throw aborts the call with zero mutations. `this.#custodyRoot` remains unchanged; `inFlightRecord` remains owned; barrier remains `PENDING`. |
-| **Phase 2: Atomic State Replacement** | `this.#custodyRoot = candidateRoot` | **Infallible Reference Swap.** Exact linearization point where custody is released and the obligation is published simultaneously. |
-| **Phase 3: Post-Publication Resolution** | Proof validation, `barrier.resolveWithEvidence(evidence)`. | **Irreversible Release; Recoverable Obligation.** If resolution throws: released custody is **never** restored to in-flight; obligation remains published; newer attempts are blocked; recovery completion reevaluation applies. |
-| **Phase 4: Post-Resolution Retirement** | Moving settled obligation to `generationAuditHistory`, cleaning barrier handle. | **Terminal Settlement Intact.** If retirement throws: barrier remains settled; settlement evidence is preserved; retirement cleanup is safely retried. |
+1. **Collision with Conflicting Identity:** If candidate generation $g$ exists in `pendingSettlementObligations` and any field of `ownerToken`, `transactionId`, or `operationIdentity` differs, the operation throws `GENERATION_COLLISION_OCCUPIED_BY_DIFFERENT_OBLIGATION`. Overwriting an unresolved obligation is strictly prohibited.
+2. **Exact Idempotent Retry:** If generation $g$ exists and all identity fields match 1-to-1, the method returns the existing pre-allocated `publicationResult` with zero root mutations.
+3. **Audit History Protection:** If generation $g$ already exists in `generationAuditHistory`, the operation throws `GENERATION_AUDIT_ALREADY_COMMITTED`. Silently replacing committed audit evidence is prohibited.
+4. **Safe-Integer Validation:** All published generations and custody generations must satisfy `Number.isSafeInteger(g)` ($g < 2^{53} - 1$). If exhausted, the system fails closed with `GENERATION_SEQUENCE_EXHAUSTED`. Wrapping to 0 or truncation is strictly forbidden.
 
 ---
 
-### 12.11 Generation Fencing & Check-Then-Acquire Race Immunity
+## 12.13 Acquisition Serialization & Check-Then-Acquire Race Immunity
 
-Every path capable of acquiring, dequeuing, or replacing custody (`drainNext()`, recovery admission, retries) must evaluate the authoritative pending-obligation ledger.
+Every custody-acquisition path must adhere to the **5-Step Serialized Acquisition Rule**:
 
-#### The Serialization & Atomicity Rule for `drainNext()`:
-To prevent check-then-acquire races, the check of pending obligations and the installation of the new in-flight record occur within the same candidate-root preparation and reference replacement:
+1. **Read Current Root:** Inspect `currentRoot = this.#custodyRoot`.
+2. **Evaluate Preconditions:** Validate that `currentRoot.pendingSettlementObligations.size === 0`, `currentRoot.inFlightRecord === null`, and the caller attempt matches `this._currentAttemptId`.
+3. **Prepare Candidate Root Privately:** Construct candidate in-flight record and candidate root.
+4. **Publish Atomically:** Replace `this.#custodyRoot = candidateRoot` via single synchronous reference assignment.
+5. **No Interleaving:** Do not yield to the event loop, execute `await`, or invoke external callbacks between Step 1 and Step 4.
 
 ```typescript
 public drainNext(attemptId: number, expectedGeneration: number): DequeuedOperation | null {
   const currentRoot = this.#custodyRoot;
 
-  // 1. Mandatory Generation Fencing Guard
+  // 1. Precondition Evaluation Against Exact Root
   if (currentRoot.pendingSettlementObligations.size > 0) {
     throw new Error('CUSTODY_ACQUISITION_BLOCKED_BY_PENDING_SETTLEMENT_OBLIGATION');
   }
@@ -702,7 +833,13 @@ public drainNext(attemptId: number, expectedGeneration: number): DequeuedOperati
   const op = this._quarantineBuffer.peek();
   if (!op) return null;
 
-  // 2. Prepare Candidate Root Privately
+  // 2. Safe Generation Check
+  if (!Number.isSafeInteger(expectedGeneration) || expectedGeneration >= Number.MAX_SAFE_INTEGER) {
+    throw new Error('GENERATION_SEQUENCE_EXHAUSTED');
+  }
+
+  // 3. Prepare Candidate In-Flight Record Privately
+  const monotonicNow = performance.now();
   const newInFlight: InFlightCustodyRecord = Object.freeze({
     token: Object.freeze({
       recoveryAttemptId: attemptId,
@@ -712,17 +849,19 @@ public drainNext(attemptId: number, expectedGeneration: number): DequeuedOperati
       drainerOwnershipGeneration: this._drainerOwnershipGeneration + 1,
     }),
     dequeuedAtTimestamp: Date.now(),
+    monotonicDequeuedMs: monotonicNow,
   });
 
+  const nextPublishedGen = currentRoot.publishedGeneration + 1;
   const candidateRoot: AuthoritativeCustodyRoot = Object.freeze({
-    publishedGeneration: currentRoot.publishedGeneration + 1,
+    publishedGeneration: nextPublishedGen,
     inFlightRecord: newInFlight,
     gateState: 'IN_FLIGHT_HELD',
     pendingSettlementObligations: currentRoot.pendingSettlementObligations,
     generationAuditHistory: currentRoot.generationAuditHistory,
   });
 
-  // 3. Atomic Reference Replacement
+  // 4. Synchronous Atomic Publication
   this._quarantineBuffer.dequeue();
   this.#custodyRoot = candidateRoot;
 
@@ -730,29 +869,20 @@ public drainNext(attemptId: number, expectedGeneration: number): DequeuedOperati
 }
 ```
 
-Because both the guard condition and the in-flight record update are evaluated against `currentRoot` and published atomically via `this.#custodyRoot = candidateRoot` in a non-interleavable execution turn, a race condition between checking obligations and acquiring custody is impossible.
+---
+
+## 12.14 Comprehensive Exception-Safety Matrix Across Publication Phases
+
+| Execution Phase | Typical Operations | Exception Safety & Failure Behavior |
+| :--- | :--- | :--- |
+| **Phase 1: Pre-Publication Preparation** | Receipt validation, 5-field token checks, memory allocation (`new ImmutableMap`, `Object.freeze`), candidate root construction. | **100% Reversible.** Any throw aborts the call with zero mutations. `this.#custodyRoot` remains unchanged; `inFlightRecord` remains owned; barrier remains `PENDING`. |
+| **Phase 2: Atomic State Replacement** | `this.#custodyRoot = candidateRoot` | **Infallible Reference Swap.** Exact linearization point where custody is released and the obligation is published simultaneously. |
+| **Phase 3: Post-Publication Resolution** | Proof validation, `barrier.resolveWithEvidence(evidence)`. | **Irreversible Release; Recoverable Obligation.** If resolution throws: released custody is **never** restored to in-flight; obligation remains published; newer attempts are blocked; recovery completion reevaluation applies. |
+| **Phase 4: Post-Resolution Retirement** | Moving settled obligation to `generationAuditHistory`, cleaning barrier handle. | **Terminal Settlement Intact.** If retirement throws: barrier remains settled; settlement evidence is preserved; retirement cleanup is safely retried. |
 
 ---
 
-### 12.12 Deep Immutability of Published Custody Records
-
-All published custody state objects, ownership tokens, and evidence receipts are deeply frozen:
-```typescript
-function deepFreeze<T extends object>(obj: T): Readonly<T> {
-  Object.freeze(obj);
-  for (const key of Object.getOwnPropertyNames(obj)) {
-    const val = (obj as any)[key];
-    if (val && typeof val === 'object' && !Object.isFrozen(val)) {
-      deepFreeze(val);
-    }
-  }
-  return obj;
-}
-```
-
----
-
-### 12.13 Protocol A: Drainer $\to$ Terminal Archive (Commit Reconciliation & Execution Settlement)
+## 12.15 Protocol A: Drainer $\to$ Terminal Archive (Commit Reconciliation & Execution Settlement)
 
 ```
 [Settlement / Drain Trigger (Promise Completed / Invalidation Received)]
@@ -785,8 +915,8 @@ function deepFreeze<T extends object>(obj: T): Readonly<T> {
    └─ Reject: Classify as post-commit execution failure; suppress error; Protocol B PROHIBITED!
                   │
                   ▼
-8. REVERSIBLE PRE-PUBLICATION PREPARATION:
-   Validate all brands, 5-field identities, and allocate release receipt.
+8. REVERSIBLE PRE-PUBLICATION PREPARATION & ALLOCATION:
+   Validate all brands, 5-field identities, pre-construct publicationResult and candidateRoot.
                   │
                   ▼
 9. ATOMIC ROOT REPLACEMENT (Inseparable Release & Obligation Publication):
@@ -805,7 +935,7 @@ function deepFreeze<T extends object>(obj: T): Readonly<T> {
 
 ---
 
-### 12.14 Protocol B: Drainer $\to$ Quarantine Buffer or Destination Transfer (12-Step Fencing Sequence)
+## 12.16 Protocol B: Drainer $\to$ Quarantine Buffer or Destination Transfer (12-Step Fencing Sequence)
 
 ```
 [Settlement / Fencing Trigger (Promise Completed / Rejected / Invalidation Received)]
@@ -844,8 +974,8 @@ function deepFreeze<T extends object>(obj: T): Readonly<T> {
 7. Verify Custody Representation (Single Exclusive Owner Confirmed)
                   │
                   ▼
-8. REVERSIBLE PRE-PUBLICATION PREPARATION:
-   Validate all brands, 5-field identities, and allocate release receipt.
+8. REVERSIBLE PRE-PUBLICATION PREPARATION & ALLOCATION:
+   Validate all brands, 5-field identities, pre-construct publicationResult and candidateRoot.
                   │
                   ▼
 9. ATOMIC ROOT REPLACEMENT (Inseparable Release & Obligation Publication):
@@ -929,7 +1059,7 @@ function deepFreeze<T extends object>(obj: T): Readonly<T> {
 | **7** | Post-publication throw (Phase 3) | Released | Obligation Ledger | RELEASED_PENDING | Completion reevaluation | Resurrect custody / newer attempt drain |
 | **8** | Post-resolution throw (Phase 4) | Released | Terminal Archive | RESOLVED | Retry retirement cleanup | Reuse barrier / overwrite proof |
 | **9** | Stale continuation release attempt | Released/Held | Active Owner | Untouched | Log warning & ignore | Release newer custody |
-| **10** | Watchdog timeout (5,000 ms) | In-flight held | Drainer | PENDING | Admit Attempt 2 to wait | Cancel Promise / release custody |
+| **10** | Watchdog timeout (5,000 ms monotonic) | In-flight held | Drainer | PENDING | Admit Attempt 2 to wait | Cancel Promise / release custody |
 | **11** | Idempotent commit retry (identical digest) | Committed | Archive | Resolved | Return cached commit receipt | Commit new root |
 | **12** | Mutated commit retry (altered digest) | Committed | Archive | Resolved | Throw `IDENTITY_MUTATION` | Overwrite transaction |
 | **13** | Late commit on fenced transaction | Fenced | Archive | Aborted | Throw `ALREADY_FENCED` | Overwrite tombstone |
@@ -959,12 +1089,13 @@ function deepFreeze<T extends object>(obj: T): Readonly<T> {
 6. **Strict Tombstone Capacity Ceiling:** `#fencedTransactions.size` **CANNOT** exceed 1,000 under any condition.
 7. **Active Reservation Floor Protection:** `fencingGenerationFloor` **CANNOT** advance past $\min_{r \in \text{activeReservations}}(r.\text{generation})$.
 8. **Single In-Flight Drain Invariant:** A second drain **CANNOT** dequeue an operation while `this.#custodyRoot.inFlightRecord !== null` ($N_{\text{in-flight}} \le 1$).
-9. **Watchdog Immunity:** A watchdog timeout (`SETTLEMENT_BARRIER_TIMEOUT_MS = 5000`) **CANNOT** release drainer custody or cancel the destination Promise.
+9. **Watchdog Immunity:** A monotonic watchdog timeout (`SETTLEMENT_BARRIER_TIMEOUT_MS = 5000`) **CANNOT** release drainer custody or cancel the destination Promise.
 10. **Irreversibility Precedence:** Post-commit execution failure **CANNOT** reverse an irrevocable commit or trigger Protocol B restoration.
 11. **Inseparable Release/Obligation Invariant:** A released custody state can **never** become observable without its corresponding settlement obligation already present in `this.#custodyRoot.pendingSettlementObligations`.
+12. **Runtime Immutability Invariant:** Published collections and evidence references **CANNOT** be mutated through `Map.prototype` or mutable array/buffer aliases.
 
 ### Strict Ordering of Finalization:
-$$\text{1. Settle Promise} \longrightarrow \text{2. Reconcile Custody} \longrightarrow \text{3. Pre-Validate} \longrightarrow \text{4. Atomic Root Replacement} \longrightarrow \text{5. } \mathbf{activeBarrier(g).resolveWithEvidence(evidence)}$$
+$$\text{1. Settle Promise} \longrightarrow \text{2. Reconcile Custody} \longrightarrow \text{3. Pre-Validate \& Pre-Allocate} \longrightarrow \text{4. Atomic Root Replacement} \longrightarrow \text{5. } \mathbf{activeBarrier(g).resolveWithEvidence(evidence)}$$
 
 ---
 
@@ -974,7 +1105,7 @@ The proposal excises all references to `forceEmergencyReset(capability)`:
 - Ordinary recovery APIs cannot bypass `CUSTODY_RECONCILIATION_BLOCKED`.
 - No automated root replacement is permitted while custody remains unresolved.
 - Emergency data abandonment, if ever required, needs a separate architectural decision defining operator authorization, auditability, late-settling Promise behavior, and data-loss semantics.
-- That separate decision is outside the scope of R18-R12 and is **not authorized** by this proposal.
+- That separate decision is outside the scope of R18-R13 and is **not authorized** by this proposal.
 
 ---
 
@@ -989,33 +1120,35 @@ The proposal excises all references to `forceEmergencyReset(capability)`:
 
 ## 19. Deterministic Failure Scenarios and Future Test Requirements
 
-Sub-Milestone M5.1 test suites must verify the following twenty-five deterministic test specifications:
+Sub-Milestone M5.1 test suites must verify the following twenty-seven deterministic test specifications:
 
-- **Test R18-R12-T01 (Exception Before Custody-Release Publication Leaves Original Owner Intact):** Mock throw during Phase 1 pre-publication preparation; verify `this.#custodyRoot` remains unmodified, original in-flight record remains owned, barrier remains pending, and zero release receipts or obligations are visible.
-- **Test R18-R12-T02 (Exception After Publication Leaves Settlement Obligation Discoverable):** Publish release and obligation, then mock throw during barrier resolution; verify `this.#custodyRoot.pendingSettlementObligations.has(g) === true` and custody remains released.
-- **Test R18-R12-T03 (No Observer Can See Released Custody Without Corresponding Obligation):** Assert that across all root transitions, whenever `inFlightRecord === null` following a release, `pendingSettlementObligations.get(g)` is synchronously discoverable.
-- **Test R18-R12-T04 (Newer Attempt Blocked by Pending Settlement Obligation):** With an obligation present in `this.#custodyRoot`, attempt `drainNext()` from a newer attempt; assert throws `CUSTODY_ACQUISITION_BLOCKED_BY_PENDING_SETTLEMENT_OBLIGATION`.
-- **Test R18-R12-T05 (Alternate Reset and Retry Paths Cannot Bypass Pending Obligation Guard):** Attempt to invoke administrative recovery retry or reset while `pendingSettlementObligations.size > 0`; assert rejected fail-closed.
-- **Test R18-R12-T06 (Stale Continuations Cannot Resolve or Retire Newer Generation Barrier):** Provide Attempt 1 receipt or continuation to Attempt 2 barrier; assert throws `IDENTITY_MISMATCH` and Attempt 2 barrier remains pending.
-- **Test R18-R12-T07 (Barrier Resolution Failure Preserves Obligation and Enters Terminal State):** Simulate unrecoverable barrier failure; verify obligation remains in ledger and gate transitions to `CUSTODY_RECONCILIATION_BLOCKED`.
-- **Test R18-R12-T08 (Receipt Construction/Allocation Failure Cannot Produce Ownerless Operation):** Throw `OutOfMemoryError` during release receipt construction; verify `this.#custodyRoot` is untouched and in-flight custody remains held by original owner.
-- **Test R18-R12-T09 (Check-Then-Acquire Interleaving Cannot Bypass Generation Fencing):** Attempt concurrent simulated microtask interleaving during `drainNext()`; assert single root replacement guarantees serialized execution.
-- **Test R18-R12-T10 (Successful Resolution and Retirement Remain Generation-Specific):** Resolve generation 1 barrier; verify generation 1 barrier settles permanently and generation 2 allocates a distinct, unresolved barrier.
-- **Test R18-R12-T11 (Failure After Release Cannot Resurrect Retired Source Custody):** Release custody for committed transaction, then mock throw in barrier resolution; verify source quarantine operation is NOT resurrected back into source buffer.
-- **Test R18-R12-T12 (Release Publication Followed by Coordinator Failure Preserves Obligation):** Mock failure immediately following `publishReleaseAndObligation`; verify generation obligation is retained in `_pendingSettlementObligations` and recoverable.
-- **Test R18-R12-T13 (Barrier Resolution Requires Exact-Owner Release Evidence):** Omit `DrainerCustodyReleaseReceipt`; verify `assertAuthoritativeSettlementEvidence` throws and barrier cannot resolve.
-- **Test R18-R12-T14 (Post-Commit Promise Rejection Never Reverses Irrevocable Commit):** Reject destination Promise after confirmed commit; verify transaction remains committed in archive and Protocol B restoration is rejected.
-- **Test R18-R12-T15 (Abort Restoration Returns Exclusive Ownership to Source):** Trigger `ABORTED_FENCED` restoration; verify `RestoredToSourceReceipt` proves `sourceRetainsExclusiveOwnership === true`.
-- **Test R18-R12-T16 (Abort Transfer Produces Exclusive Ownership at Destination):** Trigger `ABORTED_FENCED` transfer; verify `TransferredToDestinationReceipt` proves `destinationExclusiveOwnershipAccepted === true` and `sourceRetainsOwnership === false`.
-- **Test R18-R12-T17 (No Operation Becomes Ownerless During Abort Restoration or Transfer):** Trace custody during abort reconciliation; verify at every microtask turn the operation is owned by either drainer, source, or named destination.
-- **Test R18-R12-T18 (No Operation Becomes Multiply Owned During Custody Transition):** Verify single-owner invariant ($N_{\text{owners}} = 1$) holds across dequeue, commit, abort restoration, and transfer.
-- **Test R18-R12-T19 (FIFO Tombstone Eviction Safe Under Monotonic Generation Invariant):** Verify FIFO head of `#fencedTransactions` has generation $< \min(r.\text{generation})$ before eviction.
-- **Test R18-R12-T20 (Out-of-Order Tombstone Insertion Cannot Advance Floor Unsafely):** Insert out-of-order tombstone; verify eviction selects true minimal generation or preserves floor.
-- **Test R18-R12-T21 (No-Active-Reservation Eviction Follows Explicit Rule):** Drain all active reservations; verify eviction allows tombstones with generation $< \text{currentArchiveGeneration}$ and advances floor correctly.
-- **Test R18-R12-T22 (Strict 1,000-Tombstone Bound Holds Under Repeated Pressure):** Trigger 1,500 fencing requests under backpressure; verify `#fencedTransactions.size <= 1000` and surplus requests are rejected.
-- **Test R18-R12-T23 (Private Receipt Construction Unreachable via Public Exports):** Assert receipt branding symbols and constructors are not exported from `@syncplay/protocol`.
-- **Test R18-R12-T24 (Stale Receipt & Continuation Fencing Effective Across Transitions):** Provide Attempt 1 receipt to Attempt 2 transition; assert rejected with `IDENTITY_MISMATCH`.
-- **Test R18-R12-T25 (Watchdog Timeout Never Creates Execution Settlement Evidence):** Fire 5,000 ms watchdog; assert status latches `DEGRADED`; assert no `ExecutionSettlementReceipt` is produced.
+- **Test R18-R13-T01 (Mutation Through Object.freeze(Map) Is Prevented at Runtime):** Assert that calling `.set()`, `.delete()`, or `.clear()` on `ImmutableMap` throws `TypeError` and does not mutate internal storage.
+- **Test R18-R13-T02 (No Published Map or Set Reference Can Be Mutated by Consumers):** Obtain `pendingSettlementObligations` from published root; assert consumer mutations are rejected and internal root remains untouched.
+- **Test R18-R13-T03 (No Nested Receipt or Identity Alias Can Mutate Published Evidence):** Mutate properties on caller-supplied `expectedOwner` after publication; assert published root retains original values.
+- **Test R18-R13-T04 (Returned Result Construction Is Complete Before Root Publication):** Verify `publicationResult` is fully allocated and frozen before `this.#custodyRoot` assignment.
+- **Test R18-R13-T05 (Exceptions During Preparation Leave Original Root Unchanged):** Trigger throw during `cloneAndFreezeOwnerToken` or Map allocation; assert `this.#custodyRoot` is 100% untouched.
+- **Test R18-R13-T06 (Occupied Generation Cannot Be Overwritten by Different Obligation):** Attempt to publish obligation with existing generation but differing transaction identity; assert throws `GENERATION_COLLISION_OCCUPIED_BY_DIFFERENT_OBLIGATION`.
+- **Test R18-R13-T07 (Exact Idempotent Retries Preserve Original Obligation):** Publish identical obligation retry; assert returns cached `publicationResult` without mutating published generation.
+- **Test R18-R13-T08 (Generation Sequence Exhaustion Fails Closed):** Set generation to `Number.MAX_SAFE_INTEGER`; assert subsequent allocation throws `GENERATION_SEQUENCE_EXHAUSTED`.
+- **Test R18-R13-T09 (Every Acquisition Path Checks and Publishes Against Same Root):** Verify `drainNext()`, recovery admission, and retries serialize checks and updates via atomic root replacement.
+- **Test R18-R13-T10 (No Callback or Yield Can Occur Between Acquisition Validation and Publication):** Assert `drainNext()` executes synchronously without `await` or microtask yields between check and assignment.
+- **Test R18-R13-T11 (Wall-Clock Regression Cannot Affect Elapsed-Time or Fencing):** Simulate backward NTP shift of 10,000 ms; assert monotonic duration calculations and watchdog timers remain strictly monotonic.
+- **Test R18-R13-T12 (Defensive Byte Copies Prevent Post-Publication Mutation):** Mutate `Uint8Array` digest passed to archive; assert internal archive digest remains unchanged.
+- **Test R18-R13-T13 (Exception After Publication Leaves Settlement Obligation Discoverable):** Publish release and obligation, then mock throw during barrier resolution; verify `this.#custodyRoot.pendingSettlementObligations.has(g) === true`.
+- **Test R18-R13-T14 (No Observer Can See Released Custody Without Corresponding Obligation):** Assert that across all transitions, `inFlightRecord === null` implies `pendingSettlementObligations.has(g) === true`.
+- **Test R18-R13-T15 (Newer Attempt Blocked by Pending Settlement Obligation):** With obligation present, attempt `drainNext()` from newer attempt; assert throws `CUSTODY_ACQUISITION_BLOCKED_BY_PENDING_SETTLEMENT_OBLIGATION`.
+- **Test R18-R13-T16 (Alternate Reset and Retry Paths Cannot Bypass Pending Obligation Guard):** Attempt to invoke recovery retry while `pendingSettlementObligations.size > 0`; assert rejected fail-closed.
+- **Test R18-R13-T17 (Stale Continuations Cannot Resolve or Retire Newer Generation Barrier):** Provide Attempt 1 receipt to Attempt 2 barrier; assert throws `IDENTITY_MISMATCH`.
+- **Test R18-R13-T18 (Barrier Resolution Failure Preserves Obligation and Enters Terminal State):** Simulate unrecoverable barrier failure; verify obligation remains in ledger and gate transitions to `CUSTODY_RECONCILIATION_BLOCKED`.
+- **Test R18-R13-T19 (Receipt Construction/Allocation Failure Cannot Produce Ownerless Operation):** Throw `OutOfMemoryError` during receipt construction; verify in-flight custody remains held by original owner.
+- **Test R18-R13-T20 (Successful Resolution and Retirement Remain Generation-Specific):** Resolve generation 1 barrier; verify generation 1 settles permanently and generation 2 allocates distinct barrier.
+- **Test R18-R13-T21 (Failure After Release Cannot Resurrect Retired Source Custody):** Release custody for committed transaction, then mock throw in barrier resolution; verify source quarantine operation is NOT resurrected.
+- **Test R18-R13-T22 (Post-Commit Promise Rejection Never Reverses Irrevocable Commit):** Reject destination Promise after confirmed commit; verify transaction remains committed in archive.
+- **Test R18-R13-T23 (Abort Restoration Returns Exclusive Ownership to Source):** Trigger `ABORTED_FENCED` restoration; verify `RestoredToSourceReceipt` proves `sourceRetainsExclusiveOwnership === true`.
+- **Test R18-R13-T24 (Abort Transfer Produces Exclusive Ownership at Destination):** Trigger `ABORTED_FENCED` transfer; verify `TransferredToDestinationReceipt` proves `destinationExclusiveOwnershipAccepted === true`.
+- **Test R18-R13-T25 (No Operation Becomes Ownerless or Multiply Owned):** Trace custody during transitions; verify single-owner invariant ($N_{\text{owners}} = 1$) holds across all microtask turns.
+- **Test R18-R13-T26 (Strict 1,000-Tombstone Bound Holds Under Repeated Pressure):** Trigger 1,500 fencing requests; verify `#fencedTransactions.size <= 1000`.
+- **Test R18-R13-T27 (Private Receipt Construction Unreachable via Public Exports):** Assert receipt branding symbols and constructors are not exported from `@syncplay/protocol`.
 
 ---
 
@@ -1023,29 +1156,31 @@ Sub-Milestone M5.1 test suites must verify the following twenty-five determinist
 
 ```
 ================================================================================
-ENGINEERING AUTHORITY APPROVAL QUESTIONS (MILESTONE M5.0-R18-R12):
+ENGINEERING AUTHORITY APPROVAL QUESTIONS (MILESTONE M5.0-R18-R13):
 ================================================================================
-1. [INSEPARABLE ATOMIC ROOT REPLACEMENT]: Does the Engineering Authority approve
-   publishing custody release and its corresponding pending-settlement obligation
-   via a single synchronous reference replacement of AuthoritativeCustodyRoot,
-   guaranteeing that released custody is never observable without its obligation?
+1. [RUNTIME IMMUTABILITY VIA PRIVATE FIELDS]: Does the Engineering Authority approve
+   replacing Object.freeze(Map) with ImmutableMap backed by ECMAScript #private
+   fields, guaranteeing true runtime immutability against Map.prototype mutations?
 
-2. [SEPARATION OF THREE GUARANTEES]: Does the Engineering Authority approve the
-   precise terminological separation between Non-Interleavable Execution (single-turn),
-   Atomic Publication (single reference replacement), and Barrier Linearization
-   (barrier resolution point)?
+2. [COMPLETE INGRESS/EGRESS ALIAS CLOSURE]: Does the Engineering Authority approve
+   defensive cloning of all tokens, receipts, and Uint8Array byte buffers on both
+   ingress and egress, eliminating caller-controlled mutable aliases?
 
-3. [COMPLETE OBLIGATION PAYLOAD & RECOVERY]: Does the Engineering Authority approve
-   the complete 6-item obligation payload encapsulating all pre-allocated receipts
-   and identities required for exception-safe recovery?
+3. [STRICT PRE-PUBLICATION ALLOCATION]: Does the Engineering Authority approve
+   fully pre-allocating the return result (PublicationResult) before the authoritative
+   root replacement, achieving zero post-publication allocations?
 
-4. [CHECK-THEN-ACQUIRE RACE IMMUNITY]: Does the Engineering Authority approve
-   the serialized candidate-root acquisition rule in drainNext(), enforcing that
-   checking pending obligations and acquiring in-flight custody cannot be raced?
+4. [COLLISION HANDLING & SAFE-INTEGER EXHAUSTION]: Does the Engineering Authority
+   approve rejecting conflicting obligations on occupied generations, permitting
+   exact idempotent retries, and failing closed upon Number.MAX_SAFE_INTEGER exhaustion?
 
-5. [PHASE-SPECIFIC EXCEPTION SAFETY]: Does the Engineering Authority approve the
-   four-phase exception safety model, ensuring all fallible allocations precede
-   publication and released custody is never subject to simulated rollback?
+5. [SERIALIZED ACQUISITION CONTRACT]: Does the Engineering Authority approve
+   the 5-step serialized acquisition rule across all custody entry points, ensuring
+   check-then-acquire races cannot occur?
+
+6. [DECOUPLED MONOTONIC CLOCK SEMANTICS]: Does the Engineering Authority approve
+   restricting wall-clock timestamps to diagnostic metadata and mandating monotonic
+   clocks for all duration, timeout, and watchdog evaluations?
 ================================================================================
 ```
 
@@ -1055,13 +1190,13 @@ ENGINEERING AUTHORITY APPROVAL QUESTIONS (MILESTONE M5.0-R18-R12):
 
 ```
 ================================================================================
-M5.0-R18-R12 ARCHITECTURAL DECISION PROPOSAL VERDICT:
+M5.0-R18-R13 ARCHITECTURAL DECISION PROPOSAL VERDICT:
 DECISION PROPOSAL COMPLETE — READY FOR ENGINEERING AUTHORITY REVIEW
 ================================================================================
 ```
 
-This R18-R12 proposal closes the remaining distributed-systems publication ambiguity. It formalizes the inseparable atomic publication of custody release and settlement obligations through a single state-reference replacement, establishes precise linearization terminology, guarantees check-then-acquire race immunity, qualifies the receipt security model, and provides exhaustive exception-safety rules.
+This R18-R13 proposal establishes definitive runtime correctness for the concurrent recovery architecture. It replaces vulnerable `Object.freeze(Map)` patterns with true runtime-immutable `#private` collections, closes all ingress/egress mutable aliases, enforces zero post-publication allocations, formalizes generation collision and sequence exhaustion boundaries, serializes custody acquisition across all paths, and decouples diagnostic wall-clock timestamps from monotonic clocks.
 
 ### Mandatory Implementation Authorization Statement
 
-> "M5.0-R18-R12 is an architectural documentation correction only. No production implementation has been started. M5.1, including M5.1a, remains strictly unauthorized pending explicit Engineering Authority approval."
+> "M5.0-R18-R13 is an architectural documentation correction only. No production implementation has been started. M5.1, including M5.1a, remains strictly unauthorized pending explicit Engineering Authority approval."
