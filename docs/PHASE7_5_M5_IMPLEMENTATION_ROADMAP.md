@@ -1,6 +1,6 @@
 # Phase 7.5 Milestone M5 — Implementation Roadmap
 
-**Status:** APPROVED ARCHITECTURAL SPECIFICATION (MILESTONE M5.0-R9 AMENDED)
+**Status:** APPROVED ARCHITECTURAL SPECIFICATION (MILESTONE M5.0-R10 AMENDED)
 **Date:** 2026-11-25
 **Authoritative Starting Baseline:** `40b11fdafcd247c7a289723f90ec0e2029c94f64` (Phase 7.5 M4.3d Formally Accepted)
 **Accepted Baselines:** M4.3c (`eab2428`), M4.3b (`f3c29b6`), Approved Architecture (`2bb117c`), Frozen M4.2d (`aafa366`)
@@ -34,7 +34,7 @@ flowchart TD
 
 ## 2. Sub-Milestone Detailed Specifications
 
-### Milestone M5.0: Runtime Integration Architecture Audit & Final Consistency Closure (Amended M5.0-R9)
+### Milestone M5.0: Runtime Integration Architecture Audit & Final Consistency Closure (Amended M5.0-R10)
 - **Role:** Independent Senior TypeScript Distributed-Systems Architect
 - **Status:** CURRENT MILESTONE (Planning Only)
 - **Objective:** Complete source audit, close review findings across R1 through R6, and author final consistent architecture specifications for M5.
@@ -49,8 +49,8 @@ flowchart TD
   - Qualify performance benchmark contract (Node.js LTS reference environment vs browser runtimes) and clarify young-gen / escape analysis allocation claims (R3-08).
   - Specify capability-gated trust context provenance (`DrainAdmissionContext = TrustedLocalReplayCapability | TrustedRepairBatchCapability`) verified via strict reference identity, eliminating caller-supplied string vulnerability and preventing accidental trust escalation (R6-01).
   - Enforce canonical ordering feasibility check against compacted snapshots ($L(A) > \text{snapshot.maxLogicalTimestamp}$ and $\forall p,\ L(A) > \text{originFrontierTimestamps}[p]$) and explicit incompatibility gate (`INCOMPATIBLE_COMPACTED_HISTORY` aborting to `DEGRADED`) to prevent SMR total-order inversion ($A \prec B$ hazard), preserving causal dependency validation (R5-02).
-  - Formalize administrative `resetRecovery()` capability authorization, concurrent reset serialization, shared settlement barrier ownership, in-flight invalidation with retained ownership slot, drain settlement barrier, mandatory attempt-ID fencing at acceptance boundary ($N_{\text{in-flight}} \le 1$), and failure-atomic 5-step lifecycle semantics (`PURGE_AND_RETRY` vs `REINITIALIZE_CLEAN`), preventing escape-hatch abuse and incomplete root rollback (R6-02, R7-02, R8-01, R8-02, R9-01–R9-05).
-  - Resolve `REINITIALIZE_CLEAN` exact notification ordering (Step 1 purges stale notifications; Step 3 synthesizes clean baseline notification; Step 5 dispatches clean baseline notifications) and define non-throwing listener dispatch with isolated error handling and explicit irreversible external effect boundaries (R8-03, R8-04, R9-06).
+  - Formalize administrative `resetRecovery()` capability authorization, concurrent reset serialization, shared settlement barrier ownership, in-flight invalidation with retained ownership slot, unambiguous operation custody with acknowledged custody transfer (`TerminalQuarantineArchive`), watchdog timeout independence (distinguishing timeout, actual settlement, and ownership release), candidate root staging with atomic pointer swap linearization, mandatory attempt-ID fencing at acceptance boundary ($N_{\text{in-flight}} \le 1$), and failure-atomic 5-step lifecycle semantics (`PURGE_AND_RETRY` vs `REINITIALIZE_CLEAN`), preventing escape-hatch abuse and incomplete root rollback (R6-02, R7-02, R8-01, R8-02, R9-01–R9-05, R10-01–R10-03).
+  - Resolve `REINITIALIZE_CLEAN` exact notification ordering (Step 1 purges stale notifications; Step 2 installs clean baseline; Step 3 disengages recovery mode; Step 4 transitions coordinator to ACTIVE; Step 5 dispatches clean baseline notifications) and define non-throwing listener dispatch with isolated error handling and explicit irreversible external effect boundaries without unsupported assertions (R8-03, R8-04, R9-06, R10-04).
   - Formalize package boundary guarantee (`package.json` root `.` export only, prohibiting supported public package subpath imports of internal custody module), runtime shallow immutability (`Object.freeze`), private transfer bundle (`AuthorizedDrainCapabilities`), `bindEngine()` single-attachment composition root scope, and absence of capability getters (R6-01, R7-01, R8-05, R9-07).
   - Formalize capability custody and operation provenance distinction: capability grants admission authority, but payload provenance is strictly enforced (`stashedLocalQueue` exclusivity, prohibition of remote relabeling, and identity hash verification $H(op) == H(log)$) (R6-03, R7-03).
 - **Affected Files:** Documentation files only (`docs/PHASE7_5_M5_*.md`). Zero production or test code modified.
@@ -73,8 +73,8 @@ flowchart TD
     - Bundle drain capabilities into immutable `AuthorizedDrainCapabilities` for private transfer to `RecoveryCoordinator` via `bindEngine(engine, recoveryCapability, drainCapabilities)` without public getters.
   - Implement single-attachment invariant in `coordinator.bindEngine(engine, capability)`: throw `SyncEngineError('ALREADY_BOUND')` if already attached. Prohibit sharing coordinators across engines.
   - Implement capability-authorized `resetRecovery(capability, resetAction)` strictly from `DEGRADED` state with failure-atomic lifecycle semantics:
-    - `PURGE_AND_RETRY`: monotonic attempt counter increment (`currentAttemptId++`), concurrent reset serialization with post-settlement attempt re-validation, in-flight invalidation with retained ownership slot and drain settlement barrier ($N_{\text{in-flight}} \le 1$), mandatory acceptance-boundary attempt-ID fencing, and permanent suppression of deferred notifications.
-    - `REINITIALIZE_CLEAN`: strict 5-step M4.3c sequence: (1) atomic clean baseline install via `replaceCoreStateAtomic`, (2) quarantine/reconciliation cleanup (purges all stale deferred notifications), (3) `setRecoveryMode(false)`, (4) coordinator to `ACTIVE`, (5) non-throwing `flushDeferredNotifications()` dispatching clean baseline state with isolated listener errors. Once `ACTIVE` is reached in step 4, state transition is externally observable; if pre-ACTIVE steps fail, catch block restores `setRecoveryMode(true)`, suppresses notifications, and locks engine in `DEGRADED` anchored on the clean baseline without rolling back.
+    - `PURGE_AND_RETRY`: monotonic attempt counter increment (`currentAttemptId++`), concurrent reset serialization with post-settlement attempt re-validation, in-flight invalidation with retained ownership slot and drain settlement barrier ($N_{\text{in-flight}} \le 1$), unambiguous custody transfer to `QuarantineBuffer` or `TerminalQuarantineArchive` (R10-01), watchdog timeout independence without cancellation (R10-02), candidate staging with atomic root pointer swap (R10-03), mandatory acceptance-boundary attempt-ID fencing, and permanent suppression of deferred notifications.
+    - `REINITIALIZE_CLEAN`: strict 5-step M4.3c sequence: (1) stale deferred notification purge, (2) atomic clean baseline install via `replaceCoreStateAtomic`, (3) `setRecoveryMode(false)`, (4) coordinator to `ACTIVE`, (5) non-throwing `flushDeferredNotifications()` dispatching clean baseline state with isolated listener errors strictly after ACTIVE (R10-04). Once `ACTIVE` is reached in step 4, state transition is externally observable; if pre-ACTIVE steps fail, catch block restores `setRecoveryMode(true)`, suppresses notifications, and locks engine in `DEGRADED` anchored on the clean baseline without rolling back.
   - Wire coordinator lifecycle completion sequence:
     1. Quarantine drain completes (`totalRetainedCount === 0`).
     2. Recovery bookkeeping completes.

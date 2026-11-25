@@ -1,6 +1,6 @@
 # Phase 7.5 Milestone M5 — Interface Specification
 
-**Status:** APPROVED ARCHITECTURAL SPECIFICATION (MILESTONE M5.0-R9 AMENDED)
+**Status:** APPROVED ARCHITECTURAL SPECIFICATION (MILESTONE M5.0-R10 AMENDED)
 **Date:** 2026-11-25
 **Authoritative Starting Baseline:** `40b11fdafcd247c7a289723f90ec0e2029c94f64` (Phase 7.5 M4.3d Formally Accepted)
 **Accepted Baselines:** M4.3c (`eab2428`), M4.3b (`f3c29b6`), Approved Architecture (`2bb117c`), Frozen M4.2d (`aafa366`)
@@ -246,12 +246,13 @@ export interface ILeaderlessSyncEngineRecovery {
    * cannot be inserted or relabeled as local). Identity hash H(op) == H(log) and causal dependencies are verified;
    * any identity conflict or unsatisfied dependency aborts recovery immediately to DEGRADED.
    *
-   * Mandatory Attempt-ID Fencing & Synchronous Indivisibility (R8-02, R9-02, R9-03):
+   * Mandatory Attempt-ID Fencing, Candidate Staging & Single Root Swap (R8-02, R9-02, R9-03, R10-03):
    * attemptId is strictly mandatory for recovery admission. If attemptId !== coordinator.currentAttemptId,
    * or coordinator is not in RECONCILING, admitDrainedOperation fails closed: returns status TERMINALLY_REJECTED
    * with error 'STALE_ATTEMPT_FENCED' and performs zero state mutation, zero log insertion, and zero vector advancement.
-   * Execution is 100% synchronous: under JavaScript run-to-completion semantics, the attempt check and all state
-   * mutations execute in a single indivisible call frame with zero possibility of interleaving.
+   * Execution is strictly synchronous in two phases: (1) side-effect free validation and candidate core staging,
+   * (2) atomic linearization point via single synchronous root pointer swap (this.core = candidateCore).
+   * Guarantees absolute exception atomicity under JavaScript run-to-completion semantics.
    *
    * Trust context is NEVER read or inferred from wire payloads or mutable operation fields.
    * Calling with an invalid, forged, or mismatched capability throws SyncEngineError('UNAUTHORIZED').
@@ -309,7 +310,7 @@ export type DestinationAcceptanceReceipt =
   | { readonly status: 'ACCEPTED_PENDING'; readonly vectorAdvanced: false; readonly reason: 'MISSING_DEPENDENCY' }
   | { readonly status: 'ALREADY_REPRESENTED'; readonly vectorAdvanced: false }
   | { readonly status: 'ALREADY_OWNED_DUPLICATE'; readonly vectorAdvanced: false }
-  | { readonly status: 'TERMINALLY_REJECTED'; readonly vectorAdvanced: false; readonly error: string }
+  | { readonly status: 'TERMINALLY_REJECTED'; readonly vectorAdvanced: false; readonly error: string; readonly reason?: string; readonly operationId?: string }
   | { readonly status: 'CAPACITY_REJECTED'; readonly vectorAdvanced: false; readonly currentQueueSize: number; readonly maxCapacity: number };
 
 /**
@@ -410,7 +411,7 @@ export interface IRuntimeRecoveryCoordinator {
    * Safely purges un-reconciled state or re-initializes engine to a clean verified baseline;
    * never declares incomplete or corrupted state as healthy.
    *
-   * Failure-Atomic Lifecycle Semantics (Closing R8-01–R8-05, R9-01–R9-06):
+   * Failure-Atomic Lifecycle Semantics (Closing R8-01–R8-05, R9-01–R9-06, R10-01–R10-04):
    * 1. 'PURGE_AND_RETRY':
    *    - Monotonically increments attempt counter (currentAttemptId++), fencing all async callbacks/timers.
    *    - Concurrent Reset Serialization (R9-01): multiple reset requests share settlement barrier; each re-validates
@@ -418,15 +419,18 @@ export interface IRuntimeRecoveryCoordinator {
    *    - In-flight invalidation with retained ownership slot (R8-01): marks invalidated = true, retains slot
    *      (N_in-flight = 1), blocks new drains via drainSettledBarrier() until settled. When settled, releases
    *      the exact owned record (N_in-flight = 0).
-   *    - Settlement failure/timeout policy (R9-04): terminal rejections release slot; 5s watchdog aborts to DEGRADED.
+   *    - Unambiguous Operation Custody (R10-01): acknowledged custody transfer to QuarantineBuffer (retryable/stale)
+   *      or TerminalQuarantineArchive (permanent validation failure) before releasing in-flight record.
+   *    - Watchdog Timeout vs Settlement vs Ownership Release (R10-02): 5s watchdog aborts coordinator to DEGRADED
+   *      without cancelling Promise or releasing in-flight slot; in-flight record released strictly after actual settlement.
    *    - Mandatory attempt fencing at acceptance boundary (R8-02, R9-02, R9-03): admitDrainedOperation rejects stale IDs.
-   *    - Acceptance Linearization (R9-05): operations accepted before invalidation remain in log; stale continuation zero new mutation.
+   *    - Acceptance Linearization & Root Swap (R9-05, R10-03): candidate core staging and single root pointer swap.
    *    - Purges QuarantineBuffer, FutureEpochBuffer, stashedLocalQueue, and deferred notification queues.
    *    - Transitions coordinator to RECOVERING under new attempt ID, keeping recoveryActive locked.
-   * 2. 'REINITIALIZE_CLEAN' (R8-03, R8-04, R9-06):
+   * 2. 'REINITIALIZE_CLEAN' (R8-03, R8-04, R9-06, R10-04):
    *    - Preserves strict 5-step M4.3c sequence: (1) stale notification purge, (2) atomic clean baseline install,
-   *      (3) engine.setRecoveryMode(false) + clean baseline notification enqueue, (4) coordinator to ACTIVE,
-   *      (5) flush clean baseline notifications via non-throwing dispatch (isolated listener failures).
+   *      (3) engine.setRecoveryMode(false), (4) coordinator to ACTIVE, (5) flush clean baseline notifications
+   *      via non-throwing dispatch (isolated listener failures).
    *    - Irrevocable root swap: once step 2 executes, clean baseline reference swap is irrevocable.
    *    - Explicit failure boundary (R8-04): once ACTIVE is reached in step 4, state transition is externally
    *      observable; delivered listener effects cannot be rolled back. If pre-ACTIVE steps fail, catch block
