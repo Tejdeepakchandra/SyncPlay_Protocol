@@ -1,6 +1,6 @@
 # Phase 7.5 Milestone M5 — Engine Runtime Recovery Integration Architecture
 
-**Status:** APPROVED ARCHITECTURAL SPECIFICATION (MILESTONE M5.0-R5 AMENDED)
+**Status:** APPROVED ARCHITECTURAL SPECIFICATION (MILESTONE M5.0-R6 AMENDED)
 **Date:** 2026-11-25
 **Authoritative Starting Baseline:** `40b11fdafcd247c7a289723f90ec0e2029c94f64` (Phase 7.5 M4.3d Formally Accepted)
 **Accepted Baselines:** M4.3c (`eab2428`), M4.3b (`f3c29b6`), Approved Architecture (`2bb117c`), Frozen M4.2d (`aafa366`)
@@ -71,9 +71,12 @@ flowchart TD
     RRP -->|triggerRecovery on onHistoryExhausted| RC
 ```
 
-### 2.1 Capability Custody, Attachment Semantics & Failure Behavior (Closing F5, R2-H5, R3-07)
+### 2.1 Capability Custody, Attachment Semantics & Failure Behavior (Closing F5, R2-H5, R3-07, R6-01)
 
-The accepted capability model relies on frozen object identity:
+Milestone M5 follows the established capability-custody architecture of Phase 7.5 (e.g. `RecoveryInstallationCapability`, `InboundTransportCapability`), relying on branded symbols, frozen objects, and strict reference identity verification.
+
+#### 2.1.1 Recovery Installation Capability
+The accepted installation capability model relies on frozen object identity:
 `export interface RecoveryInstallationCapability { readonly authority: string; readonly sessionId: string; readonly token: string; }`.
 To preserve exact capability custody and single-attachment guarantees without claiming un-modeled capability "revocation":
 
@@ -90,6 +93,44 @@ To preserve exact capability custody and single-attachment guarantees without cl
    - **Successful Binding:** Coordinator stores the engine reference and authorized capability in private fields.
    - **Failure During Engine Construction:** If engine initialization throws after `bindEngine()` has run (e.g. invalid configuration or constructor failure), engine construction unwinds; the engine reference is never published, and the partially constructed engine is reclaimed by garbage collection. An externally injected coordinator bound during a failed constructor call cannot be safely reused and must be discarded.
    - **Engine Disposal:** Invoking `engine.dispose()` invokes `coordinator.dispose()`. Calling `replaceCoreStateAtomic` on a disposed engine throws `SyncEngineError('ENGINE_DISPOSED')`, effectively dead-ending the capability even if a reference is retained externally.
+
+#### 2.1.2 Drain Admission Context Capabilities: Unforgeable Provenance (Closing R6-01)
+A typed string (`'LOCAL_REPLAY' | 'REPAIR_BATCH'`) is a declaration of context, not proof of provenance: any caller can supply a string. To prevent accidental trust escalation where untrusted remote operations bypass arrival-rate limits and clock-inflation checks, post-snapshot drain admission is capability-gated:
+
+```typescript
+export const DRAIN_ADMISSION_BRAND: unique symbol = Symbol('DRAIN_ADMISSION_BRAND');
+
+export interface TrustedLocalReplayCapability {
+  readonly [DRAIN_ADMISSION_BRAND]: true;
+  readonly kind: 'LOCAL_REPLAY';
+  readonly sessionId: string;
+  readonly authority: string;
+  readonly token: string;
+}
+
+export interface TrustedRepairBatchCapability {
+  readonly [DRAIN_ADMISSION_BRAND]: true;
+  readonly kind: 'REPAIR_BATCH';
+  readonly sessionId: string;
+  readonly authority: string;
+  readonly token: string;
+}
+
+export type DrainAdmissionContext =
+  | TrustedLocalReplayCapability
+  | TrustedRepairBatchCapability;
+```
+
+#### Seven Non-Negotiable Capability Properties:
+1. **Unforgeable in Normal API:** `DRAIN_ADMISSION_BRAND` is a package-private unique symbol. Ordinary SDK consumers cannot fabricate a valid capability literal with `[DRAIN_ADMISSION_BRAND]: true`.
+2. **Created & Retained by Composition Root / Engine:** `LeaderlessSyncEngine` mints its own `authorizedLocalReplayCapability` and `authorizedRepairBatchCapability` upon construction.
+3. **Exact Reference Identity Check:** `admitDrainedOperation(op, capability)` checks exact object-reference identity (`capability === this.authorizedLocalReplayCapability` or `capability === this.authorizedRepairBatchCapability`).
+4. **Physical Custody Segregation:**
+   - `QuarantineDrainer` is initialized strictly with `TrustedRepairBatchCapability`. It has **zero reference** to `TrustedLocalReplayCapability`. Remote quarantine draining can NEVER obtain or present local replay capability.
+   - The local stashed reconciliation workflow is held privately by `RecoveryCoordinator` and provided with `TrustedLocalReplayCapability`.
+5. **No Wire or Payload Inference:** The operation's wire payload, headers, and mutable fields can never influence the selected trust context. Trust is determined solely by the capability presented.
+6. **Fail-Closed on Invalid/Missing Capabilities:** Any invocation with a missing, null, undefined, forged, or mismatched capability throws `SyncEngineError('UNAUTHORIZED')` immediately.
+7. **Preservation of Accepted Drain Invariants:** M4.3b capability custody, M4.3c single-owner drain ($N_{\text{in-flight}} \le 1$), and M4.3d production orchestration contracts remain 100% intact.
 
 ---
 
@@ -168,6 +209,29 @@ export type RemoteAdmissionDecision =
    - Records the decision via `recordDecision(event, decision)` and drops the remote event.
    - **Contract Clarity:** `REJECTED_CAPACITY` is a declared `EngineDecision.code` emitted by the engine, NOT a variant of `RemoteAdmissionDecision`.
    - For local user actions (`receiveLocal` / `submit`), local inputs **do throw** `SyncEngineError('REJECTED_DEGRADED')` synchronously.
+
+### 3.4 Administrative Recovery Reset Semantics & Guardrails (Closing R6-02)
+
+`resetRecovery()` exists strictly as an administrative recovery reset, NOT as a general-purpose escape hatch to clear degradation while leaving incomplete or corrupted state in place.
+
+#### 1. Strict State Guard & Capability Authorization
+- `resetRecovery(capability, resetAction)` is allowed **strictly from the `DEGRADED` state** (`this.stateMachine.state === 'DEGRADED'`). Calling it from `ACTIVE`, `RECOVERING`, `RECONCILING`, or `DISPOSED` throws `SyncEngineError('INVALID_STATE')`.
+- Requires an authorized `RecoveryInstallationCapability` checked via strict object-reference identity (`capability === this.authorizedRecoveryCapability`). Unauthorized invocations throw `SyncEngineError('UNAUTHORIZED')`.
+
+#### 2. Safe Reset Actions & Semantics
+`resetRecovery()` supports two explicit reset actions:
+1. **`PURGE_AND_RETRY` (Autonomous Clean Retry):**
+   - Discards all un-drained quarantined operations from `QuarantineBuffer` and resets `FutureEpochBuffer`.
+   - Purges `stashedLocalQueue` and any incomplete reconciliation state.
+   - Permanently discards `deferredStateChanges` and `deferredDecisions` (they are **never flushed to listeners**).
+   - Resets the recovery coordinator state machine to `RECOVERING` (attempt ID incremented), keeping engine recovery mode locked (`engine.setRecoveryMode(true)`).
+   - Initiates a fresh, full recovery discovery and transfer cycle.
+   - The engine does NOT return to `ACTIVE` until this new recovery attempt completes successfully.
+2. **`REINITIALIZE_CLEAN` (Administrative Baseline Restoration):**
+   - Used when the application session decides to restart from a known clean genesis state or agreed anchor snapshot rather than continuing peer recovery.
+   - Atomically replaces `EngineCoreState` with the clean baseline anchor via capability-gated replacement.
+   - Purges all quarantine buffers, drain records, and deferred notifications.
+   - Clears engine recovery mode (`engine.setRecoveryMode(false)`) and transitions coordinator to `ACTIVE` **only after** the clean verified baseline is installed.
 
 ---
 
@@ -270,42 +334,51 @@ A central challenge in state machine replication over compacted snapshots is the
    - **Hazard Resolution:**
      - **Priority 1 (Delta Log Repair):** The engine rejects snapshot replacement and initiates anti-entropy log repair (`RepairRequestPipeline`) from a common ancestor so that all uncompacted operations from all peers can be placed into `OrderedOperationLog` and ordered canonically by `compareOperations` before compaction.
      - **Priority 2 (Explicit Incompatibility Gate):** If anti-entropy log repair is not possible (history has been truncated across all peers and cannot be fetched), the engine **must not** apply the snapshot and replay $A$ out of order. Recovery detects that canonical SMR order cannot be guaranteed and **aborts safely to `DEGRADED`** with error code `INCOMPATIBLE_COMPACTED_HISTORY` (`SyncEngineError('INCOMPATIBLE_COMPACTED_HISTORY')`).
-   - **Replay-Safe Condition:** A stashed local operation $A$ is eligible for replay onto the snapshot base if and only if:
-     $$\forall p \in \text{compacted origins},\ L(A) > \text{snapshot.originFrontierTimestamps}[p]$$
-     (or $L(A) > \text{snapshot.maxLogicalTimestamp}$).
-     Under this condition, $\forall op \in S_{\text{snap}},\ K(op) \prec K(A)$ holds universally, guaranteeing that $S_{\text{snap}} \to A$ is the exact canonical SMR execution order.
+   - **Replay-Safe Conditions & Precise Semantics:**
+     - **Conservative Sufficient Condition:**
+       $$L(A) > \text{snapshot.maxLogicalTimestamp}$$
+       provided `snapshot.maxLogicalTimestamp` genuinely represents the maximum Lamport timestamp across the entire compacted history.
+     - **Per-Origin Frontier Condition:**
+       $$\forall p \in \text{compacted origins},\ L(A) > \text{snapshot.originFrontierTimestamps}[p]$$
+       with the non-negotiable guarantees that:
+       1. Every compacted origin is explicitly represented in `originFrontierTimestamps`.
+       2. Each origin's frontier timestamp is the exact Lamport timestamp of its highest compacted sequence (not an approximation or an unrelated later checkpoint).
+     - **Critical Qualification on Causal Dependencies:** The canonical ordering feasibility check proves that $A$ sorts strictly after all compacted operations in the canonical total order. It does NOT independently prove that all causal dependencies of $A$ are satisfied. Causal dependencies must still be validated by the engine's causal admission pipeline upon replay.
 
-#### Dual Replay Trust Contexts & Physical Custody Provenance: LOCAL_REPLAY vs. REPAIR_BATCH (R5-01)
-To preserve the authoritative Phase 7.2 trust and validation boundaries (`docs/PHASE7_2_R5_FINAL_CORRECTIONS.md`), post-snapshot reconciliation strictly distinguishes two separate operation streams through an explicit typed parameter on `admitDrainedOperation()`:
+#### Capability-Gated Replay Trust Contexts: TrustedLocalReplay vs. TrustedRepairBatch (R5-01, R6-01)
+A typed string parameter (e.g. `'LOCAL_REPLAY'`) is merely a declaration of context, not proof of provenance. If callers could pass `'LOCAL_REPLAY'` as a string, untrusted remote operations could bypass arrival-rate and clock-inflation protections.
+
+To eliminate this vulnerability, post-snapshot reconciliation enforces capability-gated admission:
 
 ```typescript
 admitDrainedOperation(
   op: QuarantinedOperation,
-  trustContext: 'LOCAL_REPLAY' | 'REPAIR_BATCH' = 'REPAIR_BATCH',
+  capability: DrainAdmissionContext,
 ): DestinationAcceptanceReceipt;
 ```
 
-1. **Physical Custody Provenance (Closing Review Finding):**
-   - **Source of Truth:** Trust context is determined exclusively by the physical in-process queue custody of the calling subsystem:
-     - Draining `stashedLocalQueue` (operations extracted from local `OrderedOperationLog` before snapshot installation) passes `trustContext: 'LOCAL_REPLAY'`.
-     - Draining `quarantineBuffer` (remote network arrivals intercepted during recovery) passes `trustContext: 'REPAIR_BATCH'`.
+1. **Unforgeable In-Process Custody Provenance:**
+   - **Subsystem Custody:** Trust context is determined exclusively by the authorized capability held by the calling subsystem:
+     - Draining `stashedLocalQueue` presents `this.authorizedLocalReplayCapability` (`TrustedLocalReplayCapability`).
+     - Draining `quarantineBuffer` presents `this.repairBatchCapability` (`TrustedRepairBatchCapability`).
+   - `QuarantineDrainer` is constructed with and holds strictly `TrustedRepairBatchCapability`. It has **zero access** to `TrustedLocalReplayCapability`. Remote quarantine draining can never obtain or present local replay trust.
    - **No Metadata Inference:** Trust context is **NEVER read, inferred, or accepted from:**
      - Network wire frames, payload properties, or message headers.
      - Mutable operation object fields.
      - User input or peer-supplied metadata.
-   - Provenance is guaranteed solely by trusted internal subsystem custody.
+   - Any invocation with an invalid, forged, or mismatched capability throws `SyncEngineError('UNAUTHORIZED')` immediately.
 
-2. **Locally Committed Stashed Operations (`LOCAL_REPLAY` Context):**
+2. **Locally Committed Stashed Operations (`TrustedLocalReplayCapability`):**
    - **Nature:** Operations that were already validated, accepted, and committed in the local `OrderedOperationLog` prior to snapshot installation.
    - **Trust Boundary:** Trusted internal replay. Cannot introduce new origin peer IDs, new sequence numbers, or altered payloads.
-   - **Validation Semantics:** Exempt from token-bucket arrival rate limits and remote clock inflation checks (`LogicalClockManager.validateAndAdvanceRemote` with `context === 'LOCAL_REPLAY'` returns `this.currentClock` without mutating Lamport clocks).
+   - **Validation Semantics:** Evaluated upon presenting `TrustedLocalReplayCapability` (verified via `capability === this.authorizedLocalReplayCapability`). Exempt from token-bucket arrival rate limits and remote clock inflation checks (`LogicalClockManager.validateAndAdvanceRemote` with `context === 'LOCAL_REPLAY'` returns `this.currentClock` without mutating Lamport clocks).
    - **Admission Evaluation:** Evaluated on top of the newly installed snapshot base. Their causal dependencies must be satisfied by the snapshot base checkpoints or earlier replayed operations.
    - **Fork / Failure Action:** If a locally committed stashed operation encounters a sequence collision, identity conflict ($H(op) \ne H(log)$), or missing dependency that cannot be resolved, this proves an irreconcilable history divergence between local committed state and the snapshot. Recovery **must immediately abort to `DEGRADED`**. Locally committed progress is NEVER silently dropped.
 
-3. **Remotely Quarantined Operations (`REPAIR_BATCH` Context):**
+3. **Remotely Quarantined Operations (`TrustedRepairBatchCapability`):**
    - **Nature:** Remote operations that arrived over the network while recovery was in progress (`RECOVERING` or `RECONCILING`). They were buffered in `QuarantineBuffer` and have never been admitted to the local log.
    - **Trust Boundary:** Untrusted remote historical/repair operations.
-   - **Validation Semantics:** Evaluated under `REPAIR_BATCH` semantics via `engine.admitDrainedOperation(op, 'REPAIR_BATCH')`. They bypass wall-clock token-bucket arrival rate limits, but must pass complete structural validation: epoch fencing, per-origin Lamport monotonicity, dependency resolution across snapshot checkpoints and log, and collision checks.
+   - **Validation Semantics:** Evaluated upon presenting `TrustedRepairBatchCapability` (verified via `capability === this.authorizedRepairBatchCapability`). They bypass wall-clock token-bucket arrival rate limits, but must pass complete structural validation: epoch fencing, per-origin Lamport monotonicity, dependency resolution across snapshot checkpoints and log, and collision checks.
    - **Admission Evaluation:** Admitted into `OrderedOperationLog` only upon satisfying all causal dependencies (`ACCEPTED_REDUCED`) or buffered in `PendingDependencyQueue` (`ACCEPTED_PENDING`).
 
 #### Deterministic Replay Decision Contract & Total Ordering (R4-02, R5-02)
@@ -339,7 +412,7 @@ Operations are deterministically classified into six exhaustive categories:
 3. **Never Apply an Operation Twice:** Re-admission strictly fences against `baseSnapshotFrontier`, `replicationVector`, and `operationLog`, preventing duplicate state mutations.
 4. **Never Fabricate Causal Dependencies:** If causal dependencies are missing, the operation enters `PendingDependencyQueue` and triggers delta repair; dependencies are never synthesized or assumed.
 5. **Preserve Original Identity & Sequence:** Stashed operations retain their immutable `logicalEventId`, `originPeerId`, `originSequenceNumber`, `logicalTimestamp`, `causalContext`, and `payload`. Re-numbering or rewriting event identity is strictly forbidden.
-6. **Preserve Physical Custody Trust Distinction:** `LOCAL_REPLAY` applies strictly to already-accepted local operations re-anchoring on the new base state. `REPAIR_BATCH` applies to unadmitted network arrivals. Trust context is never inferred from wire messages.
+6. **Preserve Capability-Gated Trust Distinction:** Replay trust is derived strictly from unforgeable capability custody (`DrainAdmissionContext`). `TrustedLocalReplayCapability` applies strictly to already-accepted local operations re-anchoring on the new base state. `TrustedRepairBatchCapability` applies to unadmitted network arrivals. Trust context is never inferred from wire messages, headers, or mutable operation fields. Any invalid, forged, or mismatched capability fails closed with `SyncEngineError('UNAUTHORIZED')`.
 7. **Reuse Accepted M4.3c Single-Owner Drain:** Quarantined and stashed operations are processed with single-in-flight custody ($N_{\text{in-flight}} \le 1$) via `QuarantineDrainer`.
 8. **Abort When Safe Replay Is Unprovable:** If historical compatibility cannot be proven, or if stashed operations cannot reduce cleanly, snapshot recovery must abort to `DEGRADED` rather than risking divergence or data loss.
 

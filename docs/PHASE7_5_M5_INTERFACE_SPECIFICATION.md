@@ -1,6 +1,6 @@
 # Phase 7.5 Milestone M5 — Interface Specification
 
-**Status:** APPROVED ARCHITECTURAL SPECIFICATION (MILESTONE M5.0-R5 AMENDED)
+**Status:** APPROVED ARCHITECTURAL SPECIFICATION (MILESTONE M5.0-R6 AMENDED)
 **Date:** 2026-11-25
 **Authoritative Starting Baseline:** `40b11fdafcd247c7a289723f90ec0e2029c94f64` (Phase 7.5 M4.3d Formally Accepted)
 **Accepted Baselines:** M4.3c (`eab2428`), M4.3b (`f3c29b6`), Approved Architecture (`2bb117c`), Frozen M4.2d (`aafa366`)
@@ -76,6 +76,92 @@ export interface RecoveryInstallationCapability {
   readonly sessionId: string;
   readonly token: string;
 }
+
+// ── Drain Admission Context Capabilities (Closing R6-01) ──────────────────────
+
+/**
+ * Package-private unique symbol branding unforgeable drain admission capabilities.
+ * [PROPOSED — M5.1]
+ */
+export const DRAIN_ADMISSION_BRAND: unique symbol = Symbol('DRAIN_ADMISSION_BRAND');
+
+/**
+ * Unforgeable capability authorizing local operation replay during post-snapshot reconciliation.
+ * Bypasses arrival token-bucket rate limits and remote clock inflation checks.
+ * Held strictly by trusted internal local reconciliation workflow.
+ * [PROPOSED — M5.1]
+ */
+export interface TrustedLocalReplayCapability {
+  readonly [DRAIN_ADMISSION_BRAND]: true;
+  readonly kind: 'LOCAL_REPLAY';
+  readonly sessionId: string;
+  readonly authority: string;
+  readonly token: string;
+}
+
+/**
+ * Unforgeable capability authorizing quarantined remote batch admission during post-snapshot drain.
+ * Undergoes full structural and causal dependency validation.
+ * Held strictly by QuarantineDrainer.
+ * [PROPOSED — M5.1]
+ */
+export interface TrustedRepairBatchCapability {
+  readonly [DRAIN_ADMISSION_BRAND]: true;
+  readonly kind: 'REPAIR_BATCH';
+  readonly sessionId: string;
+  readonly authority: string;
+  readonly token: string;
+}
+
+/**
+ * Discriminated union of unforgeable drain admission capabilities.
+ * [PROPOSED — M5.1]
+ */
+export type DrainAdmissionContext =
+  | TrustedLocalReplayCapability
+  | TrustedRepairBatchCapability;
+
+/**
+ * Internal factory for minting authorized TrustedLocalReplayCapability.
+ * Package-private / internal factory.
+ * [PROPOSED — M5.1]
+ */
+export function createLocalReplayCapability(
+  sessionId: string,
+  authority = 'local-reconciliation',
+  token?: string,
+): TrustedLocalReplayCapability {
+  return Object.freeze({
+    [DRAIN_ADMISSION_BRAND]: true as const,
+    kind: 'LOCAL_REPLAY' as const,
+    sessionId,
+    authority,
+    token:
+      token ??
+      `local-replay-cap-${sessionId}-${Math.random().toString(36).slice(2)}-${Date.now()}`,
+  });
+}
+
+/**
+ * Internal factory for minting authorized TrustedRepairBatchCapability.
+ * Package-private / internal factory.
+ * [PROPOSED — M5.1]
+ */
+export function createRepairBatchCapability(
+  sessionId: string,
+  authority = 'quarantine-drainer',
+  token?: string,
+): TrustedRepairBatchCapability {
+  return Object.freeze({
+    [DRAIN_ADMISSION_BRAND]: true as const,
+    kind: 'REPAIR_BATCH' as const,
+    sessionId,
+    authority,
+    token:
+      token ??
+      `repair-batch-cap-${sessionId}-${Math.random().toString(36).slice(2)}-${Date.now()}`,
+  });
+}
 ```
 
 ### 2.2 LeaderlessSyncEngine Public & Protected Recovery Methods (Closing F1, F7, R2-C1, R2-C2, R2-M2, R3-03, R3-06)
@@ -135,15 +221,16 @@ export interface ILeaderlessSyncEngineRecovery {
   /**
    * Submits an in-flight quarantined or stashed operation to destination engine for admission/reduction.
    * Enforces N_in-flight <= 1. Evaluates operations across the 6 deterministic replay categories.
-   * Trust context is bound to caller's physical in-process custody:
-   * - 'LOCAL_REPLAY' for stashed local operations from OrderedOperationLog (trusted, immutable, rate/clock checks bypassed).
-   * - 'REPAIR_BATCH' for quarantined remote operations from QuarantineBuffer (untrusted, full structural validation).
+   * Capability-gated: requires unforgeable DrainAdmissionContext checked via strict object-reference identity:
+   * - TrustedLocalReplayCapability (strictly for stashed local operations from OrderedOperationLog).
+   * - TrustedRepairBatchCapability (strictly for quarantined remote operations from QuarantineDrainer).
    * Trust context is NEVER read or inferred from wire payloads or mutable operation fields.
-   * [EXISTING — M4 ACCEPTED in LeaderlessSyncEngine.ts:977, amended with trustContext in M5.1/M5.4]
+   * Calling with an invalid, forged, or mismatched capability throws SyncEngineError('UNAUTHORIZED').
+   * [EXISTING — M4 ACCEPTED in LeaderlessSyncEngine.ts:977, capability-gated in M5.1/M5.4]
    */
   admitDrainedOperation(
     op: QuarantinedOperation,
-    trustContext?: 'LOCAL_REPLAY' | 'REPAIR_BATCH',
+    capability: DrainAdmissionContext,
   ): DestinationAcceptanceReceipt;
 
   /**
@@ -287,9 +374,16 @@ export interface IRuntimeRecoveryCoordinator {
   abortRecovery(reason: RecoveryFailureReason, errorOrMessage?: Error | string): void;
 
   /**
-   * Resets recovery state back to ACTIVE. Allowed only from DEGRADED state.
+   * Administratively resets recovery state. Allowed strictly from DEGRADED state.
+   * Requires authorized RecoveryInstallationCapability checked via strict reference equality.
+   * Safely purges un-reconciled state or re-initializes engine to a clean verified baseline;
+   * never declares incomplete or corrupted state as healthy.
+   * [PROPOSED — M5.1]
    */
-  resetRecovery(initiatedBy: string): void;
+  resetRecovery(
+    capability: RecoveryInstallationCapability,
+    resetAction: 'PURGE_AND_RETRY' | 'REINITIALIZE_CLEAN',
+  ): void;
 
   /** Disposes coordinator resources, timers, and listeners. Idempotent. */
   dispose(): void;
@@ -516,4 +610,5 @@ export interface RecoveryTimerInventory {
 | `FORK_DETECTED_INCOMPARABLE`| Coordinator | Divergent histories with conflicting operations | Coordinator aborts recovery to `DEGRADED`. |
 | `INCOMPATIBLE_COMPACTED_HISTORY` | Coordinator / Replay | Canonical SMR total-order preservation against compacted snapshots | Recovery aborts to `DEGRADED` when stashed local operations have Lamport timestamp <= snapshot compacted frontier and cannot be canonically ordered after snapshot base. |
 | `ALREADY_BOUND` | Coordinator | Single-attachment invariant | Throws `SyncEngineError` if coordinator is bound to more than one engine. |
-| `UNAUTHORIZED` | LeaderlessSyncEngine | Capability custody enforced by object identity | Throws `SyncEngineError` if capability does not match `authorizedRecoveryCapability`. |
+| `UNAUTHORIZED` | LeaderlessSyncEngine | Capability custody enforced by object identity | Throws `SyncEngineError` if capability does not match `authorizedRecoveryCapability` or `DrainAdmissionContext`. |
+| `INVALID_STATE` | Coordinator | State guard for administrative recovery resets | Throws `SyncEngineError` if `resetRecovery()` is invoked from non-`DEGRADED` state. |
