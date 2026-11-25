@@ -1,8 +1,9 @@
 # Phase 7.5 Milestone M5 — Interface Specification
 
-**Status:** APPROVED ARCHITECTURAL SPECIFICATION (MILESTONE M5.0-R1 AMENDED)  
-**Date:** 2026-11-25  
-**Authoritative Starting Baseline:** `40b11fdafcd247c7a289723f90ec0e2029c94f64` (Phase 7.5 M4.3d Formally Accepted)  
+**Status:** APPROVED ARCHITECTURAL SPECIFICATION (MILESTONE M5.0-R2 AMENDED)
+**Date:** 2026-11-25
+**Authoritative Starting Baseline:** `40b11fdafcd247c7a289723f90ec0e2029c94f64` (Phase 7.5 M4.3d Formally Accepted)
+**Accepted Baselines:** M4.3c (`eab2428`), M4.3b (`f3c29b6`), Approved Architecture (`2bb117c`), Frozen M4.2d (`aafa366`)
 **Scope:** Interface contracts, type definitions, and API specifications for Milestone M5 Engine Runtime Recovery Integration.
 
 ---
@@ -19,7 +20,7 @@ Every interface and method in this document is labeled as either:
 
 ## 2. LeaderlessSyncEngine Runtime Integration Interfaces
 
-### 2.1 Engine Configuration (Closing F5 — Mutually Exclusive Options)
+### 2.1 Engine Configuration (Closing F5, R2-H5)
 
 ```typescript
 /**
@@ -41,14 +42,14 @@ export interface LeaderlessSyncEngineConfig {
 
   /**
    * Option A (Autonomous Construction): Options to construct and own RecoveryCoordinator internally.
-   * Mutually exclusive with recoveryCoordinator.
+   * Mutually exclusive with recoveryCoordinator. Supplying both throws SyncEngineError('INVALID_CONFIG').
    * [PROPOSED — M5.1]
    */
   readonly recoveryOptions?: EngineRecoveryOptions;
 
   /**
    * Option B (External Coordinator Injection): Injected coordinator instance.
-   * Mutually exclusive with recoveryOptions.
+   * Mutually exclusive with recoveryOptions. Supplying both throws SyncEngineError('INVALID_CONFIG').
    * [PROPOSED — M5.1]
    */
   readonly recoveryCoordinator?: IRuntimeRecoveryCoordinator;
@@ -67,7 +68,7 @@ export interface EngineRecoveryOptions {
 }
 ```
 
-### 2.2 LeaderlessSyncEngine Public & Protected Recovery Methods (Closing F1 & F7)
+### 2.2 LeaderlessSyncEngine Public & Protected Recovery Methods (Closing F1, F7, R2-C1, R2-C2, R2-M2)
 
 ```typescript
 export interface ILeaderlessSyncEngineRecovery {
@@ -96,8 +97,11 @@ export interface ILeaderlessSyncEngineRecovery {
   // ── Single-Root Core State Replacement [EXISTING — M4 ACCEPTED] ───────────
 
   /**
-   * Synchronous capability-gated single-root core state replacement.
-   * Replaces this.core across all 12 authoritative fields in 0 ticks.
+   * Capability-gated single-root core state replacement.
+   * Replaces this.core across all 12 authoritative fields in one synchronous reference
+   * replacement under JavaScript run-to-completion semantics.
+   * Ordinary consumers NEVER hold candidate EngineCoreState; this is called exclusively
+   * by SnapshotInstaller.commitAtomic() via opaque StagedSnapshotInstallation handle.
    * [EXISTING — M4 ACCEPTED in LeaderlessSyncEngine.ts:883]
    */
   replaceCoreStateAtomic(
@@ -107,6 +111,7 @@ export interface ILeaderlessSyncEngineRecovery {
 
   /**
    * Submits an in-flight quarantined operation to destination engine for admission/reduction.
+   * Reuses accepted M4.3c contract with N_in-flight <= 1.
    * [EXISTING — M4 ACCEPTED in LeaderlessSyncEngine.ts:977]
    */
   admitDrainedOperation(op: QuarantinedOperation): DestinationAcceptanceReceipt;
@@ -118,7 +123,8 @@ export interface ILeaderlessSyncEngineRecovery {
   hasOperation(originPeerId: string, sequenceNumber: number): boolean;
 
   /**
-   * Flushes deferred notifications strictly AFTER state transitions to ACTIVE.
+   * Flushes deferred notifications strictly AFTER engine recovery mode is cleared
+   * and coordinator state transitions to ACTIVE.
    * - stateChangeListeners: exactly ONE coalesced notification with final PlaybackState.
    * - decisionListeners: all decisions dispatched sequentially in FIFO order.
    * [EXISTING — M4 ACCEPTED in LeaderlessSyncEngine.ts:929, updated in M5.1]
@@ -151,9 +157,9 @@ export interface ILeaderlessSyncEngineRecovery {
 
 ---
 
-## 3. Recovery Coordinator Runtime Binding & Discriminated Decisions
+## 3. Recovery Coordinator Runtime Binding & Interception Decisions
 
-### 3.1 IRuntimeRecoveryCoordinator Interface (Closing F1 & F5)
+### 3.1 IRuntimeRecoveryCoordinator Interface (Closing F1, F5, R2-H5)
 
 ```typescript
 /**
@@ -169,11 +175,12 @@ export interface IRuntimeRecoveryCoordinator {
   /** Whether the coordinator is disposed */
   readonly isDisposed: boolean;
 
-  /** Current attempt sequence number (fences all async callbacks) */
+  /** Current attempt sequence number (fences all async attempt-scoped callbacks) */
   readonly currentAttemptId: number;
 
   /**
-   * Binds the coordinator to the engine. Throws if already bound.
+   * Binds the coordinator to the engine. Enforces single-attachment invariant.
+   * Throws SyncEngineError('ALREADY_BOUND') if coordinator is already bound.
    * [PROPOSED — M5.1]
    */
   bindEngine(engine: LeaderlessSyncEngine, capability: RecoveryInstallationCapability): void;
@@ -187,7 +194,8 @@ export interface IRuntimeRecoveryCoordinator {
   /**
    * Intercepts an inbound remote event using discriminated union results.
    * Synchronous, O(1), <= 5μs overhead in ACTIVE state.
-   * [PROPOSED — M5.2 replacing optional boolean result]
+   * Throws SyncEngineError('QUARANTINE_OVERFLOW') on buffer limit breach.
+   * [PROPOSED — M5.2]
    */
   interceptRemoteEvent(
     event: AnyControlSyncEvent,
@@ -200,7 +208,8 @@ export interface IRuntimeRecoveryCoordinator {
   interceptLocalSubmission(): LocalAdmissionResult;
 
   /**
-   * Executes atomic installation and quarantine drain for an assembled snapshot.
+   * Executes atomic installation and quarantine drain for an assembled snapshot
+   * using the accepted opaque staged handle contract.
    */
   executeRecoveryWithSnapshot(
     snapshotPayload: StateSnapshotPayloadV2,
@@ -222,16 +231,18 @@ export interface IRuntimeRecoveryCoordinator {
    */
   resetRecovery(initiatedBy: string): void;
 
-  /** Disposes coordinator resources, timers, and listeners */
+  /** Disposes coordinator resources, timers, and listeners. Idempotent. */
   dispose(): void;
 }
 ```
 
-### 3.2 Discriminated Inbound Interception Decision (Closing F3 & F9)
+### 3.2 Discriminated Inbound Interception Decision (Closing F3, F9, R2-H2)
 
 ```typescript
 /**
  * Unambiguous discriminated union returned by interceptRemoteEvent().
+ * Note: Overflow is an exceptional boundary condition that throws SyncEngineError,
+ * not a return outcome.
  * [PROPOSED — M5.2]
  */
 export type RemoteAdmissionDecision =
@@ -272,18 +283,12 @@ export type RemoteAdmissionDecision =
   | {
       /** Engine or coordinator is disposed: event rejected */
       readonly outcome: 'REJECTED_DISPOSED';
-    }
-  | {
-      /** Quarantine or future-epoch buffer overflow: recovery aborted to DEGRADED */
-      readonly outcome: 'ABORTED_OVERFLOW';
-      readonly overflowType: 'QUARANTINE_OVERFLOW' | 'FUTURE_EPOCH_OVERFLOW';
-      readonly detail: string;
     };
 ```
 
 ---
 
-## 4. Single-Root Engine Core State Contract (Closing F2)
+## 4. Single-Root Engine Core State Contract (Closing F2, R2-C1)
 
 ```typescript
 /**
@@ -310,15 +315,41 @@ export interface EngineCoreState {
   // ── Referential Alias Property (Invariant: playbackState === state) ────────
   playbackState: PlaybackState;                // 13. Deeply frozen alias pointing to state
 }
+
+/**
+ * Immutable opaque handle representing a staged snapshot installation.
+ * The candidate EngineCoreState is retained in private WeakMap storage inside
+ * SnapshotInstaller and is never exposed to external callers or the coordinator.
+ * [EXISTING — M4 ACCEPTED in snapshot-installer.ts]
+ */
+export interface StagedSnapshotInstallation {
+  readonly handleId: string;
+  readonly sessionId: string;
+  readonly targetEpoch: number;
+  readonly targetFrontier: Readonly<Record<string, number>>;
+  readonly canonicalDigest: string;
+  readonly maxLogicalTimestamp: number;
+}
 ```
 
 ---
 
-## 5. Supplier Selection & Lattice Ordering Types (Closing F4)
+## 5. Supplier Selection, Lattice Ordering & Deterministic Comparator (Closing F4, R2-C3, R2-H1)
 
 ```typescript
 /**
+ * Protocol-stable, locale-independent peer ID comparator.
+ * Based on UTF-16 code units / Unicode code point ordering.
+ * [PROPOSED — M5.4]
+ */
+export function comparePeerIds(a: string, b: string): number {
+  return a < b ? -1 : (a > b ? 1 : 0);
+}
+
+/**
  * Detailed outcome of evaluating candidates for snapshot recovery.
+ * Fully distinguishes strict domination, identical states, compatible branches,
+ * and true causal forks without conflating incomparable vectors with forks.
  * [PROPOSED — M5.4]
  */
 export type CandidateSupplierSelectionResult =
@@ -326,14 +357,37 @@ export type CandidateSupplierSelectionResult =
       readonly status: 'SELECTED';
       readonly supplierPeerId: string;
       readonly snapshotFrontier: Record<string, number>;
-      readonly selectionReason: 'STRICT_DOMINATION' | 'EQUAL_LOWER_RTT' | 'EQUAL_LEXICOGRAPHICAL_TIEBREAK' | 'PROACTIVE_HORIZON_SENDER';
+      readonly selectionReason:
+        | 'STRICT_DOMINATION'
+        | 'EQUAL_LOWER_RTT'
+        | 'EQUAL_CANONICAL_PEER_ID'
+        | 'HISTORICAL_PREFIX_SUBSUMES';
     }
   | {
-      readonly status: 'INCOMPARABLE_FORK_DETECTED';
+      readonly status: 'IDENTICAL_STATE';
+      readonly reason: string;
+    }
+  | {
+      readonly status: 'INCOMPARABLE_COMPATIBLE';
       readonly candidateA: string;
-      readonly frontierA: Record<string, number>;
       readonly candidateB: string;
-      readonly frontierB: Record<string, number>;
+      readonly reason: string;
+    }
+  | {
+      readonly status: 'REPAIRABLE_WITHIN_HORIZON';
+      readonly maxGap: number;
+      readonly logCapacity: number;
+    }
+  | {
+      readonly status: 'PROVEN_CONFLICT_FORK_DETECTED';
+      readonly candidateA: string;
+      readonly candidateB: string;
+      readonly conflictingOrigin: string;
+      readonly sequenceNumber: number;
+      readonly reason: string;
+    }
+  | {
+      readonly status: 'INSUFFICIENT_EVIDENCE';
       readonly reason: string;
     }
   | {
@@ -344,7 +398,7 @@ export type CandidateSupplierSelectionResult =
 
 ---
 
-## 6. Pipeline Handoff & Latch Interfaces (Closing F10)
+## 6. Pipeline Handoff, Latch & Timer Ownership (Closing F10, R2-H4)
 
 ```typescript
 /**
@@ -357,6 +411,27 @@ export interface InboundTransferCompletionHandler {
     attemptId: number,
   ): Promise<void>;
 }
+
+/**
+ * Four-category timer classifications and their cancellation lifecycles.
+ */
+export interface RecoveryTimerInventory {
+  /** Snapshot-attempt timer: cancelled on attempt success, retry, abort, or disposal */
+  overallTimer: NodeJS.Timeout | null;
+
+  /** Reconciliation timer: cancelled on drain success, abort, or disposal */
+  reconciliationTimer: NodeJS.Timeout | null;
+
+  /** Offer/transfer discovery timer: cancelled on offer selection, transfer start, abort, or disposal */
+  offerAwaitTimer: NodeJS.Timeout | null;
+
+  /**
+   * Future-epoch convergence timer: independent grace timer (5s).
+   * Scoped to epoch identity. NOT cancelled on snapshot attempt complete/retry/reset.
+   * Cancelled ONLY when engine epoch advances >= target epoch, on grace expiration, or on disposal.
+   */
+  futureEpochGraceTimer: NodeJS.Timeout | null;
+}
 ```
 
 ---
@@ -368,10 +443,11 @@ export interface InboundTransferCompletionHandler {
 | `REJECTED_RECOVERING` | Engine / Local Gating | Local inputs strictly prohibited during recovery | Synchronous exception throw (`SyncEngineError`) in `receiveLocal()` / `submit()`. |
 | `REJECTED_DEGRADED` | Engine / Local Gating | Engine state corrupted or recovery unresolvable | Synchronous exception throw on local intents; remote events dropped with `outcome: 'REJECTED_DEGRADED'`. |
 | `BUFFERED_QUARANTINE` | Engine Decision | Remote events during recovery must not mutate active state | Engine records decision; event queued in `QuarantineBuffer`. |
-| `BUFFERED_FUTURE_EPOCH`| Coordinator | Epoch transition must be capability authorized | Event staged in `FutureEpochBuffer` with 5s expiration timer. |
+| `BUFFERED_FUTURE_EPOCH`| Coordinator | Epoch transition must be capability authorized | Event staged in `FutureEpochBuffer` with independent 5s expiration timer. |
 | `DISCARD_OBSOLETE_EPOCH`| Coordinator | Obsolete membership operations ignored | Remote event dropped with zero anti-entropy or state recording. |
-| `QUARANTINE_OVERFLOW` | QuarantineBuffer | Dual bound: 1,000 ops / 4 MiB total | Throws `SyncEngineError`; coordinator aborts recovery to `DEGRADED`. |
-| `FUTURE_EPOCH_OVERFLOW`| FutureEpochBuffer | Bound: 100 ops / 512 KiB total | Throws `SyncEngineError`; coordinator aborts recovery to `DEGRADED`. |
+| `QUARANTINE_OVERFLOW` | QuarantineBuffer | Dual bound: 1,000 ops / 4 MiB aggregate | Throws `SyncEngineError`; coordinator aborts recovery to `DEGRADED`; engine isolates to `REJECTED_CAPACITY`. |
+| `FUTURE_EPOCH_OVERFLOW`| FutureEpochBuffer | Bound: 100 ops / 512 KiB aggregate | Throws `SyncEngineError`; coordinator aborts recovery to `DEGRADED`; engine isolates to `REJECTED_CAPACITY`. |
 | `UNRESOLVED_FUTURE_EPOCH`| Coordinator | 5s grace period expired without capability | Coordinator aborts recovery to `DEGRADED`. |
-| `DRAIN_CAPACITY_EXCEEDED`| QuarantineDrainer | Destination queue capacity preserved | Drain halts; in-flight op unshifted; recovery aborts to `DEGRADED`. |
-| `FORK_DETECTED_INCOMPARABLE`| Coordinator | No arbitrary ordering between incomparable dominating frontiers | Coordinator aborts recovery to `DEGRADED`. |
+| `REJECTED_CAPACITY` | LeaderlessSyncEngine | Memory and queue capacity bounds preserved | Remote event rejected; engine records decision; remote error isolated without throwing. |
+| `FORK_DETECTED_INCOMPARABLE`| Coordinator | Divergent histories with conflicting operations | Coordinator aborts recovery to `DEGRADED`. |
+| `ALREADY_BOUND` | Coordinator | Single-attachment invariant | Throws `SyncEngineError` if coordinator is bound to more than one engine. |
