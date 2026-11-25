@@ -1,6 +1,6 @@
 # Phase 7.5 Milestone M5 — Interface Specification
 
-**Status:** APPROVED ARCHITECTURAL SPECIFICATION (MILESTONE M5.0-R8 AMENDED)
+**Status:** APPROVED ARCHITECTURAL SPECIFICATION (MILESTONE M5.0-R9 AMENDED)
 **Date:** 2026-11-25
 **Authoritative Starting Baseline:** `40b11fdafcd247c7a289723f90ec0e2029c94f64` (Phase 7.5 M4.3d Formally Accepted)
 **Accepted Baselines:** M4.3c (`eab2428`), M4.3b (`f3c29b6`), Approved Architecture (`2bb117c`), Frozen M4.2d (`aafa366`)
@@ -246,10 +246,12 @@ export interface ILeaderlessSyncEngineRecovery {
    * cannot be inserted or relabeled as local). Identity hash H(op) == H(log) and causal dependencies are verified;
    * any identity conflict or unsatisfied dependency aborts recovery immediately to DEGRADED.
    *
-   * Attempt-ID Fencing at Acceptance Boundary (R8-02):
-   * If attemptId is provided and attemptId !== coordinator.currentAttemptId, or coordinator is not in RECONCILING,
-   * admitDrainedOperation fails closed: returns status TERMINALLY_REJECTED with error 'STALE_ATTEMPT_FENCED'
-   * and performs zero state mutation, zero log insertion, and zero replication vector advancement.
+   * Mandatory Attempt-ID Fencing & Synchronous Indivisibility (R8-02, R9-02, R9-03):
+   * attemptId is strictly mandatory for recovery admission. If attemptId !== coordinator.currentAttemptId,
+   * or coordinator is not in RECONCILING, admitDrainedOperation fails closed: returns status TERMINALLY_REJECTED
+   * with error 'STALE_ATTEMPT_FENCED' and performs zero state mutation, zero log insertion, and zero vector advancement.
+   * Execution is 100% synchronous: under JavaScript run-to-completion semantics, the attempt check and all state
+   * mutations execute in a single indivisible call frame with zero possibility of interleaving.
    *
    * Trust context is NEVER read or inferred from wire payloads or mutable operation fields.
    * Calling with an invalid, forged, or mismatched capability throws SyncEngineError('UNAUTHORIZED').
@@ -258,7 +260,7 @@ export interface ILeaderlessSyncEngineRecovery {
   admitDrainedOperation(
     op: QuarantinedOperation,
     capability: DrainAdmissionContext,
-    attemptId?: number,
+    attemptId: number,
   ): DestinationAcceptanceReceipt;
 
   /**
@@ -408,22 +410,24 @@ export interface IRuntimeRecoveryCoordinator {
    * Safely purges un-reconciled state or re-initializes engine to a clean verified baseline;
    * never declares incomplete or corrupted state as healthy.
    *
-   * Failure-Atomic Lifecycle Semantics (Closing R8-01, R8-02, R8-03, R8-04):
+   * Failure-Atomic Lifecycle Semantics (Closing R8-01–R8-05, R9-01–R9-06):
    * 1. 'PURGE_AND_RETRY':
    *    - Monotonically increments attempt counter (currentAttemptId++), fencing all async callbacks/timers.
-   *    - In-flight invalidation with retained ownership slot (R8-01): if an in-flight operation exists, marks
-   *      invalidated = true, retains the in-flight slot (N_in-flight = 1), and blocks new drains via drain
-   *      settlement barrier until the pending operation settles. When settled, slot is cleared (N_in-flight = 0).
-   *    - Attempt-ID fencing at acceptance boundary (R8-02): admitDrainedOperation rejects stale attempt IDs.
+   *    - Concurrent Reset Serialization (R9-01): multiple reset requests share settlement barrier; each re-validates
+   *      attemptId === currentAttemptId post-settlement so only newest attempt starts recovery work.
+   *    - In-flight invalidation with retained ownership slot (R8-01): marks invalidated = true, retains slot
+   *      (N_in-flight = 1), blocks new drains via drainSettledBarrier() until settled. When settled, releases
+   *      the exact owned record (N_in-flight = 0).
+   *    - Settlement failure/timeout policy (R9-04): terminal rejections release slot; 5s watchdog aborts to DEGRADED.
+   *    - Mandatory attempt fencing at acceptance boundary (R8-02, R9-02, R9-03): admitDrainedOperation rejects stale IDs.
+   *    - Acceptance Linearization (R9-05): operations accepted before invalidation remain in log; stale continuation zero new mutation.
    *    - Purges QuarantineBuffer, FutureEpochBuffer, stashedLocalQueue, and deferred notification queues.
    *    - Transitions coordinator to RECOVERING under new attempt ID, keeping recoveryActive locked.
-   * 2. 'REINITIALIZE_CLEAN':
-   *    - Preserves strict 5-step M4.3c sequence: (1) atomic clean baseline install via replaceCoreStateAtomic,
-   *      (2) quarantine and reconciliation cleanup (purges all stale deferred notifications),
-   *      (3) engine.setRecoveryMode(false) (enqueues single clean baseline notification if applicable),
-   *      (4) coordinator to ACTIVE,
+   * 2. 'REINITIALIZE_CLEAN' (R8-03, R8-04, R9-06):
+   *    - Preserves strict 5-step M4.3c sequence: (1) stale notification purge, (2) atomic clean baseline install,
+   *      (3) engine.setRecoveryMode(false) + clean baseline notification enqueue, (4) coordinator to ACTIVE,
    *      (5) flush clean baseline notifications via non-throwing dispatch (isolated listener failures).
-   *    - Irrevocable root swap: once step 1 executes, clean baseline reference swap is irrevocable.
+   *    - Irrevocable root swap: once step 2 executes, clean baseline reference swap is irrevocable.
    *    - Explicit failure boundary (R8-04): once ACTIVE is reached in step 4, state transition is externally
    *      observable; delivered listener effects cannot be rolled back. If pre-ACTIVE steps fail, catch block
    *      restores engine.setRecoveryMode(true), engine remains in DEGRADED, and notifications are NEVER flushed.

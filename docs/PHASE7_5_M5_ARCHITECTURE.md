@@ -1,6 +1,6 @@
 # Phase 7.5 Milestone M5 — Engine Runtime Recovery Integration Architecture
 
-**Status:** APPROVED ARCHITECTURAL SPECIFICATION (MILESTONE M5.0-R8 AMENDED)
+**Status:** APPROVED ARCHITECTURAL SPECIFICATION (MILESTONE M5.0-R9 AMENDED)
 **Date:** 2026-11-25
 **Authoritative Starting Baseline:** `40b11fdafcd247c7a289723f90ec0e2029c94f64` (Phase 7.5 M4.3d Formally Accepted)
 **Accepted Baselines:** M4.3c (`eab2428`), M4.3b (`f3c29b6`), Approved Architecture (`2bb117c`), Frozen M4.2d (`aafa366`)
@@ -94,7 +94,7 @@ To preserve exact capability custody and single-attachment guarantees without cl
    - **Failure During Engine Construction:** If engine initialization throws after `bindEngine()` has run (e.g. invalid configuration or constructor failure), engine construction unwinds; the engine reference is never published, and the partially constructed engine is reclaimed by garbage collection. An externally injected coordinator bound during a failed constructor call cannot be safely reused and must be discarded.
    - **Engine Disposal:** Invoking `engine.dispose()` invokes `coordinator.dispose()`. Calling `replaceCoreStateAtomic` on a disposed engine throws `SyncEngineError('ENGINE_DISPOSED')`, effectively dead-ending the capability even if a reference is retained externally.
 
-#### 2.1.2 Drain Admission Context Capabilities: Unforgeable Provenance & Package-Boundary Contract (Closing R6-01, R7-01, R8-05)
+#### 2.1.2 Drain Admission Context Capabilities: Unforgeable Provenance & Package-Boundary Contract (Closing R6-01, R7-01, R8-05, R9-07)
 A typed string (`'LOCAL_REPLAY' | 'REPAIR_BATCH'`) is a declaration of context, not proof of provenance: any caller can supply a string. To prevent accidental trust escalation where untrusted remote operations bypass arrival-rate limits and clock-inflation checks, post-snapshot drain admission is capability-gated:
 
 ```typescript
@@ -141,7 +141,7 @@ export interface AuthorizedDrainCapabilities {
    - The local stashed reconciliation workflow is held privately by `RecoveryCoordinator` and provided with `TrustedLocalReplayCapability`.
    - Neither component receives or retains unnecessary capabilities.
 5. **Exact Reference Identity Check:** `admitDrainedOperation(op, capability, attemptId)` evaluates the presented capability using strict object-reference identity (`capability === this.authorizedLocalReplayCapability` or `capability === this.authorizedRepairBatchCapability`).
-6. **Package-Boundary Export Guarantee (R8-05):**
+6. **Package-Boundary Export Guarantee (R8-05, R9-07):**
    - The package entry manifest (`packages/sync-engine/package.json`) defines strictly:
      ```json
      "exports": {
@@ -151,8 +151,9 @@ export interface AuthorizedDrainCapabilities {
        }
      }
      ```
-     Under standard Node.js and TypeScript module resolution, root `.` is the ONLY supported package entry point. There are NO wildcard subpaths (`"./*"`), NO `./recovery/*` exports, and NO internal deep-import paths. Any external consumer attempting to import internal modules (e.g. `@syncplay/sync-engine/recovery/...`) is rejected at compile time by TypeScript and at runtime with `ERR_PACKAGE_PATH_NOT_EXPORTED` by Node.js.
-   - The public package entry point (`packages/sync-engine/src/index.ts`) exports **strictly TypeScript type declarations** (`export type { DrainAdmissionContext, TrustedLocalReplayCapability, TrustedRepairBatchCapability, AuthorizedDrainCapabilities }`), never runtime values, symbols, or factory functions.
+     Under standard Node.js and TypeScript module resolution, root `.` is the ONLY supported package entry point. There are NO wildcard subpaths (`"./*"`), NO `./recovery/*` exports, and NO internal deep-import paths.
+   - **Wording Qualification:** This guarantee is an API package boundary against supported package-specifier imports (e.g. `import ... from '@syncplay/sync-engine/recovery/...'` throws `ERR_PACKAGE_PATH_NOT_EXPORTED` at runtime and fails compilation). It is not claimed to be an OS-level file permission sandbox against an attacker with direct local filesystem access to `node_modules` files.
+   - The public package entry point (`packages/sync-engine/src/index.ts`) exports **strictly TypeScript type declarations** (`export type { DrainAdmissionContext, TrustedLocalReplayCapability, TrustedRepairBatchCapability, AuthorizedDrainCapabilities }`), never runtime values, symbols, or factory functions. Type-only exports pose zero runtime risk because the engine validates exact object identity against privately retained capability instances.
 7. **In-Realm Defensive Trust Model Clarification:** In a cooperative JavaScript runtime, unique symbols and opaque objects provide structural encapsulation and defensiveness against API misuse, configuration errors, and duck-typing, but do not construct a cryptographic sandbox against hostile code running in the identical JavaScript realm. Actual protection is achieved through private capability custody, exact object-reference checks, package export gating, and fail-closed validation.
 
 ---
@@ -233,7 +234,7 @@ export type RemoteAdmissionDecision =
    - **Contract Clarity:** `REJECTED_CAPACITY` is a declared `EngineDecision.code` emitted by the engine, NOT a variant of `RemoteAdmissionDecision`.
    - For local user actions (`receiveLocal` / `submit`), local inputs **do throw** `SyncEngineError('REJECTED_DEGRADED')` synchronously.
 
-### 3.4 Administrative Recovery Reset Semantics, Drain Cancellation Barrier & Notification Semantics (Closing R6-02, R7-02, R8-01, R8-02, R8-03, R8-04)
+### 3.4 Administrative Recovery Reset Semantics, Concurrent Reset Serialization & Admission Linearization (Closing R6-02, R7-02, R8-01–R8-05, R9-01–R9-06)
 
 `resetRecovery()` exists strictly as an administrative recovery reset, NOT as a general-purpose escape hatch to clear degradation while leaving incomplete or corrupted state in place.
 
@@ -241,42 +242,66 @@ export type RemoteAdmissionDecision =
 - `resetRecovery(capability, resetAction)` is allowed **strictly from the `DEGRADED` state** (`this.stateMachine.state === 'DEGRADED'`). Calling it from `ACTIVE`, `RECOVERING`, `RECONCILING`, or `DISPOSED` throws `SyncEngineError('INVALID_STATE')`.
 - Requires an authorized `RecoveryInstallationCapability` checked via strict object-reference identity (`capability === this.authorizedRecoveryCapability`). Unauthorized invocations throw `SyncEngineError('UNAUTHORIZED')`.
 
-#### 2. Safe Reset Actions & Failure-Atomic Lifecycle Semantics
+#### 2. Safe Reset Actions, Concurrent Serialization & Settlement Failure Semantics
 
 `resetRecovery()` supports two explicit reset actions:
 
-1. **`PURGE_AND_RETRY` (Autonomous Clean Retry, In-Flight Settlement Barrier & Attempt Fencing — Closing R8-01, R8-02):**
+1. **`PURGE_AND_RETRY` (Autonomous Clean Retry, Concurrent Reset Serialization & Settlement Barrier — Closing R8-01, R8-02, R9-01, R9-02, R9-03, R9-04, R9-05):**
    - **Monotonic Attempt Sequence Fencing:** Before initiating retry actions, the coordinator increments the attempt counter: `const newAttemptId = ++this.currentAttemptId;`. All pending asynchronous recovery workflows (chunk arrivals, transfer callbacks, timeout timers, and discovery responses) check `attemptId === this.currentAttemptId`; any frame or timer belonging to a prior attempt is dropped immediately as a stale no-op.
+   - **Concurrent Reset Serialization & Shared Settlement Barrier (R9-01):**
+     If two or more administrative reset requests arrive while an asynchronous drain operation is actively pending (e.g., Attempt 1 has operation A in flight, Reset A starts Attempt 2 and awaits settlement, and Reset B arrives before settlement and starts Attempt 3):
+     1. **Monotonic Sequence Increment:** Each reset call increments `this.currentAttemptId` (`Attempt 2`, then `Attempt 3`).
+     2. **Shared Settlement Barrier:** Both reset continuations await the single underlying drain settlement barrier (`await this.quarantineDrainer.drainSettledBarrier()`).
+     3. **Post-Settlement Attempt Re-Validation:** When the settlement barrier resolves, **every waiting reset continuation immediately re-checks its attempt ID and lifecycle state:**
+        ```typescript
+        if (myAttemptId !== this.currentAttemptId || this.stateMachine.state !== 'RECOVERING') {
+          return; // Stale earlier reset continuation aborted immediately
+        }
+        ```
+        Only the newest authorized attempt (`myAttemptId === this.currentAttemptId`) proceeds to start recovery discovery and transfer. Earlier reset continuations are safely fenced out and cannot start draining or recovery work.
+     4. **Record Identity Safety:** When the stale in-flight drain operation settles, its continuation releases ONLY the exact record instance it owns (`if (this._inFlightRecord === staleRecord) this._inFlightRecord = null`), never releasing or mutating a newer record belonging to a subsequent attempt.
    - **Asynchronous In-Flight Invalidation with Retained Ownership Slot (R8-01):**
-     Clearing the drainer's bookkeeping record (`inFlightRecord = null`) while an asynchronous drain operation is actively executing does NOT cancel the underlying Promise, undo an already accepted operation, or guarantee that a second drain cannot begin. To guarantee that $N_{\text{in-flight}} \le 1$ remains strictly true across reset boundaries:
+     Clearing `inFlightRecord = null` while an asynchronous drain operation is actively executing does NOT cancel the underlying Promise, undo an already accepted operation, or guarantee that a second drain cannot begin. To guarantee that $N_{\text{in-flight}} \le 1$ remains strictly true across reset boundaries:
      1. When `resetRecovery('PURGE_AND_RETRY')` is invoked, `quarantineDrainer` inspects whether an operation is currently in flight (`this._inFlightRecord !== null`).
      2. If an in-flight operation exists, its record is flagged as invalidated (`this._inFlightRecord.invalidated = true`).
      3. **The in-flight ownership slot is RETAINED** ($N_{\text{in-flight}} = 1$); the drainer does NOT clear the record or allow new operations to be dequeued.
-     4. `PURGE_AND_RETRY` executes an **asynchronous drain settlement barrier**: it awaits or latches settlement of the pending in-flight operation (`await this.quarantineDrainer.drainSettledBarrier()`). No new drain operation can begin until the pending operation settles.
+     4. `PURGE_AND_RETRY` executes an asynchronous drain settlement barrier: it awaits or latches settlement of the pending in-flight operation (`await this.quarantineDrainer.drainSettledBarrier()`). No new drain operation can begin until the pending operation settles.
      5. When the stale asynchronous drain continuation settles (resolves or rejects), it detects `invalidated === true`. It performs zero state mutation, releases the retained in-flight ownership slot (`this._inFlightRecord = null`, $N_{\text{in-flight}} \to 0$), and signals the settlement barrier.
-     6. Only after the ownership slot is completely empty ($N_{\text{in-flight}} = 0$) can the new recovery attempt dequeue and drain operations. Stale continuations can NEVER overwrite, release, or mutate ownership belonging to the new attempt.
-   - **Attempt-ID Fencing at the Actual State-Mutation Boundary (R8-02):**
-     Attempt-ID fencing is not merely evaluated when an asynchronous callback begins; it is verified at the **final state-mutation and acceptance boundary**:
+     6. Only after the ownership slot is completely empty ($N_{\text{in-flight}} = 0$) can the newest recovery attempt dequeue and drain operations.
+   - **Settlement Rejection, Error & Timeout Terminal Policy (R9-04):**
+     - **Definition of Settlement:** Settlement means the asynchronous drain step has finished execution (either resolved with a destination receipt or threw an unhandled error).
+     - **Terminal Rejections:** If the destination returns `TERMINALLY_REJECTED`, or if the drain step throws an error, the operation is considered settled. Its status is updated, and the in-flight slot is released ($N_{\text{in-flight}} \to 0$).
+     - **Buffer Custody Preservation:** Quarantined operations that fail or reject remain in `QuarantineBuffer` custody or are permanently retired with error diagnostics recorded, guaranteeing zero un-accounted operation loss.
+     - **Settlement Barrier Watchdog Timeout:** The settlement barrier is guarded by a bounded watchdog timeout (`SETTLEMENT_BARRIER_TIMEOUT_MS = 5000`). If a pending drain operation hangs indefinitely, the coordinator detects an unrecoverable drain hang and transitions to `DEGRADED` (`DRAIN_HANG_TIMEOUT`). The slot is NOT simply cleared while an un-fenced operation could still mutate state; rather, the engine locks notification deferral and halts in `DEGRADED`. Attempt-ID fencing at `admitDrainedOperation` guarantees that if the hung operation resolves later, it will be rejected as stale with zero state mutation.
+   - **Mandatory Attempt-ID Fencing & Synchronous Indivisibility (R8-02, R9-02, R9-03):**
+     `attemptId: number` is a **strictly mandatory** parameter for recovery-originated admission:
      ```typescript
      admitDrainedOperation(
        op: QuarantinedOperation,
        capability: DrainAdmissionContext,
-       attemptId?: number,
+       attemptId: number,
      ): DestinationAcceptanceReceipt;
      ```
-     Inside `admitDrainedOperation()`, if `attemptId` is provided and `attemptId !== this.coordinator.currentAttemptId`, or if the coordinator is no longer in `RECONCILING` for that attempt, the engine **fails closed immediately**: it rejects the operation with receipt `{ status: 'TERMINALLY_REJECTED', vectorAdvanced: false, error: 'STALE_ATTEMPT_FENCED' }`, performing zero mutation of `OrderedOperationLog`, zero advancement of `replicationVector`, and zero mutation of playback state.
+     Recovery operations cannot omit `attemptId` to bypass fencing. Ordinary non-recovery admission uses standard live pathways (`receive()`, `submit()`), never `admitDrainedOperation()`.
+     Inside `admitDrainedOperation()`, if `attemptId !== this.coordinator.currentAttemptId` or `this.coordinator.state !== 'RECONCILING'`, the engine **fails closed immediately**: it rejects the operation with receipt `{ status: 'TERMINALLY_REJECTED', vectorAdvanced: false, error: 'STALE_ATTEMPT_FENCED' }`.
+     Because `admitDrainedOperation()` is strictly synchronous from entry through validation, categorization, and state/log/vector mutation, JavaScript run-to-completion guarantees that the attempt check and state mutation execute in **one indivisible synchronous call frame** with zero possibility of microtask or macrotask interleaving!
+   - **Acceptance Linearization Point & Treatment of Prior Accepted Operations (R9-03, R9-05):**
+     - **Linearization Point:** The exact linearization point of admission is the synchronous mutation of `this.core` (log reduction, replication vector advance) within `admitDrainedOperation()`.
+     - **Already-Accepted Operations:** An operation that committed into `OrderedOperationLog` before a reset occurred has already linearized. Under `PURGE_AND_RETRY`, already-accepted operations remain in the log and are NOT retroactively undone. When the new attempt re-drains or installs a snapshot, already-accepted operations are detected as `ALREADY_REPRESENTED` (by frontier) or `ALREADY_OWNED_DUPLICATE` and safely retired.
+     - **Stale Continuation Zero Mutation Invariant:** After an attempt is invalidated, its continuation cannot perform any **new** destination acceptance or state mutation.
    - **Buffer & Queue Purge:** Discards all un-drained quarantined operations from `QuarantineBuffer` and resets `FutureEpochBuffer`. Purges `stashedLocalQueue` and any incomplete reconciliation state.
    - **Notification Suppression:** Permanently discards `deferredStateChanges` and `deferredDecisions` (they are **never flushed to listeners**).
    - **State Transition & Mode Maintenance:** Resets the recovery coordinator state machine to `RECOVERING` under `newAttemptId`, while locking engine recovery mode (`engine.setRecoveryMode(true)`). Initiates a fresh, full recovery discovery and transfer cycle. The engine does NOT return to `ACTIVE` until this new recovery attempt completes successfully.
 
-2. **`REINITIALIZE_CLEAN` (Administrative Baseline Restoration, Stale Purge vs Clean Flush & Non-Throwing Dispatch — Closing R8-03, R8-04):**
+2. **`REINITIALIZE_CLEAN` (Administrative Baseline Restoration, Stale Purge vs Clean Flush & Exact Notification Sequence — Closing R8-03, R8-04, R9-06):**
    - Used when the application session decides to restart from a known clean genesis state or agreed anchor snapshot rather than continuing peer recovery.
    - **Strict 5-Step M4.3c Completion Order:**
-     1. **Capability-Gated Baseline Installation:** Atomically replace `EngineCoreState` with the clean baseline anchor via `engine.replaceCoreStateAtomic(cleanBaseline, capability)`.
-     2. **Quarantine & Reconciliation Cleanup (Stale Notification Discard — R8-03):** Purge all quarantine buffers (`QuarantineBuffer`, `FutureEpochBuffer`), reset `QuarantineDrainer` via drain settlement barrier ($N_{\text{in-flight}} = 0$), clear `stashedLocalQueue`, and **explicitly discard all stale deferred notifications** accumulated during the failed recovery attempt (`this.deferredStateChanges.length = 0; this.deferredDecisions.length = 0;`).
-     3. **Disengage Engine Recovery Mode:** Clear internal engine recovery mode via `engine.setRecoveryMode(false)`. Operational notification deferral is now unlocked. If the application or engine synthesizes a fresh baseline state change notification upon clean reset (e.g. state change to clean genesis), that single coalesced `PlaybackState` event is enqueued into `deferredStateChanges`.
+     1. **Stale Notification Purge (R9-06):** Before any state replacement, all stale deferred notifications accumulated during previous failed attempts are permanently discarded (`this.deferredStateChanges.length = 0; this.deferredDecisions.length = 0;`).
+     2. **Capability-Gated Baseline Installation:** Atomically replace `EngineCoreState` with the clean baseline anchor via `engine.replaceCoreStateAtomic(cleanBaseline, capability)`. Under `REINITIALIZE_CLEAN`, this single-pointer swap resets `operationLog`, `state`, and `replicationVector` to clean genesis, regardless of operations admitted prior to reset.
+     3. **Disengage Engine Recovery Mode & Synthesize Clean Baseline Notification:**
+        Invoke `engine.setRecoveryMode(false)`. Operational notification deferral is now unlocked. The clean baseline installation operation synthesizes **exactly ONE coalesced `PlaybackState` change notification** representing the clean genesis/anchor state, enqueued into `deferredStateChanges`. Stale notifications from the failed attempt can never be included.
      4. **Transition Coordinator to ACTIVE:** Advance authoritative lifecycle state via `stateMachine.transition('ACTIVE', ...)`.
-     5. **Flush Notifications (Clean Baseline Dispatch — R8-03, R8-04):** Only after Step 4 completes, flush the fresh baseline state notification via `engine.flushDeferredNotifications()` (or cleanly no-op if no new notifications were enqueued).
+     5. **Flush Clean Baseline Notification (Non-Throwing Dispatch — R8-04):** Only after Step 4 completes, flush the fresh baseline state notification via `engine.flushDeferredNotifications()` (or cleanly no-op if no new notifications were enqueued).
    - **Non-Throwing Dispatch with Isolated Listener Failures (R8-04):**
      Consistent with the accepted implementation in `LeaderlessSyncEngine.ts:929`, `flushDeferredNotifications()` is a **non-throwing dispatch operation**. Every listener invocation is wrapped in a `try...catch` block:
      ```typescript
@@ -290,7 +315,7 @@ export type RemoteAdmissionDecision =
      ```
      Listener exceptions are isolated and recorded in diagnostic error counters; they **never abort the flush loop and never throw out of `flushDeferredNotifications()`**.
    - **Failure Atomicity & Irreversible External Effects (R8-04):**
-     - The clean baseline root replacement in Step 1 executes under JavaScript run-to-completion semantics (`this.core = candidateCore;`). Once executed, this reference swap is **irrevocable**: the engine cannot and must not roll back to the previous unanchored or corrupted root.
+     - The clean baseline root replacement in Step 2 executes under JavaScript run-to-completion semantics (`this.core = candidateCore;`). Once executed, this reference swap is **irrevocable**: the engine cannot and must not roll back to the previous unanchored or corrupted root.
      - **Explicit Failure Boundary:** Once the coordinator transitions to `ACTIVE` in Step 4, that state transition is externally observable by concurrent tasks and listeners. Any notifications delivered to listeners have taken effect externally and cannot be retracted or rolled back.
      - If ANY catastrophic post-installation step prior to Step 4 fails (Step 2 or 3 throws):
        - The exception is caught.
@@ -418,7 +443,7 @@ A typed string parameter (e.g. `'LOCAL_REPLAY'`) is merely a declaration of cont
 admitDrainedOperation(
   op: QuarantinedOperation,
   capability: DrainAdmissionContext,
-  attemptId?: number,
+  attemptId: number,
 ): DestinationAcceptanceReceipt;
 ```
 
