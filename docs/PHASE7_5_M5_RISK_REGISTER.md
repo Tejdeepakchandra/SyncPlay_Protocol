@@ -1,6 +1,6 @@
 # Phase 7.5 Milestone M5 — Risk Register
 
-**Status:** APPROVED ARCHITECTURAL SPECIFICATION (MILESTONE M5.0-R3 AMENDED)
+**Status:** APPROVED ARCHITECTURAL SPECIFICATION (MILESTONE M5.0-R5 AMENDED)
 **Date:** 2026-11-25
 **Authoritative Starting Baseline:** `40b11fdafcd247c7a289723f90ec0e2029c94f64` (Phase 7.5 M4.3d Formally Accepted)
 **Accepted Baselines:** M4.3c (`eab2428`), M4.3b (`f3c29b6`), Approved Architecture (`2bb117c`), Frozen M4.2d (`aafa366`)
@@ -138,31 +138,35 @@ Milestone M5 integrates the recovery subsystem directly into `LeaderlessSyncEngi
 
 ---
 
-### R-M5-09: Incomparable Frontier Lattice Fork vs. Compatible History Preservation (Closing F4, R2-C3, R2-C4, R2-H1, R3-02, R3-05, R4-02)
-- **Root Cause:** Vector frontiers form a partially ordered product lattice ($\mathbb{N}^k$). Incomparable frontiers ($V_A \parallel V_B$) are not necessarily forks; treating them as automatic forks causes unnecessary degradation. Conversely, overwriting active state with an incomparable snapshot destroys unrepresented local operations.
-- **Architectural Impact:** Unnecessary recovery degradation or irreversible loss of local progress.
+### R-M5-09: Incomparable Frontier Lattice Fork, Compacted Snapshot Reordering Hazard & Compatible History Preservation (Closing F4, R2-C3, R2-C4, R2-H1, R3-02, R3-05, R4-02, R5-01, R5-02)
+- **Root Cause:** Vector frontiers form a partially ordered product lattice ($\mathbb{N}^k$). Incomparable frontiers ($V_A \parallel V_B$) are not necessarily forks; treating them as automatic forks causes unnecessary degradation. Conversely, blindly overwriting active state with an incomparable snapshot destroys unrepresented local operations. Furthermore, if a candidate snapshot has already compacted an operation $B$ ($L(B)=11$) into its base state, replaying an uncompacted concurrent local operation $A$ ($L(A)=10$) on top of the snapshot evaluates $B \to A$ out of canonical SMR order ($A \prec B$). Because `ConflictResolver` operations (e.g. `PAUSE`, `PLAY`, `SEEK`) are not universally commutative, this reordering hazard yields divergent playback states.
+- **Architectural Impact:** Canonical SMR total order inversion, state divergence across nodes, unnecessary recovery degradation, or loss of local progress.
 - **Mitigation Strategy:**
-  - **Safe Incomparable Recovery & Deterministic Replay (R3-02, R4-02):** A snapshot must NEVER replace active state if doing so would discard compatible local operations! Prioritize anti-entropy delta log repair. If snapshot replacement is necessary, stash local operations whose sequence numbers are ahead of the snapshot, install snapshot, and re-admit stashed operations strictly via `admitDrainedOperation()`.
+  - **Canonical Ordering Feasibility Check (R5-02):** Stashed local operations must satisfy $L(A) > \text{snapshot.originFrontierTimestamps}[p]$ (or $L(A) > \text{maxLogicalTimestamp}$). If $L(A) \le \text{snapshot.maxLogicalTimestamp}$ and $A$ is concurrent with operations folded into the snapshot base, an explicit ordering hazard is detected.
+  - **Hazard Resolution:**
+    - Priority 1: Reject snapshot replacement and initiate anti-entropy log repair (`RepairRequestPipeline`) from a common ancestor so all operations are ordered canonically in the log before compaction.
+    - Priority 2 (Explicit Incompatibility Gate): If log repair is impossible (history truncated across all peers), abort recovery deterministically to `DEGRADED` with `SyncEngineError('INCOMPATIBLE_COMPACTED_HISTORY')`. Out-of-order replay is strictly prohibited.
+  - **Safe Incomparable Recovery & Deterministic Replay (R3-02, R4-02):** A snapshot must NEVER replace active state if doing so would discard compatible local operations! Prioritize anti-entropy delta log repair. If snapshot replacement is necessary, stash local operations whose sequence numbers are ahead of the snapshot, install snapshot, and re-admit stashed operations strictly via `admitDrainedOperation(op, trustContext)`.
   - **Deterministic 6-Category Replay Contract (R4-02, R5-01, R5-02):** Cat 1 (already represented: discarded), Cat 2 (unrepresented satisfied: applied/reduced), Cat 3 (concurrent with frontier: deterministic total-order SMR reduction via `compareOperations`), Cat 4 (missing dependencies: buffered in `pendingQueue` / delta repair), Cat 5 (duplicates: discarded), Cat 6 (validation failures: remote quarantined discarded, locally committed stashed aborts to `DEGRADED`).
-  - **Delineation of Replay Trust Contexts (R5-01):** Locally committed stashed operations run under `LOCAL_REPLAY` trust context (trusted, immutable, exempt from rate/clock validation). Remotely quarantined arrivals run under `REPAIR_BATCH` trust context (untrusted, full structural and causal validation).
-  - **Preservation of 8 Replay Invariants (R4-02):** Never silently discard committed local progress; never apply twice; never fabricate dependencies; preserve event ID/sequence; distinguish `LOCAL_REPLAY` from `REPAIR_BATCH`; single-owner $N_{\text{in-flight}} \le 1$ drain; single admission pipeline; abort when safe replay is unprovable.
+  - **Delineation of Replay Trust Contexts via Physical Custody (R5-01):** Locally committed stashed operations run under `LOCAL_REPLAY` trust context (trusted, immutable, exempt from rate/clock validation). Remotely quarantined arrivals run under `REPAIR_BATCH` trust context (untrusted, full structural and causal validation). Trust context is determined strictly by calling subsystem queue custody, never inferred from wire messages or metadata.
+  - **Preservation of 8 Replay Invariants (R4-02):** Never silently discard committed local progress; never invert canonical SMR order on compacted snapshots; never apply twice; never fabricate dependencies; preserve event ID/sequence; distinguish `LOCAL_REPLAY` from `REPAIR_BATCH`; single-owner $N_{\text{in-flight}} \le 1$ drain; single admission pipeline; abort when safe replay is unprovable.
   - **Post-Installation Failure Handling (R4-02):** If replay fails after snapshot installation, coordinator transitions to `DEGRADED` (`DRAIN_FAILED`), `engine.setRecoveryMode(true)` is maintained, deferred notifications are NEVER flushed, and `inFlightRecord` is preserved.
   - **Evidence Requirement (R3-02):** Matching frontier fingerprints alone are insufficient; full checkpoint hash chains or frontier timestamps are required to verify history compatibility.
   - **Deterministic Peer Comparison (R2-H1, R3-05):** Ordinal ASCII code point comparison (`comparePeerIds`) over the validated domain `/^[a-zA-Z0-9_.:-]+$/`. `localeCompare` is strictly prohibited.
   - **Cooperative Trust Model (R2-C4):** SHA-256 verifies byte-level slice and payload integrity against transport corruption, but does not prove cryptographic author authentication.
   - **Fork Detection:** Abort to `DEGRADED` only upon proven causal divergence ($H(op_A) \ne H(op_B)$) or unresolvable history.
-- **Automated Verification Control:** Unit tests in `recovery-anti-entropy-trigger.test.ts` verifying delta repair prioritization and local operation preservation.
+- **Automated Verification Control:** Unit tests in `recovery-anti-entropy-trigger.test.ts` verifying canonical ordering feasibility, delta repair prioritization, and local operation preservation.
 
 ---
 
-### R-M5-10: Lifecycle State Desynchronization & Completion Handoff (Closing F1, F7, R2-C2, R3-03)
-- **Root Cause:** If the engine maintains an independent mutable boolean alongside the coordinator's state machine, or if completion handoff ordering is inverted, listeners can observe inconsistent states.
-- **Architectural Impact:** Engine admits remote events while coordinator is recovering, or listeners observe `ACTIVE` state while engine still rejects local inputs.
+### R-M5-10: Lifecycle State Desynchronization & Completion Handoff (Closing F1, F7, R2-C2, R3-03, R5-03)
+- **Root Cause:** If the engine maintains an independent mutable boolean alongside the coordinator's state machine, or if completion handoff ordering is inverted, listeners can observe inconsistent states. If callers confuse `!isRecoveryInProgress()` with healthy active operation during `DEGRADED` states, operations could be incorrectly submitted.
+- **Architectural Impact:** Engine admits remote events while coordinator is recovering, callers submit intents while degraded, or listeners observe `ACTIVE` state while engine still rejects local inputs.
 - **Mitigation Strategy:**
-  - **Three-Tier Architecture (R3-03):** Coordinator state machine is Tier 1 sole lifecycle authority. Public engine queries are Tier 2 delegators. `this.recoveryActive` is strictly a Tier 3 slave operational gate for notification deferral.
+  - **Three-Tier Architecture (R3-03, R5-03):** Coordinator state machine is Tier 1 sole lifecycle authority (`recoveryState`). Public engine queries are Tier 2 delegators: `isRecoveryInProgress()` returns `true` strictly in `RECOVERING` and `RECONCILING`; `isDegraded()` returns `true` strictly in `DEGRADED`. Callers must never infer health from `!isRecoveryInProgress()`. `this.recoveryActive` is strictly a Tier 3 slave operational gate for notification deferral, remaining held in locked mode when `DEGRADED`.
   - **M4.3c Completion Sequence (R2-C2):** Drain completes $\to$ bookkeeping completes $\to$ `engine.setRecoveryMode(false)` $\to$ `coordinator.transition('ACTIVE')` $\to$ `flushDeferredNotifications()`.
   - If transition throws, catch block immediately restores `engine.setRecoveryMode(true)`, aborts recovery, and does NOT flush notifications.
-- **Automated Verification Control:** State consistency tests in `recovery-lifecycle-binding.test.ts` verifying listener observation guarantees and handoff rollback.
+- **Automated Verification Control:** State consistency tests in `recovery-lifecycle-binding.test.ts` verifying listener observation guarantees, `isDegraded()` query behavior, and handoff rollback.
 
 ---
 

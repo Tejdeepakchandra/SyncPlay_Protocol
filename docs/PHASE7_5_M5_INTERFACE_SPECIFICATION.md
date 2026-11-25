@@ -1,6 +1,6 @@
 # Phase 7.5 Milestone M5 — Interface Specification
 
-**Status:** APPROVED ARCHITECTURAL SPECIFICATION (MILESTONE M5.0-R3 AMENDED)
+**Status:** APPROVED ARCHITECTURAL SPECIFICATION (MILESTONE M5.0-R5 AMENDED)
 **Date:** 2026-11-25
 **Authoritative Starting Baseline:** `40b11fdafcd247c7a289723f90ec0e2029c94f64` (Phase 7.5 M4.3d Formally Accepted)
 **Accepted Baselines:** M4.3c (`eab2428`), M4.3b (`f3c29b6`), Approved Architecture (`2bb117c`), Frozen M4.2d (`aafa366`)
@@ -99,6 +99,13 @@ export interface ILeaderlessSyncEngineRecovery {
   isRecoveryInProgress(): boolean;
 
   /**
+   * Queries whether recovery has terminated in a failed DEGRADED state.
+   * Strictly true iff recoveryState === 'DEGRADED'.
+   * [PROPOSED — M5.1]
+   */
+  isDegraded(): boolean;
+
+  /**
    * Backward-compatible alias for isRecoveryInProgress().
    * [EXISTING — M4 ACCEPTED, refactored in M5.1 to delegate to isRecoveryInProgress()]
    */
@@ -128,9 +135,16 @@ export interface ILeaderlessSyncEngineRecovery {
   /**
    * Submits an in-flight quarantined or stashed operation to destination engine for admission/reduction.
    * Enforces N_in-flight <= 1. Evaluates operations across the 6 deterministic replay categories.
-   * [EXISTING — M4 ACCEPTED in LeaderlessSyncEngine.ts:977]
+   * Trust context is bound to caller's physical in-process custody:
+   * - 'LOCAL_REPLAY' for stashed local operations from OrderedOperationLog (trusted, immutable, rate/clock checks bypassed).
+   * - 'REPAIR_BATCH' for quarantined remote operations from QuarantineBuffer (untrusted, full structural validation).
+   * Trust context is NEVER read or inferred from wire payloads or mutable operation fields.
+   * [EXISTING — M4 ACCEPTED in LeaderlessSyncEngine.ts:977, amended with trustContext in M5.1/M5.4]
    */
-  admitDrainedOperation(op: QuarantinedOperation): DestinationAcceptanceReceipt;
+  admitDrainedOperation(
+    op: QuarantinedOperation,
+    trustContext?: 'LOCAL_REPLAY' | 'REPAIR_BATCH',
+  ): DestinationAcceptanceReceipt;
 
   /**
    * Queries whether the engine already holds the specified operation.
@@ -500,5 +514,6 @@ export interface RecoveryTimerInventory {
 | `UNRESOLVED_FUTURE_EPOCH`| Coordinator | 5s grace period expired without capability | Coordinator aborts recovery to `DEGRADED`. |
 | `REJECTED_CAPACITY` | LeaderlessSyncEngine | Memory and queue capacity bounds preserved | Remote event rejected; engine records decision; remote error isolated without throwing. |
 | `FORK_DETECTED_INCOMPARABLE`| Coordinator | Divergent histories with conflicting operations | Coordinator aborts recovery to `DEGRADED`. |
+| `INCOMPATIBLE_COMPACTED_HISTORY` | Coordinator / Replay | Canonical SMR total-order preservation against compacted snapshots | Recovery aborts to `DEGRADED` when stashed local operations have Lamport timestamp <= snapshot compacted frontier and cannot be canonically ordered after snapshot base. |
 | `ALREADY_BOUND` | Coordinator | Single-attachment invariant | Throws `SyncEngineError` if coordinator is bound to more than one engine. |
 | `UNAUTHORIZED` | LeaderlessSyncEngine | Capability custody enforced by object identity | Throws `SyncEngineError` if capability does not match `authorizedRecoveryCapability`. |

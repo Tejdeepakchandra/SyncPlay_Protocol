@@ -1,6 +1,6 @@
 # Phase 7.5 Milestone M5 — Implementation Roadmap
 
-**Status:** APPROVED ARCHITECTURAL SPECIFICATION (MILESTONE M5.0-R3 AMENDED)
+**Status:** APPROVED ARCHITECTURAL SPECIFICATION (MILESTONE M5.0-R5 AMENDED)
 **Date:** 2026-11-25
 **Authoritative Starting Baseline:** `40b11fdafcd247c7a289723f90ec0e2029c94f64` (Phase 7.5 M4.3d Formally Accepted)
 **Accepted Baselines:** M4.3c (`eab2428`), M4.3b (`f3c29b6`), Approved Architecture (`2bb117c`), Frozen M4.2d (`aafa366`)
@@ -34,19 +34,21 @@ flowchart TD
 
 ## 2. Sub-Milestone Detailed Specifications
 
-### Milestone M5.0: Runtime Integration Architecture Audit & Final Consistency Closure (Amended M5.0-R3)
+### Milestone M5.0: Runtime Integration Architecture Audit & Final Consistency Closure (Amended M5.0-R5)
 - **Role:** Independent Senior TypeScript Distributed-Systems Architect
 - **Status:** CURRENT MILESTONE (Planning Only)
-- **Objective:** Complete source audit, close review findings R3-01 through R3-08, and author final consistent architecture specifications for M5.
+- **Objective:** Complete source audit, close review findings across R1 through R5, and author final consistent architecture specifications for M5.
 - **Scope:**
   - Standardize browser-compatible exact byte accounting without re-serialization, preserving original transport wire length (`TextEncoder` / raw byte length) (R3-01).
   - Specify safe incomparable-compatible recovery procedure: prioritize anti-entropy log repair; if snapshot replacement is necessary, stash local unrepresented operations before install and re-drain, guaranteeing zero local operation loss. Enforce rigorous checkpoint hash chain / frontier timestamps evidence (matching frontier fingerprint alone insufficient) (R3-02).
-  - Define three-tier distinction between authoritative coordinator lifecycle state, public engine queries, and internal notification-deferral operational flag (`this.recoveryActive`), prohibiting dual lifecycle authorities (R3-03).
+  - Define three-tier distinction between authoritative coordinator lifecycle state, public engine queries (`recoveryState`, `isRecoveryInProgress()`, `isDegraded()`), and internal notification-deferral operational flag (`this.recoveryActive`), prohibiting dual lifecycle authorities and locking notification deferral in `DEGRADED` (R3-03, R5-03).
   - Formalize complete overflow decision contract across buffer, coordinator, and engine boundaries, confirming `REJECTED_CAPACITY` as an `EngineDecision.code`, zero buffer retention, and diagnostic preservation (R3-04).
   - Standardize protocol-stable ordinal ASCII peer ID comparison over the validated ASCII domain `/^[a-zA-Z0-9_.:-]+$/` (R3-05).
   - Inspect `PendingDependencyQueue` capacity ($K = 256$), define drain ownership ($N_{\text{in-flight}} \le 1$), and explicitly identify missing aggregate byte limit as an unresolved design issue (R3-06).
   - Define capability custody checked via object identity, unwinding on constructor failure, and disposal dead-ending without claiming un-modeled revocation (R3-07).
   - Qualify performance benchmark contract (Node.js LTS reference environment vs browser runtimes) and clarify young-gen / escape analysis allocation claims (R3-08).
+  - Specify physical custody trust context provenance (`LOCAL_REPLAY` vs `REPAIR_BATCH`) in `admitDrainedOperation()`, prohibiting metadata inference (R5-01).
+  - Enforce canonical ordering feasibility check against compacted snapshots ($L(A) > \text{originFrontierTimestamps}[p]$) and explicit incompatibility gate (`INCOMPATIBLE_COMPACTED_HISTORY` aborting to `DEGRADED`) to prevent SMR total-order inversion ($A \prec B$ hazard) (R5-02).
 - **Affected Files:** Documentation files only (`docs/PHASE7_5_M5_*.md`). Zero production or test code modified.
 - **Exit Condition:** Clean audit report; zero production diff; documentation committed; engineering authority approval.
 
@@ -59,8 +61,9 @@ flowchart TD
   - Refactor `LeaderlessSyncEngine`:
     - Add `readonly recoveryState: RecoveryState` delegating to coordinator (or returning `'ACTIVE'` if unattached, `'DISPOSED'` if disposed).
     - Implement `isRecoveryInProgress()` returning `true` strictly for `'RECOVERING'` and `'RECONCILING'`.
-    - Retain `isRecoveryActive()` as a backward-compatible alias.
-    - Clarify internal `this.recoveryActive` boolean strictly as a notification-deferral operational switch slaved to coordinator.
+    - Implement `isDegraded()` returning `true` strictly for `'DEGRADED'`.
+    - Retain `isRecoveryActive()` as a backward-compatible alias of `isRecoveryInProgress()`.
+    - Clarify internal `this.recoveryActive` boolean strictly as a notification-deferral operational switch slaved to coordinator, locked in `DEGRADED`.
   - Implement single-attachment invariant in `coordinator.bindEngine(engine, capability)`: throw `SyncEngineError('ALREADY_BOUND')` if already attached. Prohibit sharing coordinators across engines.
   - Wire coordinator lifecycle completion sequence:
     1. Quarantine drain completes (`totalRetainedCount === 0`).
@@ -133,8 +136,9 @@ flowchart TD
 - **Scope:**
   - Implement deterministic supplier selection under lattice partial ordering: strict domination, lowest RTT, and protocol-stable ordinal ASCII peer ID comparison (`comparePeerIds`).
   - Differentiate incomparable vector cases: compatible branches, repairable histories within log horizon, and proven causal forks.
-  - Enforce safe incomparable-compatible recovery: prioritize anti-entropy log repair; if snapshot replacement is necessary, stash local unrepresented operations before install and sequentially re-admit strictly via `admitDrainedOperation()`.
-  - Enforce the 6-category deterministic replay contract (R4-02, R5-01, R5-02): Category 1 (`ALREADY_REPRESENTED` discarded), Category 2 (`ACCEPTED_REDUCED` applied), Category 3 (deterministic total-order SMR reduction via `compareOperations`), Category 4 (`ACCEPTED_PENDING` buffered in queue / delta repair), Category 5 (`ALREADY_OWNED_DUPLICATE` discarded), Category 6 (validation failures: remote discarded, locally committed aborts to `DEGRADED`). Distinguish `LOCAL_REPLAY` trust context for stashed local operations from `REPAIR_BATCH` for remote arrivals.
+  - Enforce safe incomparable-compatible recovery: prioritize anti-entropy log repair; if snapshot replacement is necessary, stash local unrepresented operations before install and sequentially re-admit strictly via `admitDrainedOperation(op, trustContext)`.
+  - Enforce canonical ordering feasibility check: verify $L(A) > \text{snapshot.originFrontierTimestamps}[p]$ (or $L(A) > \text{maxLogicalTimestamp}$) for all stashed local operations before snapshot replacement. If an ordering hazard is detected and anti-entropy repair cannot resolve it, trigger explicit incompatibility gate: abort recovery to `DEGRADED` with `SyncEngineError('INCOMPATIBLE_COMPACTED_HISTORY')`.
+  - Enforce the 6-category deterministic replay contract (R4-02, R5-01, R5-02): Category 1 (`ALREADY_REPRESENTED` discarded), Category 2 (`ACCEPTED_REDUCED` applied), Category 3 (deterministic total-order SMR reduction via `compareOperations`), Category 4 (`ACCEPTED_PENDING` buffered in queue / delta repair), Category 5 (`ALREADY_OWNED_DUPLICATE` discarded), Category 6 (validation failures: remote discarded, locally committed aborts to `DEGRADED`). Distinguish `LOCAL_REPLAY` trust context for stashed local operations from `REPAIR_BATCH` for remote arrivals based strictly on physical in-process queue custody.
   - Enforce post-installation replay failure handling: if replay fails after snapshot installation, coordinator transitions to `DEGRADED` (`DRAIN_FAILED`), `engine.setRecoveryMode(true)` is maintained, deferred notifications are NEVER flushed, and `inFlightRecord` is preserved.
   - Require full checkpoint hash chain or frontier timestamps evidence before declaring history compatibility.
   - In `AntiEntropyManager.evaluateRemoteDigest()`, inspect `compareRemoteDigest(digest)`. If `requiresSnapshotRecovery === true` and `outsideRemoteHorizon === true`, invoke `onSnapshotRecoveryRequired` to trigger `coordinator.triggerRecovery(supplierPeerId)`.
