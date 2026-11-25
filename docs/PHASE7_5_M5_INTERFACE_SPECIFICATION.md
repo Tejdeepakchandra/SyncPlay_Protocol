@@ -1,6 +1,6 @@
 # Phase 7.5 Milestone M5 — Interface Specification
 
-**Status:** APPROVED ARCHITECTURAL SPECIFICATION (MILESTONE M5.0-R13 AMENDED)
+**Status:** APPROVED ARCHITECTURAL SPECIFICATION (MILESTONE M5.0-R14 AMENDED)
 **Date:** 2026-11-25
 **Authoritative Starting Baseline:** `40b11fdafcd247c7a289723f90ec0e2029c94f64` (Phase 7.5 M4.3d Formally Accepted)
 **Accepted Baselines:** M4.3c (`eab2428`), M4.3b (`f3c29b6`), Approved Architecture (`2bb117c`), Frozen M4.2d (`aafa366`)
@@ -531,7 +531,7 @@ export type RemoteAdmissionDecision =
 
 ---
 
-### 3.3 Terminal Quarantine Archive Governance, Atomic Retirement & Export Contracts (R12-A–R12-D, R13-A–R13-D)
+### 3.3 Terminal Quarantine Archive Governance, Atomic Retirement & Export Contracts (R12-A–R12-D, R13-A–R13-D, R14-A–R14-E)
 
 ```typescript
 // ── Module Branding & Custody Symbols [PROPOSED — M5.1] ─────────────────────
@@ -542,6 +542,22 @@ export interface TerminalArchiveAdministrationCapability {
   readonly sessionId: string;
   readonly authority: 'terminal-archive-administration';
   readonly token: string;
+}
+
+// ── Composite Operation Identity [PROPOSED — M5.1] ──────────────────────────
+export interface CompositeOperationIdentity {
+  readonly originPeerId: string;    // Generating peer domain identifier
+  readonly originSequence: number;  // Strictly monotonic sequence counter for originPeerId
+  readonly membershipEpoch: number; // Membership configuration epoch
+  readonly logicalEventId: string;  // Unique logical event identifier
+}
+
+/**
+ * Returns deterministic canonical string representation:
+ * op-id:${originPeerId}:${originSequence}:${membershipEpoch}:${logicalEventId}
+ */
+export function canonicalOperationIdentityKey(id: CompositeOperationIdentity): string {
+  return `op-id:${id.originPeerId}:${id.originSequence}:${id.membershipEpoch}:${id.logicalEventId}`;
 }
 
 // ── Reset Attempt Lifecycle Tracking Types [PROPOSED — M5.1] ────────────────
@@ -564,13 +580,22 @@ export interface ResetAttemptRecord {
 }
 
 // ── Quarantine Retirement Transaction Types [PROPOSED — M5.1] ───────────────
+export type QuarantineRetirementTransactionOutcome =
+  | 'NOT_COMMITTED'                       // Initial state before commit invocation
+  | 'COMMITTED'                           // Batch and transaction record published atomically
+  | 'COMMIT_OUTCOME_UNKNOWN'              // Exception/timeout during commit; requires query
+  | 'COMMITTED_SOURCE_RETIREMENT_PENDING' // Archive committed; source retirement executing
+  | 'COMPLETED'                           // Source retired, zero-custody verified
+  | 'FAILED';                             // Terminal failure; transaction aborted
+
 export interface QuarantineRetirementTransaction {
   readonly retirementTransactionId: string;
   readonly quarantineGeneration: number;
-  readonly operationIdentities: readonly string[];
+  readonly operationIdentities: readonly CompositeOperationIdentity[];
   readonly entryCount: number;
-  readonly totalSerializedBytes: number;
+  readonly completeArchiveEntryBytes: number; // Exact sum of RFC 8785 UTF-8 bytes of complete entries
   readonly archiveReservationId: string;
+  readonly batchDigest: string;               // SHA-256 digest of canonically serialized staged entries
   status:
     | 'PREPARING'
     | 'RESERVED'
@@ -596,6 +621,16 @@ export interface TerminalBatchCommitReceipt {
   readonly entryCount: number;
   readonly totalSerializedBytes: number;
   readonly archiveGeneration: number;
+  readonly batchDigest: string;
+}
+
+export interface QuarantineRetirementTransactionRecord {
+  readonly transactionId: string;
+  readonly outcome: QuarantineRetirementTransactionOutcome;
+  readonly entryCount: number;
+  readonly totalSerializedBytes: number;
+  readonly batchDigest: string;
+  readonly committedAtMs: number;
 }
 
 // ── Archive Export Types [PROPOSED — M5.1] ──────────────────────────────────
@@ -619,6 +654,14 @@ export interface TerminalArchiveExportReceipt {
   readonly remainingArchiveBytes: number;
 }
 
+export interface ArchiveExportTombstone {
+  readonly exportId: string;
+  readonly archiveGeneration: number;
+  readonly entryIdsDigest: string;
+  readonly acknowledgedAtMs: number;
+  readonly clearedCount: number;
+}
+
 // ── Terminal Quarantine Archive Interface [PROPOSED — M5.1] ─────────────────
 export interface ITerminalQuarantineArchive {
   readonly size: number;
@@ -637,6 +680,14 @@ export interface ITerminalQuarantineArchive {
   ): string; // Returns reservationId
 
   /**
+   * Cancels active reservation and releases reserved capacity.
+   */
+  cancelReservation(
+    reservationId: string,
+    capability: RecoveryInstallationCapability,
+  ): void;
+
+  /**
    * Idempotently commits a staged retirement batch under retirementTransactionId.
    */
   commitRetirementBatch(
@@ -644,6 +695,13 @@ export interface ITerminalQuarantineArchive {
     stagedBatch: readonly TerminalQuarantineEntry[],
     retirementTransactionId: string,
   ): TerminalBatchCommitReceipt;
+
+  /**
+   * Queries committed transaction record for uncertain-outcome reconciliation.
+   */
+  getTransaction(
+    retirementTransactionId: string,
+  ): QuarantineRetirementTransactionRecord | undefined;
 
   /**
    * Checks whether the archive has already committed a retirement transaction.
@@ -685,7 +743,11 @@ export const MAX_TERMINAL_PEER_ID_LENGTH = 128;
 export const MAX_TERMINAL_LOGICAL_EVENT_ID_LENGTH = 128;
 export const MAX_OUTSTANDING_EXPORTS = 1;
 export const MAX_EXPORT_BATCH_TOTAL_BYTES = 2097152;     // 2.0 MiB
-export const SETTLEMENT_BARRIER_TIMEOUT_MS = 5000;       // 5.0 s
+export const MAX_ACKNOWLEDGEMENT_TOMBSTONES = 50;
+export const TOMBSTONE_TTL_MS = 600000;                 // 10 minutes
+export const RESERVATION_LEASE_TIMEOUT_MS = 10000;       // 10 seconds
+export const EXPORT_LEASE_TIMEOUT_MS = 30000;            // 30 seconds
+export const SETTLEMENT_BARRIER_TIMEOUT_MS = 5000;       // 5.0 seconds
 ```
 
 ---
