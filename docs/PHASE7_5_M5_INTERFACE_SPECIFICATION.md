@@ -1,6 +1,6 @@
 # Phase 7.5 Milestone M5 — Interface Specification
 
-**Status:** APPROVED ARCHITECTURAL SPECIFICATION (MILESTONE M5.0-R12 AMENDED)
+**Status:** APPROVED ARCHITECTURAL SPECIFICATION (MILESTONE M5.0-R13 AMENDED)
 **Date:** 2026-11-25
 **Authoritative Starting Baseline:** `40b11fdafcd247c7a289723f90ec0e2029c94f64` (Phase 7.5 M4.3d Formally Accepted)
 **Accepted Baselines:** M4.3c (`eab2428`), M4.3b (`f3c29b6`), Approved Architecture (`2bb117c`), Frozen M4.2d (`aafa366`)
@@ -447,6 +447,7 @@ export interface IRuntimeRecoveryCoordinator {
 
   /**
    * Prepares a detached immutable export batch of the terminal quarantine archive.
+   * Enforces single-lease constraint (MAX_OUTSTANDING_EXPORTS = 1).
    * Does NOT clear or mutate the archive.
    * [PROPOSED — M5.1]
    */
@@ -456,12 +457,22 @@ export interface IRuntimeRecoveryCoordinator {
 
   /**
    * Acknowledges successful external receipt and clears the exported archive entries.
+   * Clears only the exact entry IDs included in the prepared export batch.
    * [PROPOSED — M5.1]
    */
   acknowledgeArchiveExport(
-    exportToken: string,
+    exportId: string,
     capability: TerminalArchiveAdministrationCapability,
-  ): boolean;
+  ): TerminalArchiveExportReceipt;
+
+  /**
+   * Cancels an active outstanding export lease without clearing any archive entries.
+   * [PROPOSED — M5.1]
+   */
+  cancelArchiveExport(
+    exportId: string,
+    capability: TerminalArchiveAdministrationCapability,
+  ): void;
 
   /** Disposes coordinator resources, timers, and listeners. Idempotent. */
   dispose(): void;
@@ -516,6 +527,165 @@ export type RemoteAdmissionDecision =
       /** Engine or coordinator is disposed: event rejected */
       readonly outcome: 'REJECTED_DISPOSED';
     };
+```
+
+---
+
+### 3.3 Terminal Quarantine Archive Governance, Atomic Retirement & Export Contracts (R12-A–R12-D, R13-A–R13-D)
+
+```typescript
+// ── Module Branding & Custody Symbols [PROPOSED — M5.1] ─────────────────────
+const TERMINAL_ARCHIVE_BRAND: unique symbol = Symbol('TERMINAL_ARCHIVE_BRAND');
+
+export interface TerminalArchiveAdministrationCapability {
+  readonly [TERMINAL_ARCHIVE_BRAND]: true;
+  readonly sessionId: string;
+  readonly authority: 'terminal-archive-administration';
+  readonly token: string;
+}
+
+// ── Reset Attempt Lifecycle Tracking Types [PROPOSED — M5.1] ────────────────
+export type ResetAttemptState =
+  | 'INITIATED'              // Reset requested, monotonic attempt ID minted
+  | 'WAITING_FOR_SETTLEMENT' // Drainer fenced, drainSettledBarrier awaited
+  | 'SETTLED'                // In-flight settled, barrier resolved (N_in-flight == 0)
+  | 'TIMED_OUT'              // Watchdog expired. Latched terminal failure state
+  | 'INVALIDATED'            // Superseded by newer reset or abort. Latched failure
+  | 'COMPLETED';             // Retirement and root replacement committed
+
+export interface ResetAttemptRecord {
+  readonly attemptId: number;
+  readonly action: 'PURGE_AND_RETRY' | 'REINITIALIZE_CLEAN';
+  status: ResetAttemptState;
+  terminalReason?: string;
+  readonly initiatedAtMs: number;
+  settledAtMs?: number;
+  completedAtMs?: number;
+}
+
+// ── Quarantine Retirement Transaction Types [PROPOSED — M5.1] ───────────────
+export interface QuarantineRetirementTransaction {
+  readonly retirementTransactionId: string;
+  readonly quarantineGeneration: number;
+  readonly operationIdentities: readonly string[];
+  readonly entryCount: number;
+  readonly totalSerializedBytes: number;
+  readonly archiveReservationId: string;
+  status:
+    | 'PREPARING'
+    | 'RESERVED'
+    | 'STAGED'
+    | 'COMMITTED_ARCHIVE'
+    | 'RETIRED_SOURCE'
+    | 'COMPLETED'
+    | 'FAILED'
+    | 'ROLLED_BACK';
+  terminalOutcome?:
+    | 'SUCCESS'
+    | 'CAPACITY_INSUFFICIENT'
+    | 'GENERATION_MISMATCH'
+    | 'INSERTION_FAILED'
+    | 'ATTEMPT_FENCED'
+    | 'TIMEOUT';
+}
+
+export interface TerminalBatchCommitReceipt {
+  readonly committed: boolean;
+  readonly alreadyCommitted: boolean;
+  readonly transactionId: string;
+  readonly entryCount: number;
+  readonly totalSerializedBytes: number;
+  readonly archiveGeneration: number;
+}
+
+// ── Archive Export Types [PROPOSED — M5.1] ──────────────────────────────────
+export interface TerminalArchiveExportBatch {
+  readonly exportId: string;
+  readonly entryIds: readonly string[];
+  readonly archiveGeneration: number;
+  readonly entryCount: number;
+  readonly totalSerializedBytes: number;
+  readonly canonicalDigest: string; // SHA-256 hex digest of RFC 8785 canonical JSON
+  readonly entries: readonly TerminalQuarantineEntry[];
+  readonly preparedAtMs: number;
+}
+
+export interface TerminalArchiveExportReceipt {
+  readonly exportId: string;
+  readonly acknowledged: boolean;
+  readonly alreadyAcknowledged: boolean;
+  readonly clearedCount: number;
+  readonly remainingArchiveEntries: number;
+  readonly remainingArchiveBytes: number;
+}
+
+// ── Terminal Quarantine Archive Interface [PROPOSED — M5.1] ─────────────────
+export interface ITerminalQuarantineArchive {
+  readonly size: number;
+  readonly totalBytes: number;
+  readonly archiveGeneration: number;
+
+  /**
+   * Pre-reserves archive entry count and byte capacity against current archive generation.
+   * Throws SyncEngineError('CAPACITY_INSUFFICIENT') if limits would be breached.
+   * Throws SyncEngineError('GENERATION_MISMATCH') if expectedGeneration !== archiveGeneration.
+   */
+  reserveCapacity(
+    entryCount: number,
+    byteCount: number,
+    expectedArchiveGeneration: number,
+  ): string; // Returns reservationId
+
+  /**
+   * Idempotently commits a staged retirement batch under retirementTransactionId.
+   */
+  commitRetirementBatch(
+    reservationId: string,
+    stagedBatch: readonly TerminalQuarantineEntry[],
+    retirementTransactionId: string,
+  ): TerminalBatchCommitReceipt;
+
+  /**
+   * Checks whether the archive has already committed a retirement transaction.
+   */
+  hasTransaction(retirementTransactionId: string): boolean;
+
+  /**
+   * Prepares a detached immutable export batch. Enforces single-lease constraint.
+   * Throws SyncEngineError('ARCHIVE_EXPORT_IN_PROGRESS') if an unacknowledged lease exists.
+   */
+  prepareArchiveExport(
+    capability: TerminalArchiveAdministrationCapability,
+  ): TerminalArchiveExportBatch;
+
+  /**
+   * Acknowledges export and clears ONLY the exact entry IDs included in the batch.
+   */
+  acknowledgeArchiveExport(
+    exportId: string,
+    capability: TerminalArchiveAdministrationCapability,
+  ): TerminalArchiveExportReceipt;
+
+  /**
+   * Cancels active export lease without clearing any entries.
+   */
+  cancelArchiveExport(
+    exportId: string,
+    capability: TerminalArchiveAdministrationCapability,
+  ): void;
+}
+
+// ── Enforceable Numeric Constants [PROPOSED — M5.1] ─────────────────────────
+export const MAX_TERMINAL_ARCHIVE_ENTRIES = 500;
+export const MAX_TERMINAL_ARCHIVE_TOTAL_BYTES = 2097152; // 2.0 MiB
+export const MAX_TERMINAL_ENTRY_BYTES = 4096;           // 4.0 KiB
+export const MAX_TERMINAL_ERROR_LENGTH = 512;
+export const MAX_TERMINAL_REASON_LENGTH = 256;
+export const MAX_TERMINAL_PEER_ID_LENGTH = 128;
+export const MAX_TERMINAL_LOGICAL_EVENT_ID_LENGTH = 128;
+export const MAX_OUTSTANDING_EXPORTS = 1;
+export const MAX_EXPORT_BATCH_TOTAL_BYTES = 2097152;     // 2.0 MiB
+export const SETTLEMENT_BARRIER_TIMEOUT_MS = 5000;       // 5.0 s
 ```
 
 ---
