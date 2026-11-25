@@ -1,6 +1,6 @@
 # Phase 7.5 Milestone M5 — Interface Specification
 
-**Status:** APPROVED ARCHITECTURAL SPECIFICATION (MILESTONE M5.0-R10 AMENDED)
+**Status:** APPROVED ARCHITECTURAL SPECIFICATION (MILESTONE M5.0-R11 AMENDED)
 **Date:** 2026-11-25
 **Authoritative Starting Baseline:** `40b11fdafcd247c7a289723f90ec0e2029c94f64` (Phase 7.5 M4.3d Formally Accepted)
 **Accepted Baselines:** M4.3c (`eab2428`), M4.3b (`f3c29b6`), Approved Architecture (`2bb117c`), Frozen M4.2d (`aafa366`)
@@ -246,13 +246,18 @@ export interface ILeaderlessSyncEngineRecovery {
    * cannot be inserted or relabeled as local). Identity hash H(op) == H(log) and causal dependencies are verified;
    * any identity conflict or unsatisfied dependency aborts recovery immediately to DEGRADED.
    *
-   * Mandatory Attempt-ID Fencing, Candidate Staging & Single Root Swap (R8-02, R9-02, R9-03, R10-03):
+   * Mandatory Attempt-ID Fencing, Candidate Staging & Root Commit Invariants (R8-02, R9-02, R9-03, R10-03, R11-A, R11-B):
    * attemptId is strictly mandatory for recovery admission. If attemptId !== coordinator.currentAttemptId,
-   * or coordinator is not in RECONCILING, admitDrainedOperation fails closed: returns status TERMINALLY_REJECTED
-   * with error 'STALE_ATTEMPT_FENCED' and performs zero state mutation, zero log insertion, and zero vector advancement.
-   * Execution is strictly synchronous in two phases: (1) side-effect free validation and candidate core staging,
-   * (2) atomic linearization point via single synchronous root pointer swap (this.core = candidateCore).
-   * Guarantees absolute exception atomicity under JavaScript run-to-completion semantics.
+   * or coordinator is not in RECONCILING, admitDrainedOperation fails closed: returns status ATTEMPT_INVALIDATED
+   * with reason 'STALE_ATTEMPT_FENCED' and performs zero state mutation, zero log insertion, and zero vector advancement.
+   *
+   * Candidate Isolation & Commit Sequence (R11-B - Required Future M5.1 Invariant):
+   * 1. Mutable Nested Object Disjointness: candidate staging allocates fresh/CoW instances of operationLog,
+   *    clockManager, pendingQueue, and replicationVector; never mutates objects reachable from active this.core.
+   * 2. Side-Effect Free Phase 1: causal validation and SMR dry-run execute purely against candidate instances.
+   * 3. Pre-Commit Fencing & CAS: asserts attemptId, coordinator in RECONCILING, and this.core === expectedPriorRoot.
+   * 4. Atomic Linearization Phase 2: single synchronous root pointer swap (this.core = candidateCore).
+   * 5. Post-Commit Encapsulation: candidate structures not exposed as writable to external callers.
    *
    * Trust context is NEVER read or inferred from wire payloads or mutable operation fields.
    * Calling with an invalid, forged, or mismatched capability throws SyncEngineError('UNAUTHORIZED').
@@ -310,6 +315,7 @@ export type DestinationAcceptanceReceipt =
   | { readonly status: 'ACCEPTED_PENDING'; readonly vectorAdvanced: false; readonly reason: 'MISSING_DEPENDENCY' }
   | { readonly status: 'ALREADY_REPRESENTED'; readonly vectorAdvanced: false }
   | { readonly status: 'ALREADY_OWNED_DUPLICATE'; readonly vectorAdvanced: false }
+  | { readonly status: 'ATTEMPT_INVALIDATED'; readonly vectorAdvanced: false; readonly attemptId: number; readonly reason: 'STALE_ATTEMPT_FENCED' | 'COORDINATOR_NOT_RECONCILING' }
   | { readonly status: 'TERMINALLY_REJECTED'; readonly vectorAdvanced: false; readonly error: string; readonly reason?: string; readonly operationId?: string }
   | { readonly status: 'CAPACITY_REJECTED'; readonly vectorAdvanced: false; readonly currentQueueSize: number; readonly maxCapacity: number };
 
@@ -411,27 +417,24 @@ export interface IRuntimeRecoveryCoordinator {
    * Safely purges un-reconciled state or re-initializes engine to a clean verified baseline;
    * never declares incomplete or corrupted state as healthy.
    *
-   * Failure-Atomic Lifecycle Semantics (Closing R8-01–R8-05, R9-01–R9-06, R10-01–R10-04):
-   * 1. 'PURGE_AND_RETRY':
+   * Failure-Atomic Lifecycle Semantics (Closing R8-01–R8-05, R9-01–R9-06, R10-01–R10-04, R11-A–R11-D):
+   * 1. 'PURGE_AND_RETRY' (R11-A, R11-C, R11-D):
    *    - Monotonically increments attempt counter (currentAttemptId++), fencing all async callbacks/timers.
    *    - Concurrent Reset Serialization (R9-01): multiple reset requests share settlement barrier; each re-validates
    *      attemptId === currentAttemptId post-settlement so only newest attempt starts recovery work.
    *    - In-flight invalidation with retained ownership slot (R8-01): marks invalidated = true, retains slot
-   *      (N_in-flight = 1), blocks new drains via drainSettledBarrier() until settled. When settled, releases
-   *      the exact owned record (N_in-flight = 0).
-   *    - Unambiguous Operation Custody (R10-01): acknowledged custody transfer to QuarantineBuffer (retryable/stale)
-   *      or TerminalQuarantineArchive (permanent validation failure) before releasing in-flight record.
-   *    - Watchdog Timeout vs Settlement vs Ownership Release (R10-02): 5s watchdog aborts coordinator to DEGRADED
-   *      without cancelling Promise or releasing in-flight slot; in-flight record released strictly after actual settlement.
-   *    - Mandatory attempt fencing at acceptance boundary (R8-02, R9-02, R9-03): admitDrainedOperation rejects stale IDs.
-   *    - Acceptance Linearization & Root Swap (R9-05, R10-03): candidate core staging and single root pointer swap.
-   *    - Purges QuarantineBuffer, FutureEpochBuffer, stashedLocalQueue, and deferred notification queues.
+   *      (N_in-flight = 1), blocks new drains via drainSettledBarrier() until settled.
+   *    - Separate Invalidation from Permanent Rejection (R11-A): returns ATTEMPT_INVALIDATED; unshifted to QuarantineBuffer.
+   *    - Quarantine Fate (R11-D): un-drained buffer ops retained for new attempt; already-linearized ops remain in log.
+   *    - Terminal Archive Overflow (R11-C): archive capacity capped at 500 without silent eviction; overflow degrades fail-closed.
    *    - Transitions coordinator to RECOVERING under new attempt ID, keeping recoveryActive locked.
-   * 2. 'REINITIALIZE_CLEAN' (R8-03, R8-04, R9-06, R10-04):
+   * 2. 'REINITIALIZE_CLEAN' (R8-03, R8-04, R9-06, R10-04, R11-D):
+   *    - Quarantine Fate (R11-D): pre-reset quarantined operations permanently retired to TerminalQuarantineArchive
+   *      (reason: REINITIALIZE_CLEAN_PURGED); strictly prohibited from replaying into clean baseline.
    *    - Preserves strict 5-step M4.3c sequence: (1) stale notification purge, (2) atomic clean baseline install,
-   *      (3) engine.setRecoveryMode(false), (4) coordinator to ACTIVE, (5) flush clean baseline notifications
-   *      via non-throwing dispatch (isolated listener failures).
-   *    - Irrevocable root swap: once step 2 executes, clean baseline reference swap is irrevocable.
+   *      (3) engine.setRecoveryMode(false), (4) coordinator to ACTIVE, (5) non-throwing flushDeferredNotifications().
+   *    - Zero-Notification Clarification (R10-04, R11-D): step 5 delivers zero notifications unless an explicit baseline
+   *      state change is enqueued; clean baseline notification is not synthesized automatically.
    *    - Explicit failure boundary (R8-04): once ACTIVE is reached in step 4, state transition is externally
    *      observable; delivered listener effects cannot be rolled back. If pre-ACTIVE steps fail, catch block
    *      restores engine.setRecoveryMode(true), engine remains in DEGRADED, and notifications are NEVER flushed.
@@ -441,6 +444,14 @@ export interface IRuntimeRecoveryCoordinator {
     capability: RecoveryInstallationCapability,
     resetAction: 'PURGE_AND_RETRY' | 'REINITIALIZE_CLEAN',
   ): void;
+
+  /**
+   * Exports and clears the diagnostic terminal quarantine archive under authorized capability.
+   * [PROPOSED — M5.1]
+   */
+  exportAndClearTerminalArchive(
+    capability: RecoveryInstallationCapability,
+  ): readonly TerminalQuarantineEntry[];
 
   /** Disposes coordinator resources, timers, and listeners. Idempotent. */
   dispose(): void;

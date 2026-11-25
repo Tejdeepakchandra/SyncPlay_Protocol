@@ -1,6 +1,6 @@
 # Phase 7.5 Milestone M5 — Risk Register
 
-**Status:** APPROVED ARCHITECTURAL SPECIFICATION (MILESTONE M5.0-R10 AMENDED)
+**Status:** APPROVED ARCHITECTURAL SPECIFICATION (MILESTONE M5.0-R11 AMENDED)
 **Date:** 2026-11-25
 **Authoritative Starting Baseline:** `40b11fdafcd247c7a289723f90ec0e2029c94f64` (Phase 7.5 M4.3d Formally Accepted)
 **Accepted Baselines:** M4.3c (`eab2428`), M4.3b (`f3c29b6`), Approved Architecture (`2bb117c`), Frozen M4.2d (`aafa366`)
@@ -125,7 +125,7 @@ Milestone M5 integrates the recovery subsystem directly into `LeaderlessSyncEngi
 
 ---
 
-### R-M5-08: Ambiguous Lifecycle Ownership, Package Boundary, Reset Failures & Teardown Leaks (Closing F5, R2-H5, R3-07, R6-02, R7-02, R8-01, R8-05, R9-07, R10-01)
+### R-M5-08: Ambiguous Lifecycle Ownership, Package Boundary, Reset Failures & Teardown Leaks (Closing F5, R2-H5, R3-07, R6-02, R7-02, R8-01, R8-05, R9-07, R10-01, R11-B, R11-C, R11-D)
 - **Root Cause:** Unclear lifecycle ownership where active timers retain the coordinator, improper capability checks allow unauthorized replacement, or administrative reset operations fail partway through without failure-atomic cleanup.
 - **Architectural Impact:** Retained background processes, hanging test suites, unauthorized core state replacement, or inconsistent partial state exposed after failed reset.
 - **Mitigation Strategy:**
@@ -135,7 +135,8 @@ Milestone M5 integrates the recovery subsystem directly into `LeaderlessSyncEngi
   - **Failure-Atomic Reset Semantics (R6-02, R7-02):**
     - `PURGE_AND_RETRY`: monotonic attempt counter increment (`currentAttemptId++`) fences all async callbacks and timers from prior attempts; synchronous drainer reset cancels in-flight record ($N_{\text{in-flight}} \le 1$); notifications are permanently suppressed.
     - `REINITIALIZE_CLEAN`: strict 5-step M4.3c sequence; if any post-install step fails, catch block immediately restores `engine.setRecoveryMode(true)`, engine remains in `DEGRADED`, notifications are never flushed, and clean baseline swap remains irrevocable without rolling back to corrupt pre-reset root.
-  - **Unambiguous Custody Resolution (R10-01):** No operation disappears between buffer and in-flight ownership; rejected operations transferred to `TerminalQuarantineArchive` (diagnostic dead-letter archive, capped at 500 entries) or restored to `QuarantineBuffer`.
+  - **Unambiguous Custody Resolution & Archive Limits (R10-01, R11-C):** No operation disappears between buffer and in-flight ownership; rejected operations transferred to `TerminalQuarantineArchive` (capped at 500 entries without silent eviction; overflow degrades fail-closed) or restored to `QuarantineBuffer`.
+  - **Reset-Policy Quarantine Fate (R11-D):** `PURGE_AND_RETRY` preserves un-drained buffer ops for retry; `REINITIALIZE_CLEAN` permanently retires pre-reset buffer ops to `TerminalQuarantineArchive` (`REINITIALIZE_CLEAN_PURGED`), prohibiting silent replay into clean baseline.
   - **Deterministic Disposal Propagation:** Calling `engine.dispose()` synchronously calls `this.recoveryCoordinator?.dispose()`.
   - Coordinator disposal is synchronous and idempotent: cancels all timers, clears all buffer queues, unregisters all callbacks, nullifies references, and marks `_isDisposed = true`.
 - **Automated Verification Control:** Teardown and reset failure tests in `recovery-lifecycle-binding.test.ts` verifying zero active timers, listener leaks, attempt fencing, and notification suppression post-failure.
@@ -163,7 +164,7 @@ Milestone M5 integrates the recovery subsystem directly into `LeaderlessSyncEngi
 
 ---
 
-### R-M5-10: Lifecycle State Desynchronization, Notification Dispatch & Irreversible Effects (Closing F1, F7, R2-C2, R3-03, R5-03, R6-02, R7-01, R7-02, R8-03, R8-04, R9-03, R9-05, R9-06, R10-03, R10-04)
+### R-M5-10: Lifecycle State Desynchronization, Notification Dispatch & Irreversible Effects (Closing F1, F7, R2-C2, R3-03, R5-03, R6-02, R7-01, R7-02, R8-03, R8-04, R9-03, R9-05, R9-06, R10-03, R10-04, R11-B, R11-D)
 - **Root Cause:** If the engine maintains an independent mutable boolean alongside the coordinator's state machine, or if completion handoff ordering is inverted, listeners can observe inconsistent states. If callers confuse `!isRecoveryInProgress()` with healthy active operation during `DEGRADED` states, operations could be incorrectly submitted. If `resetRecovery()` acts as an unvalidated escape hatch, incomplete state could be exposed as healthy.
 - **Architectural Impact:** Engine admits remote events while coordinator is recovering, callers submit intents while degraded, incomplete states exposed as healthy, or listeners observe `ACTIVE` state while engine still rejects local inputs.
 - **Mitigation Strategy:**
@@ -171,8 +172,8 @@ Milestone M5 integrates the recovery subsystem directly into `LeaderlessSyncEngi
   - **Administrative Reset Guardrails (R6-02, R7-02):** `resetRecovery(capability, resetAction)` requires authorized `RecoveryInstallationCapability` checked via object identity, is permitted strictly from `DEGRADED`, and enforces failure-atomic reset semantics (`PURGE_AND_RETRY` with monotonic attempt counter fencing vs `REINITIALIZE_CLEAN` with 5-step M4.3c sequence and irrevocable clean root swap). It never exposes an incomplete state as healthy.
   - **M4.3c Completion Sequence & Non-Throwing Dispatch (R2-C2, R8-04):** Drain completes $\to$ bookkeeping completes $\to$ `engine.setRecoveryMode(false)` $\to$ `coordinator.transition('ACTIVE')` $\to$ non-throwing `flushDeferredNotifications()` with isolated listener errors.
   - If transition throws before ACTIVE, catch block restores `engine.setRecoveryMode(true)`, aborts recovery, and does NOT flush notifications.
-  - **Explicit Observer Boundary (R8-04, R9-06, R10-04):** Once ACTIVE is reached, state transition is externally observable; delivered listener effects cannot be retracted. In `REINITIALIZE_CLEAN`, Step 1 purges stale notifications, Step 2 atomically installs clean baseline, Step 3 disengages recovery mode, Step 4 transitions coordinator to ACTIVE, and Step 5 dispatches clean baseline notifications strictly after ACTIVE.
-  - **Candidate Staging & Root-Swap Linearization (R10-03):** `admitDrainedOperation` stages candidate core and commits via atomic reference assignment (`this.core = candidateCore`), ensuring absolute exception atomicity.
+  - **Explicit Observer Boundary & Zero Notification (R8-04, R9-06, R10-04, R11-D):** Once ACTIVE is reached, state transition is externally observable; delivered listener effects cannot be retracted. In `REINITIALIZE_CLEAN`, Step 1 purges stale notifications, Step 2 atomically installs clean baseline, Step 3 disengages recovery mode, Step 4 transitions coordinator to ACTIVE, and Step 5 dispatches notifications strictly after ACTIVE (acknowledging zero notifications may be delivered).
+  - **Candidate Isolation & CAS Root Verification (R10-03, R11-B):** `admitDrainedOperation` enforces fresh/CoW mutable nested instances without mutating active root references; pre-commit asserts CAS `this.core === expectedPriorRoot` and attempt ID; Phase 2 commits via atomic reference assignment (`this.core = candidateCore`), ensuring absolute exception atomicity.
   - **Synchronous Indivisibility & Acceptance Linearization (R9-03, R9-05):** `admitDrainedOperation` executes synchronously in a single call frame under run-to-completion semantics. Operations admitted before reset remain in the log; stale continuations perform zero new state mutations.
   - **Capability Branding & Custody (R7-01):** `DRAIN_ADMISSION_BRAND: unique symbol` is module-private to `drain-admission-custody.ts` and non-exported in public package entry point. Capability instances are deeply frozen with `Object.freeze()` and transferred privately via `AuthorizedDrainCapabilities` during `bindEngine()`. In-realm defensive trust model prevents API misuse and duck-typing.
 - **Automated Verification Control:** State consistency tests in `recovery-lifecycle-binding.test.ts` verifying listener observation guarantees, `isDegraded()` query behavior, capability-authorized `resetRecovery()` safety, and handoff rollback.
