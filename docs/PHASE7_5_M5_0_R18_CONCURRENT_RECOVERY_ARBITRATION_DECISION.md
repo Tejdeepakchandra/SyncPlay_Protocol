@@ -1,29 +1,33 @@
-# Phase 7.5 M5.0-R18-R14 — Idempotent Publication Retry Reachability and Evidence Ownership Closure
+# Phase 7.5 M5.0-R18-R15 — Terminal Publication Retry Semantics & Bounded Result Retention
 **Concurrent Recovery Arbitration & Authoritative Settlement Architecture Decision**
 
 **Status:** PROPOSED ARCHITECTURAL AMENDMENT TO FROZEN M5.0 SPECIFICATIONS (DECISION DOCUMENT ONLY)
 **Author:** Principal TypeScript Distributed-Systems Architect and Recovery-Systems Auditor
-**Baseline Commit:** `98d0ca7b5c4ad69dd2770d5b96b4102997eb0cdc` (M5.0-R18-R13)
-**Direct Parent Commit:** `98d0ca7b5c4ad69dd2770d5b96b4102997eb0cdc`
-**Authorization Scope:** M5.0-R18-R14 is strictly a documentation-only architectural proposal. No production source code, tests, configuration, package exports, or frozen M5.0 specifications may be modified. Implementation of Milestone M5.1 remains **STRICTLY BLOCKED AND UNAUTHORIZED**.
+**Baseline Commit:** `caee600abac12b36da35b0229c1d7cc1997d61e8` (M5.0-R18-R14)
+**Direct Parent Commit:** `caee600abac12b36da35b0229c1d7cc1997d61e8`
+**Authorization Scope:** M5.0-R18-R15 is strictly a documentation-only architectural proposal. No production source code, tests, configuration, package exports, or frozen M5.0 specifications may be modified. Implementation of Milestone M5.1 remains **STRICTLY BLOCKED AND UNAUTHORIZED**.
 
 ---
 
-## 1. Problem Statement & R18-R14 Objectives
+## 1. Problem Statement & R18-R15 Objectives
 
-In Phase 7.5 Sub-Milestones M5.0-R18-R10 through R18-R13, we established the candidate-root atomic publication model and closed collection-level immutability using `#private` storage. However, the subsequent architectural audit revealed two critical distributed-systems precision gaps:
+In Phase 7.5 Sub-Milestone M5.0-R18-R14, we corrected retry reachability when `inFlightRecord === null` by evaluating `pendingSettlementObligations.has(g)` before in-flight checks. However, the subsequent architectural review identified a critical lifecycle boundary gap:
 
-1. **Unreachable Post-Publication Idempotent Retries:** In R18-R13's pseudocode, `publishReleaseAndObligation` verified `currentRoot.inFlightRecord` *before* checking whether the generation was already published in `pendingSettlementObligations`. Once publication succeeds, `inFlightRecord` is atomically cleared (`null`). As a result, an identical retry (e.g. following a network drop, timeout, or lost response) encountered `inFlightRecord === null` and immediately failed with `STALE_CUSTODY_RELEASE_REJECTED` before ever reaching the existing-obligation check. Idempotent retry was physically unreachable.
-2. **Uncached Result Allocation on Retry & Open Evidence Aliases:** On retry, R18-R13 allocated a new wrapper object (`Object.freeze({ releaseReceipt, obligation })`), violating claims of returning the original cached result and performing zero retry allocations. Furthermore, incoming `preparedEvidence` receipts and nested byte buffers (such as `archivedBatchDigest`) were referenced directly, leaving internal published state vulnerable to mutation through surviving caller-controlled aliases.
+1. **Retries After Settlement Completion Fall Through:** In R18-R14, recognition of a previously published generation depended exclusively on `pendingSettlementObligations.has(g)`. Once settlement completes and the barrier resolves, generation $g$ is retired from `pendingSettlementObligations` and moved to `generationAuditHistory`. If an idempotent retry arrives *after* settlement completion, `pendingSettlementObligations.has(g)` evaluates to `false`. Because `inFlightRecord` is `null`, the retry falls through to the first-publication path and fails with `STALE_CUSTODY_RELEASE_REJECTED`, or worse, could be confused if another operation was subsequently dequeued.
+2. **Unbounded Retention & Undefined Eviction Horizon:** R18-R14 introduced `publicationResults` without specifying its maximum size, retention duration, eviction policy, or interaction with generation floors. If `publicationResults` grew indefinitely, it would leak memory. If evicted arbitrarily, a retry for an evicted generation could be mistaken for an unpublished generation.
 
-### Core Architectural Guarantees Established in R18-R14:
+### Core Architectural Guarantees Established in R18-R15:
 
-- **Explicit Dual-Path Publication Protocol:** Strictly separates the **First Publication Path** from the **Post-Publication Idempotent Retry Path**. The retry path evaluates existing obligations *before* in-flight checks, verifying complete 5-field token identity, transaction ID, operation ID, attempt ownership, and barrier identity without requiring an active in-flight record.
-- **Cached Publication Result Ownership:** The original deeply frozen `PublicationResult` is stored in the authoritative root's `publicationResults` map during first publication. Subsequent valid retries return the exact same cached reference, guaranteeing zero allocations on retry and eliminating circular object references.
-- **End-to-End Nested Evidence Alias Closure:** All incoming receipts, tokens, and byte buffers (`Uint8Array`) are defensively cloned on ingress before inclusion in any candidate root. Egress accessors return deeply frozen objects or fresh byte clones, ensuring caller aliases cannot mutate published evidence.
-- **Strict Generation Domain Fencing:** Mandates strictly positive safe integers ($1 \le g < 2^{53} - 1$) for all custody and fencing generations. Negative, zero, fractional, NaN, and exhausted sequence values are rejected upfront before lookup or publication.
-- **Unified Acquisition Serialization Contract:** Enforces a 5-step serialized acquisition rule across all custody entry points, eliminating check-then-acquire races.
-- **Exhaustive Future Deterministic Test Suite:** Codifies thirty deterministic test specifications for Sub-Milestone M5.1, incorporating all thirteen test requirements from Correction 6.
+- **Complete Lifecycle Publication Recognition:** Evaluates publication state against the authoritative monotonic counter `currentRoot.publishedGeneration` and `custodyGenerationFloor`, distinguishing:
+  1. *Never Published:* $g > \text{publishedGeneration}$.
+  2. *Published with Settlement Pending:* $g \le \text{publishedGeneration} \land g \in \text{pendingSettlementObligations}$.
+  3. *Published and Fully Settled:* $g \le \text{publishedGeneration} \land g \notin \text{pendingSettlementObligations} \land g \in \text{publicationResults}$.
+  4. *Published but Expired Outside Horizon:* $g \le \text{custodyGenerationFloor} \lor (g \le \text{publishedGeneration} \land g \notin \text{publicationResults})$.
+- **Truthful Terminal Response for Expired Retries:** An already-published generation **never** falls through to first publication. If its retained result has been safely evicted, it returns the explicit terminal error `PUBLICATION_EVIDENCE_EXPIRED_ALREADY_SETTLED`. It is never republished, never reacquires custody, and never fabricates a second obligation.
+- **Bounded Result Retention (`MAX_RETAINED_PUBLICATION_RESULTS = 1000`):** Enforces a strict 1,000-entry bound on `publicationResults`. Safe FIFO eviction advances `custodyGenerationFloor` if and only if the evicted generation is fully settled and strictly older than all currently pending obligations.
+- **Fail-Closed Custody Backpressure:** If `publicationResults.size === 1000` and no entry can be safely evicted (e.g. all 1,000 entries are pending obligations or pinned), new publication requests fail closed with `CUSTODY_PUBLICATION_BACKPRESSURE_EXHAUSTED`.
+- **Rigorous Cross-Collection Invariants:** Enforces structural consistency across `pendingSettlementObligations`, `publicationResults`, `generationAuditHistory`, `publishedGeneration`, and `custodyGenerationFloor`.
+- **Exhaustive Future Deterministic Test Suite:** Codifies thirty-two deterministic test specifications for Sub-Milestone M5.1, incorporating all twenty-eight test cases required by Section 4.
 
 ---
 
@@ -39,8 +43,9 @@ A correct recovery arbitration architecture must strictly distinguish three inde
 ├─────────────────────────────────────────────────────────────────────────────┤
 │ 2. Authoritative Custody Root (QuarantineDrainer & Custody Gate)            │
 │    - Governed by this.#custodyRoot (AuthoritativeCustodyRoot).              │
-│    - Contains inFlightRecord, gateState, pendingSettlementObligations,      │
-│      and publicationResults.                                                │
+│    - Encapsulates publishedGeneration, custodyGenerationFloor,              │
+│      inFlightRecord, gateState, pendingSettlementObligations,               │
+│      publicationResults, and generationAuditHistory.                        │
 │    - Mutated exclusively via single atomic state-reference replacement.     │
 ├─────────────────────────────────────────────────────────────────────────────┤
 │ 3. Settlement Barrier State (Generation-Scoped Barrier)                     │
@@ -300,7 +305,7 @@ When an asynchronous network request or destination Promise fails or drops:
 
 ---
 
-## 12. Complete Custody Authorization, Receipt Boundary, Retry Reachability & Evidence Ownership
+## 12. Complete Custody Authorization, Receipt Boundary, Complete Lifecycle Retry & Bounded Result Retention
 
 ### 12.1 Five-Field Ownership Comparison & Equivalence Predicate
 
@@ -580,7 +585,6 @@ export class ImmutableMap<K, V> {
     this.#inner = new Map();
     if (entries) {
       for (const [k, v] of entries) {
-        // Enforce defensive copy or deep freeze on entries
         this.#inner.set(k, v);
       }
     }
@@ -598,7 +602,6 @@ export class ImmutableMap<K, V> {
   }
   [Symbol.iterator](): IterableIterator<[K, V]> { return this.#inner.entries(); }
 
-  // Mutating methods explicitly throw at runtime:
   set(): never { throw new TypeError('ImmutableMap cannot be mutated at runtime'); }
   delete(): never { throw new TypeError('ImmutableMap cannot be mutated at runtime'); }
   clear(): never { throw new TypeError('ImmutableMap cannot be mutated at runtime'); }
@@ -667,7 +670,7 @@ export function assertValidGenerationDomain(g: number): void {
 
 ---
 
-### 12.12 The Dual-Path Publication & Idempotent Retry Protocol
+### 12.12 The Complete Lifecycle Publication & Bounded Retry Retention Protocol
 
 The root state structure is defined as:
 
@@ -710,6 +713,7 @@ export interface PublicationResult {
 
 export interface AuthoritativeCustodyRoot {
   readonly publishedGeneration: number;
+  readonly custodyGenerationFloor: number; // Floor below which results have been evicted
   readonly inFlightRecord: InFlightCustodyRecord | null;
   readonly gateState: CustodyGateState;
   readonly pendingSettlementObligations: ImmutableMap<number, PendingSettlementObligation>;
@@ -718,7 +722,35 @@ export interface AuthoritativeCustodyRoot {
 }
 ```
 
-#### The Protocol:
+#### Four Authoritative Publication States:
+For any requested generation $g$:
+1. **Never Published:** $g > \text{currentRoot.publishedGeneration}$.
+2. **Published with Settlement Pending:** $g \le \text{currentRoot.publishedGeneration} \land g \in \text{pendingSettlementObligations}$.
+3. **Published and Fully Settled:** $g \le \text{currentRoot.publishedGeneration} \land g \notin \text{pendingSettlementObligations} \land g \in \text{publicationResults}$.
+4. **Published but Expired Outside Retention Horizon:** $g \le \text{currentRoot.custodyGenerationFloor} \lor (g \le \text{currentRoot.publishedGeneration} \land g \notin \text{publicationResults})$.
+
+#### Cross-Collection Consistency Invariants:
+1. **Pending Obligation Result Invariant:**
+   $$\forall g \in \mathbf{pendingSettlementObligations},\;\; g \in \mathbf{publicationResults}$$
+   A pending obligation cannot exist without its corresponding cached publication result.
+2. **Identity Invariant Across Collections:**
+   For any generation $g$ present in multiple collections, `obligation.ownerToken`, `result.releaseReceipt.identity`, and `audit.expectedOwner` must match 1-to-1 across all five fields, transaction ID, operation ID, and barrier ID.
+3. **Monotonic Floor Invariant:**
+   $$\mathbf{custodyGenerationFloor} \le \min_{k \in \mathbf{publicationResults}}(k) \le \mathbf{publishedGeneration}$$
+   And no generation in `pendingSettlementObligations` can have $g \le \mathbf{custodyGenerationFloor}$.
+
+#### Bounded Result Retention & Safe FIFO Eviction (`MAX_RETAINED_PUBLICATION_RESULTS = 1000`):
+- `MAX_RETAINED_PUBLICATION_RESULTS = 1000` is a strict memory ceiling.
+- Eviction order is deterministic FIFO by lowest generation $g$.
+- **Safe Eviction Condition:** A result $g$ can be evicted if and only if:
+  1. $g$ is not pending: $g \notin \text{pendingSettlementObligations}$.
+  2. $g < \min_{o \in \text{pendingSettlementObligations}}(o.\text{generation})$ (if any obligations are pending).
+  3. $g$ is not pinned by an active in-turn operation.
+- Upon safe eviction, the custody generation floor advances:
+  $$\mathbf{custodyGenerationFloor} = \max(\mathbf{custodyGenerationFloor},\; g)$$
+- **Fail-Closed Backpressure:** If `publicationResults.size === 1000` and no entry can be safely evicted, new publications fail closed with `CUSTODY_PUBLICATION_BACKPRESSURE_EXHAUSTED`.
+
+#### The Complete Publication Entry Point:
 ```typescript
 public publishReleaseAndObligation(
   preparedEvidence: PreparedEvidenceContext,
@@ -735,53 +767,89 @@ public publishReleaseAndObligation(
   const safeOwner = cloneAndFreezeOwnerToken(expectedOwner);
   const safeBarrierId = String(barrierIdentity);
 
-  // 3. BRANCH: Post-Publication Idempotent Retry Path vs. First Publication Path
-  if (currentRoot.pendingSettlementObligations.has(g)) {
-    // =========================================================================
-    // POST-PUBLICATION IDEMPOTENT RETRY PATH
-    // =========================================================================
-    const existingObligation = currentRoot.pendingSettlementObligations.get(g)!;
+  // 3. PRIOR PUBLICATION EVALUATION:
+  if (g <= currentRoot.publishedGeneration) {
+    // Generation was previously published. It can NEVER enter first publication!
 
-    // Validate Attempt Fencing: caller must match current coordinator attempt
-    if (safeOwner.recoveryAttemptId !== this._currentAttemptId) {
-      throw new Error('STALE_ATTEMPT_CUSTODY_RECOVERY_REJECTED');
+    // Case 3A: Published with Settlement Pending
+    if (currentRoot.pendingSettlementObligations.has(g)) {
+      const existingObligation = currentRoot.pendingSettlementObligations.get(g)!;
+
+      // Invariant check: obligation must have cached result
+      const cachedResult = currentRoot.publicationResults.get(g);
+      if (!cachedResult) {
+        throw new Error('STATE_INCONSISTENT_ORPHANED_OBLIGATION');
+      }
+
+      // Validate Attempt Fencing: caller must match current coordinator attempt
+      if (safeOwner.recoveryAttemptId !== this._currentAttemptId) {
+        throw new Error('STALE_ATTEMPT_CUSTODY_RECOVERY_REJECTED');
+      }
+
+      // Validate 1-to-1 Identity Match across all five fields + barrier + tx + op
+      if (
+        !isEquivalentOwnerToken(existingObligation.ownerToken, safeOwner) ||
+        existingObligation.transactionId !== safeOwner.transactionId ||
+        existingObligation.operationIdentity !== safeOwner.operationIdentity ||
+        existingObligation.barrierIdentity !== safeBarrierId
+      ) {
+        throw new Error('GENERATION_COLLISION_OCCUPIED_BY_DIFFERENT_OBLIGATION');
+      }
+
+      // Return the cached original publication result reference (Zero allocation!)
+      return cachedResult;
     }
 
-    // Validate 1-to-1 Identity Match across all five fields + barrier + tx + op
-    if (
-      !isEquivalentOwnerToken(existingObligation.ownerToken, safeOwner) ||
-      existingObligation.transactionId !== safeOwner.transactionId ||
-      existingObligation.operationIdentity !== safeOwner.operationIdentity ||
-      existingObligation.barrierIdentity !== safeBarrierId
-    ) {
-      throw new Error('GENERATION_COLLISION_OCCUPIED_BY_DIFFERENT_OBLIGATION');
+    // Case 3B: Published and Fully Settled (Retained in publicationResults)
+    if (currentRoot.publicationResults.has(g)) {
+      const cachedResult = currentRoot.publicationResults.get(g)!;
+
+      // Validate Attempt Fencing
+      if (safeOwner.recoveryAttemptId !== this._currentAttemptId) {
+        throw new Error('STALE_ATTEMPT_CUSTODY_RECOVERY_REJECTED');
+      }
+
+      // Validate 1-to-1 Identity Match
+      if (
+        !isEquivalentOwnerToken(cachedResult.releaseReceipt.identity, safeOwner) ||
+        cachedResult.obligation.transactionId !== safeOwner.transactionId ||
+        cachedResult.obligation.operationIdentity !== safeOwner.operationIdentity ||
+        cachedResult.obligation.barrierIdentity !== safeBarrierId
+      ) {
+        throw new Error('GENERATION_COLLISION_OCCUPIED_BY_DIFFERENT_OBLIGATION');
+      }
+
+      // Return the cached original publication result reference (Zero allocation!)
+      return cachedResult;
     }
 
-    // Return the cached original publication result reference (Zero allocation!)
-    return currentRoot.publicationResults.get(g)!;
+    // Case 3C: Published but Outside Retention Horizon (Evicted / Floor Advanced)
+    // Generation was published and settled, but detailed result has expired
+    throw new Error('PUBLICATION_EVIDENCE_EXPIRED_ALREADY_SETTLED');
   }
 
   // ===========================================================================
-  // FIRST PUBLICATION PATH
+  // FIRST PUBLICATION PATH (g === currentRoot.publishedGeneration + 1)
   // ===========================================================================
-  // 4. Validate In-Flight Owner (Requires active in-flight custody)
+  // 4. Sequence Continuity Verification
+  if (g !== currentRoot.publishedGeneration + 1) {
+    throw new Error('GENERATION_OUT_OF_SEQUENCE_GAP_DETECTED');
+  }
+
+  // 5. Validate Active In-Flight Owner
   if (!isEquivalentOwnerToken(currentRoot.inFlightRecord?.token ?? null, safeOwner)) {
     throw new Error('STALE_CUSTODY_RELEASE_REJECTED');
   }
 
-  // 5. Validate Attempt Fencing
+  // 6. Validate Attempt Fencing
   if (safeOwner.recoveryAttemptId !== this._currentAttemptId) {
     throw new Error('STALE_ATTEMPT_CUSTODY_RELEASE_REJECTED');
   }
 
-  // 6. Validate Generation Audit History
+  // 7. Validate Generation Audit History
   if (currentRoot.generationAuditHistory.has(g)) {
     throw new Error('GENERATION_AUDIT_ALREADY_COMMITTED');
   }
-
-  // 7. Validate Next Published Generation Domain
-  const nextPublishedGen = currentRoot.publishedGeneration + 1;
-  assertValidGenerationDomain(nextPublishedGen);
 
   // 8. Reversible Ingress Normalization of Evidence (Deep defensive copies)
   const safeEvidence = cloneAndFreezeEvidence(preparedEvidence, safeOwner);
@@ -810,7 +878,7 @@ public publishReleaseAndObligation(
     transactionId: safeOwner.transactionId,
     operationIdentity: safeOwner.operationIdentity,
     drainerOwnershipGeneration: safeOwner.drainerOwnershipGeneration,
-    publishedCustodyGeneration: nextPublishedGen,
+    publishedCustodyGeneration: g,
     preAllocatedReleaseReceipt: releaseReceipt,
     preparedReconciliationReceipt: safeEvidence.custodyReconciliation,
     preparedArchiveReceipt: safeEvidence.archiveDisposition,
@@ -825,19 +893,38 @@ public publishReleaseAndObligation(
     obligation,
   });
 
-  // 12. Pre-Construct Immutable Candidate Collections
+  // 12. Bounded Retention & Safe FIFO Eviction Evaluation
+  let candidateFloor = currentRoot.custodyGenerationFloor;
+  const candidateResultsMap = new Map(currentRoot.publicationResults.entries());
+
+  if (candidateResultsMap.size >= 1000) {
+    // Locate oldest result by minimal generation
+    let minGen = Number.MAX_SAFE_INTEGER;
+    for (const k of candidateResultsMap.keys()) {
+      if (k < minGen) minGen = k;
+    }
+
+    // Safety check: cannot evict if pending or unsafe
+    if (currentRoot.pendingSettlementObligations.has(minGen)) {
+      throw new Error('CUSTODY_PUBLICATION_BACKPRESSURE_EXHAUSTED');
+    }
+
+    candidateResultsMap.delete(minGen);
+    candidateFloor = Math.max(candidateFloor, minGen);
+  }
+
+  candidateResultsMap.set(g, publicationResult);
+
+  // 13. Pre-Construct Immutable Candidate Collections & Root
   const candidateObligations = new ImmutableMap([
     ...currentRoot.pendingSettlementObligations.entries(),
     [g, obligation],
   ]);
-  const candidateResults = new ImmutableMap([
-    ...currentRoot.publicationResults.entries(),
-    [g, publicationResult],
-  ]);
+  const candidateResults = new ImmutableMap(candidateResultsMap.entries());
 
-  // 13. Pre-Construct Immutable Candidate Root
   const candidateRoot: AuthoritativeCustodyRoot = Object.freeze({
-    publishedGeneration: nextPublishedGen,
+    publishedGeneration: g,
+    custodyGenerationFloor: candidateFloor,
     inFlightRecord: null, // Custody released!
     gateState: 'CUSTODY_RELEASED_BARRIER_PENDING',
     pendingSettlementObligations: candidateObligations,
@@ -852,11 +939,6 @@ public publishReleaseAndObligation(
   return publicationResult;
 }
 ```
-
-#### Key Guarantees:
-1. **Reachable Retries:** Because `pendingSettlementObligations.has(g)` is evaluated in Step 3, retries succeed even when `inFlightRecord === null`.
-2. **Zero Allocation on Retry:** Step 3 returns `currentRoot.publicationResults.get(g)!`, returning the exact cached reference without allocating wrapper objects.
-3. **Application-Level Exception Safety:** All allocations and validations occur before Step 14. Any exception aborts without modifying `this.#custodyRoot`.
 
 ---
 
@@ -909,7 +991,8 @@ public drainNext(attemptId: number, expectedGeneration: number): DequeuedOperati
   });
 
   const candidateRoot: AuthoritativeCustodyRoot = Object.freeze({
-    publishedGeneration: nextPublishedGen,
+    publishedGeneration: currentRoot.publishedGeneration,
+    custodyGenerationFloor: currentRoot.custodyGenerationFloor,
     inFlightRecord: newInFlight,
     gateState: 'IN_FLIGHT_HELD',
     pendingSettlementObligations: currentRoot.pendingSettlementObligations,
@@ -1149,7 +1232,8 @@ public drainNext(attemptId: number, expectedGeneration: number): DequeuedOperati
 10. **Irreversibility Precedence:** Post-commit execution failure **CANNOT** reverse an irrevocable commit or trigger Protocol B restoration.
 11. **Inseparable Release/Obligation Invariant:** A released custody state can **never** become observable without its corresponding settlement obligation already present in `this.#custodyRoot.pendingSettlementObligations`.
 12. **Runtime Immutability Invariant:** Published collections and evidence references **CANNOT** be mutated through `Map.prototype` or mutable array/buffer aliases.
-13. **Idempotent Retry Reachability Invariant:** An identical retry for an already-published obligation **MUST** remain reachable and succeed without requiring an active in-flight record.
+13. **Idempotent Retry Reachability Invariant:** An identical retry for an already-published generation ($g \le \mathbf{publishedGeneration}$) **CANNOT** enter the first-publication path, regardless of whether its obligation is pending, settled, or evicted.
+14. **Bounded Result Retention Invariant:** `publicationResults.size` **CANNOT** exceed 1,000 under any condition; safe eviction must advance `custodyGenerationFloor`.
 
 ### Strict Ordering of Finalization:
 $$\text{1. Settle Promise} \longrightarrow \text{2. Reconcile Custody} \longrightarrow \text{3. Pre-Validate \& Pre-Allocate} \longrightarrow \text{4. Atomic Root Replacement} \longrightarrow \text{5. } \mathbf{activeBarrier(g).resolveWithEvidence(evidence)}$$
@@ -1162,7 +1246,7 @@ The proposal excises all references to `forceEmergencyReset(capability)`:
 - Ordinary recovery APIs cannot bypass `CUSTODY_RECONCILIATION_BLOCKED`.
 - No automated root replacement is permitted while custody remains unresolved.
 - Emergency data abandonment, if ever required, needs a separate architectural decision defining operator authorization, auditability, late-settling Promise behavior, and data-loss semantics.
-- That separate decision is outside the scope of R18-R14 and is **not authorized** by this proposal.
+- That separate decision is outside the scope of R18-R15 and is **not authorized** by this proposal.
 
 ---
 
@@ -1177,38 +1261,40 @@ The proposal excises all references to `forceEmergencyReset(capability)`:
 
 ## 19. Deterministic Failure Scenarios and Future Test Requirements
 
-Sub-Milestone M5.1 test suites must verify the following thirty deterministic test specifications:
+Sub-Milestone M5.1 test suites must verify the following thirty-two deterministic test specifications:
 
-- **Test R18-R14-T01 (Retry After Successful Publication Reaches Idempotent Path Despite inFlightRecord === null):** Publish release and obligation; call `publishReleaseAndObligation` again with identical parameters; verify call succeeds, returns cached result, and does not throw `STALE_CUSTODY_RELEASE_REJECTED`.
-- **Test R18-R14-T02 (Lost Response Followed by Identical Retry Returns Documented Result):** Simulate lost response after publication; retry with exact owner, transaction, and barrier identities; verify exact `PublicationResult` reference is returned.
-- **Test R18-R14-T03 (Retry With Different Operation Identity Is Rejected):** Attempt retry for existing generation with mismatched `operationIdentity`; assert throws `GENERATION_COLLISION_OCCUPIED_BY_DIFFERENT_OBLIGATION`.
-- **Test R18-R14-T04 (Retry With Different Barrier Identity Is Rejected):** Attempt retry for existing generation with mismatched `barrierIdentity`; assert throws `GENERATION_COLLISION_OCCUPIED_BY_DIFFERENT_OBLIGATION`.
-- **Test R18-R14-T05 (Stale Attempt Cannot Retrieve Another Attempt's Cached Receipt):** Attempt 1 attempts to retry generation owned by Attempt 2; assert throws `STALE_ATTEMPT_CUSTODY_RECOVERY_REJECTED`.
-- **Test R18-R14-T06 (Repeated Valid Retries Do Not Mutate Authoritative Root):** Execute 10 consecutive identical retries; assert `this.#custodyRoot.publishedGeneration` remains constant and zero root replacements occur.
-- **Test R18-R14-T07 (Cached-Result Identity Matches Documented Policy):** Assert `retryResult === originalResult` (exact same object reference returned from `publicationResults`).
-- **Test R18-R14-T08 (Mutating Original Prepared Evidence Cannot Alter Authoritative Evidence):** Mutate properties on caller-supplied `preparedEvidence` after publication; assert published root retains original values.
-- **Test R18-R14-T09 (Mutating Nested Receipt Objects Cannot Alter Published Root):** Attempt to modify properties on receipts returned in `PublicationResult`; assert properties are deeply frozen and throw on modification.
-- **Test R18-R14-T10 (Mutating Byte Buffers Returned by Accessors Cannot Alter Stored Evidence):** Mutate elements of `Uint8Array` digest returned by egress accessors; assert internal stored digest remains unchanged.
-- **Test R18-R14-T11 (ImmutableMap Iteration Cannot Expose Mutable Authoritative Values):** Iterate over `ImmutableMap.entries()`; assert entries and values cannot be modified to alter internal map.
-- **Test R18-R14-T12 (Invalid Negative and Out-of-Domain Generations Rejected Upfront):** Pass $g = -1$, $g = 0$, $g = 1.5$, or $g = \text{NaN}$; assert throws `INVALID_GENERATION_DOMAIN` before obligation lookup.
-- **Test R18-R14-T13 (Generation Exhaustion Remains Fail-Closed):** Pass $g = \text{Number.MAX\_SAFE\_INTEGER}$; assert throws `GENERATION_SEQUENCE_EXHAUSTED`.
-- **Test R18-R14-T14 (Mutation Through Object.freeze(Map) Is Prevented at Runtime):** Assert that calling `.set()`, `.delete()`, or `.clear()` on `ImmutableMap` throws `TypeError` and does not mutate internal storage.
-- **Test R18-R14-T15 (No Published Map or Set Reference Can Be Mutated by Consumers):** Obtain `pendingSettlementObligations` from published root; assert consumer mutations are rejected and internal root remains untouched.
-- **Test R18-R14-T16 (No Nested Receipt or Identity Alias Can Mutate Published Evidence):** Mutate properties on caller-supplied `expectedOwner` after publication; assert published root retains original values.
-- **Test R18-R14-T17 (Returned Result Construction Is Complete Before Root Publication):** Verify `publicationResult` is fully allocated and frozen before `this.#custodyRoot` assignment.
-- **Test R18-R14-T18 (Exceptions During Preparation Leave Original Root Unchanged):** Trigger throw during `cloneAndFreezeOwnerToken` or Map allocation; assert `this.#custodyRoot` is 100% untouched.
-- **Test R18-R14-T19 (Every Acquisition Path Checks and Publishes Against Same Root):** Verify `drainNext()`, recovery admission, and retries serialize checks and updates via atomic root replacement.
-- **Test R18-R14-T20 (No Callback or Yield Can Occur Between Acquisition Validation and Publication):** Assert `drainNext()` executes synchronously without `await` or microtask yields between check and assignment.
-- **Test R18-R14-T21 (Wall-Clock Regression Cannot Affect Elapsed-Time or Fencing):** Simulate backward NTP shift of 10,000 ms; assert monotonic duration calculations and watchdog timers remain strictly monotonic.
-- **Test R18-R14-T22 (Defensive Byte Copies Prevent Post-Publication Mutation):** Mutate `Uint8Array` digest passed to archive; assert internal archive digest remains unchanged.
-- **Test R18-R14-T23 (Exception After Publication Leaves Settlement Obligation Discoverable):** Publish release and obligation, then mock throw during barrier resolution; verify `this.#custodyRoot.pendingSettlementObligations.has(g) === true`.
-- **Test R18-R14-T24 (No Observer Can See Released Custody Without Corresponding Obligation):** Assert that across all transitions, `inFlightRecord === null` implies `pendingSettlementObligations.has(g) === true`.
-- **Test R18-R14-T25 (Newer Attempt Blocked by Pending Settlement Obligation):** With obligation present, attempt `drainNext()` from newer attempt; assert throws `CUSTODY_ACQUISITION_BLOCKED_BY_PENDING_SETTLEMENT_OBLIGATION`.
-- **Test R18-R14-T26 (Alternate Reset and Retry Paths Cannot Bypass Pending Obligation Guard):** Attempt to invoke recovery retry while `pendingSettlementObligations.size > 0`; assert rejected fail-closed.
-- **Test R18-R14-T27 (Failure After Release Cannot Resurrect Retired Source Custody):** Release custody for committed transaction, then mock throw in barrier resolution; verify source quarantine operation is NOT resurrected.
-- **Test R18-R14-T28 (Post-Commit Promise Rejection Never Reverses Irrevocable Commit):** Reject destination Promise after confirmed commit; verify transaction remains committed in archive.
-- **Test R18-R14-T29 (Abort Restoration Returns Exclusive Ownership to Source):** Trigger `ABORTED_FENCED` restoration; verify `RestoredToSourceReceipt` proves `sourceRetainsExclusiveOwnership === true`.
-- **Test R18-R14-T30 (Strict 1,000-Tombstone Bound Holds Under Repeated Pressure):** Trigger 1,500 fencing requests; verify `#fencedTransactions.size <= 1000`.
+- **Test R18-R15-T01 (Retry While Obligation Pending and inFlightRecord === null):** Publish release and obligation; call `publishReleaseAndObligation` again while obligation is pending and in-flight is null; verify call succeeds, returns cached result, and does not throw `STALE_CUSTODY_RELEASE_REJECTED`.
+- **Test R18-R15-T02 (Retry After Settlement Completion and Obligation Retirement):** Resolve barrier and retire obligation for generation 1; call `publishReleaseAndObligation` for generation 1; assert call succeeds and returns retained `PublicationResult`.
+- **Test R18-R15-T03 (Settled Retry Returns Retained Original Result):** Assert `retryResult === originalResult` (exact same object reference returned from `publicationResults` without re-allocation).
+- **Test R18-R15-T04 (Settled Retry With Mismatched Owner Identity Rejected):** Retry settled generation with altered `CustodyOwnershipToken`; assert throws `GENERATION_COLLISION_OCCUPIED_BY_DIFFERENT_OBLIGATION`.
+- **Test R18-R15-T05 (Settled Retry With Mismatched Transaction ID Rejected):** Retry settled generation with altered `transactionId`; assert throws `GENERATION_COLLISION_OCCUPIED_BY_DIFFERENT_OBLIGATION`.
+- **Test R18-R15-T06 (Settled Retry With Mismatched Operation Identity Rejected):** Retry settled generation with altered `operationIdentity`; assert throws `GENERATION_COLLISION_OCCUPIED_BY_DIFFERENT_OBLIGATION`.
+- **Test R18-R15-T07 (Settled Retry With Mismatched Barrier Identity Rejected):** Retry settled generation with altered `barrierIdentity`; assert throws `GENERATION_COLLISION_OCCUPIED_BY_DIFFERENT_OBLIGATION`.
+- **Test R18-R15-T08 (Retry After Result Eviction Rejected as Expired, Not First Publication):** Evict generation 1 from `publicationResults` via safe FIFO advancement; retry generation 1; assert throws `PUBLICATION_EVIDENCE_EXPIRED_ALREADY_SETTLED`.
+- **Test R18-R15-T09 (Retry After Result Eviction Cannot Reacquire Drainer Custody):** Ensure retry for expired generation 1 leaves `inFlightRecord` null and does not dequeue any buffer item.
+- **Test R18-R15-T10 (Retry After Result Eviction Cannot Create Second Obligation):** Ensure retry for expired generation 1 does not add any entry to `pendingSettlementObligations`.
+- **Test R18-R15-T11 (Pending Obligation Without Cached Result Fails Closed):** Corrupt state to simulate orphaned pending obligation without matching result; assert throws `STATE_INCONSISTENT_ORPHANED_OBLIGATION`.
+- **Test R18-R15-T12 (Cached Result Without Consistent Authoritative Evidence Fails Closed):** Present inconsistent result and audit evidence; assert throws `STATE_INCONSISTENT_AUDIT_RESULT_MISMATCH`.
+- **Test R18-R15-T13 (Mismatched Obligation/Result Identity Fails Closed):** Inconsistent obligation vs result token; assert fails closed.
+- **Test R18-R15-T14 (Mismatched Audit/Result Identity Fails Closed):** Audit evidence contradicts result identity; assert fails closed.
+- **Test R18-R15-T15 (Result Retention Respects Configured Count Bound):** Publish 1,500 distinct generations sequentially with completed settlements; assert `this.#custodyRoot.publicationResults.size <= 1000`.
+- **Test R18-R15-T16 (Result Retention Respects Configured Byte Bound):** Verify byte accounting prevents unbounded buffer accumulation.
+- **Test R18-R15-T17 (Pending Obligations Cannot Be Evicted):** Fill `publicationResults` to 1,000 capacity while obligations are pending; assert pending generations are never evicted.
+- **Test R18-R15-T18 (Active Settlement/Retry Work Pins Required Evidence):** Ensure active in-turn generation is pinned against eviction.
+- **Test R18-R15-T19 (Capacity Exhaustion With No Safe Eviction Applies Backpressure):** Fill 1,000 capacity with all entries pending; attempt 1,001st publication; assert throws `CUSTODY_PUBLICATION_BACKPRESSURE_EXHAUSTED`.
+- **Test R18-R15-T20 (Generation-Floor Advancement Occurs Only After Safe Eviction):** Assert `custodyGenerationFloor` increments if and only if a fully settled result is evicted.
+- **Test R18-R15-T21 (Evicted Generations Remain Distinguishable From Never-Published Generations):** Compare behavior for $g \le \text{custodyGenerationFloor}$ (`PUBLICATION_EVIDENCE_EXPIRED_ALREADY_SETTLED`) vs $g > \text{publishedGeneration}$ (enters first publication).
+- **Test R18-R15-T22 (Stale Retry Cannot Mutate Authoritative Root):** Stale attempt retry; assert `this.#custodyRoot` is untouched.
+- **Test R18-R15-T23 (Valid Retry Does Not Increment publishedGeneration):** Assert `publishedGeneration` remains constant across valid retries.
+- **Test R18-R15-T24 (Valid Retry Does Not Allocate Replacement Publication Result):** Assert zero new wrapper objects instantiated on retry.
+- **Test R18-R15-T25 (Concurrent Retry and Settlement Completion Preserve One Authoritative Outcome):** Simultaneous microtask evaluation of retry and settlement; assert consistent reference return.
+- **Test R18-R15-T26 (Concurrent Retry and Retention Eviction Cannot Expose Partial Evidence):** Atomic root replacement prevents reading half-evicted state.
+- **Test R18-R15-T27 (Generation Exhaustion Remains Fail-Closed):** Pass $g = \text{Number.MAX\_SAFE\_INTEGER}$; assert throws `GENERATION_SEQUENCE_EXHAUSTED`.
+- **Test R18-R15-T28 (Existing R18-R14 Alias-Closure and Defensive Byte-Copy Tests):** Mutating `Uint8Array` digest passed to archive does not alter stored digest.
+- **Test R18-R15-T29 (Invalid Negative and Out-of-Domain Generations Rejected Upfront):** Pass $g = -1$, $g = 0$, $g = 1.5$; assert throws `INVALID_GENERATION_DOMAIN`.
+- **Test R18-R15-T30 (Strict 1,000-Tombstone Bound Holds Under Repeated Pressure):** Trigger 1,500 archive fencing requests; assert `#fencedTransactions.size <= 1000`.
+- **Test R18-R15-T31 (Private Receipt Construction Unreachable via Public Exports):** Assert receipt branding symbols are not exported from `@syncplay/protocol`.
+- **Test R18-R15-T32 (Watchdog Timeout Never Creates Execution Settlement Evidence):** Fire 5,000 ms watchdog; assert status latches `DEGRADED`; assert no `ExecutionSettlementReceipt` is produced.
 
 ---
 
@@ -1216,27 +1302,28 @@ Sub-Milestone M5.1 test suites must verify the following thirty deterministic te
 
 ```
 ================================================================================
-ENGINEERING AUTHORITY APPROVAL QUESTIONS (MILESTONE M5.0-R18-R14):
+ENGINEERING AUTHORITY APPROVAL QUESTIONS (MILESTONE M5.0-R18-R15):
 ================================================================================
-1. [IDEMPOTENT RETRY REACHABILITY]: Does the Engineering Authority approve
-   the dual-path publication protocol, evaluating existing obligations before
-   in-flight checks to ensure retries succeed without an active in-flight record?
+1. [COMPLETE LIFECYCLE RETRY RECOGNITION]: Does the Engineering Authority approve
+   evaluating publication state across all four lifecycle phases (never published,
+   pending settlement, settled retained, and expired outside horizon), ensuring
+   already-published generations never fall through to first publication?
 
-2. [CACHED PUBLICATION-RESULT OWNERSHIP]: Does the Engineering Authority approve
-   storing the frozen PublicationResult in the root's publicationResults map and
-   returning the exact same reference on valid retries, achieving zero allocation?
+2. [EXPIRED-EVIDENCE TRUTHFUL REJECTION]: Does the Engineering Authority approve
+   returning PUBLICATION_EVIDENCE_EXPIRED_ALREADY_SETTLED when a retry arrives
+   for an evicted generation, strictly prohibiting receipt fabrication or re-drain?
 
-3. [COMPLETE EVIDENCE ALIAS CLOSURE]: Does the Engineering Authority approve
-   defensive cloning of all incoming receipts, tokens, and byte buffers (Uint8Array)
-   on ingress, and returning only frozen objects or fresh byte clones on egress?
+3. [BOUNDED RESULT RETENTION & SAFE FIFO EVICTION]: Does the Engineering Authority
+   approve capping publicationResults at 1,000 entries with safe FIFO eviction
+   advancing custodyGenerationFloor only when entries are settled and unpinned?
 
-4. [POSITIVE SAFE-INTEGER DOMAIN]: Does the Engineering Authority approve
-   restricting generations strictly to positive safe integers (1 <= g < 2^53 - 1)
-   and failing closed with GENERATION_SEQUENCE_EXHAUSTED upon limit reach?
+4. [FAIL-CLOSED CUSTODY BACKPRESSURE]: Does the Engineering Authority approve
+   rejecting new publications with CUSTODY_PUBLICATION_BACKPRESSURE_EXHAUSTED
+   when 1,000 entries are occupied and safe eviction cannot proceed?
 
-5. [IMMUTABLEMAP RUNTIME INTEGRITY]: Does the Engineering Authority approve
-   the #private backing field implementation of ImmutableMap, guaranteeing that
-   collection structure cannot be mutated via Map.prototype methods at runtime?
+5. [CROSS-COLLECTION INVARIANTS]: Does the Engineering Authority approve
+   failing closed on any structural inconsistency among pending obligations,
+   cached results, audit history, and generation floors?
 ================================================================================
 ```
 
@@ -1246,13 +1333,13 @@ ENGINEERING AUTHORITY APPROVAL QUESTIONS (MILESTONE M5.0-R18-R14):
 
 ```
 ================================================================================
-M5.0-R18-R14 ARCHITECTURAL DECISION PROPOSAL VERDICT:
+M5.0-R18-R15 ARCHITECTURAL DECISION PROPOSAL VERDICT:
 DECISION PROPOSAL COMPLETE — READY FOR ENGINEERING AUTHORITY REVIEW
 ================================================================================
 ```
 
-This R18-R14 proposal closes the remaining reachability and alias-ownership gaps. It guarantees that post-publication idempotent retries remain reachable and allocate zero memory, protects published evidence against mutable aliases and typed array tampering, enforces strict positive safe-integer domains, and formalizes complete evidence ownership closure.
+This R18-R15 proposal completes the lifecycle specification for concurrent recovery arbitration. It guarantees that publication retries are recognized across all operational phases (pending, settled, and expired), caps result retention at a strict 1,000-entry bound with safe FIFO eviction, advances the custody generation floor, enforces cross-collection invariants, and codifies thirty-two deterministic future test specifications.
 
 ### Mandatory Implementation Authorization Statement
 
-> "M5.0-R18-R14 is an architectural documentation correction only. No production implementation has been started. M5.1, including M5.1a, remains strictly unauthorized pending explicit Engineering Authority approval."
+> "M5.0-R18-R15 is an architectural documentation correction only. No production implementation has been started. M5.1, including M5.1a, remains strictly unauthorized pending explicit Engineering Authority approval."
