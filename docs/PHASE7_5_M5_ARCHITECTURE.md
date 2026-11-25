@@ -1,6 +1,6 @@
 # Phase 7.5 Milestone M5 — Engine Runtime Recovery Integration Architecture
 
-**Status:** APPROVED ARCHITECTURAL SPECIFICATION (MILESTONE M5.0-R6 AMENDED)
+**Status:** APPROVED ARCHITECTURAL SPECIFICATION (MILESTONE M5.0-R7 AMENDED)
 **Date:** 2026-11-25
 **Authoritative Starting Baseline:** `40b11fdafcd247c7a289723f90ec0e2029c94f64` (Phase 7.5 M4.3d Formally Accepted)
 **Accepted Baselines:** M4.3c (`eab2428`), M4.3b (`f3c29b6`), Approved Architecture (`2bb117c`), Frozen M4.2d (`aafa366`)
@@ -94,11 +94,13 @@ To preserve exact capability custody and single-attachment guarantees without cl
    - **Failure During Engine Construction:** If engine initialization throws after `bindEngine()` has run (e.g. invalid configuration or constructor failure), engine construction unwinds; the engine reference is never published, and the partially constructed engine is reclaimed by garbage collection. An externally injected coordinator bound during a failed constructor call cannot be safely reused and must be discarded.
    - **Engine Disposal:** Invoking `engine.dispose()` invokes `coordinator.dispose()`. Calling `replaceCoreStateAtomic` on a disposed engine throws `SyncEngineError('ENGINE_DISPOSED')`, effectively dead-ending the capability even if a reference is retained externally.
 
-#### 2.1.2 Drain Admission Context Capabilities: Unforgeable Provenance (Closing R6-01)
+#### 2.1.2 Drain Admission Context Capabilities: Unforgeable Provenance & Custody Contract (Closing R6-01, R7-01)
 A typed string (`'LOCAL_REPLAY' | 'REPAIR_BATCH'`) is a declaration of context, not proof of provenance: any caller can supply a string. To prevent accidental trust escalation where untrusted remote operations bypass arrival-rate limits and clock-inflation checks, post-snapshot drain admission is capability-gated:
 
 ```typescript
-export const DRAIN_ADMISSION_BRAND: unique symbol = Symbol('DRAIN_ADMISSION_BRAND');
+// Declared in module packages/sync-engine/src/recovery/drain-admission-custody.ts
+// Module-private: NEVER re-exported from packages/sync-engine/src/index.ts
+const DRAIN_ADMISSION_BRAND: unique symbol = Symbol('DRAIN_ADMISSION_BRAND');
 
 export interface TrustedLocalReplayCapability {
   readonly [DRAIN_ADMISSION_BRAND]: true;
@@ -119,18 +121,26 @@ export interface TrustedRepairBatchCapability {
 export type DrainAdmissionContext =
   | TrustedLocalReplayCapability
   | TrustedRepairBatchCapability;
+
+export interface AuthorizedDrainCapabilities {
+  readonly localReplayCapability: TrustedLocalReplayCapability;
+  readonly repairBatchCapability: TrustedRepairBatchCapability;
+}
 ```
 
-#### Seven Non-Negotiable Capability Properties:
-1. **Unforgeable in Normal API:** `DRAIN_ADMISSION_BRAND` is a package-private unique symbol. Ordinary SDK consumers cannot fabricate a valid capability literal with `[DRAIN_ADMISSION_BRAND]: true`.
-2. **Created & Retained by Composition Root / Engine:** `LeaderlessSyncEngine` mints its own `authorizedLocalReplayCapability` and `authorizedRepairBatchCapability` upon construction.
-3. **Exact Reference Identity Check:** `admitDrainedOperation(op, capability)` checks exact object-reference identity (`capability === this.authorizedLocalReplayCapability` or `capability === this.authorizedRepairBatchCapability`).
+#### Seven Non-Negotiable Capability & Custody Properties:
+1. **Module-Private Branding Symbol:** `DRAIN_ADMISSION_BRAND` is declared in internal module `drain-admission-custody.ts` and is **strictly prohibited from being exported** in the public package entry point (`packages/sync-engine/src/index.ts`). Ordinary SDK consumers cannot import or fabricate a branded capability literal with `[DRAIN_ADMISSION_BRAND]: true`.
+2. **Internal Factories & Runtime Immutability:** Capability instances are minted strictly by internal module factories (`createLocalReplayCapability`, `createRepairBatchCapability`) and sealed with `Object.freeze()` so they are deeply and permanently immutable at runtime, preventing property tampering or monkey-patching.
+3. **Private Transfer via Composition Root / Binding:**
+   - `LeaderlessSyncEngine` mints its own authorized `localReplayCapability` and `repairBatchCapability` during initialization, bundled into an immutable `AuthorizedDrainCapabilities` container (`Object.freeze(...)`).
+   - The capabilities are transferred privately to `RecoveryCoordinator` via `coordinator.bindEngine(this, this.authorizedRecoveryCapability, drainCapabilities)`.
+   - **Zero Public Accessors:** Neither `LeaderlessSyncEngine` nor `RecoveryCoordinator` nor `QuarantineDrainer` provides ANY public getter, method, or property exposing these capability references (`engine.localReplayCapability` and `coordinator.repairBatchCapability` do not exist).
 4. **Physical Custody Segregation:**
    - `QuarantineDrainer` is initialized strictly with `TrustedRepairBatchCapability`. It has **zero reference** to `TrustedLocalReplayCapability`. Remote quarantine draining can NEVER obtain or present local replay capability.
    - The local stashed reconciliation workflow is held privately by `RecoveryCoordinator` and provided with `TrustedLocalReplayCapability`.
-5. **No Wire or Payload Inference:** The operation's wire payload, headers, and mutable fields can never influence the selected trust context. Trust is determined solely by the capability presented.
-6. **Fail-Closed on Invalid/Missing Capabilities:** Any invocation with a missing, null, undefined, forged, or mismatched capability throws `SyncEngineError('UNAUTHORIZED')` immediately.
-7. **Preservation of Accepted Drain Invariants:** M4.3b capability custody, M4.3c single-owner drain ($N_{\text{in-flight}} \le 1$), and M4.3d production orchestration contracts remain 100% intact.
+5. **Exact Reference Identity Check:** `admitDrainedOperation(op, capability)` evaluates the presented capability using strict object-reference identity (`capability === this.authorizedLocalReplayCapability` or `capability === this.authorizedRepairBatchCapability`).
+6. **Public SDK Export Boundary:** The public package entry point (`packages/sync-engine/src/index.ts`) exports **strictly TypeScript type declarations** (`export type { DrainAdmissionContext, TrustedLocalReplayCapability, TrustedRepairBatchCapability, AuthorizedDrainCapabilities }`), never runtime values, symbols, or factory functions.
+7. **In-Realm Defensive Trust Model Clarification:** In a cooperative JavaScript runtime, unique symbols and opaque objects provide structural encapsulation and defensiveness against API misuse, configuration errors, and duck-typing, but do not construct a cryptographic sandbox against hostile code running in the identical JavaScript realm. Actual protection is achieved through private capability custody, exact object-reference checks, and fail-closed validation.
 
 ---
 
@@ -210,7 +220,7 @@ export type RemoteAdmissionDecision =
    - **Contract Clarity:** `REJECTED_CAPACITY` is a declared `EngineDecision.code` emitted by the engine, NOT a variant of `RemoteAdmissionDecision`.
    - For local user actions (`receiveLocal` / `submit`), local inputs **do throw** `SyncEngineError('REJECTED_DEGRADED')` synchronously.
 
-### 3.4 Administrative Recovery Reset Semantics & Guardrails (Closing R6-02)
+### 3.4 Administrative Recovery Reset Semantics & Failure-Atomic Guardrails (Closing R6-02, R7-02)
 
 `resetRecovery()` exists strictly as an administrative recovery reset, NOT as a general-purpose escape hatch to clear degradation while leaving incomplete or corrupted state in place.
 
@@ -218,20 +228,33 @@ export type RemoteAdmissionDecision =
 - `resetRecovery(capability, resetAction)` is allowed **strictly from the `DEGRADED` state** (`this.stateMachine.state === 'DEGRADED'`). Calling it from `ACTIVE`, `RECOVERING`, `RECONCILING`, or `DISPOSED` throws `SyncEngineError('INVALID_STATE')`.
 - Requires an authorized `RecoveryInstallationCapability` checked via strict object-reference identity (`capability === this.authorizedRecoveryCapability`). Unauthorized invocations throw `SyncEngineError('UNAUTHORIZED')`.
 
-#### 2. Safe Reset Actions & Semantics
+#### 2. Safe Reset Actions & Failure-Atomic Lifecycle Semantics
+
 `resetRecovery()` supports two explicit reset actions:
-1. **`PURGE_AND_RETRY` (Autonomous Clean Retry):**
-   - Discards all un-drained quarantined operations from `QuarantineBuffer` and resets `FutureEpochBuffer`.
-   - Purges `stashedLocalQueue` and any incomplete reconciliation state.
-   - Permanently discards `deferredStateChanges` and `deferredDecisions` (they are **never flushed to listeners**).
-   - Resets the recovery coordinator state machine to `RECOVERING` (attempt ID incremented), keeping engine recovery mode locked (`engine.setRecoveryMode(true)`).
-   - Initiates a fresh, full recovery discovery and transfer cycle.
-   - The engine does NOT return to `ACTIVE` until this new recovery attempt completes successfully.
-2. **`REINITIALIZE_CLEAN` (Administrative Baseline Restoration):**
+
+1. **`PURGE_AND_RETRY` (Autonomous Clean Retry & Attempt Fencing):**
+   - **Monotonic Attempt Sequence Fencing:** Before initiating retry actions, the coordinator increments the attempt counter: `const newAttemptId = ++this.currentAttemptId;`. All pending asynchronous recovery workflows (chunk arrivals, transfer callbacks, timeout timers, and discovery responses) check `attemptId === this.currentAttemptId`; any frame or timer belonging to a prior attempt is dropped immediately as a stale no-op.
+   - **Synchronous In-Flight Drain Cancellation:** To preserve the accepted M4.3c single-owner drain invariant ($N_{\text{in-flight}} \le 1$) at all times, `quarantineDrainer.reset()` is invoked synchronously. It sets `inFlightRecord = null`, resets `haltedOnCapacity = false`, and purges both active and detached quarantine generations. Any late drain continuation resolving from the previous attempt detects that its in-flight record has been cleared and aborts without releasing or modifying ownership belonging to `newAttemptId`.
+   - **Buffer & Queue Purge:** Discards all un-drained quarantined operations from `QuarantineBuffer` and resets `FutureEpochBuffer`. Purges `stashedLocalQueue` and any incomplete reconciliation state.
+   - **Notification Suppression:** Permanently discards `deferredStateChanges` and `deferredDecisions` (they are **never flushed to listeners**).
+   - **State Transition & Mode Maintenance:** Resets the recovery coordinator state machine to `RECOVERING` under `newAttemptId`, while locking engine recovery mode (`engine.setRecoveryMode(true)`). Initiates a fresh, full recovery discovery and transfer cycle. The engine does NOT return to `ACTIVE` until this new recovery attempt completes successfully.
+
+2. **`REINITIALIZE_CLEAN` (Administrative Baseline Restoration & 5-Step Order):**
    - Used when the application session decides to restart from a known clean genesis state or agreed anchor snapshot rather than continuing peer recovery.
-   - Atomically replaces `EngineCoreState` with the clean baseline anchor via capability-gated replacement.
-   - Purges all quarantine buffers, drain records, and deferred notifications.
-   - Clears engine recovery mode (`engine.setRecoveryMode(false)`) and transitions coordinator to `ACTIVE` **only after** the clean verified baseline is installed.
+   - **Strict 5-Step M4.3c Completion Order:**
+     1. **Capability-Gated Baseline Installation:** Atomically replace `EngineCoreState` with the clean baseline anchor via `engine.replaceCoreStateAtomic(cleanBaseline, capability)`.
+     2. **Quarantine & Reconciliation Cleanup:** Purge all quarantine buffers (`QuarantineBuffer`, `FutureEpochBuffer`), reset `QuarantineDrainer` ($N_{\text{in-flight}} = 0$), clear `stashedLocalQueue`, and discard all deferred notification queues.
+     3. **Disengage Engine Recovery Mode:** Clear internal engine recovery mode via `engine.setRecoveryMode(false)`. Operational notification deferral is now unlocked.
+     4. **Transition Coordinator to ACTIVE:** Advance authoritative lifecycle state via `stateMachine.transition('ACTIVE', ...)`.
+     5. **Flush Notifications:** Only after Step 4 completes, permit deferred notifications to be flushed via `engine.flushDeferredNotifications()`.
+   - **Failure Atomicity & Irrevocable Root Swap:**
+     - The clean baseline root replacement in Step 1 executes under JavaScript run-to-completion semantics (`this.core = candidateCore;`). Once executed, this reference swap is **irrevocable**: the engine cannot and must not roll back to the previous unanchored or corrupted root.
+     - If ANY post-installation step (Step 2, 3, 4, or 5) fails or throws an exception:
+       - The exception is caught.
+       - `engine.setRecoveryMode(true)` is immediately restored in the catch block (notification deferral locked).
+       - Authoritative lifecycle state remains in or transitions to `DEGRADED`.
+       - Deferred notifications are **NEVER flushed**.
+       - The engine remains anchored on the clean baseline in fail-closed `DEGRADED` state (`submit` throws `REJECTED_DEGRADED`), preventing stale or inconsistent event broadcast.
 
 ---
 
@@ -345,10 +368,8 @@ A central challenge in state machine replication over compacted snapshots is the
        2. Each origin's frontier timestamp is the exact Lamport timestamp of its highest compacted sequence (not an approximation or an unrelated later checkpoint).
      - **Critical Qualification on Causal Dependencies:** The canonical ordering feasibility check proves that $A$ sorts strictly after all compacted operations in the canonical total order. It does NOT independently prove that all causal dependencies of $A$ are satisfied. Causal dependencies must still be validated by the engine's causal admission pipeline upon replay.
 
-#### Capability-Gated Replay Trust Contexts: TrustedLocalReplay vs. TrustedRepairBatch (R5-01, R6-01)
-A typed string parameter (e.g. `'LOCAL_REPLAY'`) is merely a declaration of context, not proof of provenance. If callers could pass `'LOCAL_REPLAY'` as a string, untrusted remote operations could bypass arrival-rate and clock-inflation protections.
-
-To eliminate this vulnerability, post-snapshot reconciliation enforces capability-gated admission:
+#### Capability-Gated Replay Trust Contexts: Authority vs. Provenance (Closing R5-01, R6-01, R6-03, R7-03)
+A typed string parameter (e.g. `'LOCAL_REPLAY'`) is merely a declaration of context, not proof of provenance: any caller can supply a string. To eliminate accidental trust escalation where untrusted remote operations bypass arrival-rate limits and clock-inflation checks, post-snapshot reconciliation enforces capability-gated admission:
 
 ```typescript
 admitDrainedOperation(
@@ -357,7 +378,23 @@ admitDrainedOperation(
 ): DestinationAcceptanceReceipt;
 ```
 
-1. **Unforgeable In-Process Custody Provenance:**
+#### 1. Inviolable Distinction: Capability Authority vs. Operation Provenance (R6-03, R7-03)
+A fundamental distributed-systems principle governs post-snapshot admission: **Capability possession establishes caller authority to request an admission mode, but does NOT independently validate operation data provenance.**
+
+To enforce this distinction and prevent payload forgery:
+- **`stashedLocalQueue` Provenance Exclusivity:** Operations admitted under `TrustedLocalReplayCapability` must originate **strictly and exclusively** from the private `stashedLocalQueue`.
+- **Immutable Log Extraction Only:** `stashedLocalQueue` is populated strictly by extracting previously committed, immutable local operations from `OrderedOperationLog` where `originPeerId === this.localPeerId` and `originSequenceNumber > baseSnapshotFrontier[this.localPeerId]`.
+- **Prohibition of Remote Injection or Relabeling:**
+  - Remote operations can **NEVER** be inserted into `stashedLocalQueue`.
+  - Remote operations can **NEVER** be relabeled or masqueraded as local operations through metadata, headers, or property mutations.
+  - Capability possession alone is never treated as proof that arbitrary operation data has valid provenance.
+- **Identity Hash & Causal Context Verification:** Even when presented with `TrustedLocalReplayCapability`, each replayed operation is verified against committed history:
+  - Identity hash verification: $H(op) == H(log)$. The operation's `logicalEventId`, `originPeerId`, `originSequenceNumber`, `logicalTimestamp`, `causalContext`, and `payload` must match the committed log record.
+  - Causal context check: Causal dependencies must be satisfied by the snapshot base checkpoints or preceding replayed operations.
+  - Any identity conflict or unsatisfied dependency proves history divergence; recovery **immediately aborts to `DEGRADED`**. Local operations are never dropped.
+
+#### 2. Subsystem Custody & Trust Boundaries
+1. **Unforgeable In-Process Custody:**
    - **Subsystem Custody:** Trust context is determined exclusively by the authorized capability held by the calling subsystem:
      - Draining `stashedLocalQueue` presents `this.authorizedLocalReplayCapability` (`TrustedLocalReplayCapability`).
      - Draining `quarantineBuffer` presents `this.repairBatchCapability` (`TrustedRepairBatchCapability`).
@@ -466,15 +503,15 @@ sequenceDiagram
     RC->>RC: activeAttemptId++
     RC->>LSE: setRecoveryMode(true)
     RC->>SIP: startTransfer(supplierPeerId, activeAttemptId)
-    
+
     loop Chunk Transfer & Retries
         SIP->>SIP: Receive chunks, verify SHA-256 slice digests
     end
-    
+
     SIP->>SIP: finalizeAssembly() -> canonical RFC 8785 SHA-256 match
     Note over SIP,RC: Inbound Pipeline One-Shot Latch Guard
     SIP->>RC: onTransferComplete(result, attemptId)
-    
+
     alt attemptId !== RC.currentAttemptId
         RC-->>SIP: Drop stale completion callback (Fenced!)
     else attemptId === RC.currentAttemptId
@@ -485,13 +522,13 @@ sequenceDiagram
         RC->>SI: commitAtomic(engine, stagedHandle, capability)
         SI->>LSE: replaceCoreStateAtomic(candidateCore, capability)
         Note over LSE: Single reference assignment under run-to-completion!
-        
+
         RC->>QD: reconcileQuarantine(attemptId)
         loop Sequential Drain (N_in-flight <= 1)
             QD->>LSE: admitDrainedOperation(op)
             LSE-->>QD: DestinationAcceptanceReceipt
         end
-        
+
         Note over RC,LSE: Accepted M4.3c Completion Ordering (R2-C2)
         RC->>RC: drainEndMs = nowFn() (Bookkeeping)
         RC->>LSE: setRecoveryMode(false)

@@ -1,6 +1,6 @@
 # Phase 7.5 Milestone M5 — Implementation Roadmap
 
-**Status:** APPROVED ARCHITECTURAL SPECIFICATION (MILESTONE M5.0-R6 AMENDED)
+**Status:** APPROVED ARCHITECTURAL SPECIFICATION (MILESTONE M5.0-R7 AMENDED)
 **Date:** 2026-11-25
 **Authoritative Starting Baseline:** `40b11fdafcd247c7a289723f90ec0e2029c94f64` (Phase 7.5 M4.3d Formally Accepted)
 **Accepted Baselines:** M4.3c (`eab2428`), M4.3b (`f3c29b6`), Approved Architecture (`2bb117c`), Frozen M4.2d (`aafa366`)
@@ -34,7 +34,7 @@ flowchart TD
 
 ## 2. Sub-Milestone Detailed Specifications
 
-### Milestone M5.0: Runtime Integration Architecture Audit & Final Consistency Closure (Amended M5.0-R6)
+### Milestone M5.0: Runtime Integration Architecture Audit & Final Consistency Closure (Amended M5.0-R7)
 - **Role:** Independent Senior TypeScript Distributed-Systems Architect
 - **Status:** CURRENT MILESTONE (Planning Only)
 - **Objective:** Complete source audit, close review findings across R1 through R6, and author final consistent architecture specifications for M5.
@@ -49,7 +49,9 @@ flowchart TD
   - Qualify performance benchmark contract (Node.js LTS reference environment vs browser runtimes) and clarify young-gen / escape analysis allocation claims (R3-08).
   - Specify capability-gated trust context provenance (`DrainAdmissionContext = TrustedLocalReplayCapability | TrustedRepairBatchCapability`) verified via strict reference identity, eliminating caller-supplied string vulnerability and preventing accidental trust escalation (R6-01).
   - Enforce canonical ordering feasibility check against compacted snapshots ($L(A) > \text{snapshot.maxLogicalTimestamp}$ and $\forall p,\ L(A) > \text{originFrontierTimestamps}[p]$) and explicit incompatibility gate (`INCOMPATIBLE_COMPACTED_HISTORY` aborting to `DEGRADED`) to prevent SMR total-order inversion ($A \prec B$ hazard), preserving causal dependency validation (R5-02).
-  - Formalize administrative `resetRecovery()` capability authorization and safe reset semantics (`PURGE_AND_RETRY` vs `REINITIALIZE_CLEAN`), preventing escape-hatch abuse (R6-02).
+  - Formalize administrative `resetRecovery()` capability authorization, attempt sequence fencing (`currentAttemptId++`), synchronous drainer cancellation ($N_{\text{in-flight}} \le 1$), and failure-atomic 5-step lifecycle semantics (`PURGE_AND_RETRY` vs `REINITIALIZE_CLEAN`), preventing escape-hatch abuse and incomplete root rollback (R6-02, R7-02).
+  - Formalize capability custody and operation provenance distinction: capability grants admission authority, but payload provenance is strictly enforced (`stashedLocalQueue` exclusivity, prohibition of remote relabeling, and identity hash verification $H(op) == H(log)$) (R6-03, R7-03).
+  - Formalize module-private branding symbol non-export, runtime deep immutability (`Object.freeze`), private transfer bundle (`AuthorizedDrainCapabilities`), and in-realm defensive model clarification (R6-01, R7-01).
 - **Affected Files:** Documentation files only (`docs/PHASE7_5_M5_*.md`). Zero production or test code modified.
 - **Exit Condition:** Clean audit report; zero production diff; documentation committed; engineering authority approval.
 
@@ -65,9 +67,13 @@ flowchart TD
     - Implement `isDegraded()` returning `true` strictly for `'DEGRADED'`.
     - Retain `isRecoveryActive()` as a backward-compatible alias of `isRecoveryInProgress()`.
     - Clarify internal `this.recoveryActive` boolean strictly as a notification-deferral operational switch slaved to coordinator, locked in `DEGRADED`.
-    - Mint and retain private custody of `authorizedLocalReplayCapability` and `authorizedRepairBatchCapability`.
+    - Mint and retain private custody of `authorizedLocalReplayCapability` and `authorizedRepairBatchCapability` (deeply frozen via `Object.freeze()`).
+    - Author module-internal `packages/sync-engine/src/recovery/drain-admission-custody.ts` defining module-private `DRAIN_ADMISSION_BRAND: unique symbol` (strictly non-exported in public package entry point).
+    - Bundle drain capabilities into immutable `AuthorizedDrainCapabilities` for private transfer to `RecoveryCoordinator` via `bindEngine(engine, recoveryCapability, drainCapabilities)` without public getters.
   - Implement single-attachment invariant in `coordinator.bindEngine(engine, capability)`: throw `SyncEngineError('ALREADY_BOUND')` if already attached. Prohibit sharing coordinators across engines.
-  - Implement capability-authorized `resetRecovery(capability, resetAction)` strictly from `DEGRADED` state with safe purge or reinitialization semantics.
+  - Implement capability-authorized `resetRecovery(capability, resetAction)` strictly from `DEGRADED` state with failure-atomic lifecycle semantics:
+    - `PURGE_AND_RETRY`: monotonic attempt counter increment (`currentAttemptId++`), pending async callback and timer fencing, synchronous drainer reset canceling in-flight record ($N_{\text{in-flight}} \le 1$), and permanent suppression of deferred notifications.
+    - `REINITIALIZE_CLEAN`: strict 5-step M4.3c sequence: (1) atomic clean baseline install via `replaceCoreStateAtomic`, (2) quarantine/reconciliation cleanup, (3) `setRecoveryMode(false)`, (4) coordinator to `ACTIVE`, (5) `flushDeferredNotifications()`. If any post-install step fails, catch block restores `setRecoveryMode(true)`, suppresses notifications, and locks engine in `DEGRADED` anchored on the clean baseline without rolling back.
   - Wire coordinator lifecycle completion sequence:
     1. Quarantine drain completes (`totalRetainedCount === 0`).
     2. Recovery bookkeeping completes.
@@ -142,6 +148,7 @@ flowchart TD
   - Enforce safe incomparable-compatible recovery: prioritize anti-entropy log repair; if snapshot replacement is necessary, stash local unrepresented operations before install and sequentially re-admit strictly via `admitDrainedOperation(op, capability)`.
   - Enforce canonical ordering feasibility check: verify $L(A) > \text{snapshot.originFrontierTimestamps}[p]$ (or $L(A) > \text{snapshot.maxLogicalTimestamp}$) for all stashed local operations before snapshot replacement. If an ordering hazard is detected and anti-entropy repair cannot resolve it, trigger explicit incompatibility gate: abort recovery to `DEGRADED` with `SyncEngineError('INCOMPATIBLE_COMPACTED_HISTORY')`. Causal dependencies remain strictly validated during replay.
   - Enforce the 6-category deterministic replay contract (R4-02, R5-01, R5-02, R6-01): Category 1 (`ALREADY_REPRESENTED` discarded), Category 2 (`ACCEPTED_REDUCED` applied), Category 3 (deterministic total-order SMR reduction via `compareOperations`), Category 4 (`ACCEPTED_PENDING` buffered in queue / delta repair), Category 5 (`ALREADY_OWNED_DUPLICATE` discarded), Category 6 (validation failures: remote discarded, locally committed aborts to `DEGRADED`). Enforce capability-gated trust context: `QuarantineDrainer` presents strictly `TrustedRepairBatchCapability`, while stashed local replay presents `TrustedLocalReplayCapability`, checked via strict object-reference identity (`===`).
+    - Enforce inviolable operation provenance distinction: capability grants admission authority, but payload provenance is strictly enforced: `LOCAL_REPLAY` operations originate exclusively from `stashedLocalQueue` (populated strictly from immutable local log entries; remote operations prohibited from entering or being relabeled as local); identity hash $H(op) == H(log)$ and causal dependencies verified against snapshot base, immediately aborting to `DEGRADED` on conflict.
   - Enforce post-installation replay failure handling: if replay fails after snapshot installation, coordinator transitions to `DEGRADED` (`DRAIN_FAILED`), `engine.setRecoveryMode(true)` is maintained, deferred notifications are NEVER flushed, and `inFlightRecord` is preserved.
   - Require full checkpoint hash chain or frontier timestamps evidence before declaring history compatibility.
   - In `AntiEntropyManager.evaluateRemoteDigest()`, inspect `compareRemoteDigest(digest)`. If `requiresSnapshotRecovery === true` and `outsideRemoteHorizon === true`, invoke `onSnapshotRecoveryRequired` to trigger `coordinator.triggerRecovery(supplierPeerId)`.

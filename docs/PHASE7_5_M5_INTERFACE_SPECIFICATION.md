@@ -1,6 +1,6 @@
 # Phase 7.5 Milestone M5 — Interface Specification
 
-**Status:** APPROVED ARCHITECTURAL SPECIFICATION (MILESTONE M5.0-R6 AMENDED)
+**Status:** APPROVED ARCHITECTURAL SPECIFICATION (MILESTONE M5.0-R7 AMENDED)
 **Date:** 2026-11-25
 **Authoritative Starting Baseline:** `40b11fdafcd247c7a289723f90ec0e2029c94f64` (Phase 7.5 M4.3d Formally Accepted)
 **Accepted Baselines:** M4.3c (`eab2428`), M4.3b (`f3c29b6`), Approved Architecture (`2bb117c`), Frozen M4.2d (`aafa366`)
@@ -77,13 +77,15 @@ export interface RecoveryInstallationCapability {
   readonly token: string;
 }
 
-// ── Drain Admission Context Capabilities (Closing R6-01) ──────────────────────
+// ── Drain Admission Context Capabilities & Private Custody (Closing R6-01, R7-01) ──
 
 /**
- * Package-private unique symbol branding unforgeable drain admission capabilities.
+ * Internal unique symbol branding unforgeable drain admission capabilities.
+ * Declared strictly within module packages/sync-engine/src/recovery/drain-admission-custody.ts.
+ * Module-private: NEVER exported from packages/sync-engine/src/index.ts.
  * [PROPOSED — M5.1]
  */
-export const DRAIN_ADMISSION_BRAND: unique symbol = Symbol('DRAIN_ADMISSION_BRAND');
+const DRAIN_ADMISSION_BRAND: unique symbol = Symbol('DRAIN_ADMISSION_BRAND');
 
 /**
  * Unforgeable capability authorizing local operation replay during post-snapshot reconciliation.
@@ -122,8 +124,19 @@ export type DrainAdmissionContext =
   | TrustedRepairBatchCapability;
 
 /**
+ * Immutable container bundle transferring drain admission capabilities privately
+ * from LeaderlessSyncEngine to RecoveryCoordinator during engine binding.
+ * [PROPOSED — M5.1]
+ */
+export interface AuthorizedDrainCapabilities {
+  readonly localReplayCapability: TrustedLocalReplayCapability;
+  readonly repairBatchCapability: TrustedRepairBatchCapability;
+}
+
+/**
  * Internal factory for minting authorized TrustedLocalReplayCapability.
- * Package-private / internal factory.
+ * Sealed at runtime via Object.freeze() for deep immutability.
+ * Package-private / internal module factory.
  * [PROPOSED — M5.1]
  */
 export function createLocalReplayCapability(
@@ -144,7 +157,8 @@ export function createLocalReplayCapability(
 
 /**
  * Internal factory for minting authorized TrustedRepairBatchCapability.
- * Package-private / internal factory.
+ * Sealed at runtime via Object.freeze() for deep immutability.
+ * Package-private / internal module factory.
  * [PROPOSED — M5.1]
  */
 export function createRepairBatchCapability(
@@ -224,6 +238,14 @@ export interface ILeaderlessSyncEngineRecovery {
    * Capability-gated: requires unforgeable DrainAdmissionContext checked via strict object-reference identity:
    * - TrustedLocalReplayCapability (strictly for stashed local operations from OrderedOperationLog).
    * - TrustedRepairBatchCapability (strictly for quarantined remote operations from QuarantineDrainer).
+   *
+   * Authority vs. Provenance Invariant:
+   * Capability possession establishes caller authority to request admission mode, but does NOT validate
+   * operation payload provenance. Operations admitted under TrustedLocalReplayCapability must originate
+   * strictly and exclusively from stashedLocalQueue (immutable committed local log entries; remote operations
+   * cannot be inserted or relabeled as local). Identity hash H(op) == H(log) and causal dependencies are verified;
+   * any identity conflict or unsatisfied dependency aborts recovery immediately to DEGRADED.
+   *
    * Trust context is NEVER read or inferred from wire payloads or mutable operation fields.
    * Calling with an invalid, forged, or mismatched capability throws SyncEngineError('UNAUTHORIZED').
    * [EXISTING — M4 ACCEPTED in LeaderlessSyncEngine.ts:977, capability-gated in M5.1/M5.4]
@@ -327,15 +349,16 @@ export interface IRuntimeRecoveryCoordinator {
 
   /**
    * Binds the coordinator to the engine. Enforces single-attachment invariant.
+   * Transfers authorized RecoveryInstallationCapability and AuthorizedDrainCapabilities privately.
    * Throws SyncEngineError('ALREADY_BOUND') if coordinator is already bound.
    * [PROPOSED — M5.1]
    */
-  bindEngine(engine: LeaderlessSyncEngine, capability: RecoveryInstallationCapability): void;
+  bindEngine(
+    engine: LeaderlessSyncEngine,
+    capability: RecoveryInstallationCapability,
+    drainCapabilities: AuthorizedDrainCapabilities,
+  ): void;
 
-  /**
-   * Triggers an autonomous recovery attempt targeting the specified supplier.
-   * Strictly idempotent if recovery is already in progress.
-   */
   triggerRecovery(peerId: string, reason: string): void;
 
   /**
@@ -378,6 +401,20 @@ export interface IRuntimeRecoveryCoordinator {
    * Requires authorized RecoveryInstallationCapability checked via strict reference equality.
    * Safely purges un-reconciled state or re-initializes engine to a clean verified baseline;
    * never declares incomplete or corrupted state as healthy.
+   *
+   * Failure-Atomic Lifecycle Semantics:
+   * 1. 'PURGE_AND_RETRY':
+   *    - Monotonically increments attempt counter (currentAttemptId++), fencing all async callbacks/timers.
+   *    - Synchronously cancels QuarantineDrainer in-flight custody (inFlightRecord = null, N_in-flight <= 1).
+   *    - Purges QuarantineBuffer, FutureEpochBuffer, stashedLocalQueue, and deferred notification queues.
+   *    - Transitions coordinator to RECOVERING under new attempt ID, keeping recoveryActive locked.
+   * 2. 'REINITIALIZE_CLEAN':
+   *    - Preserves strict 5-step M4.3c sequence: (1) atomic clean baseline install via replaceCoreStateAtomic,
+   *      (2) quarantine and reconciliation cleanup, (3) engine.setRecoveryMode(false), (4) coordinator to ACTIVE,
+   *      (5) flush deferred notifications.
+   *    - Irrevocable root swap: once step 1 executes, clean baseline reference swap is irrevocable.
+   *    - If any post-install step fails: catch block restores engine.setRecoveryMode(true), engine remains
+   *      in DEGRADED, deferred notifications are NEVER flushed, anchored on clean baseline in fail-closed state.
    * [PROPOSED — M5.1]
    */
   resetRecovery(
