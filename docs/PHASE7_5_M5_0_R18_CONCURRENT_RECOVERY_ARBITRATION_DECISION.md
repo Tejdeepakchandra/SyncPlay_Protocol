@@ -1,81 +1,140 @@
-# Phase 7.5 M5.0-R18-R2 — Archive Commit Reconciliation, Source Retirement & Emergency Authority Boundary
+# Phase 7.5 M5.0-R18-R3 — Atomic Custody Transfer & In-Flight Ownership Release Semantics
 
-**Sub-Milestone Title:** Archive Commit Reconciliation, Source Retirement & Emergency Authority Boundary (R18-R2 Revision)
+**Sub-Milestone Title:** Atomic Custody Transfer & In-Flight Ownership Release Semantics (R18-R3 Revision)
 **Role:** Principal TypeScript Distributed-Systems Architect and Recovery-Systems Auditor
 **Mode:** STRICTLY DOCUMENTATION-ONLY ARCHITECTURAL CORRECTION
 **Status:** PROPOSED ARCHITECTURAL DECISION AMENDMENT (AWAITING ENGINEERING AUTHORITY APPROVAL)
-**Baseline Document:** R18-R1 Commit `61cd74b0da2eb60d01c03ade18ba80f2fde002ed`, Formally Accepted M5.0 Freeze (`b654cd2e5c38440f6c26ff0d827a6fdc9652c378`), and Stage 0-R3 Report (`4175e8930df01bc914be4e0f902f59c8e4fb20a5`)
+**Baseline Document:** R18-R2 Commit `d87debcb7028574e3339da17e2178075fd34af3c`, Formally Accepted M5.0 Freeze (`b654cd2e5c38440f6c26ff0d827a6fdc9652c378`), and Stage 0-R3 Report (`4175e8930df01bc914be4e0f902f59c8e4fb20a5`)
 **Implementation Authorization Status: Milestone M5.1 remains STRICTLY BLOCKED AND UNAUTHORIZED.**
 
 ---
 
-## 1. Problem Statement & R18-R2 Objectives
+## 1. Problem Statement & R18-R3 Objectives
 
-Following the independent R18-R1 review, this R18-R2 correction resolves four fundamental architectural precision gaps in the decision proposal:
+Following the independent R18-R2 review, this R18-R3 revision establishes definitive architectural closure by eliminating all remaining ambiguities regarding custody transfer, in-flight ownership release, and transitional states:
 
-1. **Archive Commit Confirmation Must Not Imply Custody Settlement (§4, §5):**
-   In R18-R1, Case E stated that confirming an archive commit via 3-way query permits slot release and declares `CUSTODY_SETTLED`. This is architecturally insufficient. Confirming that entries exist in `TerminalQuarantineArchive` does **not** prove that source operations have been retired from `QuarantineBuffer`. Releasing the slot prior to confirmed source retirement creates dual custody (operations simultaneously committed in archive and retained in buffer) or prematurely unblocks the settlement barrier. A strict 7-step reconciliation protocol is now codified.
-2. **Reconciliation State Machine Clarification (§3):**
-   The four states of the Custody-Reconciliation Gate (`SETTLEMENT_PENDING`, `CUSTODY_RECONCILIATION_REQUIRED`, `CUSTODY_RECONCILIATION_BLOCKED`, `CUSTODY_SETTLED`) are formally defined with their exact operational meanings, legal transitions, root-replacement permissions, and ownership responsibilities.
-3. **Correction of Cases D, E, F, and G (§5):**
-   All archive-related failure cases in §5 are completely reworked with explicit identification of archive transaction status, source quarantine status, reservation status, drainer in-flight ownership, barrier status, custody gate status, reset admission results, and exact slot release conditions.
-4. **Complete Removal of Unapproved Emergency Reset Authority (§5 Case H, §6):**
-   The unapproved `forceEmergencyReset(capability)` escape hatch has been completely excised. No emergency bypass or automated data abandonment is authorized by this proposal; ordinary recovery APIs cannot bypass `CUSTODY_RECONCILIATION_BLOCKED`.
-5. **Codification of 12 Deterministic Test Requirements (§8):**
-   Twelve explicit failure scenarios covering archive commit confirmation, source retirement exceptions, partial retirement progress, absent transaction cancellation, and invalid barrier orderings are specified.
+1. **Three Independent Ownership Concepts (§2):** Formally distinguishes *Quarantine-Buffer Ownership*, *Drainer In-Flight Custody*, and *Terminal Archive Representation*. Eliminates ambiguous phrases like "zero source ownership" while an in-flight record exists.
+2. **Two Formally Grounded Custody-Transfer Protocols (§3):** Specifies the end-to-end multi-step protocols for *Drainer $\to$ Terminal Archive* and *Drainer $\to$ Quarantine Buffer*, establishing their exact linearization points and proving why transitional representations are fail-safe under ECMAScript run-to-completion semantics.
+3. **Exhaustive Failure and Retry Semantics Across 12 Critical Cases (§5):** Specifies exact system ownership, gate states, and retry permissions for 12 edge cases including throw-before-mutation, throw-after-mutation, partial retirement progress, and repeated reconciliation.
+4. **Correction of Transitional Cases E & F (§6):** Refines Cases E and F to explicitly represent the transitional window where archive commitment or buffer restoration is confirmed but the drainer has not yet executed its synchronous in-flight release instruction.
+5. **Codification of 12 Deterministic Test Requirements (§10):** Expands the future M5.1 test plan with explicit failure-injection scenarios validating that the barrier is structurally incapable of resolving prematurely.
 
 ---
 
-## 2. Separation of the Two Independent Ownership Lifecycles
+## 2. Three Independent Ownership Concepts
 
-The recovery protocol maintains two strictly decoupled runtime lifecycles coupled exclusively at the Step 4 settlement barrier:
+To ensure mathematical precision across subsystem boundaries, the recovery architecture defines three independent, concurrent ownership concepts:
 
 ```
 ┌─────────────────────────────────────────────────────────────────────────────────┐
-│              LIFECYCLE 1: ADMINISTRATIVE RECOVERY-ATTEMPT OWNERSHIP             │
-│                                                                                 │
-│   [DEGRADED] ──resetRecovery()──► [RECOVERING] ──Step 4 await──► [ACTIVE]       │
-│        ▲                                │ (Watchdog Expired)                    │
-│        └────────────────────────────────┴───────────────────────────────────────┘
-│   Authority: Attempt ID, State Machine Transition, Candidate Root Swap          │
-└─────────────────────────────────────────────────────────────────────────────────┘
-                                         ▲
-                         COUPLING POINT: STEP 4 BARRIER
-                                         ▼
-┌─────────────────────────────────────────────────────────────────────────────────┐
-│                 LIFECYCLE 2: DRAINER OPERATION CUSTODY                          │
-│                                                                                 │
-│   [BUFFER] ──drainNext()──► [IN_FLIGHT (N=1)] ──Reconciliation──► [SETTLED]    │
-│                                  │ (Pending Promise)                  │         │
-│                                  └────────────────────────────────────┴─────────┤
-│   Custody: Physical Operation Record, Drain Promise, Buffer/Archive Transfer    │
+│                       THREE INDEPENDENT OWNERSHIP CONCEPTS                      │
+├─────────────────────────────────────────────────────────────────────────────────┤
+│ 1. Quarantine-Buffer Ownership:                                                 │
+│    Operation is stored in QuarantineBufferCoreState.#entries                    │
+│    Indexed by #identityIndex (originPeerId + sequenceNumber).                   │
+│    Meaning: Operation is owned by buffer and eligible for future drain dequeue. │
+├─────────────────────────────────────────────────────────────────────────────────┤
+│ 2. Drainer In-Flight Custody:                                                   │
+│    Operation is referenced in QuarantineDrainer._inFlightRecord.operation.      │
+│    Flag _isDraining === true (N_in-flight = 1).                                 │
+│    Meaning: Drainer holds exclusive possession while destination settlement     │
+│    and custody reconciliation are pending. Cannot be dequeued by another drain. │
+├─────────────────────────────────────────────────────────────────────────────────┤
+│ 3. Terminal Archive Representation:                                             │
+│    Entry is committed in TerminalArchiveCoreState.#entries.                     │
+│    Indexed in #committedTransactions by transaction ID and digest.              │
+│    Meaning: Operation is terminally archived under an immutable candidate root.  │
+│    Permanently retired; strictly forbidden from replaying into engine playback. │
 └─────────────────────────────────────────────────────────────────────────────────┘
 ```
 
-### 2.1 Administrative Recovery-Attempt Ownership
-- **Owner Component:** `RecoveryCoordinator`.
-- **Acquisition:** Acquired when `resetRecovery(capability, action)` is invoked strictly from `DEGRADED` state and the Custody-Reconciliation Gate is in a permitted state (`CUSTODY_SETTLED` or `SETTLEMENT_PENDING`). Mints a monotonic `attemptId = ++this.currentAttemptId`.
-- **Exclusive Authority:** Holds sole authority to transition the coordinator state machine, configure recovery admission gating, pre-reserve archive capacity, and commit clean baseline roots via `replaceCoreStateAtomic`.
-- **Concurrency Control:** While an administrative attempt is active (`RECOVERING` or `RECONCILING`), all concurrent `resetRecovery` invocations are rejected fail-closed with `SyncEngineError('RECOVERY_ALREADY_IN_PROGRESS')`.
-- **Watchdog Invalidation:** When `SETTLEMENT_BARRIER_TIMEOUT_MS = 5000` expires in Step 4, the coordinator latches `attempt.status = 'TIMED_OUT'` and transitions to `DEGRADED`. This invalidates the administrative authority of Attempt 1.
-- **Continuation Fencing:** Every asynchronous suspension point (`await`) re-validates `attempt.status !== 'TIMED_OUT'` and `attempt.attemptId === this.currentAttemptId`. If invalidated, the continuation terminates immediately with zero state mutation, zero candidate root replacement, and zero notification flush.
-
-### 2.2 Drainer Operation Custody
-- **Owner Component:** `QuarantineDrainer`.
-- **Acquisition:** Acquired when `drainer.drainNext()` dequeues an operation from `QuarantineBuffer` and enters in-flight state (`this._inFlightRecord !== null`, $N_{\text{in-flight}} = 1$, `this._isDraining = true`).
-- **Persistence Across Attempt Invalidation:** Drainer custody persists through the underlying destination Promise regardless of whether the administrative attempt times out, degrades, or transitions. Administrative attempt termination does **NOT** cancel the Promise, clear `_inFlightRecord`, or release custody.
-- **Custody Reconciliation:** Upon actual Promise settlement (resolution or rejection), the drainer executes safe custody disposition:
-  - `ATTEMPT_INVALIDATED` or Promise Rejection $\to$ restores to `QuarantineBuffer` head via `unshiftDrain(op)`.
-  - `ACCEPTED_REDUCED` / `ACCEPTED_PENDING` $\to$ transfers ownership to destination engine log.
-  - `TERMINALLY_REJECTED` $\to$ commits to `TerminalQuarantineArchive` and retires source.
-  - `CAPACITY_REJECTED` $\to$ restores to `QuarantineBuffer` head via `unshiftDrain(op)`.
-- **Release and Settlement Barrier Resolution:** `this._inFlightRecord = null` and `this._isDraining = false` occur strictly **after** custody disposition and source retirement have been confirmed. The settlement barrier (`drainSettledBarrier(): Promise<void>`) resolves strictly and exclusively upon this condition.
+### Analysis of Intermediate Ownership States:
+- **During Active Drain ($N_{\text{in-flight}} = 1$):** Buffer Ownership = 0; Drainer Custody = 1; Archive Representation = 0.
+- **Transitional Restoration (Buffer restored before slot cleared):** Buffer Ownership = 1; Drainer Custody = 1; Archive Representation = 0.
+- **Transitional Archive Commit (Archive committed before source retired):** Buffer Ownership = 1 (or 0); Drainer Custody = 1; Archive Representation = 1.
+- **Transitional Source Retirement (Source retired before slot cleared):** Buffer Ownership = 0; Drainer Custody = 1; Archive Representation = 1.
+- **Settled Terminal State (Drainer slot released):** Buffer Ownership = 0; Drainer Custody = 0; Archive Representation = 1. `CUSTODY_SETTLED`.
 
 ---
 
-## 3. The Custody-Reconciliation Gate State Machine
+## 3. Two Formal Custody-Transfer Protocols
 
-The coordinator formalizes an explicit four-state Custody-Reconciliation Gate governing reset admission, drainer dequeue, and root replacement:
+In a single-threaded ECMAScript environment, multi-subsystem transfers cannot be executed as a single CPU-level hardware CAS. Instead, they are structured as **idempotent multi-step staged protocols with explicit transitional ownership and verified linearization points**.
+
+### 3.1 Protocol A: Drainer $\to$ Terminal Archive
+
+```
+[Destination Settled]
+         │
+         ▼
+1. Authoritative Archive Lookup (archive.getTransaction(txId))
+         │
+         ▼
+2. Verify Commit Digest & Composite Operation Identities (1-to-1 match)
+         │
+         ▼
+3. Source Quarantine Retirement (quarantineBuffer.retireCommittedBatch(identities, cap))
+         │
+         ▼
+4. Verify Source Buffer Disjointness (hasOperation(...) === false for all identities)
+         │
+         ▼
+5. LINEARIZATION POINT: Drainer Relinquishes In-Flight Custody
+   [Synchronous Turn: this._inFlightRecord = null; this._isDraining = false]
+         │
+         ▼
+6. Transition Gate to CUSTODY_SETTLED
+         │
+         ▼
+7. Resolve Settlement Barrier (drainSettledBarrier() Promise RESOLVES)
+```
+
+- **Linearization Point:** The exact instruction where drainer in-flight custody is relinquished is the synchronous assignment:
+  $$\mathbf{this.\_inFlightRecord = null;}$$
+- **Intermediate Safety:** Between Step 3 and Step 5, the operation is committed in the archive and excised from the buffer, but the drainer still temporarily holds `_inFlightRecord`. This intermediate state is completely safe because:
+  1. The custody gate remains `CUSTODY_RECONCILIATION_REQUIRED`;
+  2. The settlement barrier remains **PENDING**;
+  3. No new drain can dequeue ($N_{\text{in-flight}} = 1$);
+  4. Step 5 executes synchronously in the same microtask turn.
+
+---
+
+### 3.2 Protocol B: Drainer $\to$ Quarantine Buffer
+
+```
+[Absence Confirmed / Destination Fenced / Rejected]
+         │
+         ▼
+1. Cancel Staged Reservation (archive.cancelReservation(resId, cap) if active)
+         │
+         ▼
+2. Buffer Head Restoration (quarantineBuffer.unshiftDrain(op))
+         │
+         ▼
+3. Verify Buffer Representation (hasOperation(...) === true & retainedCount++)
+         │
+         ▼
+4. LINEARIZATION POINT: Drainer Relinquishes In-Flight Custody
+   [Synchronous Turn: this._inFlightRecord = null; this._isDraining = false]
+         │
+         ▼
+5. Transition Gate to CUSTODY_SETTLED
+         │
+         ▼
+6. Resolve Settlement Barrier (drainSettledBarrier() Promise RESOLVES)
+```
+
+- **Linearization Point:** The exact instruction where drainer in-flight custody is relinquished is the synchronous assignment:
+  $$\mathbf{this.\_inFlightRecord = null;}$$
+- **Transitional Dual Representation:** Between Step 2 and Step 4, the operation is represented in the buffer AND referenced in `_inFlightRecord`. This transitional overlap is fail-safe because:
+  1. `_isDraining` remains `true`, preventing `drainNext()` from re-dequeuing the operation;
+  2. The settlement barrier remains **PENDING**;
+  3. If an uncaught runtime crash occurs, both components are in volatile memory;
+  4. If Step 2 throws before mutation, buffer has 0, drainer retains 1, gate moves to `CUSTODY_RECONCILIATION_BLOCKED`.
+
+---
+
+## 4. The Custody-Reconciliation Gate State Machine
 
 ```mermaid
 stateDiagram-v2
@@ -92,7 +151,7 @@ stateDiagram-v2
     CUSTODY_RECONCILIATION_BLOCKED --> [*]: Reset strictly BLOCKED; No automated root swap
 ```
 
-### Detailed State Specifications
+### State Operational Rules
 
 | Gate State | Operational Meaning | Reset Request Admission | Drainer Dequeue Permitted? | Candidate Root Staging Permitted? | Root Replacement Permitted? | Barrier Status | Next Action Owner | Transition Conditions |
 |:---|:---|:---|:---|:---|:---|:---|:---|:---|
@@ -103,38 +162,26 @@ stateDiagram-v2
 
 ---
 
-## 4. The 7-Step Archive Commit & Source Retirement Reconciliation Protocol
+## 5. Exhaustive Failure and Retry Semantics Across 12 Critical Cases
 
-Under `TERMINALLY_REJECTED` receipts or uncertain archive commit outcomes, confirming that an archive transaction committed is **not** sufficient to clear custody. The coordinator and drainer must execute a strict 7-step sequence:
-
-```
-┌─────────────────────────────────────────────────────────────────────────────────┐
-│              7-STEP ARCHIVE COMMIT & SOURCE RETIREMENT RECONCILIATION            │
-├─────────────────────────────────────────────────────────────────────────────────┤
-│ 1. Query Archive State: archive.getTransaction(txId)                            │
-│ 2. Confirm Commit Digest: Verify committedTxDigest matches stagedBatchDigest    │
-│ 3. Match Operation Identities: Assert composite identities match 1-to-1        │
-│ 4. Retire Source Operations: quarantineBuffer.retireCommittedBatch(identities)  │
-│ 5. Verify Zero Source Ownership: Assert source buffer no longer holds op        │
-│ 6. Release In-Flight Slot: this._inFlightRecord = null; _isDraining = false     │
-│ 7. Resolve Settlement Barrier: drainSettledBarrier() Promise RESOLVES           │
-└─────────────────────────────────────────────────────────────────────────────────┘
-```
-
-### Failure Behavior for Every Intermediate Step:
-- **Step 1 (Query Archive State):** If `archive.getTransaction(txId)` throws or times out, outcome is inconclusive $	o$ gate transitions to `CUSTODY_RECONCILIATION_BLOCKED`. Slot retained; barrier remains pending.
-- **Step 2 (Confirm Digest):** If `committedTxDigest` does not match staged digest $	o$ throws `TRANSACTION_ID_DIGEST_MISMATCH`. Gate transitions to `CUSTODY_RECONCILIATION_BLOCKED`. Slot retained.
-- **Step 3 (Match Identities):** If identity verification fails $	o$ gate transitions to `CUSTODY_RECONCILIATION_BLOCKED`. Slot retained.
-- **Step 4 (Retire Source Operations):**
-  - If `retireCommittedBatch()` throws: Archive holds committed entries, but buffer still retains source. Gate transitions to `CUSTODY_RECONCILIATION_BLOCKED`. Slot retained; barrier remains pending.
-  - If `retireCommittedBatch()` reports partial progress: Gate transitions to `CUSTODY_RECONCILIATION_BLOCKED`.
-- **Step 5 (Verify Zero Source Ownership):** If buffer or drainer retains residual ownership $	o$ dual zero-custody assertion fails (`SyncEngineError('CUSTODY_LEAK_DETECTED')`). Gate transitions to `CUSTODY_RECONCILIATION_BLOCKED`.
-- **Step 6 & 7 (Slot Release & Barrier Resolution):** Occur strictly after Steps 1–5 succeed. Gate transitions to `CUSTODY_SETTLED`. Barrier resolves.
-- **Repeated Reconciliation Retry:** If reconciliation is retried after Step 4 succeeded, archive returns existing receipt idempotently (`lookup-first`), `retireCommittedBatch` confirms operations are already retired (idempotent no-op), and Steps 6–7 complete cleanly.
+| Case # | Scenario Description | Component Retaining Custody | Archive Representation | Buffer Representation | `_inFlightRecord` Occupied? | `_isDraining` True? | Barrier Status | Custody Gate State | Reconciliation Can Retry? | Permitted Actions (Reset / Drain / Root Swap) |
+|:---|:---|:---|:---|:---|:---|:---|:---|:---|:---|:---|
+| **1** | Source retirement succeeds, but in-flight release throws/fails | Drainer in-flight + Archive | **YES (Committed)** | **NO (Retired)** | **YES** | **YES** | **PENDING** | `CUSTODY_RECONCILIATION_BLOCKED` | **YES (Idempotent retry)**: re-invoking retirement is no-op; completes slot release. | Resets, drains, and root replacement are **STRICTLY PROHIBITED**. |
+| **2** | Source retirement partially succeeds (some ops retired, error before completion) | Drainer in-flight (partial in buffer/archive) | **YES (Committed)** | **Partial** | **YES** | **YES** | **PENDING** | `CUSTODY_RECONCILIATION_BLOCKED` | **YES**: Retry passes remaining identities; buffer excises rest under candidate root. | Resets, drains, and root replacement are **STRICTLY PROHIBITED**. |
+| **3** | Source retirement throws before mutation | Drainer in-flight + Archive | **YES (Committed)** | **YES (Retained)** | **YES** | **YES** | **PENDING** | `CUSTODY_RECONCILIATION_BLOCKED` | **YES**: Safe to re-invoke `retireCommittedBatch`; old root was untouched. | Resets, drains, and root replacement are **STRICTLY PROHIBITED**. |
+| **4** | Source retirement throws after mutation | Drainer in-flight + Archive | **YES (Committed)** | **NO (Retired)** | **YES** | **YES** | **PENDING** | `CUSTODY_RECONCILIATION_BLOCKED` | **YES**: Idempotent retry checks buffer; confirms already retired; clears slot. | Resets, drains, and root replacement are **STRICTLY PROHIBITED**. |
+| **5** | Restoration succeeds, but in-flight release throws/fails | Drainer in-flight + Buffer | **NO** | **YES (Restored)** | **YES** | **YES** | **PENDING** | `CUSTODY_RECONCILIATION_BLOCKED` | **YES**: Retry confirms buffer presence via `hasOperation`; completes slot release. | Resets, drains, and root replacement are **STRICTLY PROHIBITED**. |
+| **6** | Restoration partially succeeds | Drainer in-flight | **NO** | **Partial** | **YES** | **YES** | **PENDING** | `CUSTODY_RECONCILIATION_BLOCKED` | **YES**: Re-evaluates missing ops; restores unrepresented ops cleanly. | Resets, drains, and root replacement are **STRICTLY PROHIBITED**. |
+| **7** | Restoration throws before mutation | Drainer in-flight | **NO** | **NO** | **YES** | **YES** | **PENDING** | `CUSTODY_RECONCILIATION_BLOCKED` | **YES**: Safe to retry `unshiftDrain`; buffer was untouched. | Resets, drains, and root replacement are **STRICTLY PROHIBITED**. |
+| **8** | Restoration throws after mutation | Drainer in-flight + Buffer | **NO** | **YES (Restored)** | **YES** | **YES** | **PENDING** | `CUSTODY_RECONCILIATION_BLOCKED` | **YES**: Retry confirms presence; does not re-insert duplicate; clears slot. | Resets, drains, and root replacement are **STRICTLY PROHIBITED**. |
+| **9** | Retry encounters already-retired source operation | Drainer (transitional) | **YES (Committed)** | **NO (Retired)** | **YES** | **YES** | Resolves post-slot release | `CUSTODY_RECONCILIATION_REQUIRED` $\to$ `SETTLED` | **YES**: Buffer treats as safe no-op; drainer clears slot; barrier resolves. | Root replacement permitted ONLY after barrier resolves. |
+| **10** | Retry encounters already-restored buffer operation | Drainer (transitional) | **NO** | **YES (Restored)** | **YES** | **YES** | Resolves post-slot release | `CUSTODY_RECONCILIATION_REQUIRED` $\to$ `SETTLED` | **YES**: Buffer treats duplicate unshift as no-op; drainer clears slot; barrier resolves. | Root replacement permitted ONLY after barrier resolves. |
+| **11** | Archive commit confirmed, but source retirement uncertain | Drainer in-flight + Archive | **YES (Committed)** | **Uncertain** | **YES** | **YES** | **PENDING** | `CUSTODY_RECONCILIATION_REQUIRED` | **YES**: Query buffer; if still present, re-execute retirement; if absent, clear slot. | Resets, drains, and root replacement are **STRICTLY PROHIBITED**. |
+| **12** | Archive absence confirmed, but restoration uncertain | Drainer in-flight | **NO (Absent)** | **Uncertain** | **YES** | **YES** | **PENDING** | `CUSTODY_RECONCILIATION_REQUIRED` | **YES**: Query buffer; if present, clear slot; if absent, invoke `unshiftDrain(op)`. | Resets, drains, and root replacement are **STRICTLY PROHIBITED**. |
 
 ---
 
-## 5. Comprehensive Analysis of Retry Admission Across Unresolved Custody Cases (Cases A through H)
+## 6. Comprehensive Analysis of Cases A through H Across Operational States
 
 | Failure Case | Archive Transaction Status | Source Quarantine Status | Reservation Status | Drainer In-Flight Slot ($N_{\text{in-flight}}$) | Settlement Barrier Status | Custody Gate Status | Reset Admission Result | Outstanding Disposition | Condition Permitting Slot Release |
 |:---|:---|:---|:---|:---|:---|:---|:---|:---|:---|
@@ -142,24 +189,45 @@ Under `TERMINALLY_REJECTED` receipts or uncertain archive commit outcomes, confi
 | **Case B: Destination Promise settled; normal reconciliation** | Staging / Querying | Retained until Step 4 | Active | 1 (Reconciling) | Pending (Resolving) | `CUSTODY_RECONCILIATION_REQUIRED` | **REJECTED.** Throws `RECOVERY_ALREADY_IN_PROGRESS`. | Reconciliation in flight. | Reconciliation & source retirement complete. |
 | **Case C: Destination settled; `unshiftDrain()` threw error** | Absent | Restoration failed; stranded | None | 1 (Occupied) | Pending (Blocked) | `CUSTODY_RECONCILIATION_BLOCKED` | **STRICTLY REJECTED.** Throws `CUSTODY_RECONCILIATION_BLOCKED`. | Buffer restoration unconfirmed. | Successful unshiftDrain retry confirms buffer custody. |
 | **Case D: Archive commit outcome inconclusive** | Uncertain (Query required) | Retained in buffer / in-flight | Active / Unconsumed | 1 (Occupied) | Pending (Blocked) | `CUSTODY_RECONCILIATION_REQUIRED` | **STRICTLY REJECTED.** Throws `CUSTODY_RECONCILIATION_REQUIRED`. | 3-way archive query not yet resolved. | Query confirms status AND source retirement completes. |
-| **Case E: Archive query confirms committed** | Confirmed Committed | **Source retirement pending** | Consumed | 1 (Occupied) | Pending (Resolving) | `CUSTODY_RECONCILIATION_REQUIRED` $\to$ `CUSTODY_SETTLED` (only post-retirement) | **REJECTED** while retiring; **ACCEPTED** once settled. | Source retirement in `QuarantineBuffer`. | `quarantineBuffer.retireCommittedBatch()` completes AND confirms zero source ownership. |
-| **Case F: Archive query confirms absent** | Confirmed Absent | Uncommitted in drainer | Safely Cancelled | 1 $\to$ 0 (Post-unshift) | Resolves post-unshift | `CUSTODY_RECONCILIATION_REQUIRED` $\to$ `CUSTODY_SETTLED` (post-unshift) | **ACCEPTED** once unshift completed. | Source restoration via `unshiftDrain(op)`. | Reservation cancelled AND `unshiftDrain(op)` succeeds. |
+| **Case E: Archive query confirms committed (Transitional)** | Confirmed Committed | **Source retirement pending** | Consumed | 1 (Occupied) | Pending (Resolving) | `CUSTODY_RECONCILIATION_REQUIRED` (Transitional) | **REJECTED** while retiring; **ACCEPTED** once settled. | Source retirement in `QuarantineBuffer`. | `retireCommittedBatch()` completes AND confirms zero source ownership. |
+| **Case F: Archive query confirms absent (Transitional)** | Confirmed Absent | Restoration in progress | Safely Cancelled | 1 (Occupied) | Resolves post-unshift | `CUSTODY_RECONCILIATION_REQUIRED` (Transitional) | **ACCEPTED** once unshift completed. | Source restoration via `unshiftDrain(op)`. | Reservation cancelled AND `unshiftDrain(op)` verified. |
 | **Case G: Archive query remains inconclusive** | Permanently Inconclusive | Retained in drainer | Active / Orphaned | 1 (Occupied) | Pending (Blocked) | `CUSTODY_RECONCILIATION_BLOCKED` | **STRICTLY REJECTED.** Throws `CUSTODY_RECONCILIATION_BLOCKED`. | Transaction state unknown. | Verified query succeeds; blind re-publish/restore is prohibited. |
 | **Case H: Permanent custody fault / unrecoverable failure** | Inconclusive / Failed | Stranded in drainer | Faulted | 1 (Occupied) | Permanently Pending | `CUSTODY_RECONCILIATION_BLOCKED` | **STRICTLY REJECTED.** Throws `CUSTODY_RECONCILIATION_BLOCKED`. | Unresolved custody fault. | **No automated root replacement.** Emergency abandonment requires a separate unapproved authority. |
 
 ---
 
-## 6. Removal of Unapproved Emergency Reset Authority
+## 7. Mandatory Barrier and Drain Invariants
 
-The proposal explicitly removes `forceEmergencyReset(capability)`:
+The protocol establishes seven strict distributed invariants:
 
-1. **No Automated Root Swap During Blocked Custody:** Under no circumstances may ordinary recovery APIs (`resetRecovery`, `reinitializeClean`, `purgeAndRetry`) replace an engine root or clear in-flight records while gate status is `CUSTODY_RECONCILIATION_BLOCKED`.
-2. **Capability Objects Alone Do Not Establish Safety:** Presenting a capability object cannot magically waive distributed data loss risks. Bypassing blocked custody risks irrevocable loss of un-reconciled operations, corrupted causal replication vectors, and split-brain execution.
-3. **Emergency Abandonment is Out of Scope:** Any procedure allowing manual abandonment of stranded in-flight operations requires a separate, dedicated architectural decision defining operator authorization, comprehensive audit logging, late-settling Promise suppression, and explicit data-loss acknowledgments. This proposal provides **no such authorization**.
+1. **In-Flight Custody Resolution Precedence:** The settlement barrier (`drainSettledBarrier()`) **CANNOT** resolve while `this._inFlightRecord !== null`.
+2. **Archive Commitment Insufficiency:** The settlement barrier **CANNOT** resolve merely because an archive transaction committed. Source retirement must be verified first.
+3. **Restoration Verification Precedence:** The settlement barrier **CANNOT** resolve merely because `unshiftDrain()` was invoked; buffer presence must be verified and the drainer must execute slot relinquishment.
+4. **Single In-Flight Drain Invariant:** A second drain **CANNOT** dequeue an operation while `this._inFlightRecord !== null` ($N_{\text{in-flight}} \le 1$).
+5. **Idempotent Retry Non-Duplication:** Reconciliation retries must be lookup-first and **CANNOT** create duplicate archive entries or duplicate buffer records.
+6. **Drainer Custody Immunity to Stale Attempts:** Stale or timed-out administrative recovery attempts **CANNOT** release, mutate, or overwrite custody held by `QuarantineDrainer`.
+7. **Watchdog Immunity:** A watchdog timeout (`SETTLEMENT_BARRIER_TIMEOUT_MS = 5000`) **CANNOT** release drainer custody or cancel the destination Promise.
+
+### Strict Ordering of Finalization:
+1. Custody disposition verification (Buffer check or Archive check confirmed);
+2. In-flight slot release: `this._inFlightRecord = null;`
+3. Drain flag release: `this._isDraining = false;`
+4. Custody gate transition: `this.custodyGateStatus = 'CUSTODY_SETTLED';`
+5. Barrier resolution: `this._barrierResolver?.();`
 
 ---
 
-## 7. Resolution of Attempt Overlap After Watchdog Timeout
+## 8. Removal of Unapproved Emergency Reset Authority
+
+The proposal excises all references to `forceEmergencyReset(capability)`:
+- Ordinary recovery APIs cannot bypass `CUSTODY_RECONCILIATION_BLOCKED`.
+- No automated root replacement is permitted while custody remains unresolved.
+- Emergency data abandonment, if ever required, needs a separate architectural decision defining operator authorization, auditability, late-settling Promise behavior, and data-loss semantics.
+- That separate decision is outside the scope of R18-R3 and is **not authorized** by this proposal.
+
+---
+
+## 9. Attempt Overlap Resolution After Watchdog Timeout
 
 1. **Admitted Under New Monotonic Token:** Attempt 2 is admitted from `DEGRADED` when gate status is `SETTLEMENT_PENDING`, incrementing `currentAttemptId = 2`.
 2. **Permanent Invalidation of Attempt 1:** Attempt 1 is superseded (`1 !== currentAttemptId (2)`) and latched `TIMED_OUT`. Its continuation is completely fenced and cannot mutate roots or stage batches.
@@ -168,69 +236,65 @@ The proposal explicitly removes `forceEmergencyReset(capability)`:
 
 ---
 
-## 8. Deterministic Failure Scenarios and Test Requirements
+## 10. Deterministic Failure Scenarios and Test Requirements
 
 Sub-Milestone M5.1 test suites must verify the following twelve deterministic test sequences:
 
-- **Test R18-R2-T1 (Archive Commit Confirmed; Source Retirement Succeeds):** Mock commit to return uncertain; mock `archive.getTransaction` to return committed; assert source retirement is invoked; assert slot released ONLY AFTER source retirement confirms zero ownership; barrier resolves.
-- **Test R18-R2-T2 (Archive Commit Confirmed; Source Retirement Throws):** Mock commit confirmed; mock `quarantineBuffer.retireCommittedBatch` to throw; assert in-flight slot remains occupied, gate transitions to `CUSTODY_RECONCILIATION_BLOCKED`, and barrier remains pending.
-- **Test R18-R2-T3 (Archive Commit Confirmed; Partial Retirement Progress):** Mock source retirement to return partial progress; assert coordinator locks in `CUSTODY_RECONCILIATION_BLOCKED`; assert no root replacement permitted.
-- **Test R18-R2-T4 (Archive Commit Confirmed; Repeated Retirement Reconciliation):** Retry reconciliation for already-retired batch; assert archive returns receipt idempotently; assert source retirement confirms already retired; assert slot released cleanly.
-- **Test R18-R2-T5 (Archive Authoritatively Absent; Cancellation & Restoration Succeed):** Mock `archive.getTransaction` to return `undefined`; assert reservation is cancelled; assert `unshiftDrain(op)` succeeds; assert gate transitions to `CUSTODY_SETTLED`; barrier resolves.
-- **Test R18-R2-T6 (Archive Absent; Source Restoration Fails):** Mock archive absent; mock `unshiftDrain(op)` to throw; assert in-flight slot remains occupied; gate transitions to `CUSTODY_RECONCILIATION_BLOCKED`; barrier remains pending.
-- **Test R18-R2-T7 (Archive Query Remains Inconclusive):** Mock both commit and 3-way query to throw/timeout; assert slot remains occupied; gate locks in `CUSTODY_RECONCILIATION_BLOCKED`; assert reset requests are rejected fail-closed.
-- **Test R18-R2-T8 (Destination Promise Pending Beyond Watchdog Timeout):** Advance fake timers past 5,000 ms; assert Attempt 1 transitions to `TIMED_OUT`; coordinator enters `DEGRADED` with gate `SETTLEMENT_PENDING`; slot remains occupied.
-- **Test R18-R2-T9 (Old Attempt Settles After New Attempt Admitted):** Admit Attempt 2 from `DEGRADED`; Attempt 2 waits in Step 4; resolve destination Promise; assert Attempt 1 is fenced; assert custody reconciles; barrier resolves; Attempt 2 resumes with clean custody.
-- **Test R18-R2-T10 (Stale Continuation Attempts Root Replacement Post-Invalidation):** Attempt 1 wakes up after Attempt 2 admitted; Attempt 1 attempts `replaceCoreStateAtomic`; assert fenced fail-closed; zero state mutation.
-- **Test R18-R2-T11 (Invalid Ordering: Barrier Resolves Before Source Retirement):** Assert that settlement barrier Promise resolver is structurally incapable of firing while `_inFlightRecord !== null` or source retirement is unconfirmed.
-- **Test R18-R2-T12 (New Drain Blocked While Old In-Flight Owned):** Attempt `drainer.drainNext()` while `_inFlightRecord !== null`; assert drain dequeue fails closed; $N_{\text{in-flight}}$ remains strictly 1.
+- **Test R18-R3-T1 (Staged Archive Custody Transfer):** Verify complete 7-step sequence; assert intermediate ownership at every step; verify slot released strictly after source retirement.
+- **Test R18-R3-T2 (Staged Buffer Restoration):** Verify complete 6-step restoration protocol; assert transitional dual representation before slot release; verify slot released strictly after buffer verification.
+- **Test R18-R3-T3 (Partial Source Retirement Handling):** Mock source retirement to fail midway; assert slot retained; gate transitions to `CUSTODY_RECONCILIATION_BLOCKED`; assert no root swap permitted.
+- **Test R18-R3-T4 (Partial Restoration Handling):** Mock buffer restoration to fail midway; assert slot retained; barrier remains pending.
+- **Test R18-R3-T5 (Throw-Before-Mutation Behavior):** Mock `retireCommittedBatch` to throw before candidate pointer swap; assert core state untouched; retry succeeds.
+- **Test R18-R3-T6 (Throw-After-Mutation Behavior):** Mock error after candidate root swap but before slot clearing; assert retry is idempotent and completes slot release cleanly.
+- **Test R18-R3-T7 (Idempotent Retry After Successful Retirement):** Re-execute retirement on already-retired batch; assert no-op; assert zero duplicate archive entries.
+- **Test R18-R3-T8 (Idempotent Retry After Successful Restoration):** Re-execute restoration on already-restored buffer op; assert no-op; assert zero duplicate buffer records.
+- **Test R18-R3-T9 (In-Flight Slot Retention During Unresolved Transfer):** Assert slot is retained throughout inconclusive 3-way query; barrier remains pending.
+- **Test R18-R3-T10 (Barrier Resolution Requires Verified Custody Relinquishment):** Assert barrier cannot resolve while `_inFlightRecord !== null`.
+- **Test R18-R3-T11 (Second Drain Blocked While Old In-Flight Record Active):** Attempt `drainer.drainNext()` while `_inFlightRecord !== null`; assert dequeue fails closed.
+- **Test R18-R3-T12 (Stale Administrative Attempt Cannot Release Custody):** Stale Attempt 1 continuation invokes reset cleanup; assert fenced fail-closed; drainer custody untouched.
 
 ---
 
-## 9. Updated Formal Approval Questions for Engineering Authority
+## 11. Updated Formal Approval Questions for Engineering Authority
 
 ```
 ================================================================================
-ENGINEERING AUTHORITY APPROVAL QUESTIONS (MILESTONE M5.0-R18-R2):
+ENGINEERING AUTHORITY APPROVAL QUESTIONS (MILESTONE M5.0-R18-R3):
 ================================================================================
-1. [7-STEP ARCHIVE RECONCILIATION]: Does the Engineering Authority approve the
-   7-step reconciliation protocol, establishing that a confirmed archive commit
-   does NOT release drainer custody or settle the barrier until source quarantine
-   retirement is confirmed?
+1. [THREE OWNERSHIP CONCEPTS]: Does the Engineering Authority approve the formal
+   distinction between Quarantine-Buffer Ownership, Drainer In-Flight Custody,
+   and Terminal Archive Representation, recognizing explicit transitional states?
 
-2. [CUSTODY GATE STATE MACHINE]: Does the Engineering Authority approve the
-   four-state Custody-Reconciliation Gate (CUSTODY_SETTLED, SETTLEMENT_PENDING,
-   CUSTODY_RECONCILIATION_REQUIRED, CUSTODY_RECONCILIATION_BLOCKED), strictly
-   prohibiting root replacement while reconciliation is pending or blocked?
+2. [CUSTODY-TRANSFER PROTOCOLS]: Does the Engineering Authority approve the
+   multi-step staged protocols for Drainer -> Terminal Archive and Drainer -> Buffer,
+   with the synchronous linearization point defined as this._inFlightRecord = null?
 
-3. [POST-TIMEOUT OVERLAP RE-ENTRY]: Does the Engineering Authority approve that
-   a fresh reset from DEGRADED following a watchdog timeout is admitted under a
-   new attempt ID and serialized on the pending settlement barrier in Step 4,
-   while the timed-out attempt is permanently fenced?
+3. [12 FAILURE CASES & CUSTODY GATE]: Does the Engineering Authority approve the
+   exhaustive failure matrix across Cases 1-12 and the four-state Custody Gate,
+   strictly prohibiting root replacement during unresolved or blocked custody?
 
-4. [CONCURRENCY REJECTION]: Does the Engineering Authority approve rejecting all
-   concurrent reset requests arriving during RECOVERING or RECONCILING fail-closed
-   with RECOVERY_ALREADY_IN_PROGRESS, rather than ambient Promise joining?
+4. [ATTEMPT OVERLAP GOVERNANCE]: Does the Engineering Authority approve admitting
+   a fresh reset from DEGRADED into Step 4 barrier await under new attempt ID
+   while an earlier destination Promise is pending, keeping old attempt fenced?
 
 5. [REMOVAL OF EMERGENCY BYPASS]: Does the Engineering Authority confirm that no
-   automated emergency reset bypass (forceEmergencyReset) is authorized, and that
-   permanent custody faults remain strictly blocked until a separate authority
-   decision is established?
+   automated emergency reset bypass is authorized, and that permanent custody faults
+   remain strictly blocked until a separate authority decision is established?
 ================================================================================
 ```
 
 ---
 
-## 10. Final Verdict & Mandatory Authorization Statement
+## 12. Final Verdict & Mandatory Authorization Statement
 
 ```
 ================================================================================
-M5.0-R18-R2 ARCHITECTURAL DECISION PROPOSAL VERDICT:
+M5.0-R18-R3 ARCHITECTURAL DECISION PROPOSAL VERDICT:
 DECISION PROPOSAL COMPLETE — AWAITING ENGINEERING AUTHORITY
 ================================================================================
 ```
 
-This R18-R2 proposal delivers complete architectural closure: it enforces that archive confirmation does not imply custody settlement, formalizes the 7-step source retirement sequence, specifies the 4-state custody gate, details failure cases A through H, excises unapproved emergency bypasses, and provides twelve deterministic test scenarios.
+This R18-R3 proposal achieves complete distributed systems rigor: it defines the three independent ownership concepts, codifies the two custody-transfer protocols with exact linearization points, resolves all transitional states in Cases E and F, details the 12 failure and retry cases, preserves the emergency boundary, and provides twelve deterministic test scenarios.
 
 ### Mandatory Implementation Authorization Statement
-**"M5.0-R18-R2 is an architectural decision proposal only. Engineering Authority approval remains pending. M5.1 implementation, including M5.1a, remains strictly unauthorized. No production implementation has started."**
+**"M5.0-R18-R3 is an architectural decision proposal only. Engineering Authority approval remains pending. M5.1 implementation, including M5.1a, remains strictly unauthorized. No production implementation has started."**
