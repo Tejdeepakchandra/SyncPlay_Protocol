@@ -1,15 +1,17 @@
-# Phase 7.5 M5.1 — Stage 0-R2: Implementation Readiness, Settlement Barrier Test Completeness & Late-Continuation Fencing
+# Phase 7.5 M5.1 — Stage 0-R3: Implementation Readiness, Reset Arbitration Authority & Custody Reconciliation Failure Semantics
 
-**Sub-Milestone Title:** Engine Runtime Recovery Integration — Stage 0-R2 Implementation Readiness
+**Sub-Milestone Title:** Engine Runtime Recovery Integration — Stage 0-R3 Implementation Readiness
 **Role:** Principal TypeScript Distributed-Systems Architect, Senior Recovery-Systems Engineer, and Independent Implementation Auditor
 **Mode:** STRICTLY READ-ONLY SOURCE AUDIT, IMPLEMENTATION READINESS ANALYSIS, AND EXECUTION PLANNING
-**Target Milestone:** Phase 7.5 Sub-Milestone M5.1 (Stage 0-R2 Correction)
-**Revision:** Stage 0-R2 (Settlement Barrier Test Completeness & Late-Continuation Fencing)
-**Starting Baseline Commit:** `3cbf60c113e1760ad58388baab0005ecdbf0a73e` (Stage 0-R1 Commit)
+**Target Milestone:** Phase 7.5 Sub-Milestone M5.1 (Stage 0-R3 Correction)
+**Revision:** Stage 0-R3 (Reset Arbitration Authority & Custody Reconciliation Failure Semantics)
+**Starting Baseline Commit:** `5dbb87826c1655e27205af22b88d4479f88518fe` (Stage 0-R2 Commit)
 **Authoritative Historical Baselines:**
+- Stage 0-R2 Commit: `5dbb87826c1655e27205af22b88d4479f88518fe`
+- Stage 0-R1 Commit: `3cbf60c113e1760ad58388baab0005ecdbf0a73e`
+- Initial Stage 0 Commit: `260647707edbdc0b0faa78b05cf870424330583e`
 - M5.0 Final Freeze Commit: `b654cd2e5c38440f6c26ff0d827a6fdc9652c378`
 - M5.0-R17 Commit: `e16b38ea08b340d9945f069f4a41b4fc80958d0c`
-- Initial Stage 0 Commit: `260647707edbdc0b0faa78b05cf870424330583e`
 - Formally Accepted M4.3d Baseline: `40b11fdafcd247c7a289723f90ec0e2029c94f64`
 - M4.3c Baseline: `eab2428681eb8a05b1c6e71906a932f671730fc8`
 - M4.3b Baseline: `f3c29b62eea63f6b06647218e4485eacba86fb50`
@@ -20,31 +22,30 @@
 
 ---
 
-## 1. Executive Summary & R2 Corrections
+## 1. Executive Summary & R3 Audit Findings
 
-Milestone M5.0 is formally accepted and frozen. Following the Stage 0-R1 review, this Stage 0-R2 report completes the implementation readiness analysis by addressing the remaining test-plan and late-continuation fencing gaps:
+Milestone M5.0 is formally accepted and frozen. Following the Stage 0-R2 review, this Stage 0-R3 report investigates the exact architectural authority for concurrent reset arbitration and defines complete failure-safe custody reconciliation semantics:
 
-1. **Preservation of the Ten Mandatory Settlement Rules (R1 Core Contract):**
-   - Retains the strict separation of watchdog deadline expiration (`SETTLEMENT_BARRIER_TIMEOUT_MS = 5000`) from actual asynchronous settlement (`drainSettledBarrier(): Promise<void>`).
-   - Re-affirms that watchdog expiry must never resolve, reject, or force-settle the settlement barrier, nor clear `_inFlightRecord`, nor release operation custody.
-2. **Clarification of the Late-ACK Case & Four-Layer Separation:**
-   - Formally decouples four distinct concepts:
-     a. *Destination-Level Acknowledgement:* Remote or engine intake receipt (`ACCEPTED_REDUCED`, `ACCEPTED_PENDING`, `ALREADY_REPRESENTED`, `ALREADY_OWNED_DUPLICATE`, `ATTEMPT_INVALIDATED`, `TERMINALLY_REJECTED`, `CAPACITY_REJECTED`);
-     b. *Recovery-Attempt Validity:* Monotonic attempt state machine (`INITIATED`, `WAITING_FOR_SETTLEMENT`, `SETTLED`, `TIMED_OUT`, `INVALIDATED`, `COMPLETED`);
-     c. *Permission to Commit Candidate Root:* Authorization to execute `replaceCoreStateAtomic` or commit candidate archive roots (strictly forbidden for stale or timed-out attempts);
-     d. *Permission to Retire or Transfer Custody:* Drainer-level ownership release strictly synchronized with actual receipt evaluation and custody reconciliation.
-   - Proves that a late destination acknowledgement does **NOT** authorize a timed-out recovery attempt to resume root replacement or notification flush.
-3. **Comprehensive Expansion of Deterministic Test Plans (Scenarios A through F):**
-   - Retains the baseline 17-step sequence (§12.1) and introduces explicit step-by-step test plans (§12.2) using Vitest fake timers (`vi.useFakeTimers()`) and controlled deferred Promises:
-     - **Scenario A:** Watchdog expiry with unresolved destination Promise;
-     - **Scenario B:** Second reset cannot bypass outstanding settlement;
-     - **Scenario C:** Late settlement and stale-attempt fencing;
-     - **Scenario D:** Custody reconciliation before barrier resolution;
-     - **Scenario E:** Subsequent authorized recovery;
-     - **Scenario F:** Concurrent reset requests serialized on shared settlement condition.
-4. **Strict Adherence to Testability Constraints Without Exposing Private State:**
-   - Prohibits all test-only backdoor getters, raw backing map handles, or public debug APIs.
-   - Mandates external verification via observable public outcomes, receipt inspection, defensive cloning mutation tests, and static AST verification.
+1. **Reset Arbitration Authority Audit (§6.4, §12.2 Scenario F, §13):**
+   - An audit of frozen M5.0 specifications reveals that while `PHASE7_5_M5_INTERFACE_SPECIFICATION.md:423-424` and `PHASE7_5_M5_0_R9_CORRECTION_REPORT.md:40-75` specify concurrent reset serialization for homogeneous reset requests (where later attempts re-validate `attemptId === currentAttemptId` post-settlement), frozen M5.0 **does NOT define an arbitration policy for concurrent resets of differing actions** (`REINITIALIZE_CLEAN` vs. `PURGE_AND_RETRY`).
+   - Furthermore, frozen Interface Specification Table line 1046 mandates that `resetRecovery()` throws `SyncEngineError('INVALID_STATE')` if invoked from a non-`DEGRADED` state. Because Step 3 of administrative reset transitions the coordinator to `RECOVERING`, any subsequent concurrent reset arriving before settlement faces an unresolved contradiction: does it throw `INVALID_STATE`, or does it advance `currentAttemptId` and supersede?
+   - Therefore, Scenario F is corrected: the shared settlement barrier invariant is preserved, but cross-mode reset arbitration is formally identified as an **unresolved architectural gap and implementation-readiness blocker**.
+2. **Receipt Schema Verification (§12.6):**
+   - Audited the exact contract of `DestinationAcceptanceReceipt` across `quarantine-drainer.ts:65-72` (M4.3d source) and `PHASE7_5_M5_INTERFACE_SPECIFICATION.md:313-320` (M5.0 frozen).
+   - In M5.0, `ATTEMPT_INVALIDATED` is a typed variant defined strictly as:
+     `{ readonly status: 'ATTEMPT_INVALIDATED'; readonly vectorAdvanced: false; readonly attemptId: number; readonly reason: 'STALE_ATTEMPT_FENCED' | 'COORDINATOR_NOT_RECONCILING' }`.
+   - The R2 example snippet inadvertently omitted `vectorAdvanced: false`; this is now formally corrected.
+   - Crucially, attempt fencing is independently established inside the drainer via `_inFlightRecord.invalidated = true` (latched by `coordinator.fenceActiveDrain()`), meaning attempt fencing does not rely solely on untrusted external receipts.
+3. **Comprehensive Custody Reconciliation Failure Matrix (§12.3):**
+   - Formally defined fail-close custody behavior for every receipt variant when restoration, archive publication, or destination admission encounters an exception or inconclusive outcome.
+   - In all failure modes: drainer custody is retained ($N_{\text{in-flight}} = 1$), in-flight slot is NOT cleared, barrier remains pending, and coordinator transitions to `DEGRADED`.
+4. **Settlement Barrier Failure Semantics & Eight Distinct Settlement Outcomes (§12.4):**
+   - Formally decoupled actual Promise settlement from custody disposition. The barrier resolves **only** after drainer custody has been safely reconciled.
+   - Distinctly specified eight operational outcomes covering destination rejection, reconciliation exceptions, archive commit confirmations, commit absences, inconclusive queries, and idempotent retries.
+5. **Deterministic Failure Test Suite (§12.5):**
+   - Extended the deterministic test plan with eight controlled failure-injection scenarios verifying that no operations are lost, duplicated, or prematurely released.
+6. **Readiness Verdict (§15):**
+   - Because the frozen architecture does not define cross-mode reset arbitration, the readiness verdict is declared as **`BLOCKED — FROZEN ARCHITECTURE DOES NOT ESTABLISH A REQUIRED RECOVERY RULE`**.
 
 ---
 
@@ -53,13 +54,16 @@ Milestone M5.0 is formally accepted and frozen. Following the Stage 0-R1 review,
 An inspection of the local Git repository reveals:
 
 1. **Current Branch:** `main`
-2. **Starting Baseline Commit for R2:** `3cbf60c113e1760ad58388baab0005ecdbf0a73e` (Stage 0-R1 Commit)
+2. **Starting Baseline Commit for R3:** `5dbb87826c1655e27205af22b88d4479f88518fe` (Stage 0-R2 Commit)
 3. **Working-Tree Status:** Clean (`nothing to commit, working tree clean`).
-4. **Stage 0-R1 Commit in History:** Confirmed (`3cbf60c113e1760ad58388baab0005ecdbf0a73e`).
-5. **Initial Stage 0 Commit in History:** Confirmed (`260647707edbdc0b0faa78b05cf870424330583e`).
-6. **M5.0 Final Acceptance Commit in History:** Confirmed (`b654cd2e5c38440f6c26ff0d827a6fdc9652c378`).
-7. **Lineage Relationship:**
+4. **Stage 0-R2 Commit in History:** Confirmed (`5dbb87826c1655e27205af22b88d4479f88518fe`).
+5. **Stage 0-R1 Commit in History:** Confirmed (`3cbf60c113e1760ad58388baab0005ecdbf0a73e`).
+6. **Initial Stage 0 Commit in History:** Confirmed (`260647707edbdc0b0faa78b05cf870424330583e`).
+7. **M5.0 Final Acceptance Commit in History:** Confirmed (`b654cd2e5c38440f6c26ff0d827a6fdc9652c378`).
+8. **Lineage Relationship:**
    ```
+   5dbb878 (Stage 0-R2) docs(phase-7.5-m5.1): stage 0-r2 settlement barrier test completeness and late-continuation fencing
+   │
    3cbf60c (Stage 0-R1) docs(phase-7.5-m5.1): stage 0-r1 settlement barrier semantics and watchdog separation correction
    │
    2606477 (Initial Stage 0) docs(phase-7.5-m5.1): stage 0 implementation readiness and source integration plan
@@ -72,7 +76,7 @@ An inspection of the local Git repository reveals:
    │
    40b11fd (tag: m4.3d-accepted) feat(phase-7.5-m4.3d): complete recovery acceptance matrix and test coverage
    ```
-8. **Source Tree Integrity:** Executing `git diff --stat 40b11fdafcd247c7a289723f90ec0e2029c94f64 HEAD -- packages/` yields **zero lines changed**. The current codebase corresponds 100% byte-for-byte to the accepted M4.3d implementation baseline.
+9. **Source Tree Integrity:** Executing `git diff --stat 40b11fdafcd247c7a289723f90ec0e2029c94f64 HEAD -- packages/` yields **zero lines changed**. The current codebase corresponds 100% byte-for-byte to the accepted M4.3d implementation baseline.
 
 ---
 
@@ -114,8 +118,8 @@ The accepted source files in `packages/sync-engine/src/recovery/` and `packages/
 | **Engine-Coordinator Capability Binding Ceremony** | Architecture §2.1.1, AC-M5-07 | `recovery-coordinator.ts`, `leaderless-sync-engine.ts` | 146–175, 754–757 | Partially Exists | Add `bindEngine(engine, capability)` method; enforce single-attachment check (`SyncEngineError('ALREADY_BOUND')`); check object identity. |
 | **Drain Admission Context Capability & Replay Gating** | Architecture §2.1.2, AC-M5-01 | `leaderless-sync-engine.ts` | 977–1010 | Partially Exists | Add capability-gated provenance parameter to `admitDrainedOperation(op, capability)`; gate local replay provenance checks. |
 | **Receipt Variant `ATTEMPT_INVALIDATED`** | Interface §3.2, AC-M5-01 | `quarantine-drainer.ts` | 65–71, 318–344 | Missing | Add `ATTEMPT_INVALIDATED` variant to `DestinationAcceptanceReceipt`; handle in `processSingleOperation` by restoring operation to buffer via `unshiftDrain`. |
-| **Shared Settlement Barrier (`drainSettledBarrier`) (Rule 1, 9)** | Architecture §3.4.1, AC-M5-01 | `quarantine-drainer.ts`, `recovery-coordinator.ts` | 119, 174–279 | Missing | Implement `drainSettledBarrier(): Promise<void>`. Resolves **strictly and only** upon actual settlement (`_inFlightRecord === null && !_isDraining`). **Never resolves or rejects on watchdog timeout.** |
-| **Monotonic Attempt-ID Fencing & Watchdog Separation (Rule 2, 6)** | Architecture §3.4.1, AC-M5-01 | `recovery-coordinator.ts`, `quarantine-drainer.ts` | 670, 696 | Partially Exists | Coordinator advances `currentAttemptId` monotonically on reset/abort. Watchdog latches attempt to `TIMED_OUT` without touching drainer custody. Actual continuation fences on attempt ID before root replacement. |
+| **Shared Settlement Barrier (`drainSettledBarrier`)** | Architecture §3.4.1, AC-M5-01 | `quarantine-drainer.ts`, `recovery-coordinator.ts` | 119, 174–279 | Missing | Implement `drainSettledBarrier(): Promise<void>`. Resolves **strictly and only** upon actual settlement and custody reconciliation. **Never resolves or rejects on watchdog timeout.** |
+| **Monotonic Attempt-ID Fencing & Watchdog Separation** | Architecture §3.4.1, AC-M5-01 | `recovery-coordinator.ts`, `quarantine-drainer.ts` | 670, 696 | Partially Exists | Coordinator advances `currentAttemptId` monotonically on reset/abort. Watchdog latches attempt to `TIMED_OUT` without touching drainer custody. Actual continuation fences on attempt ID before root replacement. |
 | **Terminal Quarantine Archive Implementation** | Architecture §3.4.4, Interface §3.3 | `terminal-quarantine-archive.ts` (New) | N/A (New File) | **Missing** | Implement `TerminalQuarantineArchive`, `TerminalArchiveCoreState`, `reserveCapacity`, `commitRetirementBatch`, `getEntries`, and export lifecycle. |
 | **Composite Operation Identity & UTF-8 Canonical Key** | Architecture §3.4.3, Interface §3.3 | `terminal-quarantine-archive.ts` (New) | N/A (New File) | **Missing** | Implement `CompositeOperationIdentity`, pre-validate ASCII schema (`/^[a-zA-Z0-9_.:-]+$/`), compute exact UTF-8 byte lengths via `TextEncoder`, construct `opid:...` key. |
 | **Option A Atomic Source Retirement in QuarantineBuffer** | Architecture §3.4.4, Interface §3.3 | `quarantine-buffer.ts` | 76–86, 243–271 | Missing | Add `QuarantineBufferCoreState`, `#identityIndex` private encapsulation, and `retireCommittedBatch(identities, capability)` with candidate-root pointer swap. |
@@ -142,7 +146,7 @@ To guarantee absolute custody safety across asynchronous engine boundaries, the 
 7. **Frozen M5.0 Receipt Disposition:** The drainer must process the actual late receipt according to the frozen M5.0 disposition rules.
 8. **Custody Reconciliation Precedence:** Operation custody must be restored (`unshiftDrain`), transferred, or retired according to that receipt **before** the in-flight slot is released.
 9. **Barrier Resolution Condition:** The settlement barrier resolves **only** after actual settlement and completion of the corresponding custody reconciliation ($this.\_inFlightRecord === \text{null} \land this.\_isDraining === \text{false}$).
-10. **Serialized Reset Sharing:** Concurrent reset attempts must share or await the same outstanding settlement condition. They must never create independent paths that bypass the original in-flight operation.
+10. **Serialized Reset Sharing:** Concurrent reset requests must share or await the same outstanding settlement condition. They must never create independent paths that bypass the original in-flight operation.
 
 ### 6.2 Independent State Transitions
 
@@ -187,62 +191,35 @@ _isDraining = false
     BarrierResolved --> [*]
 ```
 
-#### Detailed Transition Dynamics:
-- **Transition 1: Watchdog Timeout (Coordinator-Level)**
-  - Monotonic elapsed duration reaches `SETTLEMENT_BARRIER_TIMEOUT_MS` (5,000 ms).
-  - Attempt status transitions to `attempt.status = 'TIMED_OUT'`.
-  - Coordinator aborts clean reset to `DEGRADED` (`RESET_PREREQUISITE_FAILED`).
-  - **In-flight record remains occupied** (`_inFlightRecord !== null`).
-  - **Drainer remains draining** (`_isDraining === true`).
-  - **Settlement barrier remains unresolved (pending).**
-  - Any subsequent reset attempt sharing or observing the barrier is blocked from proceeding until actual settlement occurs.
-- **Transition 2: Actual Promise Settlement (Drainer-Level)**
-  - The underlying destination Promise completes.
-  - Continuation executes: checks `attemptId === currentAttemptId`.
-  - If attempt was timed out or invalidated, destination returns `{ status: 'ATTEMPT_INVALIDATED', reason: 'STALE_ATTEMPT_FENCED' }`.
-  - Drainer restores operation to buffer via `quarantineBuffer.unshiftDrain(op)`.
-  - `_inFlightRecord` is set to `null`.
-  - `_isDraining` is set to `false`.
-  - **Settlement barrier Promise resolves.**
-  - A subsequent reset attempt awaiting the barrier is now unblocked and can safely proceed.
-
 ### 6.3 Clarification of the Late-ACK Case and Four-Layer Separation
 
 When an asynchronous drain destination settles after a watchdog timeout has expired, four distinct architectural layers must be strictly distinguished:
 
-```
-┌─────────────────────────────────────────────────────────────────────────────────┐
-│ 1. Destination-Level Acceptance                                                 │
-│    Destination returns DestinationAcceptanceReceipt                             │
-│    (ACCEPTED_REDUCED, ACCEPTED_PENDING, ATTEMPT_INVALIDATED, etc.)              │
-└──────────────────────────────────────┬──────────────────────────────────────────┘
-                                       ▼
-┌─────────────────────────────────────────────────────────────────────────────────┐
-│ 2. Recovery-Attempt Validity                                                    │
-│    Coordinator evaluates: attempt.status === 'TIMED_OUT'                        │
-│    Result: Attempt is DEAD/TERMINAL. Validity is FALSE.                         │
-└──────────────────────────────────────┬──────────────────────────────────────────┘
-                                       ▼
-┌─────────────────────────────────────────────────────────────────────────────────┐
-│ 3. Permission to Commit Candidate Root (FENCED)                                 │
-│    Can Attempt 1 execute replaceCoreStateAtomic or flush notifications?         │
-│    Result: STRICTLY FORBIDDEN. Zero state mutation. Zero notifications.        │
-└──────────────────────────────────────┬──────────────────────────────────────────┘
-                                       ▼
-┌─────────────────────────────────────────────────────────────────────────────────┐
-│ 4. Permission to Retire or Transfer Custody                                     │
-│    Drainer reconciles operation custody based on frozen M5.0 disposition rules: │
-│    - ATTEMPT_INVALIDATED -> unshiftDrain(op) to QuarantineBuffer               │
-│    - ACCEPTED_*          -> Destination owns op; clear in-flight slot           │
-│    - TERMINALLY_REJECTED -> Commit to TerminalQuarantineArchive                 │
-│    Slot released (N_in-flight -> 0) ONLY AFTER custody reconciliation completes.│
-└─────────────────────────────────────────────────────────────────────────────────┘
-```
-
-#### Detailed Layer Invariants:
 1. **Destination-Level Acceptance $\ne$ Recovery Authorization:** Even if a remote peer or destination engine returns `ACCEPTED_REDUCED`, this receipt merely acknowledges that the destination admitted the operation into its log. It provides **zero authorization** for an invalidated or timed-out recovery attempt to resume its execution sequence.
 2. **Attempt Fencing Checks Before Every Protected Mutation:** Every asynchronous suspension point (`await`) in `RecoveryCoordinator` must re-verify `attempt.status !== 'TIMED_OUT'` and `attempt.attemptId === this.currentAttemptId`. If invalidated, the continuation halts immediately without calling `engine.replaceCoreStateAtomic()`, without committing archive batches, and without calling `engine.flushDeferredNotifications()`.
 3. **Custody Reconciliation is Pre-Requisite to Barrier Resolution:** Custody disposition (restoring to buffer, committing to archive, or logging acceptance) must complete before `this._inFlightRecord = null` is executed. The settlement barrier promise resolves only when both `_inFlightRecord === null` and `_isDraining === false`.
+
+### 6.4 Analysis of Reset Arbitration Authority in Frozen M5.0
+
+A rigorous audit of the frozen specification baseline reveals an unresolved specification gap regarding concurrent reset arbitration:
+
+1. **Homogeneous Serialization in R9-01:**
+   `docs/PHASE7_5_M5_INTERFACE_SPECIFICATION.md:423-424` and `docs/PHASE7_5_M5_0_R9_CORRECTION_REPORT.md:40-75` define concurrent reset serialization for multiple reset invocations of the same type:
+   - Each invocation increments `currentAttemptId`;
+   - All invocations await `drainSettledBarrier()`;
+   - Post-settlement continuations validate `attemptId === currentAttemptId`;
+   - Non-matching earlier attempts abort silently, allowing the newest attempt to execute.
+2. **The `INVALID_STATE` State-Guard Rule:**
+   In direct tension with continuous supersession, `docs/PHASE7_5_M5_INTERFACE_SPECIFICATION.md:1046` specifies:
+   `Throws SyncEngineError('INVALID_STATE') if resetRecovery() is invoked from non-DEGRADED state.`
+   Under the 10-step reset sequence (`Architecture §3.4.2`), Step 3 immediately transitions the coordinator to `RECOVERING`. Consequently, a second reset request arriving while Step 4 awaits settlement arrives when the coordinator is in `RECOVERING`, not `DEGRADED`.
+3. **The Mixed-Mode Priority Vacuum:**
+   Frozen M5.0 specifies zero arbitration priority between differing reset actions:
+   - Does a subsequent `REINITIALIZE_CLEAN` supersede an in-flight `PURGE_AND_RETRY`?
+   - Does a subsequent `PURGE_AND_RETRY` supersede an in-flight `REINITIALIZE_CLEAN`?
+   - Or must the second request reject fail-closed with `INVALID_STATE`?
+
+**Conclusion:** The frozen architecture does not establish an unambiguous arbitration policy for concurrent reset requests across differing actions or during `RECOVERING` settlement waits. This missing decision is a blocking prerequisite for M5.1 implementation.
 
 ---
 
@@ -295,7 +272,7 @@ Concurrent readers observe either the pre-commit root or the complete post-commi
 | **8** | Uncertain commit outcome | `TQA`, `RC` | Missing | 3-way reconciliation: query `getTransaction(txId)`; if committed $\to$ retire source; if absent $\to$ cancel reservation. | Zero dual mutation; zero lost custody; halts safely in `DEGRADED` if query fails. | Simulate timeout awaiting commit receipt; execute 3-way query; assert reconciliation to committed or aborted. |
 | **9** | Attempt invalidation during preparation | `RC`, `QD` | Missing | Reset/abort advances `currentAttemptId`; stale continuation detects mismatch and aborts. | Stale continuation cannot install state or mutate archive; operations preserved. | Trigger concurrent reset while preparation awaits barrier; assert earlier attempt terminates with zero effect. |
 | **10** | Conflicting composite identity in batch | `RC`, `QB` | Missing | Full 4-field comparison (`originPeerId`, `sequenceNumber`, `membershipEpoch`, `logicalEventId`). | Batch rejected fail-closed; quarantine buffer preserved; reset halts in `DEGRADED`. | Batch contains operation with same origin/seq but different epoch; assert `RETIREMENT_BATCH_CONFLICT`. |
-| **11** | **Settlement watchdog timeout (Rules 1–10 & Scenarios A–F)** | `RC`, `QD` | Missing | Watchdog timer (`5000ms`); latches attempt to `TIMED_OUT`; clean reset aborts to `DEGRADED`. **Barrier remains pending.** | In-flight slot remains occupied; barrier does NOT settle on timeout; continuation restores custody upon actual settlement. | 17-step deterministic test sequence (§12.1) and Scenarios A through F (§12.2); verifies custody retention past timeout and barrier resolution only upon actual settlement. |
+| **11** | **Settlement watchdog timeout & Failure Semantics** | `RC`, `QD` | Missing | Watchdog timer (`5000ms`); latches attempt to `TIMED_OUT`; clean reset aborts to `DEGRADED`. **Barrier remains pending.** | In-flight slot remains occupied; barrier does NOT settle on timeout; continuation restores custody upon actual settlement. | 17-step sequence (§12.1), Scenarios A–E (§12.2), and Failure Tests 1–8 (§12.5). |
 | **12** | Dual zero-custody verification failure | `RC`, `QB`, `QD` | Missing | Coordinator asserts `buffer.count === 0 && drainer.inFlight === null`; throws `CUSTODY_LEAK_DETECTED`. | Clean-root install strictly blocked; enters `DEGRADED`; prevents uncommitted operation loss. | Inject mock leftover operation in drainer after retirement; assert clean baseline install is blocked. |
 
 ---
@@ -327,7 +304,7 @@ To guarantee risk isolation, incremental testability, and zero regression, M5.1 
 
 ```mermaid
 flowchart TD
-    M5_0["Milestone M5.0: Architecture Audit & Final Freeze<br/>(COMPLETED & FROZEN)"] --> M5_1_Stage0["M5.1 Stage 0-R2: Readiness & Test Completeness<br/>(THIS AUDIT REPORT)"]
+    M5_0["Milestone M5.0: Architecture Audit & Final Freeze<br/>(COMPLETED & FROZEN)"] --> M5_1_Stage0["M5.1 Stage 0-R3: Readiness & Failure Semantics<br/>(THIS AUDIT REPORT)"]
     M5_1_Stage0 --> M5_1a["M5.1a: Terminal Quarantine Archive & Composite Identity<br/>(Self-Contained; Zero Engine Touch)"]
     M5_1a --> M5_1b["M5.1b: QuarantineBuffer Atomic Source Retirement<br/>(Option A CoreState & Private Encapsulation)"]
     M5_1b --> M5_1c["M5.1c: QuarantineDrainer Settlement Barrier<br/>(drainSettledBarrier & Attempt-Fenced Receipts)"]
@@ -347,7 +324,7 @@ flowchart TD
 
 ---
 
-## 12. Mandatory Test Strategy & Deterministic Sequences (Corrections C & E, and R2 Extensions)
+## 12. Mandatory Test Strategy, Failure Semantics & Deterministic Sequences
 
 ### 12.1 Baseline Deterministic Settlement Barrier & Watchdog Timeout Test Sequence (Retained from R1)
 To verify that watchdog timeout and actual settlement are completely independent and that in-flight custody cannot be leaked or bypassed, Sub-Milestone M5.1c/M5.1d must include an explicit deterministic test executing the following 17-step sequence:
@@ -372,132 +349,125 @@ To verify that watchdog timeout and actual settlement are completely independent
 17. Assert that a subsequent authorized reset attempt can now proceed cleanly.
 ```
 
-*Testing Infrastructure Requirement:* This test must be implemented using Vitest deterministic fake timers (`vi.useFakeTimers()`) and microtask queue flushing (`await Promise.resolve()`). Zero arbitrary real-time sleeps (`setTimeout`) are permitted.
-
 ---
 
-### 12.2 Expanded Deterministic Scenarios A through F (Stage 0-R2 Extension)
-
-To provide exhaustive coverage of late settlement, stale-continuation fencing, custody reconciliation, and concurrent reset serialization, the test suite must implement the following six formal deterministic scenarios:
+### 12.2 Deterministic Scenarios A through E & Revised Scenario F
 
 #### Scenario A — Watchdog Expiry with Unresolved Destination Promise
-- **Objective:** Verify that exceeding the 5,000 ms watchdog latches the attempt as `TIMED_OUT` without resolving or rejecting the barrier, and without releasing drainer custody.
-- **Deterministic Step Sequence:**
-  1. Initialize Vitest fake timers (`vi.useFakeTimers()`).
-  2. Instantiate `QuarantineBuffer`, `QuarantineDrainer`, and `RecoveryCoordinator`.
-  3. Enqueue operation `op1` into `QuarantineBuffer`.
-  4. Initiate drain via `drainer.drainNext()`. Destination mock returns an unsettled deferred Promise (`destinationDeferred`).
-  5. Assert drainer has entered draining state: `drainer.isDraining() === true` and `_inFlightRecord` contains `op1` ($N_{\text{in-flight}} = 1$).
-  6. Trigger administrative clean reset via `coordinator.resetRecovery(capability, 'REINITIALIZE_CLEAN')` (Attempt 1).
-  7. Capture barrier Promise from `drainer.drainSettledBarrier()`. Attach settlement tracking flag (`barrierSettled = false`).
-  8. Advance virtual clock by 4,999 ms: `await vi.advanceTimersByTimeAsync(4999)`.
-  9. Assert Attempt 1 status is `WAITING_FOR_SETTLEMENT`, barrier is pending (`barrierSettled === false`), and `_inFlightRecord` remains occupied.
-  10. Advance virtual clock by 2 ms (reaching 5,001 ms, crossing 5,000 ms watchdog threshold).
-  11. Assert coordinator watchdog executes: Attempt 1 status is latched to `TIMED_OUT`, and coordinator transitions to `DEGRADED`.
-  12. Assert barrier Promise REMAINS PENDING (`barrierSettled === false`).
-  13. Assert drainer in-flight slot REMAINS OCCUPIED with `op1` (`drainer.hasInFlightRecord() === true`), and `drainer.isDraining() === true`.
-  14. Advance virtual clock by an additional 100,000 ms: `await vi.advanceTimersByTimeAsync(100000)`.
-  15. Assert that neither timer advancement nor timeout releases custody: barrier remains pending, `_inFlightRecord` remains occupied, and engine root remains untouched.
+- **Objective:** Verify that exceeding 5,000 ms latches Attempt 1 to `TIMED_OUT` without resolving the barrier and without releasing drainer custody.
+- **Steps:** Enqueue `op1`, start drain with unsettled deferred Promise (`destinationDeferred`), trigger clean reset (Attempt 1). Advance virtual time by 4,999 ms $\to$ assert status `WAITING_FOR_SETTLEMENT`, barrier pending, `_inFlightRecord` occupied. Advance by 2 ms (reaching 5,001 ms) $\to$ assert coordinator watchdog latches Attempt 1 to `TIMED_OUT` and moves to `DEGRADED`.
+- **Invariants:** Barrier remains pending (`barrierSettled === false`), `_inFlightRecord` remains occupied, `_isDraining === true`. Advance virtual time by +100,000 ms $\to$ assert neither timeout nor virtual timer advancement releases custody.
 
 #### Scenario B — Second Reset Cannot Bypass Outstanding Settlement
 - **Objective:** Verify that a subsequent reset attempt arriving while an earlier destination Promise is pending cannot start a new drain, cannot replace roots, and must share/await the existing settlement condition.
-- **Deterministic Step Sequence:**
-  1. Continue from Scenario A (Attempt 1 is `TIMED_OUT`, destination Promise remains pending, `_inFlightRecord` occupied by `op1`).
-  2. Initiate second reset request: `coordinator.resetRecovery(capability, 'REINITIALIZE_CLEAN')` (Attempt 2).
-  3. Assert coordinator assigns `attemptId = 2` and checks drainer status.
-  4. Assert Attempt 2 detects that drainer is occupied ($N_{\text{in-flight}} = 1$) and joins the existing settlement condition via `drainSettledBarrier()`.
-  5. Assert Attempt 2 CANNOT initiate a new drain dequeue (`QuarantineBuffer` head is not dequeued).
-  6. Assert no second in-flight record is created: $N_{\text{in-flight}}$ remains strictly 1.
-  7. Assert Attempt 2 CANNOT execute candidate root replacement or commit archive batches.
-  8. Assert original operation `op1` remains accounted for exactly once in system custody (solely in drainer `_inFlightRecord`).
+- **Steps:** Continue from Scenario A. Initiate second reset request (Attempt 2).
+- **Invariants:** Attempt 2 detects drainer occupied ($N_{\text{in-flight}} = 1$) and joins the existing settlement condition (`drainSettledBarrier()`). Attempt 2 cannot dequeue a new operation, cannot create a second in-flight record ($N_{\text{in-flight}}$ remains strictly 1), and cannot commit roots. Original operation `op1` remains accounted for exactly once in system custody.
 
 #### Scenario C — Late Settlement and Stale-Attempt Fencing
-- **Objective:** Verify that when the original destination Promise settles after the watchdog timeout, the stale Attempt 1 continuation is fenced from performing root replacement or notification flushes, and late receipts are safely handled.
-- **Deterministic Step Sequence:**
-  1. Continue from Scenario B (Attempt 1 is `TIMED_OUT`, Attempt 2 is waiting on settlement).
-  2. Resolve the original `destinationDeferred` Promise with `{ status: 'ATTEMPT_INVALIDATED', attemptId: 1, reason: 'STALE_ATTEMPT_FENCED' }`.
-  3. Drainer microtask continuation resumes execution.
-  4. Drainer evaluates receipt: observes `ATTEMPT_INVALIDATED`. Under frozen M5.0 rules, executes `quarantineBuffer.unshiftDrain(op1)`.
-  5. Drainer clears in-flight tracking: sets `_inFlightRecord = null` and `_isDraining = false`.
-  6. Barrier Promise now resolves (`barrierSettled = true`).
-  7. Attempt 1 continuation (which was awaiting the barrier in step 4 of the 10-step sequence) wakes up in microtask queue.
-  8. Attempt 1 checks its latched state: observes `this.attempt.status === 'TIMED_OUT'` (and `attempt.attemptId !== coordinator.currentAttemptId`).
-  9. Assert Attempt 1 continuation TERMINATES IMMEDIATELY with zero side effects:
-     - `engine.replaceCoreStateAtomic` is NEVER called.
-     - `archive.commitRetirementBatch` is NEVER called.
-     - `engine.flushDeferredNotifications` is NEVER called.
-  10. Assert operation `op1` is safely residing at the head of `QuarantineBuffer` with zero duplication, zero deletion, and zero dual-ownership.
+- **Objective:** Verify that when the original destination Promise settles post-timeout, Attempt 1 continuation is fenced from performing root replacement or notification flushes.
+- **Steps:** Continue from Scenario B. Resolve original `destinationDeferred` with schema-compliant `{ status: 'ATTEMPT_INVALIDATED', vectorAdvanced: false, attemptId: 1, reason: 'STALE_ATTEMPT_FENCED' }`.
+- **Invariants:** Drainer processes receipt, executes `quarantineBuffer.unshiftDrain(op1)`, clears `_inFlightRecord = null`, sets `_isDraining = false`, and resolves the barrier. Attempt 1 wakes up, detects `attempt.status === 'TIMED_OUT'`, and terminates immediately without calling `replaceCoreStateAtomic`, without committing archive batches, and without flushing notifications. `op1` is safely residing in `QuarantineBuffer` with zero duplication or loss.
 
 #### Scenario D — Custody Reconciliation Before Barrier Resolution
-- **Objective:** Verify that the settlement barrier resolves ONLY AFTER custody disposition is completely finished and asserted.
-- **Deterministic Step Sequence:**
-  1. Setup drainer with a destination returning a controlled deferred Promise.
-  2. Enqueue `op1` and start drain.
-  3. Attach spy/hook into `quarantineBuffer.unshiftDrain` and `drainSettledBarrier().then(...)`.
-  4. Resolve destination Promise with `ATTEMPT_INVALIDATED`.
-  5. Assert that when `quarantineBuffer.unshiftDrain` executes, `drainer.hasInFlightRecord() === true` (custody is transferred BEFORE releasing slot).
-  6. Assert that `drainSettledBarrier()` promise handler has NOT yet executed during `unshiftDrain`.
-  7. Allow drainer to complete slot release (`_inFlightRecord = null`, `_isDraining = false`).
-  8. Assert that `drainSettledBarrier()` resolver executes strictly after slot release.
-  9. Assert that when the barrier promise resolves, `quarantineBuffer.totalRetainedCount === 1`, `drainer.hasInFlightRecord() === false`, and `drainer.isDraining() === false`.
+- **Objective:** Verify that the settlement barrier resolves ONLY AFTER custody disposition is completely finished.
+- **Steps:** Setup drainer with controlled deferred Promise, attach execution hooks to `quarantineBuffer.unshiftDrain` and `drainSettledBarrier().then(...)`. Resolve destination Promise with `ATTEMPT_INVALIDATED`.
+- **Invariants:** Asserts that when `quarantineBuffer.unshiftDrain` executes, `drainer.hasInFlightRecord() === true` (custody transfer precedes slot release). Barrier promise handler does not execute during `unshiftDrain`. Barrier resolves strictly after `_inFlightRecord = null` and `_isDraining = false`.
 
 #### Scenario E — Subsequent Authorized Recovery
-- **Objective:** Verify that after actual settlement and custody reconciliation, a fresh authorized recovery attempt can proceed cleanly without interference from prior timed-out attempts.
-- **Deterministic Step Sequence:**
-  1. Continue following completion of Scenario C and D (Attempt 1 timed out and fenced, Attempt 2 observed settlement and clean custody state).
-  2. Attempt 2 proceeds to Step 7 of the 10-step sequence:
-     - Pre-condition check confirms: `quarantineDrainer.inFlightRecord === null` and `quarantineDrainer.isDraining === false`.
-     - `QuarantineBuffer` contains `op1` safely preserved.
-  3. Attempt 2 executes 11-stage atomic retirement transaction:
-     - Discovers `op1` composite identity;
-     - Pre-reserves capacity in `TerminalQuarantineArchive`;
-     - Commits retirement batch to archive via candidate-root swap;
-     - Retires source operation from `QuarantineBuffer` under Option A;
-     - Executes dual zero-custody verification: asserts `quarantineBuffer.totalRetainedCount === 0` and `quarantineDrainer.inFlightRecord === null`.
-  4. Attempt 2 executes Step 8: `engine.replaceCoreStateAtomic(cleanBaseline, capability)`.
-  5. Attempt 2 executes Step 9: transitions state machine to `ACTIVE` with `attempt.status = 'COMPLETED'`.
-  6. Attempt 2 executes Step 10: `engine.flushDeferredNotifications()`.
-  7. Assert Attempt 2 completes successfully with engine active and clean baseline installed.
-  8. Assert stale Attempt 1 cannot perform any subsequent mutation on Attempt 2's completed state.
+- **Objective:** Verify that after actual settlement and custody reconciliation, a fresh authorized recovery attempt can proceed cleanly.
+- **Steps:** Continue following completion of Scenarios C and D (Attempt 1 timed out and fenced, custody safely restored to buffer).
+- **Invariants:** Attempt 2 proceeds to Step 7: pre-condition confirms `inFlightRecord === null` and `isDraining === false`. Executes 11-stage atomic retirement transaction (Option A), executes dual zero-custody verification, calls `replaceCoreStateAtomic(cleanBaseline, capability)`, transitions state machine to `ACTIVE` with `attempt.status = 'COMPLETED'`, and dispatches deferred notifications. Stale Attempt 1 cannot perform any subsequent mutation.
 
-#### Scenario F — Concurrent Reset Requests
-- **Objective:** Verify that multiple concurrent reset requests arriving while destination settlement is pending all observe the same settlement condition, earlier attempts are invalidated cleanly, and no split-brain recovery occurs.
-- **Deterministic Step Sequence:**
-  1. Enqueue `op1` and initiate drain with unsettled `destinationDeferred`.
-  2. Concurrently invoke three reset requests from separate callers:
-     - `promiseA = coordinator.resetRecovery(cap, 'REINITIALIZE_CLEAN')` (Attempt A, ID=1);
-     - `promiseB = coordinator.resetRecovery(cap, 'REINITIALIZE_CLEAN')` (Attempt B, ID=2);
-     - `promiseC = coordinator.resetRecovery(cap, 'PURGE_AND_RETRY')` (Attempt C, ID=3).
-  3. Assert coordinator advances `currentAttemptId` to 3.
-  4. Assert Attempt A and Attempt B are latched to `INVALIDATED` (superseded by newer reset requests).
-  5. Assert all three requests share and await the same underlying drainer settlement condition (`drainSettledBarrier()`).
-  6. Assert only ONE in-flight operation exists ($N_{\text{in-flight}} = 1$); no concurrent drains are dequeued.
-  7. Resolve `destinationDeferred` with `ATTEMPT_INVALIDATED`.
-  8. Allow microtasks to execute:
-     - Drainer unshifts `op1` to `QuarantineBuffer` and releases slot;
-     - Barrier resolves;
-     - Attempt A wakes up, detects `attempt.status === 'INVALIDATED'`, and halts with zero mutation;
-     - Attempt B wakes up, detects `attempt.status === 'INVALIDATED'`, and halts with zero mutation;
-     - Attempt C (authoritative attempt, ID=3) wakes up, confirms `attemptId === coordinator.currentAttemptId`, and proceeds to execute `PURGE_AND_RETRY`.
-  9. Assert zero state corruption, zero duplicate retirement, and zero unhandled Promise rejections.
+#### Revised Scenario F — Concurrent Reset Arbitration Analysis (Unresolved Specification Blocker)
+- **Objective:** Verify shared settlement barrier preservation under concurrent reset requests, while identifying reset arbitration policy as an unresolved specification blocker.
+- **Deterministic Invariants Verified:**
+  1. All concurrent reset requests share and await the identical outstanding `drainSettledBarrier()`.
+  2. Exactly one in-flight record exists ($N_{\text{in-flight}} \le 1$); no concurrent drains are dequeued.
+  3. Drainer custody reconciliation must settle before any waiting reset continuation resumes.
+- **Identified Specification Blocker:**
+  - Frozen M5.0 does not specify which request wins when concurrent resets specify conflicting actions (`REINITIALIZE_CLEAN` vs `PURGE_AND_RETRY`), nor does it reconcile concurrent invocation with the `INVALID_STATE` guard (Interface Table line 1046) when state is `RECOVERING`.
+  - The implementation must NOT silently invent latest-wins, first-wins, or queuing policies. This decision is blocked pending Engineering Authority resolution.
 
 ---
 
-### 12.3 Late-ACK Semantics & Custody Disposition Verification Matrix
+### 12.3 Complete Custody Reconciliation Failure Matrix
 
-| Destination Acceptance Receipt Status | Destination Meaning | Recovery Attempt Status (Post-Timeout) | Authorized to Commit Candidate Root? | Drainer Custody Disposition Action | Post-Condition at Barrier Resolution |
+| Receipt Variant | Receipt Meaning | Custody Action on Success | Failure Mode Encountered | Failure Reconciliation Behavior | In-Flight Slot & Barrier State |
 |:---|:---|:---|:---|:---|:---|
-| **`ATTEMPT_INVALIDATED`** | Engine admission boundary rejected op due to attempt fencing (`STALE_ATTEMPT_FENCED`). Vector not advanced. | `TIMED_OUT` (Terminal) | **NO (Strictly Fenced)** | Restore operation to `QuarantineBuffer` head via `unshiftDrain(op)`. Release in-flight slot. | Op safely in buffer; slot empty; barrier resolves; ready for next attempt. |
-| **`ACCEPTED_REDUCED`** | Engine or peer admitted and reduced op into causal vector. | `TIMED_OUT` (Terminal) | **NO (Strictly Fenced)** | Destination holds custody. Drainer logs receipt, increments metrics, and releases in-flight slot. | Op in engine log; slot empty; barrier resolves; timed-out attempt halts. |
-| **`ACCEPTED_PENDING`** | Engine admitted op to pending queue awaiting missing dependency. | `TIMED_OUT` (Terminal) | **NO (Strictly Fenced)** | Destination holds custody. Drainer logs receipt and releases in-flight slot. | Op in engine pending queue; slot empty; barrier resolves; timed-out attempt halts. |
-| **`ALREADY_REPRESENTED`** | Op already covered by engine replication vector (frontier duplicate). | `TIMED_OUT` (Terminal) | **NO (Strictly Fenced)** | Deduplicated. Drainer releases in-flight slot ($N_{\text{in-flight}} \to 0$). | Op safely ignored; slot empty; barrier resolves; timed-out attempt halts. |
-| **`ALREADY_OWNED_DUPLICATE`** | Op already present in engine operation log. | `TIMED_OUT` (Terminal) | **NO (Strictly Fenced)** | Deduplicated. Drainer releases in-flight slot ($N_{\text{in-flight}} \to 0$). | Op safely ignored; slot empty; barrier resolves; timed-out attempt halts. |
-| **`TERMINALLY_REJECTED`** | Op failed schema validation, obsolete epoch, or malformed payload. | `TIMED_OUT` (Terminal) | **NO (Strictly Fenced)** | Stage and commit op to `TerminalQuarantineArchive`. Release in-flight slot. | Op safely in archive; slot empty; barrier resolves; timed-out attempt halts. |
-| **`CAPACITY_REJECTED`** | Destination queue full (transient backpressure). | `TIMED_OUT` (Terminal) | **NO (Strictly Fenced)** | Restore operation to `QuarantineBuffer` head via `unshiftDrain(op)`. Halt drain. | Op safely in buffer; slot empty; barrier resolves; coordinator halts in `DEGRADED`. |
+| **`ATTEMPT_INVALIDATED`** | Destination rejected op due to attempt fencing (`STALE_ATTEMPT_FENCED`). | `quarantineBuffer.unshiftDrain(op)` restores op to buffer head. | `unshiftDrain()` throws or fails (e.g. memory exhaustion). | Retain op in `_inFlightRecord`; do NOT release slot; coordinator latches in `DEGRADED` (`CUSTODY_RESTORATION_FAILED`). | Slot remains OCCUPIED ($N_{\text{in-flight}} = 1$); barrier REMAINS PENDING. |
+| **`ACCEPTED_REDUCED` / `ACCEPTED_PENDING`** | Destination admitted op into causal log or pending queue. | Destination assumes custody; drainer clears slot. | Destination Promise rejects or throws uncaught exception. | Op was NOT admitted. Drainer catches rejection, attempts fallback buffer restoration via `unshiftDrain(op)`; if fallback fails, retains `_inFlightRecord`. | Slot remains OCCUPIED until safe disposition confirmed; barrier REMAINS PENDING. |
+| **`ALREADY_REPRESENTED` / `ALREADY_OWNED_DUPLICATE`** | Op is confirmed duplicate (frontier or log). | Op is deduplicated; drainer safely releases slot. | Deduplication receipt cannot be verified or parsed. | Drainer treats ownership as uncertain; retains op in `_inFlightRecord`; halts drain. | Slot remains OCCUPIED; barrier REMAINS PENDING; coordinator to `DEGRADED`. |
+| **`TERMINALLY_REJECTED`** | Op failed schema validation, epoch, or malformed payload. | Construct entry; reserve capacity; commit to `TerminalQuarantineArchive`; release slot. | Archive pre-reservation or publication throws before commit. | Candidate root discarded; no archive mutation; op NOT retired; retained in `_inFlightRecord`. | Slot remains OCCUPIED ($N_{\text{in-flight}} = 1$); barrier REMAINS PENDING. |
+| **`TERMINALLY_REJECTED` (Uncertain Commit)** | Op failed validation; commit call returned uncertain. | Query `archive.getTransaction(txId)`: if committed $\to$ release slot; if absent $\to$ cancel reservation. | 3-way reconciliation query fails, times out, or returns inconclusive. | Drainer CANNOT confirm archive publication; retains op in `_inFlightRecord`; locks recovery in `DEGRADED`. | Slot remains OCCUPIED; barrier REMAINS PENDING; zero duplicate archive entries. |
+| **`CAPACITY_REJECTED`** | Destination queue full (transient backpressure). | `quarantineBuffer.unshiftDrain(op)` restores op; drain halts. | `unshiftDrain()` throws or fails. | Retain op in `_inFlightRecord`; do NOT release slot; coordinator transitions to `DEGRADED`. | Slot remains OCCUPIED ($N_{\text{in-flight}} = 1$); barrier REMAINS PENDING. |
 
 ---
 
-### 12.4 Preserving Testability Without Exposing Private State (Qualification A & E)
+### 12.4 Settlement Barrier Failure Semantics & Eight Distinct Settlement Outcomes
+
+The settlement barrier (`drainSettledBarrier(): Promise<void>`) resolves **only** when the drainer has completed a known, safe custody disposition. The engine runtime distinguishes eight distinct operational outcomes:
+
+1. **Outcome 1: Successful Settlement & Successful Reconciliation:** Destination settles; custody successfully transferred or restored; `_inFlightRecord = null`; `_isDraining = false`; **Barrier Resolves**.
+2. **Outcome 2: Destination Promise Rejection Followed by Safe Disposition:** Destination rejects; drainer catches error, unshifts op to buffer; confirmed restored; `_inFlightRecord = null`; `_isDraining = false`; **Barrier Resolves**; Coordinator moves to `DEGRADED`.
+3. **Outcome 3: Custody Reconciliation Exception:** Thrown error during receipt processing or staging; slot NOT cleared (`_inFlightRecord !== null`); **Barrier Remains Pending**; Coordinator moves to `DEGRADED`.
+4. **Outcome 4: Archive Commit Confirmed (via 3-Way Query):** Query confirms transaction committed in archive; slot cleared (`_inFlightRecord = null`); `_isDraining = false`; **Barrier Resolves**.
+5. **Outcome 5: Archive Commit Confirmed Absent (via 3-Way Query):** Query confirms transaction absent; reservation cancelled; op retained in `_inFlightRecord`; **Barrier Remains Pending**; Coordinator moves to `DEGRADED`.
+6. **Outcome 6: Archive Commit Outcome Inconclusive:** Query throws or times out; state uncertain; op retained in `_inFlightRecord`; **Barrier Remains Pending**; Coordinator locks in `DEGRADED`.
+7. **Outcome 7: Restoration Failure:** `unshiftDrain()` throws; op retained in `_inFlightRecord`; **Barrier Remains Pending**; Coordinator locks in `DEGRADED`.
+8. **Outcome 8: Duplicate or Idempotent Reconciliation Retry:** Retry of existing transaction ID; archive returns existing receipt idempotently; zero duplicate entries; slot cleared; **Barrier Resolves**.
+
+---
+
+### 12.5 Deterministic Failure Test Scenarios
+
+To ensure exhaustive test coverage of all failure modes without leaking private state, the test suite must implement the following eight deterministic failure tests using Vitest fake timers:
+
+- **Failure Test 1: Restoration Throws After `ATTEMPT_INVALIDATED`:** Mock `quarantineBuffer.unshiftDrain` to throw an exception. Resolve destination Promise with `ATTEMPT_INVALIDATED`. Assert that `drainer.hasInFlightRecord() === true`, barrier remains pending, and coordinator transitions to `DEGRADED`.
+- **Failure Test 2: Terminal Archive Commit Throws Before Publication:** Mock `archive.commitRetirementBatch` to throw during candidate-root creation. Assert candidate root is discarded, archive size is unchanged, `_inFlightRecord` remains occupied, and barrier remains pending.
+- **Failure Test 3: Terminal Archive Commit With Uncertain Outcome (Confirmed Committed):** Mock commit to simulate a timeout/network drop; mock `archive.getTransaction(txId)` to return committed receipt. Assert coordinator performs 3-way query, detects committed record, safely releases slot, and barrier resolves.
+- **Failure Test 4: Terminal Archive Commit With Uncertain Outcome (Confirmed Absent):** Mock commit to fail; mock `archive.getTransaction(txId)` to return absent (`undefined`). Assert reservation is cancelled, operation is retained in `_inFlightRecord`, barrier remains pending, and coordinator enters `DEGRADED`.
+- **Failure Test 5: Terminal Archive Commit With Inconclusive Query:** Mock both commit and subsequent `getTransaction` query to throw. Assert operation is strictly retained in `_inFlightRecord`, barrier remains pending, and coordinator locks in `DEGRADED` without losing custody.
+- **Failure Test 6: Duplicate Reconciliation Retry:** Submit identical transaction ID twice to archive. Assert second submission returns existing receipt idempotently with zero duplicate entries added to archive.
+- **Failure Test 7: Destination Promise Rejection with Fallback Disposition:** Destination Promise rejects with `Error('CONNECTION_RESET')`. Assert drainer catches rejection, safely unshifts operation back to buffer, clears in-flight slot, and barrier resolves.
+- **Failure Test 8: Second Reset Request Arrives While Custody Reconciliation Fails:** Trigger a reset while a drain is failing reconciliation. Assert second reset cannot acquire drainer custody, cannot clear the occupied in-flight record, and halts safely without creating dual ownership.
+
+---
+
+### 12.6 Exact Receipt Schema Compliance
+
+Every receipt instance utilized in implementation and tests must strictly conform to `docs/PHASE7_5_M5_INTERFACE_SPECIFICATION.md:313-320`:
+
+```typescript
+// 1. ACCEPTED_REDUCED:
+{ status: 'ACCEPTED_REDUCED', vectorAdvanced: true, newSequence: 42 }
+
+// 2. ACCEPTED_PENDING:
+{ status: 'ACCEPTED_PENDING', vectorAdvanced: false, reason: 'MISSING_DEPENDENCY' }
+
+// 3. ALREADY_REPRESENTED:
+{ status: 'ALREADY_REPRESENTED', vectorAdvanced: false }
+
+// 4. ALREADY_OWNED_DUPLICATE:
+{ status: 'ALREADY_OWNED_DUPLICATE', vectorAdvanced: false }
+
+// 5. ATTEMPT_INVALIDATED (M5.0 Formal Contract):
+{
+  status: 'ATTEMPT_INVALIDATED',
+  vectorAdvanced: false,
+  attemptId: 1,
+  reason: 'STALE_ATTEMPT_FENCED' // or 'COORDINATOR_NOT_RECONCILING'
+}
+
+// 6. TERMINALLY_REJECTED:
+{ status: 'TERMINALLY_REJECTED', vectorAdvanced: false, error: 'MALFORMED_PAYLOAD', operationId: 'op-001' }
+
+// 7. CAPACITY_REJECTED:
+{ status: 'CAPACITY_REJECTED', vectorAdvanced: false, currentQueueSize: 100, maxCapacity: 100 }
+```
+
+---
+
+### 12.7 Preserving Testability Without Exposing Private State (Qualification A & E)
 To ensure 100% testability while strictly enforcing the Eight Rules of Map Ownership:
 1. **Public Observable Behavior:** Unit and integration tests verify state transitions, returned receipts, thrown error codes, and exported snapshots via public API methods only.
 2. **Structural & Encapsulation Verification:** ECMAScript `#private` fields (`#committedTransactions`, `#activeReservations`, `#identityIndex`, `#core`) are verified via compile-time syntax enforcement and static AST checks, asserting that reflection (`Object.getOwnPropertyNames`, `Object.getOwnPropertySymbols`) reveals zero internal collection handles.
@@ -506,7 +476,7 @@ To ensure 100% testability while strictly enforcing the Eight Rules of Map Owner
 
 ---
 
-### 12.5 Regression Test Floors
+### 12.8 Regression Test Floors
 - Total Monorepo Tests: $\ge 1,550$ passing tests.
 - Sync-Engine Package Tests: $\ge 965$ passing tests.
 - Recovery Subsystem Tests: $\ge 42$ passing tests.
@@ -514,15 +484,16 @@ To ensure 100% testability while strictly enforcing the Eight Rules of Map Owner
 
 ---
 
-## 13. Risks and Unresolved Questions (Correction D)
+## 13. Risks and Unresolved Questions (Blockers)
 
-1. **V8 Heap vs. Wire Bounds:** As identified in R17, JavaScript object wrappers and closures consume $\sim 3.5\times$ to $5\times$ more heap than serialized wire bytes. The 2 MiB wire limit for `TerminalQuarantineArchive` translates to $\sim 7$ to $10$ MiB of V8 heap. Telemetry must track heap expansion during long-running sessions.
-2. **Monotonic Elapsed Duration & Browser Throttling (Correction D):**
-   - `performance.now()` measures **monotonic elapsed time**, NOT wall-clock time. It is immune to system clock adjustments, NTP stepping, or leap seconds.
-   - The coordinator watchdog must record its start time using `performance.now()` and compare elapsed monotonic duration when the timer callback executes.
-   - Browser environments frequently throttle timers in inactive background tabs (delaying `setTimeout` callbacks by seconds or minutes).
-   - **Critical Rule:** Executing a watchdog callback must NEVER be treated as evidence that an underlying destination Promise settled. The settlement barrier must continue awaiting real Promise settlement regardless of elapsed duration. The frozen 5,000 ms timeout policy (`SETTLEMENT_BARRIER_TIMEOUT_MS = 5000`) is preserved.
-3. **Promise Cancellation Impossibility:** ECMAScript Promises cannot be aborted at the engine runtime level. The shared settlement barrier guarantees that even after an attempt times out, the occupied slot is retained until the Promise completes, preventing concurrent re-entry or custody leaks.
+1. **Unresolved Specification Gap: Reset Arbitration Policy (BLOCKER):**
+   - As established in §6.4 and §12.2 Scenario F, frozen M5.0 does not specify arbitration priority between differing reset modes (`REINITIALIZE_CLEAN` vs. `PURGE_AND_RETRY`) or reconcile concurrent reset calls with the `INVALID_STATE` guard (Interface Table line 1046).
+   - This architectural gap prevents authorizing runtime reset dispatch. An explicit Engineering Authority determination is required.
+2. **V8 Heap vs. Wire Bounds:** As identified in R17, JavaScript object wrappers and closures consume $\sim 3.5\times$ to $5\times$ more heap than serialized wire bytes. The 2 MiB wire limit for `TerminalQuarantineArchive` translates to $\sim 7$ to $10$ MiB of V8 heap. Telemetry must track heap expansion during long-running sessions.
+3. **Monotonic Elapsed Duration & Browser Throttling:**
+   - `performance.now()` measures monotonic elapsed time, not wall-clock time. Production implementations must record start timestamps and compare elapsed monotonic duration.
+   - Background browser tabs clamp timer scheduling; unit and failure tests must strictly utilize Vitest fake timers (`vi.useFakeTimers()`).
+4. **Promise Cancellation Impossibility:** ECMAScript Promises cannot be aborted. The shared settlement barrier guarantees that in-flight slots are retained until real settlement and safe custody reconciliation occur.
 
 ---
 
@@ -537,22 +508,25 @@ SUB-MILESTONE M5.1a: TERMINAL QUARANTINE ARCHIVE & COMPOSITE IDENTITY DOMAIN
 ```
 
 ### Justification for M5.1a:
-1. **Zero Coupling to Live Engine:** `TerminalQuarantineArchive` is an independent, leaf component. Implementing it creates a new file (`packages/sync-engine/src/recovery/terminal-quarantine-archive.ts`) with **zero modifications** to existing `LeaderlessSyncEngine`, `QuarantineDrainer`, or `RecoveryCoordinator` logic.
+1. **Zero Coupling to Live Engine:** `TerminalQuarantineArchive` is an independent leaf component. Implementing it creates a new file (`packages/sync-engine/src/recovery/terminal-quarantine-archive.ts`) with **zero modifications** to existing `LeaderlessSyncEngine`, `QuarantineDrainer`, or `RecoveryCoordinator` logic.
 2. **Immediate Testability:** All core collection encapsulation invariants (Eight Rules of Map Ownership, `#private` fields, defensive `Uint8Array` cloning, single-pointer swap, lookup-first idempotency, and Scenarios 1, 2, 3, 4, 6, 7) can be verified via dedicated unit tests.
 3. **Firm Architectural Anchor:** Establishing M5.1a provides the exact, audited contracts and composite identity structures required by subsequent stages (M5.1b source retirement and M5.1d coordinator orchestration).
 
 ---
 
-## 15. Final Stage 0-R2 Verdict & Mandatory Authorization Boundary
+## 15. Final Stage 0-R3 Verdict & Mandatory Authorization Boundary
 
 ```
 ================================================================================
-STAGE 0-R2 IMPLEMENTATION READINESS VERDICT:
-PASS — STAGE 0 READY FOR FINAL ACCEPTANCE REVIEW
+STAGE 0-R3 IMPLEMENTATION READINESS VERDICT:
+BLOCKED — FROZEN ARCHITECTURE DOES NOT ESTABLISH A REQUIRED RECOVERY RULE
 ================================================================================
 ```
 
-All 20 Scope and Architecture Preservation Rules have been adhered to. The baseline source code is fully audited, verified, and grounded in exact file paths and line ranges. The settlement barrier semantics have been corrected to remain completely independent of watchdog timeout, the 17-step deterministic baseline test sequence is retained, comprehensive deterministic Scenarios A through F covering late settlement, stale-continuation fencing, custody reconciliation, and concurrent reset serialization are codified, monotonic clock duration semantics are refined, and private state encapsulation is fully preserved.
+### Statement of Blocking Issue:
+While all custody reconciliation failure semantics, schema compliances, and deterministic failure test plans have been fully established, **the frozen M5.0 architecture does not establish an unambiguous reset arbitration policy for concurrent reset requests of differing modes (`REINITIALIZE_CLEAN` vs. `PURGE_AND_RETRY`) or resolve the contradiction between continuous supersession (R9-01) and the non-`DEGRADED` `INVALID_STATE` guard (Interface Table line 1046)**.
+
+Until an authoritative Engineering Authority decision resolves this reset arbitration specification gap, Milestone M5.1 implementation remains formally blocked.
 
 ### Mandatory Implementation Authorization Statement
-**"M5.1 Stage 0-R2 documentation correction is complete. No production implementation has been started. M5.1a remains unauthorized pending explicit Engineering Authority approval."**
+**"M5.1 Stage 0-R3 documentation correction is complete. No production implementation has been started. M5.1a remains unauthorized pending explicit Engineering Authority approval."**
