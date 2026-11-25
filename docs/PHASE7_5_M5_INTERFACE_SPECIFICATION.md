@@ -126,8 +126,8 @@ export interface ILeaderlessSyncEngineRecovery {
   ): void;
 
   /**
-   * Submits an in-flight quarantined operation to destination engine for admission/reduction.
-   * Enforces N_in-flight <= 1. Returns typed receipts.
+   * Submits an in-flight quarantined or stashed operation to destination engine for admission/reduction.
+   * Enforces N_in-flight <= 1. Evaluates operations across the 6 deterministic replay categories.
    * [EXISTING — M4 ACCEPTED in LeaderlessSyncEngine.ts:977]
    */
   admitDrainedOperation(op: QuarantinedOperation): DestinationAcceptanceReceipt;
@@ -166,6 +166,38 @@ export interface ILeaderlessSyncEngineRecovery {
    * [PROPOSED — M5.3]
    */
   submit(intent: LocalControlIntent): EngineDecision;
+}
+
+/**
+ * Synchronous confirmation receipt returned by the destination engine container
+ * upon evaluating an in-flight operation from QuarantineDrainer.
+ * [EXISTING — M4 ACCEPTED in quarantine-drainer.ts:65]
+ */
+export type DestinationAcceptanceReceipt =
+  | { readonly status: 'ACCEPTED_REDUCED'; readonly vectorAdvanced: true; readonly newSequence: number }
+  | { readonly status: 'ACCEPTED_PENDING'; readonly vectorAdvanced: false; readonly reason: 'MISSING_DEPENDENCY' }
+  | { readonly status: 'ALREADY_REPRESENTED'; readonly vectorAdvanced: false }
+  | { readonly status: 'ALREADY_OWNED_DUPLICATE'; readonly vectorAdvanced: false }
+  | { readonly status: 'TERMINALLY_REJECTED'; readonly vectorAdvanced: false; readonly error: string }
+  | { readonly status: 'CAPACITY_REJECTED'; readonly vectorAdvanced: false; readonly currentQueueSize: number; readonly maxCapacity: number };
+
+/**
+ * Authoritative in-flight tracking record owned exclusively by QuarantineDrainer.
+ * Cardinality is bounded to at most 1 operation in flight at any instant.
+ * [EXISTING — M4 ACCEPTED in quarantine-drainer.ts:54]
+ */
+export interface DrainedInFlightRecord {
+  readonly operation: QuarantinedOperation;
+  readonly dequeuedAtMs: number;
+  attemptCount: number;
+  destinationStatus:
+    | 'PENDING'
+    | 'ACCEPTED_REDUCED'
+    | 'ACCEPTED_PENDING'
+    | 'ALREADY_REPRESENTED'
+    | 'ALREADY_OWNED_DUPLICATE'
+    | 'TERMINALLY_REJECTED'
+    | 'CAPACITY_REJECTED';
 }
 ```
 

@@ -225,20 +225,20 @@ export function comparePeerIds(a: string, b: string): number {
 ```
 `String.prototype.localeCompare()` is strictly prohibited across all protocol and selection logic.
 
-### 5.2 Safe Incomparable-Compatible Recovery & History Preservation (R2-C3, R3-02)
+### 5.2 Safe Incomparable-Compatible Recovery & Deterministic Replay Contract (Closing R2-C3, R3-02, R4-02, R5-01)
 Vector frontiers form a product lattice ($\mathbb{N}^k$). In a leaderless system, incomparable frontiers ($V_A \parallel V_B$) naturally arise from concurrent progress across independent peers.
 
-**Fundamental Safety Invariant:** A snapshot must NEVER replace active state if doing so would discard compatible local operations! If local node has operations that the candidate snapshot lacks, blindly overwriting state with the snapshot would irreversibly wipe out local progress.
+**Fundamental Safety Invariant:** A snapshot must NEVER replace active state if doing so would discard compatible local operations! If the local node has operations that the candidate snapshot lacks ($S_{\text{local}} > S_{\text{snapshot}}$), blindly overwriting state with the snapshot would irreversibly wipe out local progress.
 
-#### Normative Procedure for Incomparable Frontiers (R3-02)
+#### Normative Procedure for Incomparable Frontiers (R3-02, R4-02)
 1. **Priority 1 — Anti-Entropy Log Repair (Delta Catch-Up):**
-   If the missing operations from the remote candidate fall within the active log horizon ($\text{gap} \le \text{logCapacity}$), the engine **must not** perform snapshot replacement. Instead, it delegates to `RepairRequestPipeline` to fetch only the missing delta operations. When applied, local vector advances without overwriting local progress.
-2. **Priority 2 — Compatible History Reconciliation (Local Operation Stashing):**
-   If the missing remote operations exceed the log horizon and snapshot recovery is strictly necessary:
+   If the missing operations from the remote candidate fall within the active log horizon ($\text{gap} \le \text{logCapacity}$), the engine **must not** perform snapshot replacement. Instead, it delegates to `RepairRequestPipeline` to fetch only the missing delta operations. When applied, the local vector advances without overwriting local progress.
+2. **Priority 2 — Compatible History Reconciliation (Local Operation Stashing & Deterministic Replay):**
+   If missing remote operations exceed the log horizon and snapshot recovery is strictly necessary:
    - The engine extracts all local operations whose sequence numbers are ahead of the candidate snapshot's frontier ($S_{\text{local}} > S_{\text{snapshot}}$) from `OrderedOperationLog`.
-   - These local operations are stashed into a temporary reconciliation queue or prepended to `QuarantineBuffer`.
+   - These local operations are stashed into a temporary reconciliation queue prior to snapshot replacement.
    - The candidate snapshot is installed atomically via `replaceCoreStateAtomic()`.
-   - During the subsequent quarantine drain pass, the stashed local operations are re-admitted via `admitDrainedOperation()`. Because their dependencies are satisfied by the snapshot, they reduce cleanly on top of the snapshot base, preserving all local operations without loss.
+   - Following installation, stashed local operations and quarantined remote operations are reconciled through the deterministic replay contract.
 3. **Rigorous Evidence Requirement for History Compatibility (R3-02):**
    A matching frontier fingerprint alone is NOT proof of historical identity! To establish history compatibility across shared prefix ranges:
    - Full checkpoint hash chain verification (`compactedCheckpoints` SHA-256 chain), or
@@ -246,6 +246,70 @@ Vector frontiers form a product lattice ($\mathbb{N}^k$). In a leaderless system
    - Verified operation digest chains across the shared prefix range are required.
    If common prefix history cannot be verified, the candidate is classified as `INSUFFICIENT_EVIDENCE` and cannot overwrite local state.
 4. **Proven Conflict Forks:** If divergent operations are detected for the same origin and sequence ($H(op_A) \ne H(op_B)$), the histories are conflicting forks. Recovery aborts deterministically to `DEGRADED` (`FORK_DETECTED_INCOMPARABLE`).
+
+#### Dual Replay Trust Contexts: LOCAL_REPLAY vs. REPAIR_BATCH (R5-01)
+To preserve the authoritative Phase 7.2 trust and validation boundaries (`docs/PHASE7_2_R5_FINAL_CORRECTIONS.md`), post-snapshot reconciliation strictly distinguishes two separate operation streams:
+
+1. **Locally Committed Stashed Operations (`LOCAL_REPLAY` Context):**
+   - **Nature:** Operations that were already validated, accepted, and committed in the local `OrderedOperationLog` prior to snapshot installation.
+   - **Trust Boundary:** Trusted internal replay. Cannot introduce new origin peer IDs, new sequence numbers, or altered payloads.
+   - **Validation Semantics:** Exempt from token-bucket arrival rate limits and remote clock inflation checks (`LogicalClockManager.validateAndAdvanceRemote` with `context === 'LOCAL_REPLAY'` returns `this.currentClock` without mutating Lamport clocks).
+   - **Admission Evaluation:** Evaluated on top of the newly installed snapshot base. Their causal dependencies must be satisfied by the snapshot base checkpoints or earlier replayed operations.
+   - **Fork / Failure Action:** If a locally committed stashed operation encounters a sequence collision, identity conflict ($H(op) \ne H(log)$), or missing dependency that cannot be resolved, this proves an irreconcilable history divergence between local committed state and the snapshot. Recovery **must immediately abort to `DEGRADED`**. Locally committed progress is NEVER silently dropped.
+2. **Remotely Quarantined Operations (`REPAIR_BATCH` Context):**
+   - **Nature:** Remote operations that arrived over the network while recovery was in progress (`RECOVERING` or `RECONCILING`). They were buffered in `QuarantineBuffer` and have never been admitted to the local log.
+   - **Trust Boundary:** Untrusted remote historical/repair operations.
+   - **Validation Semantics:** Evaluated under `REPAIR_BATCH` semantics via `engine.admitDrainedOperation(op)`. They bypass wall-clock token-bucket arrival rate limits, but must pass complete structural validation: epoch fencing, per-origin Lamport monotonicity, dependency resolution across snapshot checkpoints and log, and collision checks.
+   - **Admission Evaluation:** Admitted into `OrderedOperationLog` only upon satisfying all causal dependencies (`ACCEPTED_REDUCED`) or buffered in `PendingDependencyQueue` (`ACCEPTED_PENDING`).
+
+#### Deterministic Replay Decision Contract & Total Ordering (R4-02, R5-02)
+Post-snapshot operation evaluation operates strictly under **Deterministic Total-Order State Machine Replication (SMR)** with operation-specific conflict resolution (not generic CRDT or OT).
+
+The deterministic total ordering key is:
+$$\text{OperationOrderingKey} = \langle \text{logicalTimestamp}, \text{originPeerId}, \text{logicalEventId} \rangle$$
+enforced by `compareOperations(e1, e2)` (`packages/sync-engine/src/ordering/comparator.ts`):
+1. Primary order: Lamport `logicalTimestamp` (ascending numerical).
+2. Secondary order: Deterministic ordinal ASCII `originPeerId` tie-breaker.
+3. Tertiary order: Stable `logicalEventId` tie-breaker.
+
+Reducer entry points:
+- **Incremental Admission:** `ConflictResolver.reduce(currentState, operation, monotonicNow, context, priorOperations)` (`packages/sync-engine/src/conflict/conflict-resolver.ts:40`).
+- **Base Snapshot Replay:** `ConflictResolver.replay(baseState, operations, monotonicNow, context)` (`packages/sync-engine/src/conflict/conflict-resolver.ts:403`).
+
+Operations are deterministically classified into six exhaustive categories:
+
+| Category | Description & Condition | Engine Admission Check | Typed Receipt | Drain Action | Invariants Preserved |
+|---|---|---|---|---|---|
+| **Cat 1: Already Represented** | Covered by newly installed snapshot base (`originSeq <= baseSnapshotFrontier[originPeerId]`). | `baseFrontier` check | `ALREADY_REPRESENTED` | **Discarded.** Safe retirement; in-flight custody released. | Never applied twice; idempotent retirement. |
+| **Cat 2: Not Represented (Satisfied)** | Ahead of snapshot base (`originSeq > baseFrontier`), causal dependencies satisfied (`originSeq === haveSeq + 1` and all $reqSeq \le repVec$). | Causal context check | `ACCEPTED_REDUCED` | **Retained & Reduced.** Admitted into `operationLog`, reduced into state, vector advanced. | Zero operation loss; deterministic reduction on snapshot base. |
+| **Cat 3: Concurrent with Frontier** | Concurrent with snapshot frontier ($V_{\text{op}} \parallel V_{\text{snapshot}}$), causal dependencies satisfied by snapshot. | Total-order SMR evaluation (`compareOperations`) | `ACCEPTED_REDUCED` | **Retained & Reduced.** Deterministic reduction via `ConflictResolver.reduce()` / `replay()`. | Total order tie-break on $\langle L, \text{peerId}, \text{eventId} \rangle$ strictly preserved. |
+| **Cat 4: Missing Dependencies** | Causal dependencies not yet satisfied (`originSeq !== haveSeq + 1` or missing dependency in $repVec$). | Missing dependency check | `ACCEPTED_PENDING` (or `CAPACITY_REJECTED`) | **Retained in Queue.** Buffered in `PendingDependencyQueue`. Anti-entropy log repair requested. If queue full ($K=256$), drain halts immediately on `CAPACITY_REJECTED` $\to$ **Abort to `DEGRADED`**. | Never fabricate dependencies; in-flight custody preserved on queue overflow. |
+| **Cat 5: Duplicate / Existing Ownership** | Already present in `replicationVector`, `operationLog`, or `pendingQueue`. | Duplicate index check | `ALREADY_OWNED_DUPLICATE` | **Discarded.** In-flight custody released without duplicate execution. | Exactly-once reduction guarantee; duplicate-safe. |
+| **Cat 6: Validation / Reduction Failure** | Fails schema, epoch mismatch, identity conflict ($H(op) \ne H(log)$), or pre-horizon dependency breach. | Validation / clock checks | `TERMINALLY_REJECTED` or throws | **Action depends on trust context:**<br/>• Quarantined remote (`REPAIR_BATCH`): Discarded (`DISCARDED`).<br/>• **Locally committed stashed (`LOCAL_REPLAY`):** **Abort to `DEGRADED`**. | **Never silently discard committed local progress!** Abort recovery if local history cannot safely reduce. |
+
+#### Eight Non-Negotiable Replay Invariants (R4-02, R5-01)
+1. **Never Silently Discard Committed Local Operations:** A locally committed operation that cannot be safely reduced onto the snapshot base must cause recovery to abort into `DEGRADED`. Silent dropping is strictly prohibited.
+2. **Never Apply an Operation Twice:** Re-admission strictly fences against `baseSnapshotFrontier`, `replicationVector`, and `operationLog`, preventing duplicate state mutations.
+3. **Never Fabricate Causal Dependencies:** If causal dependencies are missing, the operation enters `PendingDependencyQueue` and triggers delta repair; dependencies are never synthesized or assumed.
+4. **Preserve Original Identity & Sequence:** Stashed operations retain their immutable `logicalEventId`, `originPeerId`, `originSequenceNumber`, `logicalTimestamp`, `causalContext`, and `payload`. Re-numbering or rewriting event identity is strictly forbidden.
+5. **Preserve `LOCAL_REPLAY` vs `REPAIR_BATCH` Trust Distinction:** `LOCAL_REPLAY` applies strictly to already-accepted local operations re-anchoring on the new base state. `REPAIR_BATCH` applies to unadmitted network arrivals.
+6. **Reuse Accepted M4.3c Single-Owner Drain:** Quarantined and stashed operations are processed with single-in-flight custody ($N_{\text{in-flight}} \le 1$) via `QuarantineDrainer`.
+7. **Single Admission Pipeline:** All operations post-commit enter exclusively via `engine.admitDrainedOperation()`. No secondary or out-of-band admission paths may be introduced.
+8. **Abort When Safe Replay Is Unprovable:** If historical compatibility cannot be proven, or if stashed operations cannot reduce cleanly, snapshot recovery must abort to `DEGRADED` rather than risking divergence or data loss.
+
+#### Snapshot Installation Atomicity vs. Replay Completion & Degraded State (R4-02, R5-03)
+- **Installation Atomicity:** Snapshot installation (`SnapshotInstaller.commitAtomic()`) is a **synchronous, indivisible, single-pointer swap** (`this.core = candidateCore;`) under JavaScript run-to-completion semantics. Intermediate states are impossible.
+- **Irrevocable Base Replacement:** Once `replaceCoreStateAtomic(candidateCore, capability)` executes, the previous `EngineCoreState` is permanently superseded by the candidate `EngineCoreState`. The engine core now holds the newly installed base snapshot state.
+- **Replay Completion:** Replay and quarantine drain are **asynchronous, multi-step batch operations** executed post-commit.
+- **Post-Installation Failure Behavior:** If replay subsequently fails or halts (e.g. `CAPACITY_REJECTED`, validation failure on stashed local operation, unhandled exception, or timeout):
+  1. The engine does NOT roll back to the pre-installation state (the previous root is permanently unanchored). The engine remains anchored on the newly installed base snapshot with an incomplete replay log.
+  2. `RecoveryCoordinator` transitions immediately to `state: 'DEGRADED'`, `substate: 'DRAIN_FAILED'`.
+  3. `engine.setRecoveryMode(true)` is **maintained** (operational deferral remains locked; recovery mode is NOT cleared).
+  4. `engine.flushDeferredNotifications()` is **NEVER called**. External listeners receive zero intermediate or corrupted notifications.
+  5. The failing operation remains preserved in `QuarantineDrainer.inFlightRecord`.
+  6. Un-drained operations remain in `QuarantineBuffer` custody.
+  7. Public engine queries expose `isRecoveryInProgress() === false` and `recoveryState === 'DEGRADED'`. Under no circumstances can recovery report or transition to `'ACTIVE'`.
+  8. Coordinator exposes diagnostics via `getMetrics()` and error events for operator inspection or automated session reset.
 
 ### 5.3 Candidate Eligibility Taxonomy
 
@@ -378,11 +442,22 @@ Invariant `INV-M5-01` is governed by a rigorous performance measurement contract
 
 All recovery buffers enforce strict, verifiable memory bounds using browser-compatible byte accounting:
 
-### 9.1 Explicit Buffer Boundaries
+### 9.1 Explicit Buffer Boundaries & Verified Source Limits (Closing R2-H3, R3-01, R4-01)
+The exact memory bounds of `QuarantineBuffer` and `FutureEpochBuffer` are verified directly from accepted source code (`packages/sync-engine/src/recovery/quarantine-buffer.ts:26-30` and `future-epoch-buffer.ts:20-24`):
+
 | Buffer Component | Maximum Operation Count | Maximum Aggregate Bytes | Maximum Individual Event Size | Expiration Grace Period |
 |---|:---:|:---:|:---:|:---:|
-| **QuarantineBuffer** | **1,000 operations** | **4 MiB** (4,194,304 bytes) | **4 KiB** (4,096 bytes) | None (drained post-commit) |
-| **FutureEpochBuffer** | **100 operations** | **512 KiB** (524,288 bytes) | **4 KiB** (4,096 bytes) | **5,000 ms** (autonomous timer) |
+| **QuarantineBuffer** | **1,000 operations** (`MAX_QUARANTINE_OPERATIONS = 1000`) | **4 MiB** (`MAX_QUARANTINE_TOTAL_BYTES = 4194304`) | **4 KiB** (`MAX_QUARANTINE_EVENT_BYTES = 4096`) | None (drained post-commit) |
+| **FutureEpochBuffer** | **100 operations** (`DEFAULT_MAX_OPERATIONS = 100`) | **512 KiB** (`DEFAULT_MAX_TOTAL_BYTES = 524288`) | **4 KiB** (`DEFAULT_MAX_EVENT_BYTES = 4096`) | **5,000 ms** (autonomous timer) |
+
+#### Exact Implemented QuarantineBuffer Contracts (R4-01):
+1. **Maximum Retained Operation Count:** Strictly bounded to **1,000 operations** across both active generation queue and detached drain batch (`this.totalRetainedCount + 1 > this.maxOperations` throws `SyncEngineError('QUARANTINE_OVERFLOW')`).
+2. **Maximum Aggregate Retained Wire Bytes:** Strictly bounded to **4 MiB** (4,194,304 bytes) across both active and drain storage (`this.totalRetainedBytes + op.serializedByteLength > this.maxTotalBytes` throws `SyncEngineError('QUARANTINE_OVERFLOW')`). Warning threshold triggers at 80% (3,355,443 bytes / ~3.2 MiB).
+3. **Maximum Individual Operation Wire Bytes:** Strictly bounded to **4 KiB** (4,096 bytes) (`op.serializedByteLength > this.maxEventBytes` throws `SyncEngineError('REJECTED_INVALID')`).
+4. **Configurability:** Configurable via constructor interface `QuarantineBufferConfig { maxOperations?: number; maxTotalBytes?: number; maxEventBytes?: number; }`. When omitted, default constants (`MAX_QUARANTINE_OPERATIONS = 1000`, `MAX_QUARANTINE_TOTAL_BYTES = 4 * 1024 * 1024`, `MAX_QUARANTINE_EVENT_BYTES = 4096`) are enforced. `RecoveryCoordinator` instantiates `this.quarantineBuffer = config.quarantineBuffer ?? new QuarantineBuffer()`, inheriting the standard 1,000 ops / 4 MiB / 4 KiB defaults.
+5. **Zero Retention on Rejection:** When `enqueue()` throws (`REJECTED_INVALID` or `QUARANTINE_OVERFLOW`), the operation is NOT added to `activeQueue` or `identityIndex`, and `_activeBytes` is NOT incremented. Rejected operations retain **0 bytes** and **0 ownership** in the buffer.
+6. **Discrepancy Reconciliation Note (R4-01):** The errant text reference to "64 MB" appearing in M5.0-R3 report sections 4.6 and 6 was an accidental drafting typo. The actual accepted implementation has always enforced 4 MiB (`MAX_QUARANTINE_TOTAL_BYTES = 4194304`), matching the original M4.3a implementation and M5.0-R2 specifications. All documents are now 100% reconciled to the 4 MiB source baseline.
+7. **Serialized Wire Weight vs. JavaScript Heap Footprint (R4-01):** The 4 MiB bound strictly constrains the retained serialized UTF-8 wire byte weight as received from transport frames, ensuring a deterministic, platform-independent boundary. In-memory JavaScript object graph allocations (V8 object headers, hidden class descriptors, internal array slots) naturally incur additional runtime heap overhead beyond raw wire bytes; this heap footprint is strictly bounded by the concurrent count limit ($K=1,000$ operations) and is completely reclaimed upon post-commit generational drain.
 
 ### 9.2 Browser-Compatible Wire Byte Accounting (R3-01)
 1. **Preserving Original Transport Wire Size:**

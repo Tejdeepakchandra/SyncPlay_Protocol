@@ -133,7 +133,9 @@ flowchart TD
 - **Scope:**
   - Implement deterministic supplier selection under lattice partial ordering: strict domination, lowest RTT, and protocol-stable ordinal ASCII peer ID comparison (`comparePeerIds`).
   - Differentiate incomparable vector cases: compatible branches, repairable histories within log horizon, and proven causal forks.
-  - Enforce safe incomparable-compatible recovery: prioritize anti-entropy log repair; if snapshot replacement is necessary, stash local unrepresented operations before install and re-drain, guaranteeing zero local operation loss.
+  - Enforce safe incomparable-compatible recovery: prioritize anti-entropy log repair; if snapshot replacement is necessary, stash local unrepresented operations before install and sequentially re-admit strictly via `admitDrainedOperation()`.
+  - Enforce the 6-category deterministic replay contract (R4-02, R5-01, R5-02): Category 1 (`ALREADY_REPRESENTED` discarded), Category 2 (`ACCEPTED_REDUCED` applied), Category 3 (deterministic total-order SMR reduction via `compareOperations`), Category 4 (`ACCEPTED_PENDING` buffered in queue / delta repair), Category 5 (`ALREADY_OWNED_DUPLICATE` discarded), Category 6 (validation failures: remote discarded, locally committed aborts to `DEGRADED`). Distinguish `LOCAL_REPLAY` trust context for stashed local operations from `REPAIR_BATCH` for remote arrivals.
+  - Enforce post-installation replay failure handling: if replay fails after snapshot installation, coordinator transitions to `DEGRADED` (`DRAIN_FAILED`), `engine.setRecoveryMode(true)` is maintained, deferred notifications are NEVER flushed, and `inFlightRecord` is preserved.
   - Require full checkpoint hash chain or frontier timestamps evidence before declaring history compatibility.
   - In `AntiEntropyManager.evaluateRemoteDigest()`, inspect `compareRemoteDigest(digest)`. If `requiresSnapshotRecovery === true` and `outsideRemoteHorizon === true`, invoke `onSnapshotRecoveryRequired` to trigger `coordinator.triggerRecovery(supplierPeerId)`.
   - Wire `RepairRequestPipeline.onHistoryExhausted` into `coordinator.triggerRecovery()`.

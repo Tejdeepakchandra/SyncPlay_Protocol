@@ -69,20 +69,22 @@ Milestone M5 integrates the recovery subsystem directly into `LeaderlessSyncEngi
 
 ---
 
-### R-M5-04: Quarantine Memory Exhaustion Under High-Concurrency Bursts (Closing R2-H2, R2-H3, R3-01, R3-04)
+### R-M5-04: Quarantine Memory Exhaustion Under High-Concurrency Bursts (Closing R2-H2, R2-H3, R3-01, R3-04, R4-01)
 - **Root Cause:** While catching up across a 4 MB snapshot over a high-latency link, active peers continue broadcasting live operations. A malicious or high-throughput peer could flood the recovering node with events, causing OOM.
 - **Architectural Impact:** Browser tab crash or engine heap exhaustion.
 - **Mitigation Strategy:**
-  - Explicit bounds in `QuarantineBuffer`:
+  - Explicit bounds verified from source code in `QuarantineBuffer` (`quarantine-buffer.ts:26-30`):
     - Hard count limit: 1,000 operations (`MAX_QUARANTINE_OPERATIONS = 1000`).
     - Hard aggregate byte limit: 4 MiB (`MAX_QUARANTINE_TOTAL_BYTES = 4194304`).
     - Individual event limit: 4 KiB (`MAX_QUARANTINE_EVENT_BYTES = 4096`).
+    - Warning threshold: ~3.2 MiB (`QUARANTINE_WARNING_THRESHOLD_BYTES = 3355443`).
+    - Note on Discrepancy Reconciliation (R4-01): Corrected inadvertent typo in M5.0-R3 report mentioning 64 MB; 4 MiB is the authoritative source baseline.
   - Explicit bounds in `FutureEpochBuffer`:
     - Hard count limit: 100 operations.
     - Hard aggregate byte limit: 512 KiB.
     - Individual event limit: 4 KiB.
   - **Browser-Compatible Wire Accounting (R3-01):** Wire byte lengths are measured directly at transport ingestion (`TextEncoder` / `rawSerializedLength`) without re-serializing with `JSON.stringify()`.
-  - **Complete Overflow Contract (R3-04):** Buffer throws $\to$ `RecoveryCoordinator` catches, transitions to `DEGRADED`, and rethrows $\to$ `LeaderlessSyncEngine.receive()` isolates remote error to `REJECTED_CAPACITY` without throwing to transport callers. Rejected operations are not retained or partially owned by the buffer.
+  - **Complete Overflow Contract (R3-04):** Buffer throws $\to$ `RecoveryCoordinator` catches, transitions to `DEGRADED`, and rethrows $\to$ `LeaderlessSyncEngine.receive()` isolates remote error to `REJECTED_CAPACITY` without throwing to transport callers. Rejected operations retain zero buffer memory and zero ownership.
 - **Automated Verification Control:** Stress tests in `recovery-remote-interception.test.ts` injecting count- and byte-exceeding operations verify deterministic transition to `DEGRADED`, remote error isolation, and zero buffer retention.
 
 ---
@@ -136,11 +138,15 @@ Milestone M5 integrates the recovery subsystem directly into `LeaderlessSyncEngi
 
 ---
 
-### R-M5-09: Incomparable Frontier Lattice Fork vs. Compatible History Preservation (Closing F4, R2-C3, R2-C4, R2-H1, R3-02, R3-05)
+### R-M5-09: Incomparable Frontier Lattice Fork vs. Compatible History Preservation (Closing F4, R2-C3, R2-C4, R2-H1, R3-02, R3-05, R4-02)
 - **Root Cause:** Vector frontiers form a partially ordered product lattice ($\mathbb{N}^k$). Incomparable frontiers ($V_A \parallel V_B$) are not necessarily forks; treating them as automatic forks causes unnecessary degradation. Conversely, overwriting active state with an incomparable snapshot destroys unrepresented local operations.
 - **Architectural Impact:** Unnecessary recovery degradation or irreversible loss of local progress.
 - **Mitigation Strategy:**
-  - **Safe Incomparable Recovery (R3-02):** A snapshot must NEVER replace active state if doing so would discard compatible local operations! Prioritize anti-entropy delta log repair. If snapshot replacement is necessary, stash local operations whose sequence numbers are ahead of the snapshot, install snapshot, and re-drain stashed operations on top of the snapshot base.
+  - **Safe Incomparable Recovery & Deterministic Replay (R3-02, R4-02):** A snapshot must NEVER replace active state if doing so would discard compatible local operations! Prioritize anti-entropy delta log repair. If snapshot replacement is necessary, stash local operations whose sequence numbers are ahead of the snapshot, install snapshot, and re-admit stashed operations strictly via `admitDrainedOperation()`.
+  - **Deterministic 6-Category Replay Contract (R4-02, R5-01, R5-02):** Cat 1 (already represented: discarded), Cat 2 (unrepresented satisfied: applied/reduced), Cat 3 (concurrent with frontier: deterministic total-order SMR reduction via `compareOperations`), Cat 4 (missing dependencies: buffered in `pendingQueue` / delta repair), Cat 5 (duplicates: discarded), Cat 6 (validation failures: remote quarantined discarded, locally committed stashed aborts to `DEGRADED`).
+  - **Delineation of Replay Trust Contexts (R5-01):** Locally committed stashed operations run under `LOCAL_REPLAY` trust context (trusted, immutable, exempt from rate/clock validation). Remotely quarantined arrivals run under `REPAIR_BATCH` trust context (untrusted, full structural and causal validation).
+  - **Preservation of 8 Replay Invariants (R4-02):** Never silently discard committed local progress; never apply twice; never fabricate dependencies; preserve event ID/sequence; distinguish `LOCAL_REPLAY` from `REPAIR_BATCH`; single-owner $N_{\text{in-flight}} \le 1$ drain; single admission pipeline; abort when safe replay is unprovable.
+  - **Post-Installation Failure Handling (R4-02):** If replay fails after snapshot installation, coordinator transitions to `DEGRADED` (`DRAIN_FAILED`), `engine.setRecoveryMode(true)` is maintained, deferred notifications are NEVER flushed, and `inFlightRecord` is preserved.
   - **Evidence Requirement (R3-02):** Matching frontier fingerprints alone are insufficient; full checkpoint hash chains or frontier timestamps are required to verify history compatibility.
   - **Deterministic Peer Comparison (R2-H1, R3-05):** Ordinal ASCII code point comparison (`comparePeerIds`) over the validated domain `/^[a-zA-Z0-9_.:-]+$/`. `localeCompare` is strictly prohibited.
   - **Cooperative Trust Model (R2-C4):** SHA-256 verifies byte-level slice and payload integrity against transport corruption, but does not prove cryptographic author authentication.
@@ -176,6 +182,6 @@ Milestone M5 integrates the recovery subsystem directly into `LeaderlessSyncEngi
 - **Architectural Impact:** Silent operation loss during post-recovery reconciliation.
 - **Mitigation Strategy:**
   - **$N_{\text{in-flight}} \le 1$ Ownership:** `QuarantineDrainer` retains dequeued operation in `inFlightRecord` until confirmed.
-  - **Capacity Rejection Handling:** Destination returns `CAPACITY_REJECTED`. The operation is restored to queue, drain halts immediately (`haltedOnCapacity = true`), and recovery transitions safely to `DEGRADED`.
+  - **Capacity Rejection & Post-Installation Failure Handling (R4-02):** Destination returns `CAPACITY_REJECTED`. The operation is preserved in `inFlightRecord`, drain halts immediately (`haltedOnCapacity = true`), and recovery transitions safely to `DEGRADED` (`substate: 'DRAIN_FAILED'`). Operational notification deferral (`engine.setRecoveryMode(true)`) remains locked; deferred notifications are NEVER flushed.
   - **Identified Open Design Issue (R3-06):** `PendingDependencyQueue` enforces count capacity ($K=256$), but has no aggregate byte limit. Documented as an open design issue for post-M5 hardening.
 - **Automated Verification Control:** Capacity tests in `recovery-engine-integration.test.ts` verifying zero operation loss when `pendingQueue` capacity is exhausted during drain.
