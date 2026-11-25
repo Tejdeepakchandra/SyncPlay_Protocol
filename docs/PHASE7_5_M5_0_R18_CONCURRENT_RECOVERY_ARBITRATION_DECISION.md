@@ -1,30 +1,32 @@
-# Phase 7.5 M5.0-R18-R9 — Final Custody Authorization and Settlement-Barrier Proof Correction
+# Phase 7.5 M5.0-R18-R10 — Authoritative Settlement Evidence and Outcome-Specific Custody Reconciliation
 
 **Role:** Principal TypeScript Distributed-Systems Architect and Recovery-Systems Auditor
 **Mode:** STRICTLY DOCUMENTATION-ONLY ARCHITECTURAL CORRECTION
 **Target Document:** `docs/PHASE7_5_M5_0_R18_CONCURRENT_RECOVERY_ARBITRATION_DECISION.md`
-**Baseline Commit:** `32e2ddd29af9a61cb5b5f4a7bcbced5a9fe796c4`
-**Direct Parent Commit:** `32e2ddd29af9a61cb5b5f4a7bcbced5a9fe796c4`
+**Baseline Commit:** `4363f99efc28bc311db662dc58004f3f96f39ec7`
+**Direct Parent Commit:** `4363f99efc28bc311db662dc58004f3f96f39ec7`
 **Implementation Authorization:** Milestone M5.1 remains **STRICTLY BLOCKED AND UNAUTHORIZED**.
 
 ---
 
-## 1. Problem Statement & R18-R9 Objectives
+## 1. Problem Statement & R18-R10 Objectives
 
-The M5.0-R18-R8 architectural decision established generation-scoped settlement barriers and introduced the `CustodyOwnershipToken` for attempt-fenced release. However, rigorous distributed-systems auditing identified five critical authorization and proof gaps:
+The M5.0-R18-R9 architectural decision formalized the five-field owner-token equivalence check and introduced generation-scoped settlement barriers. However, rigorous distributed-systems auditing identified five critical proof and authorization vulnerabilities:
 
-1. **Incomplete Ownership-Token Comparison:** R18-R8 specified that custody release compares five immutable fields, but its pseudocode compared only three (`recoveryAttemptId`, `custodyGeneration`, `drainerOwnershipGeneration`), omitting `operationIdentity` and `transactionId`. If a concurrent or retried attempt had matching attempt and generation counters but was executing a different operation or transaction, custody could be improperly released. Custody release must compare **all five** immutable fields via an explicit equivalence predicate.
-2. **Missing Settlement Prerequisites Proof Prior to Barrier Resolution:** R18-R8 declared the invariant `BARRIER_RESOLVED(g) => EXECUTION_SETTLED(g) && CUSTODY_RECONCILED(g) && NO_IN_FLIGHT_OWNER(g)`, but its pseudocode resolved `activeBarrier(g)` based on owner-token clearance alone without verifying typed proof that the execution Promise physically settled and custody was reconciled.
-3. **Incomplete Generation-Scoped Barrier Lifecycle:** While R18-R8 isolated barriers per generation, the lifecycle for barrier registration of concurrent waiters, active barrier retirement, and disposal was underspecified.
-4. **Tombstone Backpressure Operational Recovery:** R18-R8 introduced backpressure when safe tombstone eviction was blocked by active reservations, but did not define the synchronous, bounded recovery sequence when a blocking reservation settles.
-5. **Deep Immutability & Adversarial Fencing:** Proof was required showing that an adversarial caller presenting matching attempt and generation counters but mismatched operation or transaction identities is strictly rejected.
+1. **Claims Confounded with Authoritative Evidence:** R18-R9 defined `SettlementReconciliationProof` with caller-supplied public Boolean fields (`executionSettled: true`, `custodyReconciled: true`, `sourceBufferDisjoint: true`). In a TypeScript runtime, any caller capable of constructing the object can forge these claims. A public interface with Boolean properties is an assertion, not evidence. Evidence must be substantiated by unforgeable authoritative receipts produced directly by the responsible subsystem components.
+2. **Missing Receipt-to-Identity Binding:** R18-R9 lacked a mandatory rule binding every intermediate receipt to the complete five-field custody identity (`recoveryAttemptId`, `custodyGeneration`, `operationIdentity`, `transactionId`, `drainerOwnershipGeneration`). A receipt from an earlier attempt or different transaction must not be reused.
+3. **Undifferentiated Outcome Reconciliation:** R18-R9 used generic fields (`custodyReconciled`, `sourceBufferDisjoint`) that conflate the opposing custody consequences of commit versus abort. In a commit, the operation must be absent from source quarantine (`sourceBufferDisjoint === true`); in an abort/fence, the operation must be restored to source quarantine (`sourceBufferContainsOperation === true`).
+4. **Omission of Drainer Release Evidence:** The barrier proof validator did not require explicit proof that the drainer had published its release. A barrier must never resolve merely because an in-flight slot appears empty.
+5. **Undefined Proof Linearization Point & Retirement Ordering:** The sequence among receipt validation, exact-owner release, proof assembly, barrier resolution, and barrier retirement lacked a strict, failure-safe execution order.
 
-### Core Architectural Guarantees Established in R18-R9:
-- **Exhaustive Five-Field Ownership Comparison:** `publishCustodyRelease(expectedOwnerToken, settlementProof)` validates all five fields (`recoveryAttemptId`, `custodyGeneration`, `operationIdentity`, `transactionId`, `drainerOwnershipGeneration`) via `isEquivalentOwnerToken`. Mismatches reject with `STALE_CUSTODY_RELEASE_REJECTED`.
-- **Typed Settlement Reconciliation Proof:** Enforces `SettlementReconciliationProof` validation as a mandatory prerequisite before any barrier may resolve. A barrier cannot resolve merely because an in-flight slot was cleared.
-- **Closed Generation-Scoped Barrier Lifecycle:** Formulates creation, concurrent waiter registration, owner association, once-only resolution, generation-checked retirement, and replacement.
-- **Operational Tombstone Backpressure Recovery:** Specifies synchronous reevaluation upon reservation settlement, advancing `fencingGenerationFloor` safely without unbounded queues or hidden retained states.
-- **Twenty Deterministic Future Test Requirements:** Codifies 20 exhaustive test requirements for future M5.1 suites.
+### Core Architectural Guarantees Established in R18-R10:
+- **Authoritative-Evidence Model:** Replaces Boolean claims with authoritative, component-issued receipts (`ExecutionSettlementReceipt`, `ArchiveDispositionReceipt`, `CustodyReconciliationReceipt`, `DrainerCustodyReleaseReceipt`).
+- **Complete Five-Field Receipt Identity Binding:** Enforces `isMatchingReceiptIdentity` across all five fields on every single receipt. Earlier-attempt or mismatched receipts are rejected fail-closed.
+- **Discriminated Outcome-Specific Custody Reconciliation:** Separates `SourceQuarantineRetirementReceipt` (for `COMMITTED`) from `SourceQuarantineRestorationReceipt` (for `ABORTED_FENCED`), proving exact custody location for both terminal outcomes.
+- **Explicit Drainer Release Receipt:** Requires `DrainerCustodyReleaseReceipt` produced only after five-field owner validation and atomic custody publication.
+- **Final Authoritative Proof Predicate:** Defines `assertAuthoritativeSettlementEvidence`, establishing the exact linearization point at which a barrier may resolve.
+- **Preserved Watchdog & Late-Continuation Semantics:** Guarantees that a 5-second watchdog timeout never settles Promises, releases custody, or resolves barriers.
+- **Twenty-Four Deterministic Future Test Requirements:** Codifies 24 exhaustive test requirements for future M5.1 suites.
 
 ---
 
@@ -266,7 +268,7 @@ SYNCHRONOUS ATOMIC PUBLICATION SEGMENT (Single Non-Interleavable Microtask Turn)
 `fencingGenerationFloor` advances **if and only if** `#fencedTransactions` reaches capacity (`MAX_FENCED_TRANSACTIONS = 1000`) and the oldest tombstone can be safely evicted:
 $$\text{candidateRoot.fencingGenerationFloor} = \max(\text{currentRoot.fencingGenerationFloor},\; \text{evictedTombstone.fencingGeneration})$$
 
-### 8.3 Protection of Active Reservations & Strict Backpressure Recovery (Mandatory Correction D)
+### 8.3 Protection of Active Reservations & Strict Backpressure Recovery
 To prevent advancing the floor past an active reservation while enforcing the hard 1,000-entry memory bound:
 1. **Eviction Safety Condition:** Safe eviction requires:
    $$\mathbf{evictedTombstone.fencingGeneration} < \min_{r \in \mathbf{activeReservations}}(r.\mathbf{generation})$$
@@ -320,7 +322,7 @@ getTransactionDisposition(
 
 ### A. Confirmed Committed (Level 3 Proof)
 - **Condition:** Authoritative lookup `archive.getTransactionDisposition(txId) === 'COMMITTED'` confirms exact `txId`, matching `stagedBatchDigest`, and composite operation identities.
-- **Required Action:** Execute Protocol A: retire source operations from `QuarantineBuffer`, verify buffer disjointness, await destination Promise settlement, publish attempt-fenced custody release with valid settlement proof, and resolve the generation-scoped settlement barrier.
+- **Required Action:** Execute Protocol A: retire source operations from `QuarantineBuffer`, verify buffer disjointness, await destination Promise settlement, publish attempt-fenced custody release, and resolve the settlement barrier upon verified authoritative evidence.
 
 ### B. Post-Commit Promise Rejection (Execution Failure)
 - **Condition:** Archive transaction is confirmed `COMMITTED`, but the original destination Promise settles with a rejection (`Promise.reject(err)`).
@@ -328,13 +330,13 @@ getTransactionDisposition(
 - **Invariants:**
   1. The archive commit remains **100% authoritative and irrevocable**. Zero archive rollback!
   2. Protocol B restoration is **strictly prohibited** (preventing double replay).
-  3. Execution is marked settled (`EXECUTION_SETTLED = true`).
+  3. Execution is marked settled (`ExecutionSettlementReceipt.settlementType = 'REJECTED'`).
   4. Final custody reconciliation (source retirement verification) must still succeed.
-  5. If reconciliation succeeds, construct `SettlementReconciliationProof`, publish custody release, and resolve the barrier. If reconciliation fails, enter `CUSTODY_RECONCILIATION_BLOCKED`.
+  5. If reconciliation succeeds, construct `AuthoritativeSettlementEvidence`, publish custody release, and resolve the barrier. If reconciliation fails, enter `CUSTODY_RECONCILIATION_BLOCKED`.
 
 ### C. Aborted Fenced (Level 3 Proof)
 - **Condition:** Atomic arbitration confirms `archive.arbitrateOrFenceTransaction(...)` returned `ABORTED_FENCED`.
-- **Required Action:** Execute Protocol B: await destination Promise settlement, restore operation to `QuarantineBuffer` head via `unshiftDrain(op)`, verify buffer representation, construct settlement proof, publish attempt-fenced custody release, and resolve the barrier.
+- **Required Action:** Execute Protocol B: await destination Promise settlement, restore operation to `QuarantineBuffer` head via `unshiftDrain(op)`, verify buffer representation, construct authoritative settlement evidence, publish attempt-fenced custody release, and resolve the barrier.
 
 ### D. Inconclusive or Commit Pending (Level 3 Ambiguity)
 - **Condition:** Arbitration throws, times out, or reports `NOT_FOUND_AT_QUERY` or `COMMIT_PENDING`.
@@ -375,59 +377,174 @@ export function isEquivalentOwnerToken(
 Consider an adversarial or confused delayed continuation:
 - **Active Current State:** `Attempt 2`, `Custody Gen 1`, operating on `stream-A:seq-10` under `tx-2-res-1` (drainer gen 1).
 - **Adversarial Caller Token:** `Attempt 2`, `Custody Gen 1`, but operating on `stream-B:seq-99` under `tx-2-res-99` (drainer gen 1).
-- **Evaluation:** In R18-R8's pseudocode, comparing only attempt, custody generation, and drainer generation would have falsely succeeded. Under R18-R9, `isEquivalentOwnerToken` evaluates:
+- **Evaluation:** In R18-R8's pseudocode, comparing only attempt, custody generation, and drainer generation would have falsely succeeded. Under R18-R10, `isEquivalentOwnerToken` evaluates:
   $$\text{"stream-B:seq-99"} === \text{"stream-A:seq-10"} \implies \mathbf{false}$$
   $$\text{"tx-2-res-99"} === \text{"tx-2-res-1"} \implies \mathbf{false}$$
 - **Result:** The release is rejected with `STALE_CUSTODY_RELEASE_REJECTED`. The active in-flight custody of `stream-A:seq-10` and its barrier are 100% untouched.
 
 ---
 
-### 12.2 Typed Settlement Reconciliation Proof (Mandatory Correction B)
-A settlement barrier must **never** resolve based on custody-slot clearance alone. It requires formal verification of `SettlementReconciliationProof`:
+### 12.2 Distinguishing Claims from Authoritative Evidence (Mandatory Correction A & B)
+To eliminate the vulnerability of caller-fabricated Boolean flags, the architecture enforces a strict tripartite distinction:
+1. **Typed Outcome Description (Caller Claim):** A public data interface describing a desired state (e.g. `{ executionSettled: true }`). Trust level: ZERO. Any caller can construct it. It cannot authorize barrier resolution.
+2. **Authoritative Subsystem Receipt (Component Evidence):** An unforgeable receipt issued SOLELY by the authoritative component executing the operation:
+   - **Execution Settlement:** Issued by `DestinationExecutionObserver` upon Promise completion.
+   - **Archive Disposition:** Issued by `TerminalQuarantineArchive` upon atomic candidate swap.
+   - **Source Custody:** Issued by `QuarantineBuffer` upon verified retirement or restoration.
+   - **Drainer Release:** Issued by `QuarantineDrainer` upon verified 5-field owner release.
+3. **Validated Settlement Proof (Barrier Authorization):** The consolidated proof constructed by passing all four authoritative subsystem receipts through `assertAuthoritativeSettlementEvidence`.
+
+---
+
+### 12.3 Complete Five-Field Custody Identity & Receipt Binding (Mandatory Correction B)
+Every authoritative receipt accepted by the recovery subsystem must immutably embed the exact five-field `CustodyOwnershipIdentity`:
 
 ```typescript
-export interface SettlementReconciliationProof {
+export interface CustodyOwnershipIdentity {
   readonly recoveryAttemptId: number;
   readonly custodyGeneration: number;
   readonly operationIdentity: string;
   readonly transactionId: string;
-  readonly executionSettled: boolean;
-  readonly settlementType: 'FULFILLED' | 'REJECTED';
-  readonly archiveDisposition: 'COMMITTED' | 'ABORTED_FENCED';
-  readonly custodyReconciled: boolean;
-  readonly sourceBufferDisjoint: boolean;
+  readonly drainerOwnershipGeneration: number;
 }
 
-export function assertValidSettlementProof(
-  proof: SettlementReconciliationProof,
-  ownerToken: CustodyOwnershipToken,
-): void {
-  if (!proof.executionSettled) {
-    throw new Error('BARRIER_PRECONDITION_FAILED: Execution Promise has not physically settled.');
-  }
-  if (!proof.custodyReconciled) {
-    throw new Error('BARRIER_PRECONDITION_FAILED: Custody reconciliation is not complete.');
-  }
-  if (proof.archiveDisposition !== 'COMMITTED' && proof.archiveDisposition !== 'ABORTED_FENCED') {
-    throw new Error(`BARRIER_PRECONDITION_FAILED: Archive disposition ${proof.archiveDisposition} is not terminal.`);
-  }
-  if (proof.archiveDisposition === 'COMMITTED' && !proof.sourceBufferDisjoint) {
-    throw new Error('BARRIER_PRECONDITION_FAILED: Source buffer disjointness is unverified.');
-  }
-  if (
-    proof.recoveryAttemptId !== ownerToken.recoveryAttemptId ||
-    proof.custodyGeneration !== ownerToken.custodyGeneration ||
-    proof.operationIdentity !== ownerToken.operationIdentity ||
-    proof.transactionId !== ownerToken.transactionId
-  ) {
-    throw new Error('BARRIER_PRECONDITION_FAILED: Proof identity does not match expected owner token.');
-  }
+export function isMatchingReceiptIdentity(
+  receiptIdentity: CustodyOwnershipIdentity,
+  expectedOwner: CustodyOwnershipIdentity,
+): boolean {
+  return (
+    receiptIdentity.recoveryAttemptId === expectedOwner.recoveryAttemptId &&
+    receiptIdentity.custodyGeneration === expectedOwner.custodyGeneration &&
+    receiptIdentity.operationIdentity === expectedOwner.operationIdentity &&
+    receiptIdentity.transactionId === expectedOwner.transactionId &&
+    receiptIdentity.drainerOwnershipGeneration === expectedOwner.drainerOwnershipGeneration
+  );
 }
 ```
 
 ---
 
-### 12.3 Closed Generation-Scoped Barrier Lifecycle (Mandatory Correction C)
+### 12.4 Discriminated Outcome-Specific Custody Reconciliation (Mandatory Correction C)
+```typescript
+export type CustodyReconciliationReceipt =
+  | SourceQuarantineRetirementReceipt
+  | SourceQuarantineRestorationReceipt;
+
+export interface SourceQuarantineRetirementReceipt {
+  readonly outcome: 'COMMITTED';
+  readonly identity: CustodyOwnershipIdentity;
+  readonly retiredOperationCount: number;
+  readonly retiredBytes: number;
+  readonly sourceBufferDisjoint: true;
+  readonly retirementDigest: string;
+}
+
+export interface SourceQuarantineRestorationReceipt {
+  readonly outcome: 'ABORTED_FENCED';
+  readonly identity: CustodyOwnershipIdentity;
+  readonly restoredOperationCount: number;
+  readonly restoredBytes: number;
+  readonly sourceBufferContainsOperation: true;
+  readonly restorationDigest: string;
+}
+```
+
+---
+
+### 12.5 Explicit Drainer Custody Release Evidence (Mandatory Correction D)
+The barrier coordinator must not assume custody has been released merely because `QuarantineDrainer._custodyState.inFlightRecord === null`. The drainer must explicitly issue a branded `DrainerCustodyReleaseReceipt`:
+
+```typescript
+export interface DrainerCustodyReleaseReceipt {
+  readonly outcome: 'CUSTODY_RELEASED';
+  readonly identity: CustodyOwnershipIdentity;
+  readonly releasedAtMonotonicMs: number;
+  readonly releasedInFlightSlot: true;
+  readonly gateStateSettled: true;
+}
+```
+
+---
+
+### 12.6 The Final Authoritative Barrier Proof Predicate (Mandatory Correction E)
+Before any settlement barrier can resolve, all four component receipts must be assembled into `AuthoritativeSettlementEvidence` and verified via `assertAuthoritativeSettlementEvidence`:
+
+```typescript
+export interface ExecutionSettlementReceipt {
+  readonly outcome: 'EXECUTION_SETTLED';
+  readonly identity: CustodyOwnershipIdentity;
+  readonly settlementType: 'FULFILLED' | 'REJECTED';
+  readonly settledAtMonotonicMs: number;
+}
+
+export type ArchiveDispositionReceipt =
+  | { readonly outcome: 'COMMITTED'; readonly identity: CustodyOwnershipIdentity; readonly commitReceipt: TerminalBatchCommitReceipt }
+  | { readonly outcome: 'ABORTED_FENCED'; readonly identity: CustodyOwnershipIdentity; readonly fencingToken: string; readonly fencingGeneration: number };
+
+export interface AuthoritativeSettlementEvidence {
+  readonly executionSettlement: ExecutionSettlementReceipt;
+  readonly archiveDisposition: ArchiveDispositionReceipt;
+  readonly custodyReconciliation: CustodyReconciliationReceipt;
+  readonly drainerRelease: DrainerCustodyReleaseReceipt;
+}
+
+export function assertAuthoritativeSettlementEvidence(
+  evidence: AuthoritativeSettlementEvidence,
+  expectedOwner: CustodyOwnershipIdentity,
+): void {
+  // 1. Validate All Receipts Exist
+  if (!evidence.executionSettlement || !evidence.archiveDisposition ||
+      !evidence.custodyReconciliation || !evidence.drainerRelease) {
+    throw new Error('BARRIER_EVIDENCE_INCOMPLETE: One or more authoritative receipts are missing.');
+  }
+
+  // 2. Validate Five-Field Identity Binding Across All Receipts
+  if (!isMatchingReceiptIdentity(evidence.executionSettlement.identity, expectedOwner)) {
+    throw new Error('BARRIER_EVIDENCE_IDENTITY_MISMATCH: Execution settlement identity mismatch.');
+  }
+  if (!isMatchingReceiptIdentity(evidence.archiveDisposition.identity, expectedOwner)) {
+    throw new Error('BARRIER_EVIDENCE_IDENTITY_MISMATCH: Archive disposition identity mismatch.');
+  }
+  if (!isMatchingReceiptIdentity(evidence.custodyReconciliation.identity, expectedOwner)) {
+    throw new Error('BARRIER_EVIDENCE_IDENTITY_MISMATCH: Custody reconciliation identity mismatch.');
+  }
+  if (!isMatchingReceiptIdentity(evidence.drainerRelease.identity, expectedOwner)) {
+    throw new Error('BARRIER_EVIDENCE_IDENTITY_MISMATCH: Drainer release identity mismatch.');
+  }
+
+  // 3. Validate Outcome-Specific Custody Matching
+  if (evidence.archiveDisposition.outcome === 'COMMITTED') {
+    if (evidence.custodyReconciliation.outcome !== 'COMMITTED' ||
+        evidence.custodyReconciliation.sourceBufferDisjoint !== true) {
+      throw new Error('BARRIER_EVIDENCE_OUTCOME_MISMATCH: Committed archive requires verified source retirement.');
+    }
+  } else if (evidence.archiveDisposition.outcome === 'ABORTED_FENCED') {
+    if (evidence.custodyReconciliation.outcome !== 'ABORTED_FENCED' ||
+        evidence.custodyReconciliation.sourceBufferContainsOperation !== true) {
+      throw new Error('BARRIER_EVIDENCE_OUTCOME_MISMATCH: Fenced archive requires verified source restoration.');
+    }
+  } else {
+    throw new Error('BARRIER_EVIDENCE_INVALID: Archive disposition is not terminal.');
+  }
+
+  // 4. Validate Drainer Release Confirmation
+  if (evidence.drainerRelease.releasedInFlightSlot !== true ||
+      evidence.drainerRelease.gateStateSettled !== true) {
+    throw new Error('BARRIER_EVIDENCE_INVALID: Drainer custody release not confirmed.');
+  }
+}
+```
+
+### Barrier Resolution Linearization Point:
+Inside `GenerationSettlementBarrier.resolveWithEvidence(evidence)`, synchronously after `assertAuthoritativeSettlementEvidence(evidence, this.#ownerIdentity)` succeeds:
+```typescript
+this.#resolved = true;
+this.#resolver(); // LINEARIZATION POINT: Barrier Promise Resolves
+```
+
+---
+
+### 12.7 Closed Generation-Scoped Barrier Lifecycle (Mandatory Correction C)
 Barriers are strictly scoped per **in-flight custody generation** ($g \in \mathbb{N}$):
 
 ```typescript
@@ -450,9 +567,9 @@ export class GenerationSettlementBarrier {
     return this._promise;
   }
 
-  public resolveWithProof(proof: SettlementReconciliationProof): void {
+  public resolveWithEvidence(evidence: AuthoritativeSettlementEvidence): void {
     if (this._resolved) return;
-    assertValidSettlementProof(proof, this.ownerToken);
+    assertAuthoritativeSettlementEvidence(evidence, this.ownerToken);
     this._resolved = true;
     this._resolver();
   }
@@ -467,7 +584,7 @@ export class GenerationSettlementBarrier {
 1. **Creation:** When `drainNext()` dequeues operation $g$, `custodyGeneration` advances ($g \to g+1$), creating `new GenerationSettlementBarrier(g+1, ownerToken)`.
 2. **Registration of Waiters:** Any coordinator or caller invoking `drainSettledBarrier()` awaits `this._activeBarrier.promise`. Concurrent callers share the identical Promise.
 3. **Owner Association:** Bound immutably to `ownerToken`.
-4. **Resolution:** `publishCustodyRelease(expectedOwnerToken, proof)` invokes `barrier.resolveWithProof(proof)`.
+4. **Resolution:** `publishCustodyRelease(expectedOwnerToken, proof)` invokes `barrier.resolveWithEvidence(evidence)`.
 5. **Retirement & Safe Replacement:** Active barrier reference is cleared only when the retiring barrier's generation matches:
    ```typescript
    if (this._activeBarrier && this._activeBarrier.generation === expectedOwnerToken.custodyGeneration) {
@@ -479,7 +596,27 @@ export class GenerationSettlementBarrier {
 
 ---
 
-### 12.4 Deep Immutability of Published Custody Records (Mandatory Correction D)
+### 12.8 Barrier Resolution and Retirement Execution Ordering (Mandatory Correction G)
+To prevent partial success from being represented as full settlement, the subsystem executes operations in a strict, failure-safe order:
+
+```
+┌─────────────────────────────────────────────────────────────────────────────────────────┐
+│                    STRICT FINALIZATION & RETIREMENT ORDER                               │
+├─────────────────────────────────────────────────────────────────────────────────────────┤
+│ Step 1: Execution Settlement ──► Destination Promise settles ──► ExecutionSettlementReceipt│
+│ Step 2: Archive Disposition  ──► Atomic arbitration swap   ──► ArchiveDispositionReceipt │
+│ Step 3: Custody Reconcile    ──► Buffer retire / unshift   ──► CustodyReconciliationReceipt│
+│ Step 4: Drainer Release      ──► 5-Field Match + Root Swap ──► DrainerCustodyReleaseReceipt│
+│ Step 5: Proof Assembly       ──► Combine all 4 receipts into AuthoritativeSettlementEvidence│
+│ Step 6: Proof Validation     ──► assertAuthoritativeSettlementEvidence(...) validates all│
+│ Step 7: LINEARIZATION POINT  ──► activeBarrier(g).resolveWithEvidence(evidence)           │
+│ Step 8: Barrier Retirement   ──► this._retireBarrier(g, expectedOwner) clears reference │
+└─────────────────────────────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+### 12.9 Deep Immutability of Published Custody Records
 ```typescript
 export interface DrainerCustodyState {
   readonly inFlightRecord: Readonly<DrainerInFlightRecord> | null;
@@ -494,19 +631,21 @@ export interface DrainerCustodyState {
 
 ---
 
-### 12.5 Protocol A: Drainer $	o$ Terminal Archive (Execution Settlement & Attempt Fenced)
+### 12.10 Protocol A: Drainer $\to$ Terminal Archive (Execution Settlement & Attempt Fenced)
 
 ```
 [Level 3 Authoritative Commit Confirmed]
                  │
                  ▼
 1. Authoritative Archive Lookup (archive.getTransactionDisposition(txId) === 'COMMITTED')
+   └──► Yields ArchiveDispositionReceipt (COMMITTED)
                  │
                  ▼
 2. Verify Commit Digest & Composite Operation Identities (assertExactImmutableIdentityMatch)
                  │
                  ▼
 3. Source Quarantine Retirement (quarantineBuffer.retireCommittedBatch(identities, cap))
+   └──► Yields SourceQuarantineRetirementReceipt (sourceBufferDisjoint === true)
                  │
                  ▼
 4. Verify Source Buffer Disjointness (hasOperation(...) === false for all identities)
@@ -517,6 +656,7 @@ export interface DrainerCustodyState {
                  │
                  ▼
 6. Await Actual Destination Promise Settlement (Fulfilled or Rejected)
+   └──► Yields ExecutionSettlementReceipt (FULFILLED or REJECTED)
                  │
                  ▼
 7. Reconcile Settlement Against Confirmed Commit:
@@ -524,14 +664,16 @@ export interface DrainerCustodyState {
    └─ Reject: Classify as post-commit execution failure; suppress error; Protocol B PROHIBITED!
                  │
                  ▼
-8. Construct SettlementReconciliationProof (assertValidSettlementProof)
-                 │
-                 ▼
-9. ATTEMPT-FENCED CUSTODY RELEASE: this.publishCustodyRelease(ownerToken, proof);
+8. ATTEMPT-FENCED CUSTODY RELEASE: this.publishCustodyRelease(ownerToken);
    [Verifies all 5 fields via isEquivalentOwnerToken; simultaneously publishes inFlightRecord = null and gateState = 'CUSTODY_SETTLED']
+   └──► Yields DrainerCustodyReleaseReceipt
                  │
                  ▼
-10. Resolve Generation Barrier Exactly Once: activeBarrier(g).resolveWithProof(proof);
+9. Assemble AuthoritativeSettlementEvidence & Validate:
+   assertAuthoritativeSettlementEvidence(evidence, ownerToken)
+                 │
+                 ▼
+10. Resolve Generation Barrier Exactly Once: activeBarrier(g).resolveWithEvidence(evidence);
                  │
                  ▼
 11. Retire Generation Barrier: this._retireBarrier(expectedOwnerToken.custodyGeneration);
@@ -539,7 +681,7 @@ export interface DrainerCustodyState {
 
 ---
 
-### 12.6 Protocol B: Drainer $	o$ Quarantine Buffer (12-Step Fencing Sequence)
+### 12.11 Protocol B: Drainer $\to$ Quarantine Buffer (12-Step Fencing Sequence)
 
 ```
 [Settlement / Fencing Trigger (Promise Completed / Rejected / Invalidation Received)]
@@ -553,6 +695,9 @@ export interface DrainerCustodyState {
    ├─ If COMMITTED ────────────────────────► DIVERT TO PROTOCOL A (Source Retirement)
    ├─ If INCONCLUSIVE / ERROR ─────────────► TRANSITION TO CUSTODY_RECONCILIATION_BLOCKED (Halt)
    └─ If ABORTED_FENCED ───────────────────▼
+   └──► Yields ArchiveDispositionReceipt (ABORTED_FENCED)
+                 │
+                 ▼
 3. Obtain Authoritative Terminal Outcome (Verify ArchiveArbitrationReceipt.status === 'ABORTED_FENCED')
                  │
                  ▼
@@ -560,22 +705,26 @@ export interface DrainerCustodyState {
                  │
                  ▼
 5. Await Actual Destination Promise Settlement (Fulfilled or Rejected)
+   └──► Yields ExecutionSettlementReceipt
                  │
                  ▼
 6. Safe Idempotent Buffer Head Restoration (quarantineBuffer.unshiftDrain(op))
+   └──► Yields SourceQuarantineRestorationReceipt (sourceBufferContainsOperation === true)
                  │
                  ▼
 7. Verify Buffer Representation (hasOperation(...) === true & retainedCount++)
                  │
                  ▼
-8. Construct SettlementReconciliationProof (assertValidSettlementProof)
-                 │
-                 ▼
-9. ATTEMPT-FENCED CUSTODY RELEASE: this.publishCustodyRelease(ownerToken, proof);
+8. ATTEMPT-FENCED CUSTODY RELEASE: this.publishCustodyRelease(ownerToken);
    [Verifies all 5 fields via isEquivalentOwnerToken; simultaneously publishes inFlightRecord = null and gateState = 'CUSTODY_SETTLED']
+   └──► Yields DrainerCustodyReleaseReceipt
                  │
                  ▼
-10. Resolve Generation Barrier Exactly Once: activeBarrier(g).resolveWithProof(proof);
+9. Assemble AuthoritativeSettlementEvidence & Validate:
+   assertAuthoritativeSettlementEvidence(evidence, ownerToken)
+                 │
+                 ▼
+10. Resolve Generation Barrier Exactly Once: activeBarrier(g).resolveWithEvidence(evidence);
                  │
                  ▼
 11. Retire Generation Barrier: this._retireBarrier(expectedOwnerToken.custodyGeneration);
@@ -626,30 +775,34 @@ stateDiagram-v2
 
 ---
 
-## 15. Exhaustive Failure and Retry Matrix (20 Deterministic Cases)
+## 15. Exhaustive Failure and Retry Matrix (24 Deterministic Cases)
 
-| Case # | Scenario Description | Archive Transaction State | Execution Settlement State | Commit-vs-Cancel Winner | Fencing Generation | Buffer Representation | Drainer Custody | In-Flight Slot | Barrier Status | Custody Gate State | Restoration Permitted? | Source Retirement Required? | Late Commit Possible? | Permitted Next Action |
-|:---|:---|:---|:---|:---|:---|:---|:---|:---|:---|:---|:---|:---|:---|:---|
-| **1** | Attempt A stale continuation attempts release | Any | Any | N/A | $G_0$ | Retained | In-flight (Attempt B) | **YES** | **PENDING** | `SETTLEMENT_PENDING` | **NO** | **NO** | **NO** | Throws `STALE_CUSTODY_RELEASE_REJECTED`; Attempt B untouched. |
-| **2** | Stale release: matching op identity, wrong attempt | Any | Any | N/A | $G_0$ | Retained | In-flight (Attempt B) | **YES** | **PENDING** | `SETTLEMENT_PENDING` | **NO** | **NO** | **NO** | Attempt mismatch detected; throws `STALE_CUSTODY_RELEASE_REJECTED`. |
-| **3** | Stale release: matching attempt, wrong custody gen | Any | Any | N/A | $G_0$ | Retained | In-flight (Gen 2) | **YES** | **PENDING** | `SETTLEMENT_PENDING` | **NO** | **NO** | **NO** | Gen mismatch detected; throws `STALE_CUSTODY_RELEASE_REJECTED`. |
-| **4** | Exact current owner releases custody | `COMMITTED` or `FENCED` | **Settled** | Commit / Cancel | $G_0$ | Reconciled | Relinquished | **NO** | **RESOLVED (g)** | `CUSTODY_SETTLED` | If Fenced | If Committed | **NO** | Release published; barrier $g$ resolves. |
-| **5** | Failed pre-publication check leaves state untouched | `ABORTED_FENCED` | Settled | Cancellation | $G_1$ | Unconfirmed | In-flight | **YES** | **PENDING (g)** | `CUSTODY_RECONCILIATION_BLOCKED` | **NO** | **NO** | **NO** | Pre-verification throw keeps slot occupied; barrier pending. |
-| **6** | Duplicate release of same owner is idempotent | `CUSTODY_SETTLED` | Settled | Resolved | $G_0$ | Reconciled | Empty ($N=0$) | **NO** | **RESOLVED (g)** | `CUSTODY_SETTLED` | Already Done | Already Done | **NO** | Duplicate call returns cleanly; barrier remains resolved. |
-| **7** | Earlier barrier resolves; new barrier resolves later | Sequential | Settled | Both | $G_0, G_1$ | Reconciled | Sequential | **NO** | **RESOLVED (g+1)**| `CUSTODY_SETTLED` | As appropriate | As appropriate | **NO** | Independent barrier lifecycle per generation. |
-| **8** | Duplicate resolution of barrier g | Any | Any | N/A | $G_0$ | Any | Any | Any | **RESOLVED (g)** | Any | N/A | N/A | **NO** | Evaluates `#resolved`; does NOT resolve barrier $g+1$. |
-| **9** | Concurrent waiters share same barrier Promise | In-flight | Pending | N/A | $G_0$ | In-flight | In-flight | **YES** | **PENDING (g)** | `SETTLEMENT_PENDING` | **NO** | **NO** | **NO** | All callers await `activeBarrier.promise`; unblock together. |
-| **10** | New barrier blocked while previous unresolved | In-flight | Pending | N/A | $G_0$ | In-flight | In-flight | **YES** | **PENDING (g)** | `SETTLEMENT_PENDING` | **NO** | **NO** | **NO** | `drainNext()` fails closed; cannot bypass unresolved slot. |
-| **11** | Tombstone collection reaches 1,000 entries | 1000 Tombs | Normal | Cancel | $G_{1000}$ | Normal | Normal | Normal | Normal | Normal | Normal | Normal | **NO** | Hard capacity ceiling maintained. |
-| **12** | Safe eviction advances generation floor | Evicted | Normal | Cancel | Floor advanced | Reconciled | Relinquished | **NO** | **RESOLVED** | `CUSTODY_SETTLED` | Normal | Normal | **NO** | Eviction advances floor; stale commits rejected. |
-| **13** | Unsafe eviction deferred by active reservation | 1000 Tombs | Active res | N/A | Floor unadvanced| Normal | Normal | Normal | Normal | Normal | Normal | Normal | **NO** | Active res protected; eviction deferred. |
-| **14** | Capacity exhaustion rejects new fencing | 1000 Tombs | Active res | Blocked | Fixed | Normal | In-flight | **YES** | **PENDING** | Normal | **NO** | **NO** | **NO** | Throws `FENCING_BACKPRESSURE_CAPACITY_EXHAUSTED`. |
-| **15** | Existing reservations preserved under backpressure | 1000 Tombs | Active res | Preserved | Fixed | Active res ok | Normal | Normal | Normal | Normal | Normal | Normal | **NO** | Valid reservations 100% preserved; no eviction corruption. |
-| **16** | Capacity recovers after blocking reservation settles | 999 Tombs | Settled res | Res settled | Res removed | Normal | Relinquished | **NO** | **RESOLVED** | `CUSTODY_SETTLED` | Normal | Normal | **NO** | Res cleared; deferred eviction executes; backpressure relieved. |
-| **17** | Caller attempts to mutate published custody record | Frozen | Any | N/A | N/A | Unchanged | Frozen snapshot | N/A | N/A | N/A | N/A | N/A | **NO** | Mutation throws or fails silently in strict mode; state safe. |
-| **18** | Timeout + late settlement cannot release new custody | Attempt 2 | Attempt 1 late | Mismatch | $G_1$ | Reconciled 2 | In-flight (2) | **YES** | **PENDING (2)** | `SETTLEMENT_PENDING` | **NO** | **NO** | **NO** | Attempt 1 continuation rejected by owner token check. |
-| **19** | Settlement barrier pending during stale release reject | Any | Any | Mismatch | Any | Retained | In-flight | **YES** | **PENDING** | `SETTLEMENT_PENDING` | **NO** | **NO** | **NO** | Stale throw preserves barrier pending state. |
-| **20** | Barrier resolves only after exact-owner release | Reconciled | Settled | Match | Any | Reconciled | Relinquished | **NO** | **RESOLVED** | `CUSTODY_SETTLED` | Verified | Verified | **NO** | Verified release resolves barrier exactly once. |
+| Case # | Scenario Description | Archive Transaction State | Execution Settlement State | Custody Reconciliation State | Drainer Release State | Identity Match Status | Barrier Status | Custody Gate State | Permitted Next Action |
+|:---|:---|:---|:---|:---|:---|:---|:---|:---|:---|
+| **1** | Caller fabricates Boolean claims | N/A | Forged claim | Forged claim | Unreleased | Rejected (No receipts) | **PENDING (g)** | `CUSTODY_RECONCILIATION_REQUIRED` | Throws `BARRIER_EVIDENCE_INCOMPLETE`; barrier pending. |
+| **2** | Valid 4-receipt exact identity match | `COMMITTED` | Settled (`FULFILLED`) | `SourceRetirementReceipt` | `ReleaseReceipt` | **100% Match** | **RESOLVED (g)**| `CUSTODY_SETTLED` | Barrier resolves; custody cleanly settled. |
+| **3** | Valid 4-receipt exact match (Aborted) | `ABORTED_FENCED`| Settled (`REJECTED`) | `SourceRestorationReceipt`| `ReleaseReceipt` | **100% Match** | **RESOLVED (g)**| `CUSTODY_SETTLED` | Barrier resolves; restored to buffer. |
+| **4** | Stale execution receipt from Attempt 1 | `COMMITTED` | Attempt 1 receipt | Current Attempt 2 | Current Attempt 2 | **Mismatch (Attempt)**| **PENDING (g)** | `SETTLEMENT_PENDING` | Throws `IDENTITY_MISMATCH`; Attempt 2 barrier pending. |
+| **5** | Archive receipt for wrong transaction ID | `COMMITTED` (Tx B)| Settled (Tx A) | Reconciled (Tx A) | Released (Tx A) | **Mismatch (TxId)** | **PENDING (g)** | `CUSTODY_RECONCILIATION_BLOCKED` | Throws `IDENTITY_MISMATCH`; barrier pending. |
+| **6** | Archive receipt for wrong custody gen | `COMMITTED` | Settled (Gen 1) | Reconciled (Gen 1) | Released (Gen 1) | **Mismatch (Gen)** | **PENDING (g)** | `CUSTODY_RECONCILIATION_BLOCKED` | Throws `IDENTITY_MISMATCH`; barrier pending. |
+| **7** | Mismatched drainer ownership gen | Any | Any | Any | Gen Mismatch | **Mismatch (DrainGen)**| **PENDING (g)**| `CUSTODY_RECONCILIATION_BLOCKED` | Throws `IDENTITY_MISMATCH`; barrier pending. |
+| **8** | Committed tx with restoration receipt | `COMMITTED` | Settled | Restoration (Invalid)| Released | **Outcome Mismatch** | **PENDING (g)** | `CUSTODY_RECONCILIATION_BLOCKED` | Throws `OUTCOME_MISMATCH`; barrier pending. |
+| **9** | Fenced tx with retirement receipt | `ABORTED_FENCED`| Settled | Retirement (Invalid) | Released | **Outcome Mismatch** | **PENDING (g)** | `CUSTODY_RECONCILIATION_BLOCKED` | Throws `OUTCOME_MISMATCH`; barrier pending. |
+| **10** | Promise rejected without archive receipt | Inconclusive | Settled (`REJECTED`) | None | Unreleased | Incomplete | **PENDING (g)** | `CUSTODY_RECONCILIATION_REQUIRED` | Awaits Level 3 arbitration; zero blind restoration. |
+| **11** | Post-commit Promise rejection | `COMMITTED` | Settled (`REJECTED`) | `SourceRetirementReceipt` | `ReleaseReceipt` | **100% Match** | **RESOLVED (g)**| `CUSTODY_SETTLED` | Rejection suppressed; Protocol A completes cleanly. |
+| **12** | Caller fabricates drainer release receipt | Any | Any | Any | Forged token | Invalid signature | **PENDING (g)** | `CUSTODY_RECONCILIATION_BLOCKED` | Throws `DRAINER_RELEASE_INVALID`; barrier pending. |
+| **13** | Stale release receipt for older generation | Current Gen 2 | Settled | Reconciled | Gen 1 release | **Mismatch (Gen)** | **PENDING (g)** | `CUSTODY_RECONCILIATION_BLOCKED` | Throws `IDENTITY_MISMATCH`; barrier 2 pending. |
+| **14** | Barrier evaluated before Promise settles | `COMMITTED` | **Pending** | Reconciled | Released | Incomplete | **PENDING (g)** | `SETTLEMENT_PENDING` | Missing execution receipt; barrier pending. |
+| **15** | Barrier evaluated before archive swap | Pending | Settled | None | Unreleased | Incomplete | **PENDING (g)** | `SETTLEMENT_PENDING` | Missing archive receipt; barrier pending. |
+| **16** | Barrier evaluated before buffer retire | `COMMITTED` | Settled | Pending | Unreleased | Incomplete | **PENDING (g)** | `CUSTODY_RECONCILIATION_REQUIRED` | Missing custody receipt; barrier pending. |
+| **17** | Barrier evaluated before drainer release | `COMMITTED` | Settled | Reconciled | Unreleased | Incomplete | **PENDING (g)** | `CUSTODY_RECONCILIATION_REQUIRED` | Missing release receipt; barrier pending. |
+| **18** | Watchdog expires at 5,000 ms | Pending | Pending | None | None | None | **PENDING (g)** | `DEGRADED` | Status latched; barrier remains pending fail-closed. |
+| **19** | Late continuation attempts newer barrier | Current Gen 2 | Late Gen 1 settled | Gen 1 | Gen 1 | Stale generation | **PENDING (2)** | `SETTLEMENT_PENDING` | Gen 1 evidence rejected; Gen 2 barrier untouched. |
+| **20** | Failure during barrier resolution | `COMMITTED` | Settled | Reconciled | Released | Exception thrown | **PENDING (g)** | `CUSTODY_RECONCILIATION_BLOCKED` | Barrier remains pending; obligations preserved. |
+| **21** | Duplicate resolution of barrier g | Resolved | Settled | Reconciled | Released | Already resolved | **RESOLVED (g)**| `CUSTODY_SETTLED` | Evaluates `#resolved`; no secondary resolution. |
+| **22** | Tombstone collection at 1,000 capacity | 1000 Tombs | Normal | Normal | Normal | Normal | Normal | Normal | Throws `FENCING_BACKPRESSURE_CAPACITY_EXHAUSTED`. |
+| **23** | Blocking reservation settles | 1000 Tombs | Res settled | Res settled | Normal | Normal | Normal | Normal | Deferred eviction runs; backpressure relieved. |
+| **24** | Caller attempts mutation of receipt | Frozen | Any | Any | Any | Immutable | Normal | Normal | Mutation throws in strict mode; evidence untouched. |
 
 ---
 
@@ -661,14 +814,14 @@ stateDiagram-v2
    $$\mathbf{STALE\_ATTEMPT} \implies \mathbf{CANNOT\_RELEASE\_NEWER\_CUSTODY}$$
 3. **Execution Settlement Precedence:** The settlement barrier **CANNOT** resolve while the destination Promise remains pending.
 4. **Five-Field Owner-Token Verification Precedence:** Custody release **CANNOT** execute unless `isEquivalentOwnerToken` evaluates to `true` across all 5 fields.
-5. **Typed Settlement Proof Precedence:** A barrier **CANNOT** resolve unless `assertValidSettlementProof` succeeds.
+5. **Authoritative Evidence Precedence:** A barrier **CANNOT** resolve unless `assertAuthoritativeSettlementEvidence` validates all four component receipts.
 6. **Strict Tombstone Capacity Ceiling:** `#fencedTransactions.size` **CANNOT** exceed 1,000 under any condition.
 7. **Active Reservation Floor Protection:** `fencingGenerationFloor` **CANNOT** advance past $\min_{r \in \text{activeReservations}}(r.\text{generation})$.
 8. **Single In-Flight Drain Invariant:** A second drain **CANNOT** dequeue an operation while `this._custodyState.inFlightRecord !== null` ($N_{\text{in-flight}} \le 1$).
 9. **Watchdog Immunity:** A watchdog timeout (`SETTLEMENT_BARRIER_TIMEOUT_MS = 5000`) **CANNOT** release drainer custody or cancel the destination Promise.
 
 ### Strict Ordering of Finalization:
-$$\text{1. Settle Promise} \longrightarrow \text{2. Reconcile Custody} \longrightarrow \text{3. Construct Proof} \longrightarrow \text{4. } \mathbf{publishCustodyRelease(token, proof)} \longrightarrow \text{5. } \mathbf{activeBarrier(g).resolveWithProof(proof)}$$
+$$\text{1. Settle Promise} \longrightarrow \text{2. Reconcile Custody} \longrightarrow \text{3. Release Drainer} \longrightarrow \text{4. Validate Proof} \longrightarrow \text{5. } \mathbf{activeBarrier(g).resolveWithEvidence(evidence)}$$
 
 ---
 
@@ -678,7 +831,7 @@ The proposal excises all references to `forceEmergencyReset(capability)`:
 - Ordinary recovery APIs cannot bypass `CUSTODY_RECONCILIATION_BLOCKED`.
 - No automated root replacement is permitted while custody remains unresolved.
 - Emergency data abandonment, if ever required, needs a separate architectural decision defining operator authorization, auditability, late-settling Promise behavior, and data-loss semantics.
-- That separate decision is outside the scope of R18-R9 and is **not authorized** by this proposal.
+- That separate decision is outside the scope of R18-R10 and is **not authorized** by this proposal.
 
 ---
 
@@ -687,34 +840,38 @@ The proposal excises all references to `forceEmergencyReset(capability)`:
 1. **Admitted Under New Monotonic Token:** Attempt 2 is admitted from `DEGRADED` when gate status is `SETTLEMENT_PENDING`, incrementing `currentAttemptId = 2`.
 2. **Permanent Invalidation of Attempt 1:** Attempt 1 is superseded (`1 !== currentAttemptId (2)`) and latched `TIMED_OUT`. Its continuation is completely fenced and cannot mutate roots or stage batches.
 3. **Step 4 Serialized Barrier Wait:** Attempt 2 enters `RECOVERING`, advances to Step 4, and halts at `await drainer.drainSettledBarrier()`. Candidate root staging, archive pre-reservation, and root replacement are strictly prohibited while in Step 4.
-4. **Resolution & Exclusive Resumption:** When Attempt 1's destination Promise finishes and Level 3 custody reconciliation completes, Attempt 1's continuation attempts `publishCustodyRelease(token1, proof)`, which is rejected because Attempt 2 owns the coordinator. The coordinator reconciles custody, executes `publishCustodyRelease(token2, proof)`, and resolves the barrier. Attempt 2 unblocks with clean custody and proceeds to Step 7 with exclusive authority.
+4. **Resolution & Exclusive Resumption:** When Attempt 1's destination Promise finishes and Level 3 custody reconciliation completes, Attempt 1's continuation attempts `publishCustodyRelease(token1)`, which is rejected because Attempt 2 owns the coordinator. The coordinator reconciles custody, executes `publishCustodyRelease(token2)`, and resolves the barrier with verified authoritative evidence. Attempt 2 unblocks with clean custody and proceeds to Step 7 with exclusive authority.
 
 ---
 
 ## 19. Deterministic Failure Scenarios and Future Test Requirements
 
-Sub-Milestone M5.1 test suites must verify the following twenty deterministic test sequences:
+Sub-Milestone M5.1 test suites must verify the following twenty-four deterministic test sequences:
 
-- **Test R18-R9-T1 (Exact Five-Field Owner-Token Match Permits Release):** Pass matching token across all 5 fields with valid settlement proof; assert custody release succeeds; barrier resolves.
-- **Test R18-R9-T2 (Matching Attempt/Gen But Mismatching Op Identity Rejected):** Supply matching attempt and generation but altered `operationIdentity`; assert throws `STALE_CUSTODY_RELEASE_REJECTED`; custody untouched.
-- **Test R18-R9-T3 (Matching Attempt/Gen But Mismatching Transaction ID Rejected):** Supply matching attempt and generation but altered `transactionId`; assert throws `STALE_CUSTODY_RELEASE_REJECTED`.
-- **Test R18-R9-T4 (Mismatching Drainer Ownership Generation Rejected):** Supply mismatched `drainerOwnershipGeneration`; assert throws `STALE_CUSTODY_RELEASE_REJECTED`.
-- **Test R18-R9-T5 (Stale Attempt A Cannot Release Attempt B Custody):** Attempt A continuation attempts release after Attempt B assumed ownership; assert throws `STALE_CUSTODY_RELEASE_REJECTED`.
-- **Test R18-R9-T6 (Rejected Stale Release Leaves Newer Custody State Byte-for-Byte Unchanged):** Assert custody state before and after rejected release is identical.
-- **Test R18-R9-T7 (Watchdog Timeout Does Not Settle Barrier):** Fire 5,000 ms watchdog; assert coordinator status latches `DEGRADED`; assert barrier remains pending.
-- **Test R18-R9-T8 (Promise Rejection Without Authoritative Disposition Does Not Resolve Barrier):** Destination Promise rejects while archive query inconclusive; assert barrier remains pending.
-- **Test R18-R9-T9 (Execution Settlement Without Custody Reconciliation Does Not Resolve Barrier):** Promise settles but source retirement unconfirmed; assert barrier remains pending.
-- **Test R18-R9-T10 (Archive Commit Without Custody Release Does Not Resolve Barrier):** Archive commit confirmed but drainer slot occupied; assert barrier remains pending.
-- **Test R18-R9-T11 (Barrier Resolves Only When All Evidence Matches Same Gen & Tx):** Provide proof with mismatched generation; assert `assertValidSettlementProof` throws; barrier remains pending.
-- **Test R18-R9-T12 (Concurrent Waiters Share Same Barrier Promise):** Multiple callers await `drainSettledBarrier()`; assert all resolve upon the identical Promise.
-- **Test R18-R9-T13 (Resolved Generation Barrier Cannot Be Reused for Later Generation):** Settle generation 1; advance to generation 2; assert generation 2 creates discrete barrier instance.
-- **Test R18-R9-T14 (Stale Resolver Cannot Affect Newer Barrier):** Attempt to invoke stale generation resolver; assert newer active barrier is unaffected.
-- **Test R18-R9-T15 (Failed Release Leaves Active Barrier Untouched):** Mock verification throw during release; assert active barrier remains pending.
-- **Test R18-R9-T16 (Blocking Active Reservation Prevents Unsafe Tombstone Eviction):** Assert tombstone eviction deferred when oldest tombstone generation exceeds active reservation.
-- **Test R18-R9-T17 (Tombstone Count Never Exceeds 1,000 Under Repeated Pressure):** Attempt multiple fences under capacity pressure; assert `#fencedTransactions.size <= 1000`.
-- **Test R18-R9-T18 (Capacity Recovery Advances Floor Safely):** Settle blocking reservation; assert synchronous eviction advances floor without breaching remaining reservations.
-- **Test R18-R9-T19 (Capacity Rejection Does Not Accumulate Unbounded Work):** Assert failed backpressure calls do not leave background timers or queues.
-- **Test R18-R9-T20 (Nested Custody Records Cannot Be Mutated Via Retained References):** Attempt to mutate external array passed into custody record; assert internal published state is deeply frozen and unaffected.
+- **Test R18-R10-T1 (Caller-Created Boolean Claims Rejected):** Pass object with Boolean flags set to true; assert `assertAuthoritativeSettlementEvidence` throws `BARRIER_EVIDENCE_INCOMPLETE`.
+- **Test R18-R10-T2 (Only Execution-Owner-Issued Settlement Evidence Accepted):** Provide genuine `ExecutionSettlementReceipt`; assert validation succeeds.
+- **Test R18-R10-T3 (Stale Execution Receipt From Earlier Attempt Rejected):** Pass Attempt 1 execution receipt to Attempt 2 barrier; assert throws `BARRIER_EVIDENCE_IDENTITY_MISMATCH`.
+- **Test R18-R10-T4 (Archive Receipt for Different Transaction Rejected):** Pass receipt with mismatched `transactionId`; assert throws `BARRIER_EVIDENCE_IDENTITY_MISMATCH`.
+- **Test R18-R10-T5 (Archive Receipt for Correct Tx But Wrong Custody Gen Rejected):** Pass receipt with mismatched `custodyGeneration`; assert throws `BARRIER_EVIDENCE_IDENTITY_MISMATCH`.
+- **Test R18-R10-T6 (Mismatched Drainer Ownership Generation Rejected):** Pass receipt with mismatched `drainerOwnershipGeneration`; assert throws `BARRIER_EVIDENCE_IDENTITY_MISMATCH`.
+- **Test R18-R10-T7 (Committed Transaction Requires Authoritative Source Retirement):** Provide `SourceQuarantineRestorationReceipt` for `COMMITTED` disposition; assert throws `BARRIER_EVIDENCE_OUTCOME_MISMATCH`.
+- **Test R18-R10-T8 (Aborted Transaction Requires Authoritative Source Restoration):** Provide `SourceQuarantineRetirementReceipt` for `ABORTED_FENCED` disposition; assert throws `BARRIER_EVIDENCE_OUTCOME_MISMATCH`.
+- **Test R18-R10-T9 (Promise Rejection Without Archive Receipt Does Not Prove Abort):** Destination Promise rejects; assert barrier remains pending until Level 3 arbitration receipt provided.
+- **Test R18-R10-T10 (Promise Rejection After Commit Remains Post-Commit Failure):** Promise rejects after archive commit; assert `ExecutionSettlementReceipt` with `settlementType: 'REJECTED'` resolves barrier under Protocol A without restoration.
+- **Test R18-R10-T11 (Fabricated Drainer Release Receipt Rejected):** Fabricate release receipt without calling `publishCustodyRelease`; assert rejected by internal token verification.
+- **Test R18-R10-T12 (Stale Drainer Release Receipt Cannot Resolve Later Barrier):** Pass generation 1 release receipt to generation 2 barrier; assert throws `BARRIER_EVIDENCE_IDENTITY_MISMATCH`.
+- **Test R18-R10-T13 (Barrier Cannot Resolve Before Actual Promise Settlement):** Omit execution settlement receipt; assert barrier remains pending.
+- **Test R18-R10-T14 (Barrier Cannot Resolve Before Terminal Archive Disposition):** Omit archive disposition receipt; assert barrier remains pending.
+- **Test R18-R10-T15 (Barrier Cannot Resolve Before Custody Reconciliation):** Omit custody reconciliation receipt; assert barrier remains pending.
+- **Test R18-R10-T16 (Barrier Cannot Resolve Before Exact-Owner Drainer Release):** Omit drainer release receipt; assert barrier remains pending.
+- **Test R18-R10-T17 (All Receipts Must Match Five-Field Identity 1-to-1):** Provide 4 receipts with one field altered on one receipt; assert throws `BARRIER_EVIDENCE_IDENTITY_MISMATCH`.
+- **Test R18-R10-T18 (Late Continuation Cannot Mutate Newer Generation):** Late Promise settlement for Attempt 1 cannot resolve Attempt 2 barrier.
+- **Test R18-R10-T19 (Barrier Resolution Failure Preserves Custody Obligations):** Mock throw in `assertAuthoritativeSettlementEvidence`; assert custody remains held fail-closed.
+- **Test R18-R10-T20 (Watchdog Timeout Leaves Barrier Pending):** Fire 5,000 ms watchdog; assert status latches `DEGRADED`; assert barrier remains unresolved.
+- **Test R18-R10-T21 (Resolved Barrier Cannot Be Reused for Later Generation):** Resolve barrier 1; assert barrier 2 requires discrete resolution.
+- **Test R18-R10-T22 (Rejected Backpressure Requests Do Not Accumulate Work):** Trigger backpressure; assert rejected calls leave zero timers or queues.
+- **Test R18-R10-T23 (Tombstone Capacity Remains At or Below 1,000 Bound):** Repeatedly trigger fencing under capacity pressure; assert `#fencedTransactions.size <= 1000`.
+- **Test R18-R10-T24 (Every Operation Remains Accounted For Across Commit/Abort):** Audit operations across all transitions; assert zero operations left ownerless.
 
 ---
 
@@ -722,28 +879,28 @@ Sub-Milestone M5.1 test suites must verify the following twenty deterministic te
 
 ```
 ================================================================================
-ENGINEERING AUTHORITY APPROVAL QUESTIONS (MILESTONE M5.0-R18-R9):
+ENGINEERING AUTHORITY APPROVAL QUESTIONS (MILESTONE M5.0-R18-R10):
 ================================================================================
-1. [FIVE-FIELD OWNERSHIP COMPARISON]: Does the Engineering Authority approve
-   requiring all five fields (recoveryAttemptId, custodyGeneration, operationIdentity,
-   transactionId, drainerOwnershipGeneration) in isEquivalentOwnerToken, ensuring
-   adversarial or mismatched continuations are strictly rejected?
+1. [AUTHORITATIVE EVIDENCE VS CLAIMS]: Does the Engineering Authority approve
+   replacing caller-supplied Boolean claims with unforgeable component receipts
+   (ExecutionSettlementReceipt, ArchiveDispositionReceipt, CustodyReconciliationReceipt,
+   DrainerCustodyReleaseReceipt)?
 
-2. [TYPED SETTLEMENT PROOF PREREQUISITE]: Does the Engineering Authority approve
-   requiring assertValidSettlementProof verification before any settlement barrier
-   may resolve, preventing premature resolution on slot clearance alone?
+2. [COMPLETE 5-FIELD IDENTITY BINDING]: Does the Engineering Authority approve
+   enforcing isMatchingReceiptIdentity across all five fields on every single receipt,
+   preventing cross-attempt or cross-generation receipt reuse?
 
-3. [CLOSED GENERATION-SCOPED BARRIER LIFECYCLE]: Does the Engineering Authority
-   approve the closed barrier lifecycle, ensuring concurrent waiters share one
-   Promise and generation retirement safely prevents cross-generation interference?
+3. [OUTCOME-SPECIFIC CUSTODY RECONCILIATION]: Does the Engineering Authority approve
+   discriminating between SourceQuarantineRetirementReceipt (for COMMITTED) and
+   SourceQuarantineRestorationReceipt (for ABORTED_FENCED)?
 
-4. [SYNCHRONOUS TOMBSTONE BACKPRESSURE RECOVERY]: Does the Engineering Authority
-   approve the synchronous recovery sequence upon reservation settlement, maintaining
-   the strict 1,000 bound without unbounded queues?
+4. [EXPLICIT DRAINER RELEASE EVIDENCE]: Does the Engineering Authority approve
+   requiring DrainerCustodyReleaseReceipt issued exclusively upon exact-owner
+   validation and atomic custody publication?
 
-5. [DEEP IMMUTABILITY & ENCAPSULATION]: Does the Engineering Authority confirm
-   that defensive deep cloning and deep freezing provide complete runtime
-   protection for published custody records?
+5. [PROOF LINEARIZATION & RETIREMENT ORDER]: Does the Engineering Authority approve
+   the strict 8-step execution order, ensuring barriers resolve only upon verified
+   proof and retirement never erases unresolved custody obligations?
 ================================================================================
 ```
 
@@ -753,12 +910,12 @@ ENGINEERING AUTHORITY APPROVAL QUESTIONS (MILESTONE M5.0-R18-R9):
 
 ```
 ================================================================================
-M5.0-R18-R9 ARCHITECTURAL DECISION PROPOSAL VERDICT:
+M5.0-R18-R10 ARCHITECTURAL DECISION PROPOSAL VERDICT:
 DECISION PROPOSAL COMPLETE — READY FOR ENGINEERING AUTHORITY REVIEW
 ================================================================================
 ```
 
-This R18-R9 proposal establishes complete architectural closure: it enforces five-field ownership-token equivalence, guarantees that settlement barriers resolve only upon verified typed settlement proof, defines the complete generation-scoped barrier lifecycle, specifies synchronous tombstone backpressure recovery, and secures published custody records with deep immutability.
+This R18-R10 proposal achieves definitive mathematical and distributed-systems closure: it eliminates caller-fabricated claims by requiring unforgeable authoritative subsystem receipts, enforces 1-to-1 five-field identity binding across all evidence, discriminates outcome-specific custody reconciliation, includes explicit drainer release receipts, and establishes a singular, validated barrier linearization point.
 
 ### Mandatory Implementation Authorization Statement
-**"M5.0-R18-R9 is an architectural documentation correction only. No production implementation has been started. M5.1, including M5.1a, remains strictly unauthorized pending explicit Engineering Authority approval."**
+**"M5.0-R18-R10 is an architectural documentation correction only. No production implementation has been started. M5.1, including M5.1a, remains strictly unauthorized pending explicit Engineering Authority approval."**
