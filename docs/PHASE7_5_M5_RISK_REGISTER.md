@@ -1,6 +1,6 @@
 # Phase 7.5 Milestone M5 — Risk Register
 
-**Status:** APPROVED ARCHITECTURAL SPECIFICATION (MILESTONE M5.0-R7 AMENDED)
+**Status:** APPROVED ARCHITECTURAL SPECIFICATION (MILESTONE M5.0-R8 AMENDED)
 **Date:** 2026-11-25
 **Authoritative Starting Baseline:** `40b11fdafcd247c7a289723f90ec0e2029c94f64` (Phase 7.5 M4.3d Formally Accepted)
 **Accepted Baselines:** M4.3c (`eab2428`), M4.3b (`f3c29b6`), Approved Architecture (`2bb117c`), Frozen M4.2d (`aafa366`)
@@ -125,13 +125,13 @@ Milestone M5 integrates the recovery subsystem directly into `LeaderlessSyncEngi
 
 ---
 
-### R-M5-08: Ambiguous Lifecycle Ownership, Capability Custody, Reset Failures & Teardown Leaks (Closing F5, R2-H5, R3-07, R6-02, R7-02)
+### R-M5-08: Ambiguous Lifecycle Ownership, Package Boundary, Reset Failures & Teardown Leaks (Closing F5, R2-H5, R3-07, R6-02, R7-02, R8-01, R8-05)
 - **Root Cause:** Unclear lifecycle ownership where active timers retain the coordinator, improper capability checks allow unauthorized replacement, or administrative reset operations fail partway through without failure-atomic cleanup.
 - **Architectural Impact:** Retained background processes, hanging test suites, unauthorized core state replacement, or inconsistent partial state exposed after failed reset.
 - **Mitigation Strategy:**
   - **Single Construction Authority:** `LeaderlessSyncEngine` owns `RecoveryCoordinator`.
   - **Single-Attachment Invariant:** Calling `bindEngine()` when already bound throws `SyncEngineError('ALREADY_BOUND')`. Sharing coordinators across engines is prohibited.
-  - **Capability Custody (R3-07, R7-01):** Checked strictly via object identity (`capability === this.authorizedRecoveryCapability`). No un-modeled dynamic revocation; constructor unwinding cleans failed bindings; engine disposal dead-ends capability invocations.
+  - **Capability Custody & Package Boundary (R3-07, R7-01, R8-05):** Checked strictly via object identity (`capability === this.authorizedRecoveryCapability`). `package.json` exports only root `.`, prohibiting external deep-imports of internal custody modules. Capability instances and containers shallow-frozen with `Object.freeze()`. `bindEngine()` is strictly internal composition root method. Zero public capability getters or diagnostic leaks. Least privilege enforced: Coordinator holds local replay authority; Drainer holds repair batch authority.
   - **Failure-Atomic Reset Semantics (R6-02, R7-02):**
     - `PURGE_AND_RETRY`: monotonic attempt counter increment (`currentAttemptId++`) fences all async callbacks and timers from prior attempts; synchronous drainer reset cancels in-flight record ($N_{\text{in-flight}} \le 1$); notifications are permanently suppressed.
     - `REINITIALIZE_CLEAN`: strict 5-step M4.3c sequence; if any post-install step fails, catch block immediately restores `engine.setRecoveryMode(true)`, engine remains in `DEGRADED`, notifications are never flushed, and clean baseline swap remains irrevocable without rolling back to corrupt pre-reset root.
@@ -162,14 +162,15 @@ Milestone M5 integrates the recovery subsystem directly into `LeaderlessSyncEngi
 
 ---
 
-### R-M5-10: Lifecycle State Desynchronization & Completion Handoff (Closing F1, F7, R2-C2, R3-03, R5-03, R6-02, R7-01, R7-02)
+### R-M5-10: Lifecycle State Desynchronization, Notification Dispatch & Irreversible Effects (Closing F1, F7, R2-C2, R3-03, R5-03, R6-02, R7-01, R7-02, R8-03, R8-04)
 - **Root Cause:** If the engine maintains an independent mutable boolean alongside the coordinator's state machine, or if completion handoff ordering is inverted, listeners can observe inconsistent states. If callers confuse `!isRecoveryInProgress()` with healthy active operation during `DEGRADED` states, operations could be incorrectly submitted. If `resetRecovery()` acts as an unvalidated escape hatch, incomplete state could be exposed as healthy.
 - **Architectural Impact:** Engine admits remote events while coordinator is recovering, callers submit intents while degraded, incomplete states exposed as healthy, or listeners observe `ACTIVE` state while engine still rejects local inputs.
 - **Mitigation Strategy:**
   - **Three-Tier Architecture (R3-03, R5-03):** Coordinator state machine is Tier 1 sole lifecycle authority (`recoveryState`). Public engine queries are Tier 2 delegators: `isRecoveryInProgress()` returns `true` strictly in `RECOVERING` and `RECONCILING`; `isDegraded()` returns `true` strictly in `DEGRADED`. Callers must never infer health from `!isRecoveryInProgress()`. `this.recoveryActive` is strictly a Tier 3 slave operational gate for notification deferral, remaining held in locked mode when `DEGRADED`.
   - **Administrative Reset Guardrails (R6-02, R7-02):** `resetRecovery(capability, resetAction)` requires authorized `RecoveryInstallationCapability` checked via object identity, is permitted strictly from `DEGRADED`, and enforces failure-atomic reset semantics (`PURGE_AND_RETRY` with monotonic attempt counter fencing vs `REINITIALIZE_CLEAN` with 5-step M4.3c sequence and irrevocable clean root swap). It never exposes an incomplete state as healthy.
-  - **M4.3c Completion Sequence (R2-C2):** Drain completes $\to$ bookkeeping completes $\to$ `engine.setRecoveryMode(false)` $\to$ `coordinator.transition('ACTIVE')` $\to$ `flushDeferredNotifications()`.
-  - If transition throws, catch block immediately restores `engine.setRecoveryMode(true)`, aborts recovery, and does NOT flush notifications.
+  - **M4.3c Completion Sequence & Non-Throwing Dispatch (R2-C2, R8-04):** Drain completes $\to$ bookkeeping completes $\to$ `engine.setRecoveryMode(false)` $\to$ `coordinator.transition('ACTIVE')` $\to$ non-throwing `flushDeferredNotifications()` with isolated listener errors.
+  - If transition throws before ACTIVE, catch block restores `engine.setRecoveryMode(true)`, aborts recovery, and does NOT flush notifications.
+  - **Explicit Observer Boundary (R8-04):** Once ACTIVE is reached, state transition is externally observable; delivered listener effects cannot be retracted. In `REINITIALIZE_CLEAN`, Step 2 purges stale notifications while Step 5 dispatches fresh clean baseline notifications (R8-03).
   - **Capability Branding & Custody (R7-01):** `DRAIN_ADMISSION_BRAND: unique symbol` is module-private to `drain-admission-custody.ts` and non-exported in public package entry point. Capability instances are deeply frozen with `Object.freeze()` and transferred privately via `AuthorizedDrainCapabilities` during `bindEngine()`. In-realm defensive trust model prevents API misuse and duck-typing.
 - **Automated Verification Control:** State consistency tests in `recovery-lifecycle-binding.test.ts` verifying listener observation guarantees, `isDegraded()` query behavior, capability-authorized `resetRecovery()` safety, and handoff rollback.
 
