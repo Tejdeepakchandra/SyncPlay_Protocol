@@ -1,31 +1,30 @@
-# Phase 7.5 M5.0-R18-R8 — Stale Custody-Release Fencing, Barrier Lifecycle & Bounded Tombstone Backpressure
+# Phase 7.5 M5.0-R18-R9 — Final Custody Authorization and Settlement-Barrier Proof Correction
 
 **Role:** Principal TypeScript Distributed-Systems Architect and Recovery-Systems Auditor
 **Mode:** STRICTLY DOCUMENTATION-ONLY ARCHITECTURAL CORRECTION
 **Target Document:** `docs/PHASE7_5_M5_0_R18_CONCURRENT_RECOVERY_ARBITRATION_DECISION.md`
-**Baseline Commit:** `f77d4e188ae9f585be13f3605e05a9c004c062cf`
-**Direct Parent Commit:** `f77d4e188ae9f585be13f3605e05a9c004c062cf`
+**Baseline Commit:** `32e2ddd29af9a61cb5b5f4a7bcbced5a9fe796c4`
+**Direct Parent Commit:** `32e2ddd29af9a61cb5b5f4a7bcbced5a9fe796c4`
 **Implementation Authorization:** Milestone M5.1 remains **STRICTLY BLOCKED AND UNAUTHORIZED**.
 
 ---
 
-## 1. Problem Statement & R18-R8 Objectives
+## 1. Problem Statement & R18-R9 Objectives
 
-The M5.0-R18-R7 architectural decision established exact 6-tuple immutable identity matching for idempotent retries, failure-safe custody publication (Option A), and generation-floor advancement rules. However, rigorous distributed-systems review revealed four critical lifecycle and concurrency hazards:
+The M5.0-R18-R8 architectural decision established generation-scoped settlement barriers and introduced the `CustodyOwnershipToken` for attempt-fenced release. However, rigorous distributed-systems auditing identified five critical authorization and proof gaps:
 
-1. **Unfenced Custody-State Clearance:** In R18-R7, `_publishCustodyRelease()` unconditionally cleared whichever in-flight record was stored. If Attempt 1 timed out and was superseded by Attempt 2, a delayed asynchronous continuation from Attempt 1 executing `_publishCustodyRelease()` could clear Attempt 2's active in-flight custody and prematurely resolve Attempt 2's barrier. Custody release must be explicitly fenced by an immutable ownership token (`CustodyOwnershipToken`).
-2. **Monolithic Barrier Lifecycle:** The lifetime-wide boolean flag `_barrierResolved` prevented subsequent operations from resolving their own barriers once an earlier barrier had resolved. Barriers must be scoped per in-flight custody generation ($g \in \mathbb{N}$), with once-only resolution per generation that does not prevent subsequent barriers from resolving.
-3. **Tombstone Capacity Deadlock & Backpressure:** R18-R7 deferred tombstone eviction if advancing the generation floor would breach an active reservation, but did not define what occurs when the collection reaches its strict ceiling (`MAX_FENCED_TRANSACTIONS = 1000`) and safe eviction remains blocked. The archive must enforce a strict, fail-closed backpressure policy (`FENCING_BACKPRESSURE_CAPACITY_EXHAUSTED`).
-4. **Shallow Immutability of Published Records:** `Object.freeze()` on the outer custody-state object leaves nested identity arrays mutable. Published custody records must enforce deep runtime immutability via defensive deep-cloning and private backing fields.
+1. **Incomplete Ownership-Token Comparison:** R18-R8 specified that custody release compares five immutable fields, but its pseudocode compared only three (`recoveryAttemptId`, `custodyGeneration`, `drainerOwnershipGeneration`), omitting `operationIdentity` and `transactionId`. If a concurrent or retried attempt had matching attempt and generation counters but was executing a different operation or transaction, custody could be improperly released. Custody release must compare **all five** immutable fields via an explicit equivalence predicate.
+2. **Missing Settlement Prerequisites Proof Prior to Barrier Resolution:** R18-R8 declared the invariant `BARRIER_RESOLVED(g) => EXECUTION_SETTLED(g) && CUSTODY_RECONCILED(g) && NO_IN_FLIGHT_OWNER(g)`, but its pseudocode resolved `activeBarrier(g)` based on owner-token clearance alone without verifying typed proof that the execution Promise physically settled and custody was reconciled.
+3. **Incomplete Generation-Scoped Barrier Lifecycle:** While R18-R8 isolated barriers per generation, the lifecycle for barrier registration of concurrent waiters, active barrier retirement, and disposal was underspecified.
+4. **Tombstone Backpressure Operational Recovery:** R18-R8 introduced backpressure when safe tombstone eviction was blocked by active reservations, but did not define the synchronous, bounded recovery sequence when a blocking reservation settles.
+5. **Deep Immutability & Adversarial Fencing:** Proof was required showing that an adversarial caller presenting matching attempt and generation counters but mismatched operation or transaction identities is strictly rejected.
 
-### Core Architectural Guarantees Established in R18-R8:
-- **Attempt-Fenced Custody Release:** `publishCustodyRelease(expectedOwnerToken)` verifies that the current custody state matches the exact expected owner across 5 dimensions (`recoveryAttemptId`, `custodyGeneration`, `operationIdentity`, `transactionId`, `drainerOwnershipGeneration`). Stale continuations reject fail-closed without mutating newer custody:
-  $$\mathbf{STALE\_ATTEMPT} \implies \mathbf{CANNOT\_RELEASE\_NEWER\_CUSTODY}$$
-- **Generation-Scoped Settlement-Barrier Lifecycle:** Each in-flight drain operation allocates a discrete `SettlementBarrier(g)` tied to custody generation $g$. Each barrier resolves at most once, and resolution of generation $g$ does not impede generation $g+1$:
-  $$\mathbf{BARRIER\_RESOLVED}(g) \implies \mathbf{EXECUTION\_SETTLED}(g) \land \mathbf{CUSTODY\_RECONCILED}(g) \land \mathbf{NO\_IN\_FLIGHT\_OWNER}(g)$$
-- **Strict Tombstone Capacity & Backpressure Contract:** Preserves the hard 1,000-entry ceiling. If safe eviction is blocked by an active reservation, the archive enters fail-closed backpressure, rejecting new fencing and reservation requests while preserving existing valid state.
-- **Deep Immutability & Encapsulation of Custody Records:** Guarantees that published custody snapshots and nested operation identity arrays are deeply cloned, private-backed, and frozen against external mutation.
-- **Twenty Deterministic Future Test Requirements:** Codifies 20 exhaustive test scenarios for future M5.1 verification suites.
+### Core Architectural Guarantees Established in R18-R9:
+- **Exhaustive Five-Field Ownership Comparison:** `publishCustodyRelease(expectedOwnerToken, settlementProof)` validates all five fields (`recoveryAttemptId`, `custodyGeneration`, `operationIdentity`, `transactionId`, `drainerOwnershipGeneration`) via `isEquivalentOwnerToken`. Mismatches reject with `STALE_CUSTODY_RELEASE_REJECTED`.
+- **Typed Settlement Reconciliation Proof:** Enforces `SettlementReconciliationProof` validation as a mandatory prerequisite before any barrier may resolve. A barrier cannot resolve merely because an in-flight slot was cleared.
+- **Closed Generation-Scoped Barrier Lifecycle:** Formulates creation, concurrent waiter registration, owner association, once-only resolution, generation-checked retirement, and replacement.
+- **Operational Tombstone Backpressure Recovery:** Specifies synchronous reevaluation upon reservation settlement, advancing `fencingGenerationFloor` safely without unbounded queues or hidden retained states.
+- **Twenty Deterministic Future Test Requirements:** Codifies 20 exhaustive test requirements for future M5.1 suites.
 
 ---
 
@@ -255,7 +254,7 @@ SYNCHRONOUS ATOMIC PUBLICATION SEGMENT (Single Non-Interleavable Microtask Turn)
 
 ---
 
-## 8. Generation-Floor Scope & Strict Tombstone Backpressure
+## 8. Generation-Floor Scope & Strict Tombstone Backpressure Recovery
 
 ### 8.1 Scope & Monotonicity of Generations
 - **Scope:** `fencingGeneration` is a monotonic counter strictly scoped to the local `TerminalQuarantineArchive` instance (`#core.fencingGeneration`).
@@ -267,7 +266,7 @@ SYNCHRONOUS ATOMIC PUBLICATION SEGMENT (Single Non-Interleavable Microtask Turn)
 `fencingGenerationFloor` advances **if and only if** `#fencedTransactions` reaches capacity (`MAX_FENCED_TRANSACTIONS = 1000`) and the oldest tombstone can be safely evicted:
 $$\text{candidateRoot.fencingGenerationFloor} = \max(\text{currentRoot.fencingGenerationFloor},\; \text{evictedTombstone.fencingGeneration})$$
 
-### 8.3 Protection of Active Reservations & Strict Backpressure
+### 8.3 Protection of Active Reservations & Strict Backpressure Recovery (Mandatory Correction D)
 To prevent advancing the floor past an active reservation while enforcing the hard 1,000-entry memory bound:
 1. **Eviction Safety Condition:** Safe eviction requires:
    $$\mathbf{evictedTombstone.fencingGeneration} < \min_{r \in \mathbf{activeReservations}}(r.\mathbf{generation})$$
@@ -280,7 +279,13 @@ To prevent advancing the floor past an active reservation while enforcing the ha
    - The 1,000-entry bound is **never exceeded**.
    - Old tombstones are **never prematurely evicted**.
    - Floor **never advances past active reservations**.
-4. **Capacity Recovery:** As soon as the oldest blocking active reservation settles (via commit or expiry/timeout), its generation is cleared from active reservations, allowing deferred tombstone eviction to proceed safely and restoring normal operation.
+4. **Synchronous Operational Recovery Path:**
+   - When a blocking reservation settles (via `commitRetirementBatch` or `cancelReservation`), it is removed from `#activeReservations`.
+   - In that **same synchronous microtask turn**, the archive evaluates whether deferred eviction can proceed:
+     $$\text{newMinResGen} = \min_{r \in \text{activeReservations}}(r.\text{generation})$$
+   - If the oldest tombstone's generation is now strictly $< \text{newMinResGen}$, the oldest tombstone is evicted immediately, advancing `fencingGenerationFloor`.
+   - **Zero Unbounded Queues:** The archive does not maintain an unbounded queue of deferred fencing requests. Callers that received `FENCING_BACKPRESSURE_CAPACITY_EXHAUSTED` retry via caller-managed exponential backoff.
+   - If active reservations remain blocking, the archive remains in backpressure fail-closed.
 
 ---
 
@@ -315,7 +320,7 @@ getTransactionDisposition(
 
 ### A. Confirmed Committed (Level 3 Proof)
 - **Condition:** Authoritative lookup `archive.getTransactionDisposition(txId) === 'COMMITTED'` confirms exact `txId`, matching `stagedBatchDigest`, and composite operation identities.
-- **Required Action:** Execute Protocol A: retire source operations from `QuarantineBuffer`, verify buffer disjointness, await destination Promise settlement, publish attempt-fenced custody release, and resolve the generation-scoped settlement barrier.
+- **Required Action:** Execute Protocol A: retire source operations from `QuarantineBuffer`, verify buffer disjointness, await destination Promise settlement, publish attempt-fenced custody release with valid settlement proof, and resolve the generation-scoped settlement barrier.
 
 ### B. Post-Commit Promise Rejection (Execution Failure)
 - **Condition:** Archive transaction is confirmed `COMMITTED`, but the original destination Promise settles with a rejection (`Promise.reject(err)`).
@@ -325,11 +330,11 @@ getTransactionDisposition(
   2. Protocol B restoration is **strictly prohibited** (preventing double replay).
   3. Execution is marked settled (`EXECUTION_SETTLED = true`).
   4. Final custody reconciliation (source retirement verification) must still succeed.
-  5. If reconciliation succeeds, publish attempt-fenced custody release and resolve the barrier. If reconciliation fails, enter `CUSTODY_RECONCILIATION_BLOCKED`.
+  5. If reconciliation succeeds, construct `SettlementReconciliationProof`, publish custody release, and resolve the barrier. If reconciliation fails, enter `CUSTODY_RECONCILIATION_BLOCKED`.
 
 ### C. Aborted Fenced (Level 3 Proof)
 - **Condition:** Atomic arbitration confirms `archive.arbitrateOrFenceTransaction(...)` returned `ABORTED_FENCED`.
-- **Required Action:** Execute Protocol B: await destination Promise settlement, restore operation to `QuarantineBuffer` head via `unshiftDrain(op)`, verify buffer representation, publish attempt-fenced custody release, and resolve the barrier.
+- **Required Action:** Execute Protocol B: await destination Promise settlement, restore operation to `QuarantineBuffer` head via `unshiftDrain(op)`, verify buffer representation, construct settlement proof, publish attempt-fenced custody release, and resolve the barrier.
 
 ### D. Inconclusive or Commit Pending (Level 3 Ambiguity)
 - **Condition:** Arbitration throws, times out, or reports `NOT_FOUND_AT_QUERY` or `COMMIT_PENDING`.
@@ -337,10 +342,10 @@ getTransactionDisposition(
 
 ---
 
-## 12. Attempt-Fenced Custody Release & Settlement-Barrier Lifecycle
+## 12. Complete Custody Authorization & Settlement-Barrier Proof Contract
 
-### 12.1 Attempt-Fenced Custody Release (Mandatory Correction A)
-To guarantee that a stale continuation cannot clear custody owned by a newer recovery attempt, custody release requires an exact immutable `CustodyOwnershipToken`:
+### 12.1 Five-Field Ownership Comparison & Equivalence Predicate (Mandatory Correction A)
+To guarantee that a stale continuation cannot release custody owned by a newer recovery attempt, custody release requires an exact immutable `CustodyOwnershipToken` compared across **all five fields**:
 
 ```typescript
 export interface CustodyOwnershipToken {
@@ -351,69 +356,91 @@ export interface CustodyOwnershipToken {
   readonly drainerOwnershipGeneration: number;
 }
 
-export interface DrainerCustodyState {
-  readonly inFlightRecord: Readonly<DrainerInFlightRecord> | null;
-  readonly isDraining: boolean;
-  readonly gateState: CustodyGateState;
-  readonly ownerToken: Readonly<CustodyOwnershipToken> | null;
+export function isEquivalentOwnerToken(
+  current: CustodyOwnershipToken | null,
+  expected: CustodyOwnershipToken,
+): boolean {
+  if (!current) return false;
+  return (
+    current.recoveryAttemptId === expected.recoveryAttemptId &&
+    current.custodyGeneration === expected.custodyGeneration &&
+    current.operationIdentity === expected.operationIdentity &&
+    current.transactionId === expected.transactionId &&
+    current.drainerOwnershipGeneration === expected.drainerOwnershipGeneration
+  );
 }
 ```
 
-#### Attempt-Fenced Release Protocol:
+#### Adversarial Equivalence Example:
+Consider an adversarial or confused delayed continuation:
+- **Active Current State:** `Attempt 2`, `Custody Gen 1`, operating on `stream-A:seq-10` under `tx-2-res-1` (drainer gen 1).
+- **Adversarial Caller Token:** `Attempt 2`, `Custody Gen 1`, but operating on `stream-B:seq-99` under `tx-2-res-99` (drainer gen 1).
+- **Evaluation:** In R18-R8's pseudocode, comparing only attempt, custody generation, and drainer generation would have falsely succeeded. Under R18-R9, `isEquivalentOwnerToken` evaluates:
+  $$\text{"stream-B:seq-99"} === \text{"stream-A:seq-10"} \implies \mathbf{false}$$
+  $$\text{"tx-2-res-99"} === \text{"tx-2-res-1"} \implies \mathbf{false}$$
+- **Result:** The release is rejected with `STALE_CUSTODY_RELEASE_REJECTED`. The active in-flight custody of `stream-A:seq-10` and its barrier are 100% untouched.
+
+---
+
+### 12.2 Typed Settlement Reconciliation Proof (Mandatory Correction B)
+A settlement barrier must **never** resolve based on custody-slot clearance alone. It requires formal verification of `SettlementReconciliationProof`:
+
 ```typescript
-class QuarantineDrainer {
-  private _custodyState: DrainerCustodyState = {
-    inFlightRecord: null,
-    isDraining: false,
-    gateState: 'CUSTODY_SETTLED',
-    ownerToken: null,
-  };
-  private _activeBarrier: GenerationSettlementBarrier | null = null;
+export interface SettlementReconciliationProof {
+  readonly recoveryAttemptId: number;
+  readonly custodyGeneration: number;
+  readonly operationIdentity: string;
+  readonly transactionId: string;
+  readonly executionSettled: boolean;
+  readonly settlementType: 'FULFILLED' | 'REJECTED';
+  readonly archiveDisposition: 'COMMITTED' | 'ABORTED_FENCED';
+  readonly custodyReconciled: boolean;
+  readonly sourceBufferDisjoint: boolean;
+}
 
-  public publishCustodyRelease(expectedOwnerToken: CustodyOwnershipToken): void {
-    const current = this._custodyState;
-
-    // 1. STALE ATTEMPT FENCING CHECK:
-    if (!current.ownerToken ||
-        current.ownerToken.recoveryAttemptId !== expectedOwnerToken.recoveryAttemptId ||
-        current.ownerToken.custodyGeneration !== expectedOwnerToken.custodyGeneration ||
-        current.ownerToken.drainerOwnershipGeneration !== expectedOwnerToken.drainerOwnershipGeneration) {
-      throw new Error(`STALE_CUSTODY_RELEASE_REJECTED: Stale attempt ${expectedOwnerToken.recoveryAttemptId} (gen: ${expectedOwnerToken.custodyGeneration}) cannot release custody owned by attempt ${current.ownerToken?.recoveryAttemptId} (gen: ${current.ownerToken?.custodyGeneration}).`);
-    }
-
-    // 2. SYNCHRONOUS ATOMIC PUBLICATION (Option A):
-    this._custodyState = Object.freeze({
-      inFlightRecord: null,
-      isDraining: false,
-      gateState: 'CUSTODY_SETTLED',
-      ownerToken: null,
-    });
-
-    // 3. RESOLVE GENERATION-SPECIFIC BARRIER:
-    if (this._activeBarrier && this._activeBarrier.generation === expectedOwnerToken.custodyGeneration) {
-      this._activeBarrier.resolveOnce();
-    }
+export function assertValidSettlementProof(
+  proof: SettlementReconciliationProof,
+  ownerToken: CustodyOwnershipToken,
+): void {
+  if (!proof.executionSettled) {
+    throw new Error('BARRIER_PRECONDITION_FAILED: Execution Promise has not physically settled.');
+  }
+  if (!proof.custodyReconciled) {
+    throw new Error('BARRIER_PRECONDITION_FAILED: Custody reconciliation is not complete.');
+  }
+  if (proof.archiveDisposition !== 'COMMITTED' && proof.archiveDisposition !== 'ABORTED_FENCED') {
+    throw new Error(`BARRIER_PRECONDITION_FAILED: Archive disposition ${proof.archiveDisposition} is not terminal.`);
+  }
+  if (proof.archiveDisposition === 'COMMITTED' && !proof.sourceBufferDisjoint) {
+    throw new Error('BARRIER_PRECONDITION_FAILED: Source buffer disjointness is unverified.');
+  }
+  if (
+    proof.recoveryAttemptId !== ownerToken.recoveryAttemptId ||
+    proof.custodyGeneration !== ownerToken.custodyGeneration ||
+    proof.operationIdentity !== ownerToken.operationIdentity ||
+    proof.transactionId !== ownerToken.transactionId
+  ) {
+    throw new Error('BARRIER_PRECONDITION_FAILED: Proof identity does not match expected owner token.');
   }
 }
 ```
 
-- **Fencing Guarantee:** If Attempt 1 times out and Attempt 2 takes custody, `current.ownerToken.recoveryAttemptId === 2`. A delayed continuation from Attempt 1 passes `recoveryAttemptId: 1`, immediately throwing `STALE_CUSTODY_RELEASE_REJECTED`. Attempt 2's in-flight record and barrier are **untouched**.
-$$\mathbf{STALE\_ATTEMPT} \implies \mathbf{CANNOT\_RELEASE\_NEWER\_CUSTODY}$$
-
 ---
 
-### 12.2 Generation-Scoped Settlement-Barrier Lifecycle (Mandatory Correction B)
+### 12.3 Closed Generation-Scoped Barrier Lifecycle (Mandatory Correction C)
 Barriers are strictly scoped per **in-flight custody generation** ($g \in \mathbb{N}$):
 
 ```typescript
-class GenerationSettlementBarrier {
+export class GenerationSettlementBarrier {
   public readonly generation: number;
+  public readonly ownerToken: Readonly<CustodyOwnershipToken>;
   private readonly _promise: Promise<void>;
   private _resolver!: () => void;
   private _resolved: boolean = false;
 
-  constructor(generation: number) {
+  constructor(generation: number, ownerToken: CustodyOwnershipToken) {
     this.generation = generation;
+    this.ownerToken = Object.freeze({ ...ownerToken });
     this._promise = new Promise<void>((resolve) => {
       this._resolver = resolve;
     });
@@ -423,8 +450,9 @@ class GenerationSettlementBarrier {
     return this._promise;
   }
 
-  public resolveOnce(): void {
+  public resolveWithProof(proof: SettlementReconciliationProof): void {
     if (this._resolved) return;
+    assertValidSettlementProof(proof, this.ownerToken);
     this._resolved = true;
     this._resolver();
   }
@@ -435,24 +463,38 @@ class GenerationSettlementBarrier {
 }
 ```
 
-#### Lifecycle Rules:
-1. **Creation:** When `drainNext()` dequeues an operation, `custodyGeneration` advances ($g \to g+1$), creating a new `GenerationSettlementBarrier(g+1)`.
-2. **Pending:** Any coordinator or caller invoking `drainSettledBarrier()` awaits `this._activeBarrier.promise`. Concurrent callers share the identical Promise.
-3. **Once-Only Resolution:** `resolveOnce()` evaluates `#resolved`. Duplicate calls are no-ops.
-4. **Subsequent Operations:** When operation $g$ settles, `barrier(g)` is resolved. When operation $g+1$ starts later, a fresh `GenerationSettlementBarrier(g+1)` is created. Resolution of $g$ does not block $g+1$.
-5. **Bypass Prohibition:** A new barrier cannot be created while `this._custodyState.inFlightRecord !== null`. `drainNext()` fails closed.
+#### Lifecycle State Transitions:
+1. **Creation:** When `drainNext()` dequeues operation $g$, `custodyGeneration` advances ($g \to g+1$), creating `new GenerationSettlementBarrier(g+1, ownerToken)`.
+2. **Registration of Waiters:** Any coordinator or caller invoking `drainSettledBarrier()` awaits `this._activeBarrier.promise`. Concurrent callers share the identical Promise.
+3. **Owner Association:** Bound immutably to `ownerToken`.
+4. **Resolution:** `publishCustodyRelease(expectedOwnerToken, proof)` invokes `barrier.resolveWithProof(proof)`.
+5. **Retirement & Safe Replacement:** Active barrier reference is cleared only when the retiring barrier's generation matches:
+   ```typescript
+   if (this._activeBarrier && this._activeBarrier.generation === expectedOwnerToken.custodyGeneration) {
+     this._activeBarrier = null;
+   }
+   ```
+6. **Bypass Prohibition:** A new barrier cannot be created while `this._custodyState.inFlightRecord !== null`. `drainNext()` strictly fails closed.
+7. **Failed Release Behavior:** If `publishCustodyRelease` throws or fails pre-verification, the barrier is **neither resolved nor retired**; it remains pending fail-closed.
 
 ---
 
-### 12.3 Deep Immutability of Published Custody Records (Mandatory Correction D)
-To eliminate reference aliasing and mutation vulnerabilities:
-1. **Private Storage:** Internal records use ECMAScript `#` private fields.
-2. **Defensive Deep Cloning:** Any array of composite operation IDs (`canonicalOperationIdentities`) or byte buffers is defensively cloned into detached instances.
-3. **Deep Freeze:** The snapshot object and all nested records are recursively frozen with `Object.freeze()`. Callers holding prior references cannot mutate the active custody state.
+### 12.4 Deep Immutability of Published Custody Records (Mandatory Correction D)
+```typescript
+export interface DrainerCustodyState {
+  readonly inFlightRecord: Readonly<DrainerInFlightRecord> | null;
+  readonly isDraining: boolean;
+  readonly gateState: CustodyGateState;
+  readonly ownerToken: Readonly<CustodyOwnershipToken> | null;
+}
+```
+- Internal records use ECMAScript `#` private fields.
+- Nested operation identity arrays (`canonicalOperationIdentities`) are defensively cloned into detached instances.
+- The snapshot object and all nested records are recursively frozen with `Object.freeze()`. Callers holding prior references cannot mutate the active custody state.
 
 ---
 
-### 12.4 Protocol A: Drainer $\to$ Terminal Archive (Execution Settlement & Attempt Fenced)
+### 12.5 Protocol A: Drainer $	o$ Terminal Archive (Execution Settlement & Attempt Fenced)
 
 ```
 [Level 3 Authoritative Commit Confirmed]
@@ -482,19 +524,22 @@ To eliminate reference aliasing and mutation vulnerabilities:
    └─ Reject: Classify as post-commit execution failure; suppress error; Protocol B PROHIBITED!
                  │
                  ▼
-8. Verify Exact Final Representation (Present in Archive, Absent in Buffer)
+8. Construct SettlementReconciliationProof (assertValidSettlementProof)
                  │
                  ▼
-9. ATTEMPT-FENCED CUSTODY RELEASE: this.publishCustodyRelease(ownerToken);
-   [Verifies ownerToken; simultaneously publishes inFlightRecord = null and gateState = 'CUSTODY_SETTLED']
+9. ATTEMPT-FENCED CUSTODY RELEASE: this.publishCustodyRelease(ownerToken, proof);
+   [Verifies all 5 fields via isEquivalentOwnerToken; simultaneously publishes inFlightRecord = null and gateState = 'CUSTODY_SETTLED']
                  │
                  ▼
-10. Resolve Generation Barrier Exactly Once: activeBarrier(g).resolveOnce();
+10. Resolve Generation Barrier Exactly Once: activeBarrier(g).resolveWithProof(proof);
+                 │
+                 ▼
+11. Retire Generation Barrier: this._retireBarrier(expectedOwnerToken.custodyGeneration);
 ```
 
 ---
 
-### 12.5 Protocol B: Drainer $\to$ Quarantine Buffer (12-Step Fencing Sequence)
+### 12.6 Protocol B: Drainer $	o$ Quarantine Buffer (12-Step Fencing Sequence)
 
 ```
 [Settlement / Fencing Trigger (Promise Completed / Rejected / Invalidation Received)]
@@ -523,14 +568,17 @@ To eliminate reference aliasing and mutation vulnerabilities:
 7. Verify Buffer Representation (hasOperation(...) === true & retainedCount++)
                  │
                  ▼
-8. Verify Late-Commit Exclusion (Assert stale commits with txId or obsolete generation will reject)
+8. Construct SettlementReconciliationProof (assertValidSettlementProof)
                  │
                  ▼
-9. ATTEMPT-FENCED CUSTODY RELEASE: this.publishCustodyRelease(ownerToken);
-   [Verifies ownerToken; simultaneously publishes inFlightRecord = null and gateState = 'CUSTODY_SETTLED']
+9. ATTEMPT-FENCED CUSTODY RELEASE: this.publishCustodyRelease(ownerToken, proof);
+   [Verifies all 5 fields via isEquivalentOwnerToken; simultaneously publishes inFlightRecord = null and gateState = 'CUSTODY_SETTLED']
                  │
                  ▼
-10. Resolve Generation Barrier Exactly Once: activeBarrier(g).resolveOnce();
+10. Resolve Generation Barrier Exactly Once: activeBarrier(g).resolveWithProof(proof);
+                 │
+                 ▼
+11. Retire Generation Barrier: this._retireBarrier(expectedOwnerToken.custodyGeneration);
 ```
 
 ---
@@ -612,14 +660,15 @@ stateDiagram-v2
 2. **Attempt-Fenced Custody Release Invariant:**
    $$\mathbf{STALE\_ATTEMPT} \implies \mathbf{CANNOT\_RELEASE\_NEWER\_CUSTODY}$$
 3. **Execution Settlement Precedence:** The settlement barrier **CANNOT** resolve while the destination Promise remains pending.
-4. **Owner-Token Verification Precedence:** Custody release **CANNOT** execute unless `ownerToken` matches the exact current owner across all 5 dimensions.
-5. **Strict Tombstone Capacity Ceiling:** `#fencedTransactions.size` **CANNOT** exceed 1,000 under any condition.
-6. **Active Reservation Floor Protection:** `fencingGenerationFloor` **CANNOT** advance past $\min_{r \in \text{activeReservations}}(r.\text{generation})$.
-7. **Single In-Flight Drain Invariant:** A second drain **CANNOT** dequeue an operation while `this._custodyState.inFlightRecord !== null` ($N_{\text{in-flight}} \le 1$).
-8. **Watchdog Immunity:** A watchdog timeout (`SETTLEMENT_BARRIER_TIMEOUT_MS = 5000`) **CANNOT** release drainer custody or cancel the destination Promise.
+4. **Five-Field Owner-Token Verification Precedence:** Custody release **CANNOT** execute unless `isEquivalentOwnerToken` evaluates to `true` across all 5 fields.
+5. **Typed Settlement Proof Precedence:** A barrier **CANNOT** resolve unless `assertValidSettlementProof` succeeds.
+6. **Strict Tombstone Capacity Ceiling:** `#fencedTransactions.size` **CANNOT** exceed 1,000 under any condition.
+7. **Active Reservation Floor Protection:** `fencingGenerationFloor` **CANNOT** advance past $\min_{r \in \text{activeReservations}}(r.\text{generation})$.
+8. **Single In-Flight Drain Invariant:** A second drain **CANNOT** dequeue an operation while `this._custodyState.inFlightRecord !== null` ($N_{\text{in-flight}} \le 1$).
+9. **Watchdog Immunity:** A watchdog timeout (`SETTLEMENT_BARRIER_TIMEOUT_MS = 5000`) **CANNOT** release drainer custody or cancel the destination Promise.
 
 ### Strict Ordering of Finalization:
-$$\text{1. Settle Promise} \longrightarrow \text{2. Reconcile Custody} \longrightarrow \text{3. } \mathbf{publishCustodyRelease(token)} \longrightarrow \text{4. } \mathbf{activeBarrier(g).resolveOnce()}$$
+$$\text{1. Settle Promise} \longrightarrow \text{2. Reconcile Custody} \longrightarrow \text{3. Construct Proof} \longrightarrow \text{4. } \mathbf{publishCustodyRelease(token, proof)} \longrightarrow \text{5. } \mathbf{activeBarrier(g).resolveWithProof(proof)}$$
 
 ---
 
@@ -629,7 +678,7 @@ The proposal excises all references to `forceEmergencyReset(capability)`:
 - Ordinary recovery APIs cannot bypass `CUSTODY_RECONCILIATION_BLOCKED`.
 - No automated root replacement is permitted while custody remains unresolved.
 - Emergency data abandonment, if ever required, needs a separate architectural decision defining operator authorization, auditability, late-settling Promise behavior, and data-loss semantics.
-- That separate decision is outside the scope of R18-R8 and is **not authorized** by this proposal.
+- That separate decision is outside the scope of R18-R9 and is **not authorized** by this proposal.
 
 ---
 
@@ -638,7 +687,7 @@ The proposal excises all references to `forceEmergencyReset(capability)`:
 1. **Admitted Under New Monotonic Token:** Attempt 2 is admitted from `DEGRADED` when gate status is `SETTLEMENT_PENDING`, incrementing `currentAttemptId = 2`.
 2. **Permanent Invalidation of Attempt 1:** Attempt 1 is superseded (`1 !== currentAttemptId (2)`) and latched `TIMED_OUT`. Its continuation is completely fenced and cannot mutate roots or stage batches.
 3. **Step 4 Serialized Barrier Wait:** Attempt 2 enters `RECOVERING`, advances to Step 4, and halts at `await drainer.drainSettledBarrier()`. Candidate root staging, archive pre-reservation, and root replacement are strictly prohibited while in Step 4.
-4. **Resolution & Exclusive Resumption:** When Attempt 1's destination Promise finishes and Level 3 custody reconciliation completes, Attempt 1's continuation attempts `publishCustodyRelease(token1)`, which is rejected because Attempt 2 owns the coordinator. The coordinator reconciles custody, executes `publishCustodyRelease(token2)`, and resolves the barrier. Attempt 2 unblocks with clean custody and proceeds to Step 7 with exclusive authority.
+4. **Resolution & Exclusive Resumption:** When Attempt 1's destination Promise finishes and Level 3 custody reconciliation completes, Attempt 1's continuation attempts `publishCustodyRelease(token1, proof)`, which is rejected because Attempt 2 owns the coordinator. The coordinator reconciles custody, executes `publishCustodyRelease(token2, proof)`, and resolves the barrier. Attempt 2 unblocks with clean custody and proceeds to Step 7 with exclusive authority.
 
 ---
 
@@ -646,26 +695,26 @@ The proposal excises all references to `forceEmergencyReset(capability)`:
 
 Sub-Milestone M5.1 test suites must verify the following twenty deterministic test sequences:
 
-- **Test R18-R8-T1 (Stale Attempt Delayed Release Cannot Clear Newer In-Flight Record):** Attempt 1 times out; Attempt 2 dequeues new op; Attempt 1 continuation invokes release; assert throws `STALE_CUSTODY_RELEASE_REJECTED`; assert Attempt 2 slot and barrier untouched.
-- **Test R18-R8-T2 (Stale Release With Matching Op Identity But Wrong Attempt Rejected):** Attempt release with current op ID but stale attempt ID; assert throws `STALE_CUSTODY_RELEASE_REJECTED`.
-- **Test R18-R8-T3 (Stale Release With Matching Attempt But Wrong Custody Gen Rejected):** Attempt release with matching attempt ID but stale custody generation; assert throws `STALE_CUSTODY_RELEASE_REJECTED`.
-- **Test R18-R8-T4 (Exact Current Owner Successfully Releases Custody):** Invoke release with exact matching `ownerToken`; assert state transitions to settled; assert barrier resolves.
-- **Test R18-R8-T5 (Failed Pre-Publication Check Leaves Custody State Untouched):** Mock verification throw before publication; assert `_custodyState` remains occupied fail-closed.
-- **Test R18-R8-T6 (Duplicate Release of Same Owner Is Idempotent):** Invoke `publishCustodyRelease` twice with identical token; assert second call returns cleanly with zero secondary mutations.
-- **Test R18-R8-T7 (Sequential Generation Barriers Resolve Independently):** Drain and settle op 1; assert barrier 1 resolves; drain and settle op 2; assert barrier 2 resolves cleanly.
-- **Test R18-R8-T8 (Duplicate Resolution of Barrier g Does Not Resolve Barrier g+1):** Call `barrier(g).resolveOnce()` twice; assert barrier $g+1$ remains pending until its own exact-owner release.
-- **Test R18-R8-T9 (Concurrent Waiters Share Same Barrier Promise):** Attach multiple callers to `drainSettledBarrier()`; assert all await the identical underlying Promise.
-- **Test R18-R8-T10 (New Barrier Cannot Bypass Unresolved Previous Custody):** Assert `drainNext()` fails closed while previous in-flight custody is occupied.
-- **Test R18-R8-T11 (Tombstone Capacity Reaches Hard 1,000-Entry Bound):** Populate `#fencedTransactions` to 1,000; assert size is exactly 1,000.
-- **Test R18-R8-T12 (Safe Eviction Advances Floor Monotonically):** Evict tombstone when no active reservations conflict; assert floor advances to evicted tombstone's generation.
-- **Test R18-R8-T13 (Unsafe Eviction Deferred When Active Reservation Conflicts):** Attempt eviction when oldest tombstone generation exceeds active reservation; assert eviction is deferred.
-- **Test R18-R8-T14 (Capacity Exhaustion Enforces Backpressure Without Exceeding Bound):** Attempt 1,001st fence when eviction deferred; assert throws `FENCING_BACKPRESSURE_CAPACITY_EXHAUSTED`; assert size remains $\le 1000$.
-- **Test R18-R8-T15 (Existing Reservations Preserved Under Backpressure):** Assert active reservations remain valid and uncorrupted during capacity backpressure.
-- **Test R18-R8-T16 (Capacity Recovers After Blocking Reservation Settles):** Settle blocking reservation; assert deferred eviction executes; assert backpressure is relieved.
-- **Test R18-R8-T17 (Caller Cannot Mutate Published Record Via Old Reference):** Mutate external array reference; assert internal published custody snapshot is completely unaffected.
-- **Test R18-R8-T18 (Timeout Followed by Late Settlement Cannot Release Newer Custody):** Mock timeout of Attempt 1; late Promise settles; assert Attempt 1 cannot release Attempt 2's custody.
-- **Test R18-R8-T19 (Settlement Barrier Remains Pending During Stale Rejection):** Assert stale release rejection does not resolve the pending barrier.
-- **Test R18-R8-T20 (Barrier Resolves Only After Exact-Owner Publication):** Verify barrier resolver is invoked if and only if `publishCustodyRelease` succeeds with exact owner match.
+- **Test R18-R9-T1 (Exact Five-Field Owner-Token Match Permits Release):** Pass matching token across all 5 fields with valid settlement proof; assert custody release succeeds; barrier resolves.
+- **Test R18-R9-T2 (Matching Attempt/Gen But Mismatching Op Identity Rejected):** Supply matching attempt and generation but altered `operationIdentity`; assert throws `STALE_CUSTODY_RELEASE_REJECTED`; custody untouched.
+- **Test R18-R9-T3 (Matching Attempt/Gen But Mismatching Transaction ID Rejected):** Supply matching attempt and generation but altered `transactionId`; assert throws `STALE_CUSTODY_RELEASE_REJECTED`.
+- **Test R18-R9-T4 (Mismatching Drainer Ownership Generation Rejected):** Supply mismatched `drainerOwnershipGeneration`; assert throws `STALE_CUSTODY_RELEASE_REJECTED`.
+- **Test R18-R9-T5 (Stale Attempt A Cannot Release Attempt B Custody):** Attempt A continuation attempts release after Attempt B assumed ownership; assert throws `STALE_CUSTODY_RELEASE_REJECTED`.
+- **Test R18-R9-T6 (Rejected Stale Release Leaves Newer Custody State Byte-for-Byte Unchanged):** Assert custody state before and after rejected release is identical.
+- **Test R18-R9-T7 (Watchdog Timeout Does Not Settle Barrier):** Fire 5,000 ms watchdog; assert coordinator status latches `DEGRADED`; assert barrier remains pending.
+- **Test R18-R9-T8 (Promise Rejection Without Authoritative Disposition Does Not Resolve Barrier):** Destination Promise rejects while archive query inconclusive; assert barrier remains pending.
+- **Test R18-R9-T9 (Execution Settlement Without Custody Reconciliation Does Not Resolve Barrier):** Promise settles but source retirement unconfirmed; assert barrier remains pending.
+- **Test R18-R9-T10 (Archive Commit Without Custody Release Does Not Resolve Barrier):** Archive commit confirmed but drainer slot occupied; assert barrier remains pending.
+- **Test R18-R9-T11 (Barrier Resolves Only When All Evidence Matches Same Gen & Tx):** Provide proof with mismatched generation; assert `assertValidSettlementProof` throws; barrier remains pending.
+- **Test R18-R9-T12 (Concurrent Waiters Share Same Barrier Promise):** Multiple callers await `drainSettledBarrier()`; assert all resolve upon the identical Promise.
+- **Test R18-R9-T13 (Resolved Generation Barrier Cannot Be Reused for Later Generation):** Settle generation 1; advance to generation 2; assert generation 2 creates discrete barrier instance.
+- **Test R18-R9-T14 (Stale Resolver Cannot Affect Newer Barrier):** Attempt to invoke stale generation resolver; assert newer active barrier is unaffected.
+- **Test R18-R9-T15 (Failed Release Leaves Active Barrier Untouched):** Mock verification throw during release; assert active barrier remains pending.
+- **Test R18-R9-T16 (Blocking Active Reservation Prevents Unsafe Tombstone Eviction):** Assert tombstone eviction deferred when oldest tombstone generation exceeds active reservation.
+- **Test R18-R9-T17 (Tombstone Count Never Exceeds 1,000 Under Repeated Pressure):** Attempt multiple fences under capacity pressure; assert `#fencedTransactions.size <= 1000`.
+- **Test R18-R9-T18 (Capacity Recovery Advances Floor Safely):** Settle blocking reservation; assert synchronous eviction advances floor without breaching remaining reservations.
+- **Test R18-R9-T19 (Capacity Rejection Does Not Accumulate Unbounded Work):** Assert failed backpressure calls do not leave background timers or queues.
+- **Test R18-R9-T20 (Nested Custody Records Cannot Be Mutated Via Retained References):** Attempt to mutate external array passed into custody record; assert internal published state is deeply frozen and unaffected.
 
 ---
 
@@ -673,27 +722,28 @@ Sub-Milestone M5.1 test suites must verify the following twenty deterministic te
 
 ```
 ================================================================================
-ENGINEERING AUTHORITY APPROVAL QUESTIONS (MILESTONE M5.0-R18-R8):
+ENGINEERING AUTHORITY APPROVAL QUESTIONS (MILESTONE M5.0-R18-R9):
 ================================================================================
-1. [ATTEMPT-FENCED CUSTODY RELEASE]: Does the Engineering Authority approve
-   requiring CustodyOwnershipToken verification in publishCustodyRelease, ensuring
-   stale continuations cannot release custody owned by newer attempts?
+1. [FIVE-FIELD OWNERSHIP COMPARISON]: Does the Engineering Authority approve
+   requiring all five fields (recoveryAttemptId, custodyGeneration, operationIdentity,
+   transactionId, drainerOwnershipGeneration) in isEquivalentOwnerToken, ensuring
+   adversarial or mismatched continuations are strictly rejected?
 
-2. [GENERATION-SCOPED BARRIER LIFECYCLE]: Does the Engineering Authority approve
-   scoping SettlementBarrier per in-flight custody generation, ensuring each barrier
-   resolves at most once without impeding subsequent barriers?
+2. [TYPED SETTLEMENT PROOF PREREQUISITE]: Does the Engineering Authority approve
+   requiring assertValidSettlementProof verification before any settlement barrier
+   may resolve, preventing premature resolution on slot clearance alone?
 
-3. [STRICT TOMBSTONE BACKPRESSURE]: Does the Engineering Authority approve the
-   fail-closed backpressure policy, enforcing the hard 1,000-entry ceiling when
-   safe eviction is blocked by active reservations?
+3. [CLOSED GENERATION-SCOPED BARRIER LIFECYCLE]: Does the Engineering Authority
+   approve the closed barrier lifecycle, ensuring concurrent waiters share one
+   Promise and generation retirement safely prevents cross-generation interference?
 
-4. [DEEP IMMUTABILITY & ENCAPSULATION]: Does the Engineering Authority approve
-   deep runtime immutability and defensive cloning for all published custody
-   records and nested identity arrays?
+4. [SYNCHRONOUS TOMBSTONE BACKPRESSURE RECOVERY]: Does the Engineering Authority
+   approve the synchronous recovery sequence upon reservation settlement, maintaining
+   the strict 1,000 bound without unbounded queues?
 
-5. [POST-COMMIT FAILURE & RECONCILIATION]: Does the Engineering Authority confirm
-   that post-commit Promise rejections are non-fatal to the archive commit, strictly
-   prohibiting Protocol B restoration while requiring custody reconciliation?
+5. [DEEP IMMUTABILITY & ENCAPSULATION]: Does the Engineering Authority confirm
+   that defensive deep cloning and deep freezing provide complete runtime
+   protection for published custody records?
 ================================================================================
 ```
 
@@ -703,12 +753,12 @@ ENGINEERING AUTHORITY APPROVAL QUESTIONS (MILESTONE M5.0-R18-R8):
 
 ```
 ================================================================================
-M5.0-R18-R8 ARCHITECTURAL DECISION PROPOSAL VERDICT:
+M5.0-R18-R9 ARCHITECTURAL DECISION PROPOSAL VERDICT:
 DECISION PROPOSAL COMPLETE — READY FOR ENGINEERING AUTHORITY REVIEW
 ================================================================================
 ```
 
-This R18-R8 proposal achieves comprehensive, bulletproof recovery closure: it enforces attempt-fenced custody release (`STALE_ATTEMPT => CANNOT_RELEASE_NEWER_CUSTODY`), defines generation-scoped settlement-barrier lifecycles with once-only resolution, formalizes strict 1,000-entry tombstone backpressure when eviction is blocked by active reservations, and guarantees deep runtime immutability of published custody records.
+This R18-R9 proposal establishes complete architectural closure: it enforces five-field ownership-token equivalence, guarantees that settlement barriers resolve only upon verified typed settlement proof, defines the complete generation-scoped barrier lifecycle, specifies synchronous tombstone backpressure recovery, and secures published custody records with deep immutability.
 
 ### Mandatory Implementation Authorization Statement
-**"M5.0-R18-R8 is an architectural documentation correction only. No production implementation has been started. M5.1, including M5.1a, remains strictly unauthorized pending explicit Engineering Authority approval."**
+**"M5.0-R18-R9 is an architectural documentation correction only. No production implementation has been started. M5.1, including M5.1a, remains strictly unauthorized pending explicit Engineering Authority approval."**
