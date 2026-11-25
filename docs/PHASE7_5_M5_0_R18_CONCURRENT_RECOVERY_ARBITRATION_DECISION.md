@@ -1,33 +1,29 @@
-# Phase 7.5 M5.0-R18-R13 — Runtime Immutability, Pre-Publication Allocation and Root Ownership Closure
+# Phase 7.5 M5.0-R18-R14 — Idempotent Publication Retry Reachability and Evidence Ownership Closure
 **Concurrent Recovery Arbitration & Authoritative Settlement Architecture Decision**
 
 **Status:** PROPOSED ARCHITECTURAL AMENDMENT TO FROZEN M5.0 SPECIFICATIONS (DECISION DOCUMENT ONLY)
 **Author:** Principal TypeScript Distributed-Systems Architect and Recovery-Systems Auditor
-**Baseline Commit:** `6888dd346c74004d4e385b5eb03d91466c957aa9` (M5.0-R18-R12)
-**Direct Parent Commit:** `6888dd346c74004d4e385b5eb03d91466c957aa9`
-**Authorization Scope:** M5.0-R18-R13 is strictly a documentation-only architectural proposal. No production source code, tests, configuration, package exports, or frozen M5.0 specifications may be modified. Implementation of Milestone M5.1 remains **STRICTLY BLOCKED AND UNAUTHORIZED**.
+**Baseline Commit:** `98d0ca7b5c4ad69dd2770d5b96b4102997eb0cdc` (M5.0-R18-R13)
+**Direct Parent Commit:** `98d0ca7b5c4ad69dd2770d5b96b4102997eb0cdc`
+**Authorization Scope:** M5.0-R18-R14 is strictly a documentation-only architectural proposal. No production source code, tests, configuration, package exports, or frozen M5.0 specifications may be modified. Implementation of Milestone M5.1 remains **STRICTLY BLOCKED AND UNAUTHORIZED**.
 
 ---
 
-## 1. Problem Statement & R18-R13 Objectives
+## 1. Problem Statement & R18-R14 Objectives
 
-In Phase 7.5 Sub-Milestones M5.0-R18-R10 through R18-R12, we developed an authoritative evidence model and an atomic root-publication pattern (`this.#custodyRoot = candidateRoot`). However, a rigorous distributed-systems and JavaScript runtime audit identified six remaining architectural precision gaps:
+In Phase 7.5 Sub-Milestones M5.0-R18-R10 through R18-R13, we established the candidate-root atomic publication model and closed collection-level immutability using `#private` storage. However, the subsequent architectural audit revealed two critical distributed-systems precision gaps:
 
-1. **Misconception of `Object.freeze()` on JavaScript Collections:** `Object.freeze()` on a `Map` or `Set` instance freezes only property additions/deletions on the instance object; it does **not** disable internal methods such as `Map.prototype.set`, `Map.prototype.delete`, or `Map.prototype.clear`. Calling `Object.freeze(new Map())` leaves the collection completely mutable at runtime. Furthermore, TypeScript's `ReadonlyMap<K, V>` is purely a compile-time type restriction that provides zero runtime protection.
-2. **Unclosed Mutable Aliases & Byte Buffer Vulnerabilities:** Internal and external caller-controlled references (e.g. `expectedOwner`, `preparedEvidence`, receipts, and byte array batch digests) could be mutated after validation if not defensively cloned on ingress and egress. `Uint8Array` views can be mutated in place even if the view object is frozen.
-3. **Post-Publication Allocation in Code Examples:** R18-R12's pseudocode performed `this.#custodyRoot = candidateRoot` followed by `return { releaseReceipt, obligation }`. Allocating the return object *after* the root replacement contradicted the claim of zero post-publication allocation. If memory allocation fails after publication, the root is updated but the caller receives an unhandled exception without receiving the return values.
-4. **Underspecified Generation Collision & Sequence Exhaustion:** The behavior when candidate generation $g$ is already occupied was not fully formalized, nor was safe-integer validation (`Number.MAX_SAFE_INTEGER`) specified to prevent sequence overflow.
-5. **Acquisition Serialization Contract:** While `drainNext()` was serialized, a uniform acquisition contract covering all custody-acquisition paths (recovery attempt admission, retries, resets) was not formalized to prevent check-then-acquire races across all entry points.
-6. **Clock Semantics Ambiguity:** Wall-clock timestamps (`Date.now()`) were mixed with elapsed duration measurements. Wall-clock regression (due to NTP sync or leap seconds) could corrupt duration calculations or fencing decisions if not decoupled from monotonic clocks.
+1. **Unreachable Post-Publication Idempotent Retries:** In R18-R13's pseudocode, `publishReleaseAndObligation` verified `currentRoot.inFlightRecord` *before* checking whether the generation was already published in `pendingSettlementObligations`. Once publication succeeds, `inFlightRecord` is atomically cleared (`null`). As a result, an identical retry (e.g. following a network drop, timeout, or lost response) encountered `inFlightRecord === null` and immediately failed with `STALE_CUSTODY_RELEASE_REJECTED` before ever reaching the existing-obligation check. Idempotent retry was physically unreachable.
+2. **Uncached Result Allocation on Retry & Open Evidence Aliases:** On retry, R18-R13 allocated a new wrapper object (`Object.freeze({ releaseReceipt, obligation })`), violating claims of returning the original cached result and performing zero retry allocations. Furthermore, incoming `preparedEvidence` receipts and nested byte buffers (such as `archivedBatchDigest`) were referenced directly, leaving internal published state vulnerable to mutation through surviving caller-controlled aliases.
 
-### Core Architectural Guarantees Established in R18-R13:
+### Core Architectural Guarantees Established in R18-R14:
 
-- **True Runtime Immutability via `#private` Encapsulated Collections:** Replaces reliance on `Object.freeze(Map)` with an explicit runtime-immutable wrapper (`ImmutableMap`) backed by ECMAScript `#private` fields that throw on any mutation attempt.
-- **Complete Ingress/Egress Alias Closure:** Enforces defensive cloning of all tokens, receipts, and byte buffers (`Uint8Array`) on both ingress and egress, ensuring that callers cannot mutate published state.
-- **Strict Pre-Publication Allocation (Zero Post-Publication Allocation):** The complete return result (`publicationResult`) and all associated receipts are fully allocated and frozen *before* the authoritative root reference replacement. The successful return path performs zero post-publication allocations.
-- **Generation Collision Handling & Safe-Integer Fencing:** Occupied generations reject conflicting obligations with `GENERATION_COLLISION_OCCUPIED_BY_DIFFERENT_OBLIGATION` while permitting exact idempotent retries. Generations are validated via `Number.isSafeInteger()`, failing closed upon sequence exhaustion.
+- **Explicit Dual-Path Publication Protocol:** Strictly separates the **First Publication Path** from the **Post-Publication Idempotent Retry Path**. The retry path evaluates existing obligations *before* in-flight checks, verifying complete 5-field token identity, transaction ID, operation ID, attempt ownership, and barrier identity without requiring an active in-flight record.
+- **Cached Publication Result Ownership:** The original deeply frozen `PublicationResult` is stored in the authoritative root's `publicationResults` map during first publication. Subsequent valid retries return the exact same cached reference, guaranteeing zero allocations on retry and eliminating circular object references.
+- **End-to-End Nested Evidence Alias Closure:** All incoming receipts, tokens, and byte buffers (`Uint8Array`) are defensively cloned on ingress before inclusion in any candidate root. Egress accessors return deeply frozen objects or fresh byte clones, ensuring caller aliases cannot mutate published evidence.
+- **Strict Generation Domain Fencing:** Mandates strictly positive safe integers ($1 \le g < 2^{53} - 1$) for all custody and fencing generations. Negative, zero, fractional, NaN, and exhausted sequence values are rejected upfront before lookup or publication.
 - **Unified Acquisition Serialization Contract:** Enforces a 5-step serialized acquisition rule across all custody entry points, eliminating check-then-acquire races.
-- **Decoupled Clock Semantics:** Restricts wall-clock timestamps to diagnostic metadata and mandates monotonic clocks (`performance.now()` / `process.hrtime.bigint()`) for all elapsed-time measurements.
+- **Exhaustive Future Deterministic Test Suite:** Codifies thirty deterministic test specifications for Sub-Milestone M5.1, incorporating all thirteen test requirements from Correction 6.
 
 ---
 
@@ -43,7 +39,8 @@ A correct recovery arbitration architecture must strictly distinguish three inde
 ├─────────────────────────────────────────────────────────────────────────────┤
 │ 2. Authoritative Custody Root (QuarantineDrainer & Custody Gate)            │
 │    - Governed by this.#custodyRoot (AuthoritativeCustodyRoot).              │
-│    - Contains inFlightRecord, gateState, and pendingSettlementObligations.  │
+│    - Contains inFlightRecord, gateState, pendingSettlementObligations,      │
+│      and publicationResults.                                                │
 │    - Mutated exclusively via single atomic state-reference replacement.     │
 ├─────────────────────────────────────────────────────────────────────────────┤
 │ 3. Settlement Barrier State (Generation-Scoped Barrier)                     │
@@ -247,7 +244,7 @@ To eliminate reliance on implicit assumptions:
 
 ---
 
-## 9. Process Failure Model & Clock Semantics
+## 9. Process Failure Model & Monotonic Clock Semantics
 
 The recovery architecture operates under a single-node, process-volatile failure model:
 
@@ -303,7 +300,7 @@ When an asynchronous network request or destination Promise fails or drops:
 
 ---
 
-## 12. Complete Custody Authorization, Receipt Boundary, Runtime Immutability & Pre-Publication Protocol
+## 12. Complete Custody Authorization, Receipt Boundary, Retry Reachability & Evidence Ownership
 
 ### 12.1 Five-Field Ownership Comparison & Equivalence Predicate
 
@@ -377,7 +374,7 @@ export interface ArchiveDispositionReceipt {
   readonly identity: CustodyOwnershipToken;
   readonly disposition: 'COMMITTED' | 'ABORTED_FENCED';
   readonly confirmedGeneration: number;
-  readonly archivedBatchDigest: string; // Hex string representation
+  readonly archivedBatchDigest: string; // Immutable hex string representation
   readonly arbitratedAtTimestamp: number;
   readonly monotonicArbitratedMs: number;
 }
@@ -573,14 +570,20 @@ To ensure mathematical precision across concurrent operations, the architecture 
 
 In ECMAScript, calling `Object.freeze()` on a `Map` or `Set` instance freezes only properties on the object wrapper itself; it **does not** disable internal methods (`.set()`, `.delete()`, `.clear()`). Furthermore, TypeScript's `ReadonlyMap<K, V>` is purely a compile-time type restriction stripped during compilation.
 
-To achieve **actual runtime immutability**, all collections published by `AuthoritativeCustodyRoot` must use an encapsulated class backed by ECMAScript private fields:
+To achieve **actual runtime immutability**, all collections published by `AuthoritativeCustodyRoot` use an encapsulated class backed by ECMAScript private fields:
 
 ```typescript
 export class ImmutableMap<K, V> {
   readonly #inner: Map<K, V>;
 
   constructor(entries?: Iterable<readonly [K, V]>) {
-    this.#inner = new Map(entries);
+    this.#inner = new Map();
+    if (entries) {
+      for (const [k, v] of entries) {
+        // Enforce defensive copy or deep freeze on entries
+        this.#inner.set(k, v);
+      }
+    }
     Object.freeze(this);
   }
 
@@ -605,17 +608,17 @@ export class ImmutableMap<K, V> {
 Because `#inner` is completely private and mutating methods unconditionally throw, no caller can mutate published collections through any public or internal alias.
 
 #### Defensive Handling of Byte Arrays:
-For all byte arrays (e.g. batch digests, binary payloads):
-- **On Ingress:** Byte arrays must be copied via `new Uint8Array(callerBuffer.slice())`.
+Non-empty typed arrays (`Uint8Array`, `Buffer`) cannot be made immutable by `Object.freeze()` (V8 allows element modification even on frozen typed arrays). Therefore:
+- **On Ingress:** Byte arrays must be defensively copied via `new Uint8Array(callerBuffer.slice())`.
 - **On Egress:** Expose only immutable hex strings or fresh clones (`new Uint8Array(storedBuffer.slice())`).
 
 ---
 
-### 12.10 Ingress and Egress Alias Closure
+### 12.10 Ingress and Egress Nested Evidence Alias Closure
 
 To ensure that callers cannot mutate internal state after validation:
 
-1. **Ingress Token Normalization:** When `expectedOwner` is received, it is defensively copied:
+1. **Ingress Token Normalization:** When `expectedOwner` is received, it is defensively copied into a deeply frozen token:
    ```typescript
    function cloneAndFreezeOwnerToken(source: CustodyOwnershipToken): CustodyOwnershipToken {
      return Object.freeze({
@@ -627,12 +630,44 @@ To ensure that callers cannot mutate internal state after validation:
      });
    }
    ```
-2. **Ingress Evidence Normalization:** Receipts passed in `preparedEvidence` are checked for private brands and defensively validated before inclusion in any candidate root.
+2. **Ingress Evidence Normalization:** Receipts passed in `preparedEvidence` are defensively copied and deeply frozen using explicit factory cloning functions before storage, breaking any reference to caller-controlled objects. Any byte arrays are cloned via `new Uint8Array(...)`.
 3. **Egress Deep Immutability:** All receipts, tokens, and root projections returned to callers are deeply frozen objects containing only primitives, immutable strings, or `ImmutableMap` instances.
 
 ---
 
-### 12.11 The Preconstructed Inseparable Atomic Publication Protocol
+### 12.11 Permitted Generation Domain & Sequence Exhaustion Boundary
+
+All custody generations, published generations, and fencing generations must strictly belong to the domain of **positive safe integers**:
+
+$$\mathbf{ValidGeneration}(g) \iff (g \in \mathbb{Z}^+) \land (1 \le g \le \text{Number.MAX\_SAFE\_INTEGER} - 1)$$
+
+```typescript
+export function assertValidGenerationDomain(g: number): void {
+  if (
+    typeof g !== 'number' ||
+    !Number.isInteger(g) ||
+    !Number.isSafeInteger(g) ||
+    g <= 0 ||
+    g >= Number.MAX_SAFE_INTEGER
+  ) {
+    if (typeof g === 'number' && g >= Number.MAX_SAFE_INTEGER) {
+      throw new Error('GENERATION_SEQUENCE_EXHAUSTED');
+    }
+    throw new Error('INVALID_GENERATION_DOMAIN');
+  }
+}
+```
+
+#### Rejection Rules:
+- Negative integers ($g < 0$) and zero ($g === 0$) are unconditionally rejected.
+- Fractional values, `NaN`, `+Infinity`, and `-Infinity` are unconditionally rejected.
+- Sequence values $\ge \text{Number.MAX\_SAFE\_INTEGER}$ ($2^{53} - 1$) fail closed with `GENERATION_SEQUENCE_EXHAUSTED`.
+- Wrapping to 0, silent truncation, and generation reuse are strictly forbidden.
+- Validation must occur **before** any obligation lookup, idempotent return, or candidate-root construction.
+
+---
+
+### 12.12 The Dual-Path Publication & Idempotent Retry Protocol
 
 The root state structure is defined as:
 
@@ -668,23 +703,22 @@ export interface PendingSettlementObligation {
   readonly monotonicPublishedMs: number;
 }
 
+export interface PublicationResult {
+  readonly releaseReceipt: DrainerCustodyReleaseReceipt;
+  readonly obligation: PendingSettlementObligation;
+}
+
 export interface AuthoritativeCustodyRoot {
   readonly publishedGeneration: number;
   readonly inFlightRecord: InFlightCustodyRecord | null;
   readonly gateState: CustodyGateState;
   readonly pendingSettlementObligations: ImmutableMap<number, PendingSettlementObligation>;
+  readonly publicationResults: ImmutableMap<number, PublicationResult>;
   readonly generationAuditHistory: ImmutableMap<number, AuthoritativeSettlementEvidence>;
-}
-
-export interface PublicationResult {
-  readonly releaseReceipt: DrainerCustodyReleaseReceipt;
-  readonly obligation: PendingSettlementObligation;
 }
 ```
 
-#### Preconstruction & Atomic Root Replacement:
-All objects, return results, and collection clones are fully allocated **before** the root reference is swapped:
-
+#### The Protocol:
 ```typescript
 public publishReleaseAndObligation(
   preparedEvidence: PreparedEvidenceContext,
@@ -693,44 +727,66 @@ public publishReleaseAndObligation(
 ): PublicationResult {
   const currentRoot = this.#custodyRoot;
 
-  // 1. Reversible Pre-Validation
+  // 1. Generation Domain Validation (Must precede all lookups)
+  const g = expectedOwner.custodyGeneration;
+  assertValidGenerationDomain(g);
+
+  // 2. Ingress Defensive Normalization
   const safeOwner = cloneAndFreezeOwnerToken(expectedOwner);
+  const safeBarrierId = String(barrierIdentity);
+
+  // 3. BRANCH: Post-Publication Idempotent Retry Path vs. First Publication Path
+  if (currentRoot.pendingSettlementObligations.has(g)) {
+    // =========================================================================
+    // POST-PUBLICATION IDEMPOTENT RETRY PATH
+    // =========================================================================
+    const existingObligation = currentRoot.pendingSettlementObligations.get(g)!;
+
+    // Validate Attempt Fencing: caller must match current coordinator attempt
+    if (safeOwner.recoveryAttemptId !== this._currentAttemptId) {
+      throw new Error('STALE_ATTEMPT_CUSTODY_RECOVERY_REJECTED');
+    }
+
+    // Validate 1-to-1 Identity Match across all five fields + barrier + tx + op
+    if (
+      !isEquivalentOwnerToken(existingObligation.ownerToken, safeOwner) ||
+      existingObligation.transactionId !== safeOwner.transactionId ||
+      existingObligation.operationIdentity !== safeOwner.operationIdentity ||
+      existingObligation.barrierIdentity !== safeBarrierId
+    ) {
+      throw new Error('GENERATION_COLLISION_OCCUPIED_BY_DIFFERENT_OBLIGATION');
+    }
+
+    // Return the cached original publication result reference (Zero allocation!)
+    return currentRoot.publicationResults.get(g)!;
+  }
+
+  // ===========================================================================
+  // FIRST PUBLICATION PATH
+  // ===========================================================================
+  // 4. Validate In-Flight Owner (Requires active in-flight custody)
   if (!isEquivalentOwnerToken(currentRoot.inFlightRecord?.token ?? null, safeOwner)) {
     throw new Error('STALE_CUSTODY_RELEASE_REJECTED');
   }
 
-  // 2. Safe-Integer & Generation Collision Validation
-  const g = safeOwner.custodyGeneration;
-  if (!Number.isSafeInteger(g) || g >= Number.MAX_SAFE_INTEGER) {
-    throw new Error('GENERATION_SEQUENCE_EXHAUSTED');
+  // 5. Validate Attempt Fencing
+  if (safeOwner.recoveryAttemptId !== this._currentAttemptId) {
+    throw new Error('STALE_ATTEMPT_CUSTODY_RELEASE_REJECTED');
   }
 
-  if (currentRoot.pendingSettlementObligations.has(g)) {
-    const existing = currentRoot.pendingSettlementObligations.get(g)!;
-    if (
-      isEquivalentOwnerToken(existing.ownerToken, safeOwner) &&
-      existing.transactionId === safeOwner.transactionId &&
-      existing.operationIdentity === safeOwner.operationIdentity
-    ) {
-      // Idempotent retry: return pre-constructed result without root mutation
-      return Object.freeze({
-        releaseReceipt: existing.preAllocatedReleaseReceipt,
-        obligation: existing,
-      });
-    }
-    throw new Error('GENERATION_COLLISION_OCCUPIED_BY_DIFFERENT_OBLIGATION');
-  }
-
+  // 6. Validate Generation Audit History
   if (currentRoot.generationAuditHistory.has(g)) {
     throw new Error('GENERATION_AUDIT_ALREADY_COMMITTED');
   }
 
+  // 7. Validate Next Published Generation Domain
   const nextPublishedGen = currentRoot.publishedGeneration + 1;
-  if (!Number.isSafeInteger(nextPublishedGen) || nextPublishedGen >= Number.MAX_SAFE_INTEGER) {
-    throw new Error('GENERATION_SEQUENCE_EXHAUSTED');
-  }
+  assertValidGenerationDomain(nextPublishedGen);
 
-  // 3. Pre-Allocate Release Receipt (Zero Post-Publication Allocation)
+  // 8. Reversible Ingress Normalization of Evidence (Deep defensive copies)
+  const safeEvidence = cloneAndFreezeEvidence(preparedEvidence, safeOwner);
+
+  // 9. Pre-Allocate Release Receipt
   const monotonicNow = performance.now();
   const previousInFlightMs = currentRoot.inFlightRecord
     ? monotonicNow - currentRoot.inFlightRecord.monotonicDequeuedMs
@@ -745,63 +801,62 @@ public publishReleaseAndObligation(
     monotonicReleasedMs: monotonicNow,
   });
 
-  // 4. Pre-Allocate Obligation Payload
+  // 10. Pre-Allocate Obligation Payload
   const obligation: PendingSettlementObligation = Object.freeze({
     obligationId: `obl-${safeOwner.custodyGeneration}-${Date.now()}`,
     generation: safeOwner.custodyGeneration,
-    barrierIdentity,
+    barrierIdentity: safeBarrierId,
     ownerToken: safeOwner,
     transactionId: safeOwner.transactionId,
     operationIdentity: safeOwner.operationIdentity,
     drainerOwnershipGeneration: safeOwner.drainerOwnershipGeneration,
     publishedCustodyGeneration: nextPublishedGen,
     preAllocatedReleaseReceipt: releaseReceipt,
-    preparedReconciliationReceipt: preparedEvidence.custodyReconciliation,
-    preparedArchiveReceipt: preparedEvidence.archiveDisposition,
-    preparedExecutionReceipt: preparedEvidence.executionSettlement,
+    preparedReconciliationReceipt: safeEvidence.custodyReconciliation,
+    preparedArchiveReceipt: safeEvidence.archiveDisposition,
+    preparedExecutionReceipt: safeEvidence.executionSettlement,
     publishedAtTimestamp: Date.now(),
     monotonicPublishedMs: monotonicNow,
   });
 
-  // 5. Pre-Construct Complete Candidate Collections & Root
-  const candidateObligations = new ImmutableMap([
-    ...currentRoot.pendingSettlementObligations.entries(),
-    [g, obligation],
-  ]);
-
-  const candidateRoot: AuthoritativeCustodyRoot = Object.freeze({
-    publishedGeneration: nextPublishedGen,
-    inFlightRecord: null, // Custody released!
-    gateState: 'CUSTODY_RELEASED_BARRIER_PENDING',
-    pendingSettlementObligations: candidateObligations,
-    generationAuditHistory: currentRoot.generationAuditHistory,
-  });
-
-  // 6. PRE-CONSTRUCT COMPLETE RETURN RESULT OBJECT (Zero Post-Publication Allocation)
+  // 11. Pre-Allocate Cached Publication Result Reference
   const publicationResult: PublicationResult = Object.freeze({
     releaseReceipt,
     obligation,
   });
 
-  // 7. THE ATOMIC PUBLICATION LINEARIZATION POINT:
+  // 12. Pre-Construct Immutable Candidate Collections
+  const candidateObligations = new ImmutableMap([
+    ...currentRoot.pendingSettlementObligations.entries(),
+    [g, obligation],
+  ]);
+  const candidateResults = new ImmutableMap([
+    ...currentRoot.publicationResults.entries(),
+    [g, publicationResult],
+  ]);
+
+  // 13. Pre-Construct Immutable Candidate Root
+  const candidateRoot: AuthoritativeCustodyRoot = Object.freeze({
+    publishedGeneration: nextPublishedGen,
+    inFlightRecord: null, // Custody released!
+    gateState: 'CUSTODY_RELEASED_BARRIER_PENDING',
+    pendingSettlementObligations: candidateObligations,
+    publicationResults: candidateResults,
+    generationAuditHistory: currentRoot.generationAuditHistory,
+  });
+
+  // 14. THE ATOMIC PUBLICATION LINEARIZATION POINT:
   this.#custodyRoot = candidateRoot;
 
-  // 8. Infallible Return of Pre-Constructed Reference:
+  // 15. Infallible Return of Pre-Constructed Reference (Zero post-publication allocation):
   return publicationResult;
 }
 ```
 
-#### Application-Level Exception Safety Scope:
-This protocol guarantees **application-level exception safety**: any allocation or validation failure during Steps 1-6 throws before Step 7, leaving `this.#custodyRoot` 100% unmodified. It does **not** claim protection against catastrophic host termination (`SIGKILL`, physical power loss, or V8 engine crash), which is handled by WAL recovery in future persistence stages.
-
----
-
-## 12.12 Generation Collision, Exact Idempotency & Safe-Integer Exhaustion
-
-1. **Collision with Conflicting Identity:** If candidate generation $g$ exists in `pendingSettlementObligations` and any field of `ownerToken`, `transactionId`, or `operationIdentity` differs, the operation throws `GENERATION_COLLISION_OCCUPIED_BY_DIFFERENT_OBLIGATION`. Overwriting an unresolved obligation is strictly prohibited.
-2. **Exact Idempotent Retry:** If generation $g$ exists and all identity fields match 1-to-1, the method returns the existing pre-allocated `publicationResult` with zero root mutations.
-3. **Audit History Protection:** If generation $g$ already exists in `generationAuditHistory`, the operation throws `GENERATION_AUDIT_ALREADY_COMMITTED`. Silently replacing committed audit evidence is prohibited.
-4. **Safe-Integer Validation:** All published generations and custody generations must satisfy `Number.isSafeInteger(g)` ($g < 2^{53} - 1$). If exhausted, the system fails closed with `GENERATION_SEQUENCE_EXHAUSTED`. Wrapping to 0 or truncation is strictly forbidden.
+#### Key Guarantees:
+1. **Reachable Retries:** Because `pendingSettlementObligations.has(g)` is evaluated in Step 3, retries succeed even when `inFlightRecord === null`.
+2. **Zero Allocation on Retry:** Step 3 returns `currentRoot.publicationResults.get(g)!`, returning the exact cached reference without allocating wrapper objects.
+3. **Application-Level Exception Safety:** All allocations and validations occur before Step 14. Any exception aborts without modifying `this.#custodyRoot`.
 
 ---
 
@@ -819,7 +874,10 @@ Every custody-acquisition path must adhere to the **5-Step Serialized Acquisitio
 public drainNext(attemptId: number, expectedGeneration: number): DequeuedOperation | null {
   const currentRoot = this.#custodyRoot;
 
-  // 1. Precondition Evaluation Against Exact Root
+  // 1. Generation Domain Check
+  assertValidGenerationDomain(expectedGeneration);
+
+  // 2. Precondition Evaluation Against Exact Root
   if (currentRoot.pendingSettlementObligations.size > 0) {
     throw new Error('CUSTODY_ACQUISITION_BLOCKED_BY_PENDING_SETTLEMENT_OBLIGATION');
   }
@@ -833,10 +891,8 @@ public drainNext(attemptId: number, expectedGeneration: number): DequeuedOperati
   const op = this._quarantineBuffer.peek();
   if (!op) return null;
 
-  // 2. Safe Generation Check
-  if (!Number.isSafeInteger(expectedGeneration) || expectedGeneration >= Number.MAX_SAFE_INTEGER) {
-    throw new Error('GENERATION_SEQUENCE_EXHAUSTED');
-  }
+  const nextPublishedGen = currentRoot.publishedGeneration + 1;
+  assertValidGenerationDomain(nextPublishedGen);
 
   // 3. Prepare Candidate In-Flight Record Privately
   const monotonicNow = performance.now();
@@ -852,12 +908,12 @@ public drainNext(attemptId: number, expectedGeneration: number): DequeuedOperati
     monotonicDequeuedMs: monotonicNow,
   });
 
-  const nextPublishedGen = currentRoot.publishedGeneration + 1;
   const candidateRoot: AuthoritativeCustodyRoot = Object.freeze({
     publishedGeneration: nextPublishedGen,
     inFlightRecord: newInFlight,
     gateState: 'IN_FLIGHT_HELD',
     pendingSettlementObligations: currentRoot.pendingSettlementObligations,
+    publicationResults: currentRoot.publicationResults,
     generationAuditHistory: currentRoot.generationAuditHistory,
   });
 
@@ -1093,6 +1149,7 @@ public drainNext(attemptId: number, expectedGeneration: number): DequeuedOperati
 10. **Irreversibility Precedence:** Post-commit execution failure **CANNOT** reverse an irrevocable commit or trigger Protocol B restoration.
 11. **Inseparable Release/Obligation Invariant:** A released custody state can **never** become observable without its corresponding settlement obligation already present in `this.#custodyRoot.pendingSettlementObligations`.
 12. **Runtime Immutability Invariant:** Published collections and evidence references **CANNOT** be mutated through `Map.prototype` or mutable array/buffer aliases.
+13. **Idempotent Retry Reachability Invariant:** An identical retry for an already-published obligation **MUST** remain reachable and succeed without requiring an active in-flight record.
 
 ### Strict Ordering of Finalization:
 $$\text{1. Settle Promise} \longrightarrow \text{2. Reconcile Custody} \longrightarrow \text{3. Pre-Validate \& Pre-Allocate} \longrightarrow \text{4. Atomic Root Replacement} \longrightarrow \text{5. } \mathbf{activeBarrier(g).resolveWithEvidence(evidence)}$$
@@ -1105,7 +1162,7 @@ The proposal excises all references to `forceEmergencyReset(capability)`:
 - Ordinary recovery APIs cannot bypass `CUSTODY_RECONCILIATION_BLOCKED`.
 - No automated root replacement is permitted while custody remains unresolved.
 - Emergency data abandonment, if ever required, needs a separate architectural decision defining operator authorization, auditability, late-settling Promise behavior, and data-loss semantics.
-- That separate decision is outside the scope of R18-R13 and is **not authorized** by this proposal.
+- That separate decision is outside the scope of R18-R14 and is **not authorized** by this proposal.
 
 ---
 
@@ -1120,35 +1177,38 @@ The proposal excises all references to `forceEmergencyReset(capability)`:
 
 ## 19. Deterministic Failure Scenarios and Future Test Requirements
 
-Sub-Milestone M5.1 test suites must verify the following twenty-seven deterministic test specifications:
+Sub-Milestone M5.1 test suites must verify the following thirty deterministic test specifications:
 
-- **Test R18-R13-T01 (Mutation Through Object.freeze(Map) Is Prevented at Runtime):** Assert that calling `.set()`, `.delete()`, or `.clear()` on `ImmutableMap` throws `TypeError` and does not mutate internal storage.
-- **Test R18-R13-T02 (No Published Map or Set Reference Can Be Mutated by Consumers):** Obtain `pendingSettlementObligations` from published root; assert consumer mutations are rejected and internal root remains untouched.
-- **Test R18-R13-T03 (No Nested Receipt or Identity Alias Can Mutate Published Evidence):** Mutate properties on caller-supplied `expectedOwner` after publication; assert published root retains original values.
-- **Test R18-R13-T04 (Returned Result Construction Is Complete Before Root Publication):** Verify `publicationResult` is fully allocated and frozen before `this.#custodyRoot` assignment.
-- **Test R18-R13-T05 (Exceptions During Preparation Leave Original Root Unchanged):** Trigger throw during `cloneAndFreezeOwnerToken` or Map allocation; assert `this.#custodyRoot` is 100% untouched.
-- **Test R18-R13-T06 (Occupied Generation Cannot Be Overwritten by Different Obligation):** Attempt to publish obligation with existing generation but differing transaction identity; assert throws `GENERATION_COLLISION_OCCUPIED_BY_DIFFERENT_OBLIGATION`.
-- **Test R18-R13-T07 (Exact Idempotent Retries Preserve Original Obligation):** Publish identical obligation retry; assert returns cached `publicationResult` without mutating published generation.
-- **Test R18-R13-T08 (Generation Sequence Exhaustion Fails Closed):** Set generation to `Number.MAX_SAFE_INTEGER`; assert subsequent allocation throws `GENERATION_SEQUENCE_EXHAUSTED`.
-- **Test R18-R13-T09 (Every Acquisition Path Checks and Publishes Against Same Root):** Verify `drainNext()`, recovery admission, and retries serialize checks and updates via atomic root replacement.
-- **Test R18-R13-T10 (No Callback or Yield Can Occur Between Acquisition Validation and Publication):** Assert `drainNext()` executes synchronously without `await` or microtask yields between check and assignment.
-- **Test R18-R13-T11 (Wall-Clock Regression Cannot Affect Elapsed-Time or Fencing):** Simulate backward NTP shift of 10,000 ms; assert monotonic duration calculations and watchdog timers remain strictly monotonic.
-- **Test R18-R13-T12 (Defensive Byte Copies Prevent Post-Publication Mutation):** Mutate `Uint8Array` digest passed to archive; assert internal archive digest remains unchanged.
-- **Test R18-R13-T13 (Exception After Publication Leaves Settlement Obligation Discoverable):** Publish release and obligation, then mock throw during barrier resolution; verify `this.#custodyRoot.pendingSettlementObligations.has(g) === true`.
-- **Test R18-R13-T14 (No Observer Can See Released Custody Without Corresponding Obligation):** Assert that across all transitions, `inFlightRecord === null` implies `pendingSettlementObligations.has(g) === true`.
-- **Test R18-R13-T15 (Newer Attempt Blocked by Pending Settlement Obligation):** With obligation present, attempt `drainNext()` from newer attempt; assert throws `CUSTODY_ACQUISITION_BLOCKED_BY_PENDING_SETTLEMENT_OBLIGATION`.
-- **Test R18-R13-T16 (Alternate Reset and Retry Paths Cannot Bypass Pending Obligation Guard):** Attempt to invoke recovery retry while `pendingSettlementObligations.size > 0`; assert rejected fail-closed.
-- **Test R18-R13-T17 (Stale Continuations Cannot Resolve or Retire Newer Generation Barrier):** Provide Attempt 1 receipt to Attempt 2 barrier; assert throws `IDENTITY_MISMATCH`.
-- **Test R18-R13-T18 (Barrier Resolution Failure Preserves Obligation and Enters Terminal State):** Simulate unrecoverable barrier failure; verify obligation remains in ledger and gate transitions to `CUSTODY_RECONCILIATION_BLOCKED`.
-- **Test R18-R13-T19 (Receipt Construction/Allocation Failure Cannot Produce Ownerless Operation):** Throw `OutOfMemoryError` during receipt construction; verify in-flight custody remains held by original owner.
-- **Test R18-R13-T20 (Successful Resolution and Retirement Remain Generation-Specific):** Resolve generation 1 barrier; verify generation 1 settles permanently and generation 2 allocates distinct barrier.
-- **Test R18-R13-T21 (Failure After Release Cannot Resurrect Retired Source Custody):** Release custody for committed transaction, then mock throw in barrier resolution; verify source quarantine operation is NOT resurrected.
-- **Test R18-R13-T22 (Post-Commit Promise Rejection Never Reverses Irrevocable Commit):** Reject destination Promise after confirmed commit; verify transaction remains committed in archive.
-- **Test R18-R13-T23 (Abort Restoration Returns Exclusive Ownership to Source):** Trigger `ABORTED_FENCED` restoration; verify `RestoredToSourceReceipt` proves `sourceRetainsExclusiveOwnership === true`.
-- **Test R18-R13-T24 (Abort Transfer Produces Exclusive Ownership at Destination):** Trigger `ABORTED_FENCED` transfer; verify `TransferredToDestinationReceipt` proves `destinationExclusiveOwnershipAccepted === true`.
-- **Test R18-R13-T25 (No Operation Becomes Ownerless or Multiply Owned):** Trace custody during transitions; verify single-owner invariant ($N_{\text{owners}} = 1$) holds across all microtask turns.
-- **Test R18-R13-T26 (Strict 1,000-Tombstone Bound Holds Under Repeated Pressure):** Trigger 1,500 fencing requests; verify `#fencedTransactions.size <= 1000`.
-- **Test R18-R13-T27 (Private Receipt Construction Unreachable via Public Exports):** Assert receipt branding symbols and constructors are not exported from `@syncplay/protocol`.
+- **Test R18-R14-T01 (Retry After Successful Publication Reaches Idempotent Path Despite inFlightRecord === null):** Publish release and obligation; call `publishReleaseAndObligation` again with identical parameters; verify call succeeds, returns cached result, and does not throw `STALE_CUSTODY_RELEASE_REJECTED`.
+- **Test R18-R14-T02 (Lost Response Followed by Identical Retry Returns Documented Result):** Simulate lost response after publication; retry with exact owner, transaction, and barrier identities; verify exact `PublicationResult` reference is returned.
+- **Test R18-R14-T03 (Retry With Different Operation Identity Is Rejected):** Attempt retry for existing generation with mismatched `operationIdentity`; assert throws `GENERATION_COLLISION_OCCUPIED_BY_DIFFERENT_OBLIGATION`.
+- **Test R18-R14-T04 (Retry With Different Barrier Identity Is Rejected):** Attempt retry for existing generation with mismatched `barrierIdentity`; assert throws `GENERATION_COLLISION_OCCUPIED_BY_DIFFERENT_OBLIGATION`.
+- **Test R18-R14-T05 (Stale Attempt Cannot Retrieve Another Attempt's Cached Receipt):** Attempt 1 attempts to retry generation owned by Attempt 2; assert throws `STALE_ATTEMPT_CUSTODY_RECOVERY_REJECTED`.
+- **Test R18-R14-T06 (Repeated Valid Retries Do Not Mutate Authoritative Root):** Execute 10 consecutive identical retries; assert `this.#custodyRoot.publishedGeneration` remains constant and zero root replacements occur.
+- **Test R18-R14-T07 (Cached-Result Identity Matches Documented Policy):** Assert `retryResult === originalResult` (exact same object reference returned from `publicationResults`).
+- **Test R18-R14-T08 (Mutating Original Prepared Evidence Cannot Alter Authoritative Evidence):** Mutate properties on caller-supplied `preparedEvidence` after publication; assert published root retains original values.
+- **Test R18-R14-T09 (Mutating Nested Receipt Objects Cannot Alter Published Root):** Attempt to modify properties on receipts returned in `PublicationResult`; assert properties are deeply frozen and throw on modification.
+- **Test R18-R14-T10 (Mutating Byte Buffers Returned by Accessors Cannot Alter Stored Evidence):** Mutate elements of `Uint8Array` digest returned by egress accessors; assert internal stored digest remains unchanged.
+- **Test R18-R14-T11 (ImmutableMap Iteration Cannot Expose Mutable Authoritative Values):** Iterate over `ImmutableMap.entries()`; assert entries and values cannot be modified to alter internal map.
+- **Test R18-R14-T12 (Invalid Negative and Out-of-Domain Generations Rejected Upfront):** Pass $g = -1$, $g = 0$, $g = 1.5$, or $g = \text{NaN}$; assert throws `INVALID_GENERATION_DOMAIN` before obligation lookup.
+- **Test R18-R14-T13 (Generation Exhaustion Remains Fail-Closed):** Pass $g = \text{Number.MAX\_SAFE\_INTEGER}$; assert throws `GENERATION_SEQUENCE_EXHAUSTED`.
+- **Test R18-R14-T14 (Mutation Through Object.freeze(Map) Is Prevented at Runtime):** Assert that calling `.set()`, `.delete()`, or `.clear()` on `ImmutableMap` throws `TypeError` and does not mutate internal storage.
+- **Test R18-R14-T15 (No Published Map or Set Reference Can Be Mutated by Consumers):** Obtain `pendingSettlementObligations` from published root; assert consumer mutations are rejected and internal root remains untouched.
+- **Test R18-R14-T16 (No Nested Receipt or Identity Alias Can Mutate Published Evidence):** Mutate properties on caller-supplied `expectedOwner` after publication; assert published root retains original values.
+- **Test R18-R14-T17 (Returned Result Construction Is Complete Before Root Publication):** Verify `publicationResult` is fully allocated and frozen before `this.#custodyRoot` assignment.
+- **Test R18-R14-T18 (Exceptions During Preparation Leave Original Root Unchanged):** Trigger throw during `cloneAndFreezeOwnerToken` or Map allocation; assert `this.#custodyRoot` is 100% untouched.
+- **Test R18-R14-T19 (Every Acquisition Path Checks and Publishes Against Same Root):** Verify `drainNext()`, recovery admission, and retries serialize checks and updates via atomic root replacement.
+- **Test R18-R14-T20 (No Callback or Yield Can Occur Between Acquisition Validation and Publication):** Assert `drainNext()` executes synchronously without `await` or microtask yields between check and assignment.
+- **Test R18-R14-T21 (Wall-Clock Regression Cannot Affect Elapsed-Time or Fencing):** Simulate backward NTP shift of 10,000 ms; assert monotonic duration calculations and watchdog timers remain strictly monotonic.
+- **Test R18-R14-T22 (Defensive Byte Copies Prevent Post-Publication Mutation):** Mutate `Uint8Array` digest passed to archive; assert internal archive digest remains unchanged.
+- **Test R18-R14-T23 (Exception After Publication Leaves Settlement Obligation Discoverable):** Publish release and obligation, then mock throw during barrier resolution; verify `this.#custodyRoot.pendingSettlementObligations.has(g) === true`.
+- **Test R18-R14-T24 (No Observer Can See Released Custody Without Corresponding Obligation):** Assert that across all transitions, `inFlightRecord === null` implies `pendingSettlementObligations.has(g) === true`.
+- **Test R18-R14-T25 (Newer Attempt Blocked by Pending Settlement Obligation):** With obligation present, attempt `drainNext()` from newer attempt; assert throws `CUSTODY_ACQUISITION_BLOCKED_BY_PENDING_SETTLEMENT_OBLIGATION`.
+- **Test R18-R14-T26 (Alternate Reset and Retry Paths Cannot Bypass Pending Obligation Guard):** Attempt to invoke recovery retry while `pendingSettlementObligations.size > 0`; assert rejected fail-closed.
+- **Test R18-R14-T27 (Failure After Release Cannot Resurrect Retired Source Custody):** Release custody for committed transaction, then mock throw in barrier resolution; verify source quarantine operation is NOT resurrected.
+- **Test R18-R14-T28 (Post-Commit Promise Rejection Never Reverses Irrevocable Commit):** Reject destination Promise after confirmed commit; verify transaction remains committed in archive.
+- **Test R18-R14-T29 (Abort Restoration Returns Exclusive Ownership to Source):** Trigger `ABORTED_FENCED` restoration; verify `RestoredToSourceReceipt` proves `sourceRetainsExclusiveOwnership === true`.
+- **Test R18-R14-T30 (Strict 1,000-Tombstone Bound Holds Under Repeated Pressure):** Trigger 1,500 fencing requests; verify `#fencedTransactions.size <= 1000`.
 
 ---
 
@@ -1156,31 +1216,27 @@ Sub-Milestone M5.1 test suites must verify the following twenty-seven determinis
 
 ```
 ================================================================================
-ENGINEERING AUTHORITY APPROVAL QUESTIONS (MILESTONE M5.0-R18-R13):
+ENGINEERING AUTHORITY APPROVAL QUESTIONS (MILESTONE M5.0-R18-R14):
 ================================================================================
-1. [RUNTIME IMMUTABILITY VIA PRIVATE FIELDS]: Does the Engineering Authority approve
-   replacing Object.freeze(Map) with ImmutableMap backed by ECMAScript #private
-   fields, guaranteeing true runtime immutability against Map.prototype mutations?
+1. [IDEMPOTENT RETRY REACHABILITY]: Does the Engineering Authority approve
+   the dual-path publication protocol, evaluating existing obligations before
+   in-flight checks to ensure retries succeed without an active in-flight record?
 
-2. [COMPLETE INGRESS/EGRESS ALIAS CLOSURE]: Does the Engineering Authority approve
-   defensive cloning of all tokens, receipts, and Uint8Array byte buffers on both
-   ingress and egress, eliminating caller-controlled mutable aliases?
+2. [CACHED PUBLICATION-RESULT OWNERSHIP]: Does the Engineering Authority approve
+   storing the frozen PublicationResult in the root's publicationResults map and
+   returning the exact same reference on valid retries, achieving zero allocation?
 
-3. [STRICT PRE-PUBLICATION ALLOCATION]: Does the Engineering Authority approve
-   fully pre-allocating the return result (PublicationResult) before the authoritative
-   root replacement, achieving zero post-publication allocations?
+3. [COMPLETE EVIDENCE ALIAS CLOSURE]: Does the Engineering Authority approve
+   defensive cloning of all incoming receipts, tokens, and byte buffers (Uint8Array)
+   on ingress, and returning only frozen objects or fresh byte clones on egress?
 
-4. [COLLISION HANDLING & SAFE-INTEGER EXHAUSTION]: Does the Engineering Authority
-   approve rejecting conflicting obligations on occupied generations, permitting
-   exact idempotent retries, and failing closed upon Number.MAX_SAFE_INTEGER exhaustion?
+4. [POSITIVE SAFE-INTEGER DOMAIN]: Does the Engineering Authority approve
+   restricting generations strictly to positive safe integers (1 <= g < 2^53 - 1)
+   and failing closed with GENERATION_SEQUENCE_EXHAUSTED upon limit reach?
 
-5. [SERIALIZED ACQUISITION CONTRACT]: Does the Engineering Authority approve
-   the 5-step serialized acquisition rule across all custody entry points, ensuring
-   check-then-acquire races cannot occur?
-
-6. [DECOUPLED MONOTONIC CLOCK SEMANTICS]: Does the Engineering Authority approve
-   restricting wall-clock timestamps to diagnostic metadata and mandating monotonic
-   clocks for all duration, timeout, and watchdog evaluations?
+5. [IMMUTABLEMAP RUNTIME INTEGRITY]: Does the Engineering Authority approve
+   the #private backing field implementation of ImmutableMap, guaranteeing that
+   collection structure cannot be mutated via Map.prototype methods at runtime?
 ================================================================================
 ```
 
@@ -1190,13 +1246,13 @@ ENGINEERING AUTHORITY APPROVAL QUESTIONS (MILESTONE M5.0-R18-R13):
 
 ```
 ================================================================================
-M5.0-R18-R13 ARCHITECTURAL DECISION PROPOSAL VERDICT:
+M5.0-R18-R14 ARCHITECTURAL DECISION PROPOSAL VERDICT:
 DECISION PROPOSAL COMPLETE — READY FOR ENGINEERING AUTHORITY REVIEW
 ================================================================================
 ```
 
-This R18-R13 proposal establishes definitive runtime correctness for the concurrent recovery architecture. It replaces vulnerable `Object.freeze(Map)` patterns with true runtime-immutable `#private` collections, closes all ingress/egress mutable aliases, enforces zero post-publication allocations, formalizes generation collision and sequence exhaustion boundaries, serializes custody acquisition across all paths, and decouples diagnostic wall-clock timestamps from monotonic clocks.
+This R18-R14 proposal closes the remaining reachability and alias-ownership gaps. It guarantees that post-publication idempotent retries remain reachable and allocate zero memory, protects published evidence against mutable aliases and typed array tampering, enforces strict positive safe-integer domains, and formalizes complete evidence ownership closure.
 
 ### Mandatory Implementation Authorization Statement
 
-> "M5.0-R18-R13 is an architectural documentation correction only. No production implementation has been started. M5.1, including M5.1a, remains strictly unauthorized pending explicit Engineering Authority approval."
+> "M5.0-R18-R14 is an architectural documentation correction only. No production implementation has been started. M5.1, including M5.1a, remains strictly unauthorized pending explicit Engineering Authority approval."
