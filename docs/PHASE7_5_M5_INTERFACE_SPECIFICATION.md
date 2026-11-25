@@ -1,6 +1,6 @@
 # Phase 7.5 Milestone M5 — Interface Specification
 
-**Status:** APPROVED ARCHITECTURAL SPECIFICATION (MILESTONE M5.0-R17 AMENDED)
+**Status:** FORMALLY ACCEPTED & FROZEN ARCHITECTURAL SPECIFICATION (MILESTONE M5.0 FINAL)
 **Date:** 2026-11-25
 **Authoritative Starting Baseline:** `40b11fdafcd247c7a289723f90ec0e2029c94f64` (Phase 7.5 M4.3d Formally Accepted)
 **Accepted Baselines:** M4.3c (`eab2428`), M4.3b (`f3c29b6`), Approved Architecture (`2bb117c`), Frozen M4.2d (`aafa366`)
@@ -553,9 +553,12 @@ export interface CompositeOperationIdentity {
 }
 
 /**
- * Returns deterministic length-prefixed canonical string representation with UTF-8 byte lengths:
+ * Returns deterministic length-prefixed canonical string representation with strict UTF-8 byte lengths:
  * opid:${originPeerIdBytes}:${originPeerId}/${sequenceNumber}/${membershipEpoch}/${logicalEventIdBytes}:${logicalEventId}
  * Example: opid:6:peer-A/42/1/10:evt_9a8b7c
+ * Note (Qualification C): String identifiers are validated against ASCII_IDENTIFIER_REGEX (/^[a-zA-Z0-9_.:-]+$/).
+ * Regardless of ASCII constraint, length prefixes MUST strictly measure UTF-8 byte lengths using TextEncoder
+ * rather than string .length, guaranteeing multi-byte safety across runtime environments.
  */
 export function canonicalOperationIdentityKey(id: CompositeOperationIdentity): string {
   if (!Number.isSafeInteger(id.sequenceNumber) || id.sequenceNumber <= 0) {
@@ -571,6 +574,16 @@ export function canonicalOperationIdentityKey(id: CompositeOperationIdentity): s
     throw new SyncEngineError('INVALID_IDENTITY', 'logicalEventId must be a non-empty string');
   }
 
+  // Pre-validate identifier character domain against protocol ASCII schema (constants.ts:87)
+  const ASCII_IDENTIFIER_REGEX = /^[a-zA-Z0-9_.:-]+$/;
+  if (!ASCII_IDENTIFIER_REGEX.test(id.originPeerId)) {
+    throw new SyncEngineError('INVALID_IDENTITY', `originPeerId contains non-ASCII or invalid characters: ${id.originPeerId}`);
+  }
+  if (!ASCII_IDENTIFIER_REGEX.test(id.logicalEventId)) {
+    throw new SyncEngineError('INVALID_IDENTITY', `logicalEventId contains non-ASCII or invalid characters: ${id.logicalEventId}`);
+  }
+
+  // Strictly calculate UTF-8 byte lengths via TextEncoder (Qualification C)
   const peerIdBytes = new TextEncoder().encode(id.originPeerId).length;
   const eventIdBytes = new TextEncoder().encode(id.logicalEventId).length;
 
@@ -629,10 +642,11 @@ export interface ArchiveReservationRecord {
 /**
  * Authoritative immutable candidate-root state for TerminalQuarantineArchive.
  * Outer root object and entries array are shallow-frozen with Object.freeze().
- * Backing Map instances (committedTransactions, activeReservations) are strictly
- * private encapsulated structures owned exclusively by the root: they are never
- * mutated post-publication, never exposed directly to external callers, and
- * cannot be made immutable via Object.freeze(map) in JavaScript (R17-A).
+ * Backing collections are strictly private implementation details protected
+ * at runtime via ECMAScript #private class fields or lexical closure-held state
+ * (R17-A, Qualification A). TypeScript compile-time annotations (`private`,
+ * `ReadonlyMap`) are erased in JavaScript and do NOT provide runtime immutability.
+ * No externally reachable reference can mutate a published root's backing collection.
  */
 export interface TerminalArchiveCoreState {
   readonly entries: ReadonlyArray<TerminalQuarantineEntry>;
@@ -646,7 +660,8 @@ export interface TerminalArchiveCoreState {
 /**
  * Authoritative candidate-root state for QuarantineBuffer under Option A.
  * Outer root object and queues are shallow-frozen with Object.freeze().
- * identityIndex Map is privately encapsulated and never mutated post-publication (R17-A).
+ * identityIndex Map is privately encapsulated via ECMAScript #private class fields
+ * or closure state and never mutated post-publication (R17-A, Qualification A).
  */
 export interface QuarantineBufferCoreState {
   readonly activeQueue: ReadonlyArray<QuarantinedOperation>;
@@ -790,6 +805,14 @@ export interface ITerminalQuarantineArchive {
    * Checks whether the archive has already committed a retirement transaction.
    */
   hasTransaction(retirementTransactionId: string): boolean;
+
+  /**
+   * Returns a detached, shallow-frozen array copy of all archived entries.
+   * Elements themselves are individually frozen TerminalQuarantineEntry records
+   * whose canonical wire bytes are defensively cloned upon access, ensuring
+   * external callers cannot mutate internal archive storage (Qualification B).
+   */
+  getEntries(): ReadonlyArray<TerminalQuarantineEntry>;
 
   /**
    * Prepares a detached immutable export batch. Enforces single-lease constraint.

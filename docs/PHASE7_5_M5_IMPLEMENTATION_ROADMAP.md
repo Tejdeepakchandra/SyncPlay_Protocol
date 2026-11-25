@@ -1,6 +1,6 @@
 # Phase 7.5 Milestone M5 — Implementation Roadmap
 
-**Status:** APPROVED ARCHITECTURAL SPECIFICATION (MILESTONE M5.0-R17 AMENDED)
+**Status:** FORMALLY ACCEPTED & FROZEN ARCHITECTURAL SPECIFICATION (MILESTONE M5.0 FINAL)
 **Date:** 2026-11-25
 **Authoritative Starting Baseline:** `40b11fdafcd247c7a289723f90ec0e2029c94f64` (Phase 7.5 M4.3d Formally Accepted)
 **Accepted Baselines:** M4.3c (`eab2428`), M4.3b (`f3c29b6`), Approved Architecture (`2bb117c`), Frozen M4.2d (`aafa366`)
@@ -16,7 +16,7 @@ Because `LeaderlessSyncEngine` is the core playback, causal ordering, and replic
 
 ```mermaid
 flowchart TD
-    M5_0["Milestone M5.0: Architecture Audit & Final Consistency Closure<br/>(Strictly Read-Only / Closed via M5.0-R3)"] --> M5_1["Milestone M5.1: Lifecycle Ownership & Coordinator Binding"]
+    M5_0["Milestone M5.0: Architecture Audit & Final Consistency Closure<br/>(FORMALLY ACCEPTED & FROZEN)"] --> M5_1["Milestone M5.1: Lifecycle Ownership & Coordinator Binding<br/>(STRICTLY UNAUTHORIZED AND UNSTARTED)"]
     M5_1 --> M5_2["Milestone M5.2: Inbound Remote Interception & Quarantine"]
     M5_2 --> M5_3["Milestone M5.3: Local Input Gating & Synchronous Fail-Close"]
     M5_3 --> M5_4["Milestone M5.4: Anti-Entropy Autonomous Trigger & Installation"]
@@ -34,9 +34,9 @@ flowchart TD
 
 ## 2. Sub-Milestone Detailed Specifications
 
-### Milestone M5.0: Runtime Integration Architecture Audit & Final Consistency Closure (Amended M5.0-R17)
+### Milestone M5.0: Runtime Integration Architecture Audit & Final Consistency Closure (FORMALLY ACCEPTED & FROZEN)
 - **Role:** Independent Senior TypeScript Distributed-Systems Architect
-- **Status:** CURRENT MILESTONE (Planning Only)
+- **Status:** FORMALLY ACCEPTED & FROZEN ARCHITECTURAL SPECIFICATION (Implementation Unauthorized)
 - **Objective:** Complete source audit, close review findings across R1 through R6, and author final consistent architecture specifications for M5.
 - **Scope:**
   - Standardize browser-compatible exact byte accounting without re-serialization, preserving original transport wire length (`TextEncoder` / raw byte length) (R3-01).

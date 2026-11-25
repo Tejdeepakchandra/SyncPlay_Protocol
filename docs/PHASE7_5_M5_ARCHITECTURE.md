@@ -1,6 +1,6 @@
 # Phase 7.5 Milestone M5 — Engine Runtime Recovery Integration Architecture
 
-**Status:** APPROVED ARCHITECTURAL SPECIFICATION (MILESTONE M5.0-R17 AMENDED)
+**Status:** FORMALLY ACCEPTED & FROZEN ARCHITECTURAL SPECIFICATION (MILESTONE M5.0 FINAL)
 **Date:** 2026-11-25
 **Authoritative Starting Baseline:** `40b11fdafcd247c7a289723f90ec0e2029c94f64` (Phase 7.5 M4.3d Formally Accepted)
 **Accepted Baselines:** M4.3c (`eab2428`), M4.3b (`f3c29b6`), Approved Architecture (`2bb117c`), Frozen M4.2d (`aafa366`)
@@ -358,7 +358,16 @@ export function canonicalOperationIdentityKey(id: CompositeOperationIdentity): s
     throw new SyncEngineError('INVALID_IDENTITY', 'logicalEventId must be a non-empty string');
   }
 
-  // 3. UTF-8 byte length computation
+  // 3. ASCII Schema Validation (constants.ts:87) (Qualification C)
+  const ASCII_IDENTIFIER_REGEX = /^[a-zA-Z0-9_.:-]+$/;
+  if (!ASCII_IDENTIFIER_REGEX.test(id.originPeerId)) {
+    throw new SyncEngineError('INVALID_IDENTITY', `originPeerId contains non-ASCII or invalid characters: ${id.originPeerId}`);
+  }
+  if (!ASCII_IDENTIFIER_REGEX.test(id.logicalEventId)) {
+    throw new SyncEngineError('INVALID_IDENTITY', `logicalEventId contains non-ASCII or invalid characters: ${id.logicalEventId}`);
+  }
+
+  // 4. Strict UTF-8 byte length computation via TextEncoder (Qualification C)
   const peerIdBytes = new TextEncoder().encode(id.originPeerId).length;
   const eventIdBytes = new TextEncoder().encode(id.logicalEventId).length;
 
@@ -427,17 +436,21 @@ Therefore, claiming that `Object.freeze(map)` guarantees runtime immutability is
 
 To establish defensible runtime immutability and complete encapsulation, the recovery architecture enforces the **Eight Rules of Map Ownership and Encapsulation**:
 
-1. **Private Implementation Details:** Backing `Map` instances are strictly private fields of the owning component (`_core.committedTransactions`, `_core.activeReservations`, `_core.identityIndex`).
+1. **Private Implementation Details (Real Runtime Encapsulation — Qualification A):** Backing `Map` instances (`#committedTransactions`, `#activeReservations`, `#identityIndex`) must be genuine runtime-private fields—specifically ECMAScript `#private` class fields or lexical closure-held variables. TypeScript's compile-time `private` keyword compiles to ordinary enumerable/accessible JavaScript properties in standard transpilations and does NOT prevent external reflection or property access. Similarly, `ReadonlyMap<K, V>` is completely erased at compile time and provides zero runtime protection against `set()`, `delete()`, or `clear()`. The invariant is strict: **no externally reachable reference can exist to a published root's backing collection**.
 2. **Exclusive Root Ownership:** A published core state object exclusively owns its internal Map instances. No external component holds a reference to these maps.
 3. **Zero Backing Map Exposure:** No public getter, accessor, receipt, callback, or exported structure ever returns or leaks a backing Map reference.
 4. **Lexical Builder Isolation:** In every state transition, candidate maps are allocated fresh in local lexical scope (`const nextMap = new Map(...)`). Once the atomic pointer swap occurs, builder references go out of scope and cannot be retained, exported, or mutated.
 5. **No Post-Publication Mutation:** No method or continuation ever calls `.set()`, `.delete()`, or `.clear()` on a Map belonging to an already-published root.
 6. **Copy-on-Write (CoW) State Transitions:** Every state modification (reservation, cancellation, commit, export) constructs a fresh `Map` and a fresh candidate root object, publishing via a single reference assignment.
 7. **Failure Isolation:** If candidate construction, allocation, or validation throws, the authoritative published root remains 100% unaltered.
-8. **Safe Detached Public Read Operations:** Public read queries return safe representations:
+8. **Safe Detached Public Read Operations & Protected Elements (Qualification B):** Public read queries return safe representations:
    - `archive.getTransaction(id)` returns a shallow-frozen record copy: `existingRecord ? Object.freeze({ ...existingRecord }) : undefined`.
    - `archive.hasTransaction(id)` returns a primitive boolean.
    - `archive.getEntries()` returns a shallow-frozen detached Array copy: `Object.freeze([...this._core.entries])`.
+   - **Protected Elements Invariant:** `Object.freeze([...this._core.entries])` protects only the outer array structure, not the nested elements. To guarantee that external callers cannot mutate internal archive storage:
+     (a) Every `TerminalQuarantineEntry` in the archive is individually shallow-frozen with `Object.freeze(entry)` upon construction, containing only immutable primitive fields;
+     (b) Mutable nested data—specifically `canonicalWireBytes: Uint8Array`—is held as private backing storage, and any entry accessor or returned copy provides a detached clone (`new Uint8Array(entry.canonicalWireBytes)`);
+     (c) Public reads of entries yield records whose nested contents cannot mutate internal archive state.
 
 ```typescript
 export interface TerminalArchiveCoreState {
@@ -633,6 +646,11 @@ stateDiagram-v2
 | **12. Dual zero-custody verification failure** | Untouched | Detected leak | Committed | `FAILED` (`CUSTODY_LEAK_DETECTED`) | Aborts clean-root install; enters `DEGRADED`; prevents uncommitted operation loss |
 
 **Hard Invariant:** Clean-root installation is strictly forbidden until every operation in the retirement set has unambiguous terminal custody and dual zero-custody verification confirms zero remaining operations in buffer and drainer.
+
+**Specification vs. Runtime Proof Qualification (Qualification D):**
+The 12-scenario Failure Recovery Matrix is an architectural specification of state transition contracts, ownership handoffs, and invariant guarantees—it does not constitute empirical runtime proof that production code has exercised every failure path.
+During Milestone M5.1 implementation, automated unit and integration test suites must systematically and rigorously exercise each failure scenario in production TypeScript.
+In particular, **Scenario 5 (Archive commit succeeds, but source retirement throws)** represents a critical partial-failure recovery path: the implementation must verify that the transaction record in `committedTransactions` is authoritative, and that subsequent coordinator retry queries `getTransaction()`, detects the prior commit, and completes source retirement cleanly without duplicate archive entries.
 
 #### 6. R15-F — Export Lease, Generation-Independent Acknowledgement & Tombstone Governance (R16-A, R17-A Aligned)
 
