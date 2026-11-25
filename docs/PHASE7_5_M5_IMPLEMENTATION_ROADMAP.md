@@ -1,6 +1,6 @@
 # Phase 7.5 Milestone M5 — Implementation Roadmap
 
-**Status:** APPROVED ARCHITECTURAL SPECIFICATION (MILESTONE M5.0-R2 AMENDED)
+**Status:** APPROVED ARCHITECTURAL SPECIFICATION (MILESTONE M5.0-R3 AMENDED)
 **Date:** 2026-11-25
 **Authoritative Starting Baseline:** `40b11fdafcd247c7a289723f90ec0e2029c94f64` (Phase 7.5 M4.3d Formally Accepted)
 **Accepted Baselines:** M4.3c (`eab2428`), M4.3b (`f3c29b6`), Approved Architecture (`2bb117c`), Frozen M4.2d (`aafa366`)
@@ -16,7 +16,7 @@ Because `LeaderlessSyncEngine` is the core playback, causal ordering, and replic
 
 ```mermaid
 flowchart TD
-    M5_0["Milestone M5.0: Architecture Audit & Consistency Corrections<br/>(Strictly Read-Only / Closed via M5.0-R2)"] --> M5_1["Milestone M5.1: Lifecycle Ownership & Coordinator Binding"]
+    M5_0["Milestone M5.0: Architecture Audit & Final Consistency Closure<br/>(Strictly Read-Only / Closed via M5.0-R3)"] --> M5_1["Milestone M5.1: Lifecycle Ownership & Coordinator Binding"]
     M5_1 --> M5_2["Milestone M5.2: Inbound Remote Interception & Quarantine"]
     M5_2 --> M5_3["Milestone M5.3: Local Input Gating & Synchronous Fail-Close"]
     M5_3 --> M5_4["Milestone M5.4: Anti-Entropy Autonomous Trigger & Installation"]
@@ -34,25 +34,19 @@ flowchart TD
 
 ## 2. Sub-Milestone Detailed Specifications
 
-### Milestone M5.0: Runtime Integration Architecture Audit & Consistency Correction (Amended M5.0-R2)
+### Milestone M5.0: Runtime Integration Architecture Audit & Final Consistency Closure (Amended M5.0-R3)
 - **Role:** Independent Senior TypeScript Distributed-Systems Architect
 - **Status:** CURRENT MILESTONE (Planning Only)
-- **Objective:** Complete source audit, close review findings F1–F10 and R2-C1–R2-C4, R2-H1–R2-H6, R2-M1–R2-M3, and author amended architecture specifications for M5.
+- **Objective:** Complete source audit, close review findings R3-01 through R3-08, and author final consistent architecture specifications for M5.
 - **Scope:**
-  - Source audit across all recovery and engine components against accepted M4.3b, M4.3c, and M4.3d baselines.
-  - Reconcile `EngineCoreState` against accepted source (`packages/sync-engine/src/recovery/engine-core-state.ts`) confirming exactly 12 stored fields + 1 referential alias (`playbackState === state`), single authoritative root, and preservation of M4.3b's opaque staged-handle design.
-  - Correct recovery completion ordering: drain completes $\to$ bookkeeping completes $\to$ `engine.setRecoveryMode(false)` $\to$ `coordinator.transition('ACTIVE')` $\to$ `flushDeferredNotifications()`. Specify failure rollback if transition throws.
-  - Correct incomparable vector semantics: do not equate incomparable vectors with proven forks. Distinguish compatible branches, repairable histories, and proven conflicts.
-  - Replace ambiguous digest statements; define cooperative non-Byzantine trust model and distinguish SHA-256 integrity from author authentication.
-  - Define protocol-stable, locale-independent peer ID comparison (`comparePeerIds`).
-  - Unify overflow semantics: buffers throw `QUARANTINE_OVERFLOW`, coordinator aborts to `DEGRADED` and rethrows, `LeaderlessSyncEngine.receive()` isolates remote error to `REJECTED_CAPACITY` without throwing.
-  - Complete memory-bound specifications: Quarantine (1,000 ops / 4 MiB / 4 KiB), Future Epoch (100 ops / 512 KiB / 4 KiB).
-  - Separate timer ownership across 4 distinct categories (preserving independent future-epoch grace timer).
-  - Clarify coordinator construction vs. lifecycle ownership and single-attachment invariant.
-  - Preserve bounded quarantine drain ($N_{\text{in-flight}} \le 1$) and destination receipts.
-  - Define performance measurement contract (reference hardware, Node LTS, 512-byte payload, 10k warm-up, 100k runs, p99 $\le 5\,\mu\text{s}$, zero queue allocations).
-  - Replace atomicity wording with precise run-to-completion reference replacement.
-  - Treat test counts as minimum regression floors ($\ge 1,550$ monorepo, $\ge 965$ sync-engine, $\ge 42$ recovery acceptance).
+  - Standardize browser-compatible exact byte accounting without re-serialization, preserving original transport wire length (`TextEncoder` / raw byte length) (R3-01).
+  - Specify safe incomparable-compatible recovery procedure: prioritize anti-entropy log repair; if snapshot replacement is necessary, stash local unrepresented operations before install and re-drain, guaranteeing zero local operation loss. Enforce rigorous checkpoint hash chain / frontier timestamps evidence (matching frontier fingerprint alone insufficient) (R3-02).
+  - Define three-tier distinction between authoritative coordinator lifecycle state, public engine queries, and internal notification-deferral operational flag (`this.recoveryActive`), prohibiting dual lifecycle authorities (R3-03).
+  - Formalize complete overflow decision contract across buffer, coordinator, and engine boundaries, confirming `REJECTED_CAPACITY` as an `EngineDecision.code`, zero buffer retention, and diagnostic preservation (R3-04).
+  - Standardize protocol-stable ordinal ASCII peer ID comparison over the validated ASCII domain `/^[a-zA-Z0-9_.:-]+$/` (R3-05).
+  - Inspect `PendingDependencyQueue` capacity ($K = 256$), define drain ownership ($N_{\text{in-flight}} \le 1$), and explicitly identify missing aggregate byte limit as an unresolved design issue (R3-06).
+  - Define capability custody checked via object identity, unwinding on constructor failure, and disposal dead-ending without claiming un-modeled revocation (R3-07).
+  - Qualify performance benchmark contract (Node.js LTS reference environment vs browser runtimes) and clarify young-gen / escape analysis allocation claims (R3-08).
 - **Affected Files:** Documentation files only (`docs/PHASE7_5_M5_*.md`). Zero production or test code modified.
 - **Exit Condition:** Clean audit report; zero production diff; documentation committed; engineering authority approval.
 
@@ -66,7 +60,7 @@ flowchart TD
     - Add `readonly recoveryState: RecoveryState` delegating to coordinator (or returning `'ACTIVE'` if unattached, `'DISPOSED'` if disposed).
     - Implement `isRecoveryInProgress()` returning `true` strictly for `'RECOVERING'` and `'RECONCILING'`.
     - Retain `isRecoveryActive()` as a backward-compatible alias.
-    - Remove mutable `recoveryActive` boolean from serving as an independent authority.
+    - Clarify internal `this.recoveryActive` boolean strictly as a notification-deferral operational switch slaved to coordinator.
   - Implement single-attachment invariant in `coordinator.bindEngine(engine, capability)`: throw `SyncEngineError('ALREADY_BOUND')` if already attached. Prohibit sharing coordinators across engines.
   - Wire coordinator lifecycle completion sequence:
     1. Quarantine drain completes (`totalRetainedCount === 0`).
@@ -91,7 +85,7 @@ flowchart TD
 ### Milestone M5.2: Inbound Remote-Event Interception & Quarantine
 - **Objective:** Route incoming remote operations through `RecoveryCoordinator.interceptRemoteEvent()` returning discriminated `RemoteAdmissionDecision`.
 - **Scope:**
-  - In `LeaderlessSyncEngine.receive()`, route remote events (`isLocal === false`) to `coordinator.interceptRemoteEvent(event, size)` when coordinator is attached.
+  - In `LeaderlessSyncEngine.receive()`, route remote events (`isLocal === false`) to `coordinator.interceptRemoteEvent(event, size)` when coordinator is attached. Pass original wire serialized length directly without re-serializing.
   - Handle discriminated outcomes:
     - `ADMIT_ACTIVE`: proceed to normal `receiveRemote()` without added latency ($\le 5\,\mu\text{s}$).
     - `QUARANTINED`: record decision `BUFFERED_QUARANTINE`, bypass `receiveRemote()`, zero log/state mutation.
@@ -137,8 +131,10 @@ flowchart TD
 ### Milestone M5.4: Anti-Entropy Autonomous Trigger, Supplier Selection & Snapshot Installation Integration
 - **Objective:** Autonomously trigger snapshot recovery from anti-entropy gap detection and execute atomic snapshot installation.
 - **Scope:**
-  - Implement deterministic supplier selection under lattice partial ordering: strict domination, lowest RTT, and protocol-stable code-point peer ID comparison (`comparePeerIds`).
+  - Implement deterministic supplier selection under lattice partial ordering: strict domination, lowest RTT, and protocol-stable ordinal ASCII peer ID comparison (`comparePeerIds`).
   - Differentiate incomparable vector cases: compatible branches, repairable histories within log horizon, and proven causal forks.
+  - Enforce safe incomparable-compatible recovery: prioritize anti-entropy log repair; if snapshot replacement is necessary, stash local unrepresented operations before install and re-drain, guaranteeing zero local operation loss.
+  - Require full checkpoint hash chain or frontier timestamps evidence before declaring history compatibility.
   - In `AntiEntropyManager.evaluateRemoteDigest()`, inspect `compareRemoteDigest(digest)`. If `requiresSnapshotRecovery === true` and `outsideRemoteHorizon === true`, invoke `onSnapshotRecoveryRequired` to trigger `coordinator.triggerRecovery(supplierPeerId)`.
   - Wire `RepairRequestPipeline.onHistoryExhausted` into `coordinator.triggerRecovery()`.
   - Wire `SnapshotInboundPipeline.onTransferComplete` to invoke `coordinator.executeRecoveryWithSnapshot(payload)` with one-shot completion latch and `activeAttemptId` fencing.
@@ -172,7 +168,7 @@ flowchart TD
     5. Future-epoch operation buffering, grace period countdown, and epoch advancement.
     6. Quarantine buffer overflow triggering graceful degradation to `DEGRADED`.
     7. Lamport clock monotonicity across multiple sequential recovery and drain cycles.
-  - Reference benchmark suite verifying active-state performance ($\le 5\,\mu\text{s}$ p99 overhead, zero queue allocations).
+  - Reference benchmark suite verifying active-state performance ($\le 5\,\mu\text{s}$ p99 overhead in Node LTS, zero queue allocations).
   - Monorepo regression test run meeting or exceeding minimum floors ($\ge 1,550$ monorepo tests, $\ge 965$ sync-engine tests, $\ge 42$ recovery acceptance tests).
 - **Affected Files:**
   - `packages/sync-engine/src/__tests__/recovery-engine-integration.test.ts`

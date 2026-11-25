@@ -1,6 +1,6 @@
 # Phase 7.5 Milestone M5 — Interface Specification
 
-**Status:** APPROVED ARCHITECTURAL SPECIFICATION (MILESTONE M5.0-R2 AMENDED)
+**Status:** APPROVED ARCHITECTURAL SPECIFICATION (MILESTONE M5.0-R3 AMENDED)
 **Date:** 2026-11-25
 **Authoritative Starting Baseline:** `40b11fdafcd247c7a289723f90ec0e2029c94f64` (Phase 7.5 M4.3d Formally Accepted)
 **Accepted Baselines:** M4.3c (`eab2428`), M4.3b (`f3c29b6`), Approved Architecture (`2bb117c`), Frozen M4.2d (`aafa366`)
@@ -20,7 +20,7 @@ Every interface and method in this document is labeled as either:
 
 ## 2. LeaderlessSyncEngine Runtime Integration Interfaces
 
-### 2.1 Engine Configuration (Closing F5, R2-H5)
+### 2.1 Engine Configuration & Capability Custody (Closing F5, R2-H5, R3-07)
 
 ```typescript
 /**
@@ -66,17 +66,27 @@ export interface EngineRecoveryOptions {
   readonly epochConvergenceGraceMs?: number;
   readonly quarantineWarningThresholdBytes?: number;
 }
+
+/**
+ * Unforgeable in-process installation capability checked via object identity.
+ * [EXISTING — M4 ACCEPTED in leaderless-sync-engine.ts:132]
+ */
+export interface RecoveryInstallationCapability {
+  readonly authority: string;
+  readonly sessionId: string;
+  readonly token: string;
+}
 ```
 
-### 2.2 LeaderlessSyncEngine Public & Protected Recovery Methods (Closing F1, F7, R2-C1, R2-C2, R2-M2)
+### 2.2 LeaderlessSyncEngine Public & Protected Recovery Methods (Closing F1, F7, R2-C1, R2-C2, R2-M2, R3-03, R3-06)
 
 ```typescript
 export interface ILeaderlessSyncEngineRecovery {
-  // ── Authoritative Lifecycle Queries (Closing F1) ──────────────────────────
+  // ── Authoritative Lifecycle Queries vs Operational Mode (Closing F1, R3-03) ──
 
   /**
-   * Queries the authoritative recovery state from the attached coordinator.
-   * Returns 'ACTIVE' if no coordinator is attached, or 'DISPOSED' if engine is disposed.
+   * Queries authoritative recovery state from attached coordinator (Tier 1).
+   * Returns 'ACTIVE' if unattached, or 'DISPOSED' if engine is disposed.
    * [PROPOSED — M5.1]
    */
   readonly recoveryState: RecoveryState;
@@ -94,14 +104,20 @@ export interface ILeaderlessSyncEngineRecovery {
    */
   isRecoveryActive(): boolean;
 
+  /**
+   * Toggles internal operational notification-deferral flag (Tier 3).
+   * Restricted slave switch driven exclusively by coordinator.
+   * [EXISTING — M4 ACCEPTED in LeaderlessSyncEngine.ts:921]
+   */
+  setRecoveryMode(active: boolean): void;
+
   // ── Single-Root Core State Replacement [EXISTING — M4 ACCEPTED] ───────────
 
   /**
    * Capability-gated single-root core state replacement.
    * Replaces this.core across all 12 authoritative fields in one synchronous reference
    * replacement under JavaScript run-to-completion semantics.
-   * Ordinary consumers NEVER hold candidate EngineCoreState; this is called exclusively
-   * by SnapshotInstaller.commitAtomic() via opaque StagedSnapshotInstallation handle.
+   * Called exclusively by SnapshotInstaller.commitAtomic() via opaque handle.
    * [EXISTING — M4 ACCEPTED in LeaderlessSyncEngine.ts:883]
    */
   replaceCoreStateAtomic(
@@ -111,7 +127,7 @@ export interface ILeaderlessSyncEngineRecovery {
 
   /**
    * Submits an in-flight quarantined operation to destination engine for admission/reduction.
-   * Reuses accepted M4.3c contract with N_in-flight <= 1.
+   * Enforces N_in-flight <= 1. Returns typed receipts.
    * [EXISTING — M4 ACCEPTED in LeaderlessSyncEngine.ts:977]
    */
   admitDrainedOperation(op: QuarantinedOperation): DestinationAcceptanceReceipt;
@@ -125,8 +141,6 @@ export interface ILeaderlessSyncEngineRecovery {
   /**
    * Flushes deferred notifications strictly AFTER engine recovery mode is cleared
    * and coordinator state transitions to ACTIVE.
-   * - stateChangeListeners: exactly ONE coalesced notification with final PlaybackState.
-   * - decisionListeners: all decisions dispatched sequentially in FIFO order.
    * [EXISTING — M4 ACCEPTED in LeaderlessSyncEngine.ts:929, updated in M5.1]
    */
   flushDeferredNotifications(): void;
@@ -146,7 +160,7 @@ export interface ILeaderlessSyncEngineRecovery {
   // ── Local Input Gating & Intent Submission [PROPOSED — M5.3] ─────────────
 
   /**
-   * Submits a local user intent for execution, fail-closing if recovery is not ACTIVE.
+   * Submits local user intent, fail-closing if recovery is not ACTIVE.
    * Throws SyncEngineError('REJECTED_RECOVERING') during RECOVERING/RECONCILING.
    * Throws SyncEngineError('REJECTED_DEGRADED') during DEGRADED.
    * [PROPOSED — M5.3]
@@ -159,7 +173,7 @@ export interface ILeaderlessSyncEngineRecovery {
 
 ## 3. Recovery Coordinator Runtime Binding & Interception Decisions
 
-### 3.1 IRuntimeRecoveryCoordinator Interface (Closing F1, F5, R2-H5)
+### 3.1 IRuntimeRecoveryCoordinator Interface (Closing F1, F5, R2-H5, R3-07)
 
 ```typescript
 /**
@@ -193,7 +207,7 @@ export interface IRuntimeRecoveryCoordinator {
 
   /**
    * Intercepts an inbound remote event using discriminated union results.
-   * Synchronous, O(1), <= 5μs overhead in ACTIVE state.
+   * Original transport wire length passed directly as rawSerializedLength.
    * Throws SyncEngineError('QUARANTINE_OVERFLOW') on buffer limit breach.
    * [PROPOSED — M5.2]
    */
@@ -236,13 +250,13 @@ export interface IRuntimeRecoveryCoordinator {
 }
 ```
 
-### 3.2 Discriminated Inbound Interception Decision (Closing F3, F9, R2-H2)
+### 3.2 Discriminated Inbound Interception Decision (Closing F3, F9, R2-H2, R3-04)
 
 ```typescript
 /**
  * Unambiguous discriminated union returned by interceptRemoteEvent().
  * Note: Overflow is an exceptional boundary condition that throws SyncEngineError,
- * not a return outcome.
+ * which is caught and mapped by engine to EngineDecision.code = 'REJECTED_CAPACITY'.
  * [PROPOSED — M5.2]
  */
 export type RemoteAdmissionDecision =
@@ -318,8 +332,8 @@ export interface EngineCoreState {
 
 /**
  * Immutable opaque handle representing a staged snapshot installation.
- * The candidate EngineCoreState is retained in private WeakMap storage inside
- * SnapshotInstaller and is never exposed to external callers or the coordinator.
+ * Candidate EngineCoreState is held in private WeakMap storage inside
+ * SnapshotInstaller and is never exposed to external callers or coordinator.
  * [EXISTING — M4 ACCEPTED in snapshot-installer.ts]
  */
 export interface StagedSnapshotInstallation {
@@ -334,12 +348,12 @@ export interface StagedSnapshotInstallation {
 
 ---
 
-## 5. Supplier Selection, Lattice Ordering & Deterministic Comparator (Closing F4, R2-C3, R2-H1)
+## 5. Supplier Selection, Lattice Ordering & Deterministic Comparator (Closing F4, R2-C3, R2-H1, R3-02, R3-05)
 
 ```typescript
 /**
  * Protocol-stable, locale-independent peer ID comparator.
- * Based on UTF-16 code units / Unicode code point ordering.
+ * Based on ordinal ASCII code point comparison over ASCII_IDENTIFIER_REGEX domain.
  * [PROPOSED — M5.4]
  */
 export function comparePeerIds(a: string, b: string): number {
@@ -360,7 +374,7 @@ export type CandidateSupplierSelectionResult =
       readonly selectionReason:
         | 'STRICT_DOMINATION'
         | 'EQUAL_LOWER_RTT'
-        | 'EQUAL_CANONICAL_PEER_ID'
+        | 'EQUAL_ORDINAL_ASCII_ID'
         | 'HISTORICAL_PREFIX_SUBSUMES';
     }
   | {
@@ -368,9 +382,11 @@ export type CandidateSupplierSelectionResult =
       readonly reason: string;
     }
   | {
+      /** Incomparable but verified compatible histories: triggers operation repair or stashing */
       readonly status: 'INCOMPARABLE_COMPATIBLE';
       readonly candidateA: string;
       readonly candidateB: string;
+      readonly reconciliationAction: 'OPERATION_REPAIR_PRIORITY' | 'LOCAL_STASHING_REQUIRED';
       readonly reason: string;
     }
   | {
@@ -379,6 +395,7 @@ export type CandidateSupplierSelectionResult =
       readonly logCapacity: number;
     }
   | {
+      /** Proven conflict fork: divergent operations detected for same origin and sequence */
       readonly status: 'PROVEN_CONFLICT_FORK_DETECTED';
       readonly candidateA: string;
       readonly candidateB: string;
@@ -387,6 +404,7 @@ export type CandidateSupplierSelectionResult =
       readonly reason: string;
     }
   | {
+      /** Insufficient evidence: matching frontier alone without verified checkpoint chain */
       readonly status: 'INSUFFICIENT_EVIDENCE';
       readonly reason: string;
     }
@@ -451,3 +469,4 @@ export interface RecoveryTimerInventory {
 | `REJECTED_CAPACITY` | LeaderlessSyncEngine | Memory and queue capacity bounds preserved | Remote event rejected; engine records decision; remote error isolated without throwing. |
 | `FORK_DETECTED_INCOMPARABLE`| Coordinator | Divergent histories with conflicting operations | Coordinator aborts recovery to `DEGRADED`. |
 | `ALREADY_BOUND` | Coordinator | Single-attachment invariant | Throws `SyncEngineError` if coordinator is bound to more than one engine. |
+| `UNAUTHORIZED` | LeaderlessSyncEngine | Capability custody enforced by object identity | Throws `SyncEngineError` if capability does not match `authorizedRecoveryCapability`. |

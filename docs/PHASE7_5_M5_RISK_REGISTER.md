@@ -1,6 +1,6 @@
 # Phase 7.5 Milestone M5 — Risk Register
 
-**Status:** APPROVED ARCHITECTURAL SPECIFICATION (MILESTONE M5.0-R2 AMENDED)
+**Status:** APPROVED ARCHITECTURAL SPECIFICATION (MILESTONE M5.0-R3 AMENDED)
 **Date:** 2026-11-25
 **Authoritative Starting Baseline:** `40b11fdafcd247c7a289723f90ec0e2029c94f64` (Phase 7.5 M4.3d Formally Accepted)
 **Accepted Baselines:** M4.3c (`eab2428`), M4.3b (`f3c29b6`), Approved Architecture (`2bb117c`), Frozen M4.2d (`aafa366`)
@@ -69,7 +69,7 @@ Milestone M5 integrates the recovery subsystem directly into `LeaderlessSyncEngi
 
 ---
 
-### R-M5-04: Quarantine Memory Exhaustion Under High-Concurrency Bursts (Closing R2-H2, R2-H3)
+### R-M5-04: Quarantine Memory Exhaustion Under High-Concurrency Bursts (Closing R2-H2, R2-H3, R3-01, R3-04)
 - **Root Cause:** While catching up across a 4 MB snapshot over a high-latency link, active peers continue broadcasting live operations. A malicious or high-throughput peer could flood the recovering node with events, causing OOM.
 - **Architectural Impact:** Browser tab crash or engine heap exhaustion.
 - **Mitigation Strategy:**
@@ -81,8 +81,9 @@ Milestone M5 integrates the recovery subsystem directly into `LeaderlessSyncEngi
     - Hard count limit: 100 operations.
     - Hard aggregate byte limit: 512 KiB.
     - Individual event limit: 4 KiB.
-  - Unified overflow contract (R2-H2): buffer throws `QUARANTINE_OVERFLOW` / `FUTURE_EPOCH_OVERFLOW`. `RecoveryCoordinator` catches, autonomously aborts recovery to `DEGRADED`, and rethrows. `LeaderlessSyncEngine.receive()` catches, isolates remote error to `REJECTED_CAPACITY`, and records decision without throwing to transport callers.
-- **Automated Verification Control:** Stress tests in `recovery-remote-interception.test.ts` injecting count- and byte-exceeding operations verify deterministic transition to `DEGRADED` and remote error isolation.
+  - **Browser-Compatible Wire Accounting (R3-01):** Wire byte lengths are measured directly at transport ingestion (`TextEncoder` / `rawSerializedLength`) without re-serializing with `JSON.stringify()`.
+  - **Complete Overflow Contract (R3-04):** Buffer throws $\to$ `RecoveryCoordinator` catches, transitions to `DEGRADED`, and rethrows $\to$ `LeaderlessSyncEngine.receive()` isolates remote error to `REJECTED_CAPACITY` without throwing to transport callers. Rejected operations are not retained or partially owned by the buffer.
+- **Automated Verification Control:** Stress tests in `recovery-remote-interception.test.ts` injecting count- and byte-exceeding operations verify deterministic transition to `DEGRADED`, remote error isolation, and zero buffer retention.
 
 ---
 
@@ -122,36 +123,37 @@ Milestone M5 integrates the recovery subsystem directly into `LeaderlessSyncEngi
 
 ---
 
-### R-M5-08: Ambiguous Lifecycle Ownership and Teardown Leaks (Closing F5, R2-H5)
-- **Root Cause:** Unclear lifecycle ownership where active timers or detached event listeners retain the coordinator or engine in memory indefinitely after application shutdown.
-- **Architectural Impact:** Retained background processes, hanging test suites, and memory growth across repeated session lifecycles.
+### R-M5-08: Ambiguous Lifecycle Ownership, Capability Custody & Teardown Leaks (Closing F5, R2-H5, R3-07)
+- **Root Cause:** Unclear lifecycle ownership where active timers retain the coordinator, or improper capability checks allow unauthorized replacement.
+- **Architectural Impact:** Retained background processes, hanging test suites, or unauthorized core state replacement.
 - **Mitigation Strategy:**
   - **Single Construction Authority:** `LeaderlessSyncEngine` owns `RecoveryCoordinator`.
   - **Single-Attachment Invariant:** Calling `bindEngine()` when already bound throws `SyncEngineError('ALREADY_BOUND')`. Sharing coordinators across engines is prohibited.
+  - **Capability Custody (R3-07):** Checked strictly via object identity (`capability === this.authorizedRecoveryCapability`). No un-modeled dynamic revocation; constructor unwinding cleans failed bindings; engine disposal dead-ends capability invocations.
   - **Deterministic Disposal Propagation:** Calling `engine.dispose()` synchronously calls `this.recoveryCoordinator?.dispose()`.
   - Coordinator disposal is synchronous and idempotent: cancels all timers, clears all buffer queues, unregisters all callbacks, nullifies references, and marks `_isDisposed = true`.
 - **Automated Verification Control:** Teardown test in `recovery-lifecycle-binding.test.ts` verifying zero active timers or listener leaks post-dispose.
 
 ---
 
-### R-M5-09: Incomparable Frontier Lattice Fork vs. Compatible Concurrent Branches (Closing F4, R2-C3, R2-C4, R2-H1)
-- **Root Cause:** Vector frontiers form a partially ordered product lattice ($\mathbb{N}^k$). Incomparable frontiers ($V_A \parallel V_B$) are not necessarily forks; treating them as automatic forks causes unnecessary degradation. Conversely, ordering them via arbitrary metrics causes split-brain state divergence.
-- **Architectural Impact:** Unnecessary recovery degradation or partition divergence where different peers install mutually contradictory snapshots.
+### R-M5-09: Incomparable Frontier Lattice Fork vs. Compatible History Preservation (Closing F4, R2-C3, R2-C4, R2-H1, R3-02, R3-05)
+- **Root Cause:** Vector frontiers form a partially ordered product lattice ($\mathbb{N}^k$). Incomparable frontiers ($V_A \parallel V_B$) are not necessarily forks; treating them as automatic forks causes unnecessary degradation. Conversely, overwriting active state with an incomparable snapshot destroys unrepresented local operations.
+- **Architectural Impact:** Unnecessary recovery degradation or irreversible loss of local progress.
 - **Mitigation Strategy:**
-  - **Differentiated Classification (R2-C3):** Distinguish strict domination, compatible concurrent branches, repairable gaps, and proven conflicting forks ($H(op_A) \ne H(op_B)$).
-  - **Deterministic Peer Comparison (R2-H1):** When tie-breaking equal frontiers, use lowest RTT followed by protocol-stable code-point peer ID comparison (`comparePeerIds`). `localeCompare` is strictly prohibited.
+  - **Safe Incomparable Recovery (R3-02):** A snapshot must NEVER replace active state if doing so would discard compatible local operations! Prioritize anti-entropy delta log repair. If snapshot replacement is necessary, stash local operations whose sequence numbers are ahead of the snapshot, install snapshot, and re-drain stashed operations on top of the snapshot base.
+  - **Evidence Requirement (R3-02):** Matching frontier fingerprints alone are insufficient; full checkpoint hash chains or frontier timestamps are required to verify history compatibility.
+  - **Deterministic Peer Comparison (R2-H1, R3-05):** Ordinal ASCII code point comparison (`comparePeerIds`) over the validated domain `/^[a-zA-Z0-9_.:-]+$/`. `localeCompare` is strictly prohibited.
   - **Cooperative Trust Model (R2-C4):** SHA-256 verifies byte-level slice and payload integrity against transport corruption, but does not prove cryptographic author authentication.
-  - **Fork Detection:** Abort to `DEGRADED` only when true causal divergence is proven or unresolved history exceeds the repair horizon under recovery policy.
-- **Automated Verification Control:** Unit tests in `recovery-anti-entropy-trigger.test.ts` verifying correct classification of compatible branches vs. proven forks.
+  - **Fork Detection:** Abort to `DEGRADED` only upon proven causal divergence ($H(op_A) \ne H(op_B)$) or unresolvable history.
+- **Automated Verification Control:** Unit tests in `recovery-anti-entropy-trigger.test.ts` verifying delta repair prioritization and local operation preservation.
 
 ---
 
-### R-M5-10: Lifecycle State Desynchronization & Completion Handoff (Closing F1, F7, R2-C2)
-- **Root Cause:** If the engine maintains an independent mutable boolean (`recoveryActive`) alongside the coordinator's state machine (`stateMachine.state`), or if completion handoff ordering is inverted, listeners can observe inconsistent states.
+### R-M5-10: Lifecycle State Desynchronization & Completion Handoff (Closing F1, F7, R2-C2, R3-03)
+- **Root Cause:** If the engine maintains an independent mutable boolean alongside the coordinator's state machine, or if completion handoff ordering is inverted, listeners can observe inconsistent states.
 - **Architectural Impact:** Engine admits remote events while coordinator is recovering, or listeners observe `ACTIVE` state while engine still rejects local inputs.
 - **Mitigation Strategy:**
-  - `RecoveryCoordinator.stateMachine.state` is the **single source of truth** (`recoveryState`).
-  - `engine.isRecoveryInProgress()` queries the coordinator directly.
+  - **Three-Tier Architecture (R3-03):** Coordinator state machine is Tier 1 sole lifecycle authority. Public engine queries are Tier 2 delegators. `this.recoveryActive` is strictly a Tier 3 slave operational gate for notification deferral.
   - **M4.3c Completion Sequence (R2-C2):** Drain completes $\to$ bookkeeping completes $\to$ `engine.setRecoveryMode(false)` $\to$ `coordinator.transition('ACTIVE')` $\to$ `flushDeferredNotifications()`.
   - If transition throws, catch block immediately restores `engine.setRecoveryMode(true)`, aborts recovery, and does NOT flush notifications.
 - **Automated Verification Control:** State consistency tests in `recovery-lifecycle-binding.test.ts` verifying listener observation guarantees and handoff rollback.
@@ -169,11 +171,11 @@ Milestone M5 integrates the recovery subsystem directly into `LeaderlessSyncEngi
 
 ---
 
-### R-M5-12: Drain Capacity Exhaustion & Operation Loss Prevention (Closing R2-H6)
+### R-M5-12: Drain Capacity Exhaustion & Pending Queue Limit (Closing R2-H6, R3-06)
 - **Root Cause:** During quarantine drain, admitted operations that are causal dependencies are forwarded to `engine.pendingQueue`. If `pendingQueue` capacity is reached, operations could be dropped if dequeued eagerly.
 - **Architectural Impact:** Silent operation loss during post-recovery reconciliation.
 - **Mitigation Strategy:**
   - **$N_{\text{in-flight}} \le 1$ Ownership:** `QuarantineDrainer` retains dequeued operation in `inFlightRecord` until confirmed.
   - **Capacity Rejection Handling:** Destination returns `CAPACITY_REJECTED`. The operation is restored to queue, drain halts immediately (`haltedOnCapacity = true`), and recovery transitions safely to `DEGRADED`.
-  - An operation is never marked applied merely because it was dequeued.
+  - **Identified Open Design Issue (R3-06):** `PendingDependencyQueue` enforces count capacity ($K=256$), but has no aggregate byte limit. Documented as an open design issue for post-M5 hardening.
 - **Automated Verification Control:** Capacity tests in `recovery-engine-integration.test.ts` verifying zero operation loss when `pendingQueue` capacity is exhausted during drain.

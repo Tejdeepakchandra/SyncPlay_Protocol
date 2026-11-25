@@ -1,6 +1,6 @@
 # Phase 7.5 Milestone M5 — Engine Runtime Recovery Integration Architecture
 
-**Status:** APPROVED ARCHITECTURAL SPECIFICATION (MILESTONE M5.0-R2 AMENDED)
+**Status:** APPROVED ARCHITECTURAL SPECIFICATION (MILESTONE M5.0-R3 AMENDED)
 **Date:** 2026-11-25
 **Authoritative Starting Baseline:** `40b11fdafcd247c7a289723f90ec0e2029c94f64` (Phase 7.5 M4.3d Formally Accepted)
 **Accepted Baselines:** M4.3c (`eab2428`), M4.3b (`f3c29b6`), Approved Architecture (`2bb117c`), Frozen M4.2d (`aafa366`)
@@ -16,10 +16,11 @@ Milestone M4 established complete implementation and verification evidence for c
 
 Prior to M5, the engine and recovery components operated with an explicit integration boundary: `RecoveryCoordinator` and `LeaderlessSyncEngine` were instantiated independently in test harnesses, with recovery triggered manually and drained operations submitted explicitly via test fixtures. Milestone M5 bridges this boundary so that:
 1. Anti-entropy gap evaluation (`compareRemoteDigest`) and repair exhaustion (`onHistoryExhausted`) autonomously trigger snapshot recovery when operations fall outside the retained operation-log compaction horizon.
-2. The engine's live ingestion path (`receive()`) routes incoming remote operations through a discriminated admission controller, ensuring current-epoch events enter quarantine, future-epoch events enter an independent 5-second staged buffer, and obsolete events are dropped, guaranteeing zero active state mutation during snapshot staging and installation.
+2. The engine's live ingestion path (`receive()`) routes incoming remote operations through a discriminated admission controller, ensuring current-epoch events enter quarantine, future-epoch events enter an independent 5-second staged buffer, and obsolete events are dropped, guaranteeing zero active state mutation during snapshot staging and installation. Original transport wire byte sizes are preserved throughout admission without reparsing or re-serialization.
 3. Local user inputs (`receiveLocal()`, `submit()`) fail-close synchronously during recovery and degraded states, preventing concurrent local divergence and causal clock skew.
 4. Snapshot installation synchronously and atomically replaces the engine's core state root (`EngineCoreState`) across all 12 authoritative components through M4.3b's opaque staged handle design, preserving exact Lamport monotonicity ($L_{\text{local}} = \max(L_{\text{local}}, L_{\text{snapshot}})$ without $+1$) and causal replication frontiers in one synchronous reference replacement under JavaScript run-to-completion semantics.
-5. The post-installation quarantine drain protocol sequentially submits quarantined operations through the engine's causal admission pipeline (`admitDrainedOperation()`), enforcing bounded single-in-flight ownership ($N_{\text{in-flight}} \le 1$), advancing replication vectors, and emitting coalesced state notifications only after reconciliation successfully clears engine recovery mode and reaches `ACTIVE`.
+5. Incomparable but compatible histories ($V_A \parallel V_B$) are reconciled safely without discarding local operations that are ahead of the candidate snapshot, prioritizing anti-entropy delta repair or pre-install local operation stashing.
+6. The post-installation quarantine drain protocol sequentially submits quarantined operations through the engine's causal admission pipeline (`admitDrainedOperation()`), enforcing bounded single-in-flight ownership ($N_{\text{in-flight}} \le 1$), advancing replication vectors, and emitting coalesced state notifications only after reconciliation successfully clears engine recovery mode and reaches `ACTIVE`.
 
 ---
 
@@ -70,46 +71,72 @@ flowchart TD
     RRP -->|triggerRecovery on onHistoryExhausted| RC
 ```
 
-### 2.1 Construction Ownership vs. Lifecycle Ownership (Closing F5, R2-H5)
+### 2.1 Capability Custody, Attachment Semantics & Failure Behavior (Closing F5, R2-H5, R3-07)
 
-To eliminate any ambiguity regarding component lifetimes, construction parameters, capability custody, and circular references:
+The accepted capability model relies on frozen object identity:
+`export interface RecoveryInstallationCapability { readonly authority: string; readonly sessionId: string; readonly token: string; }`.
+To preserve exact capability custody and single-attachment guarantees without claiming un-modeled capability "revocation":
 
-1. **Construction Ownership:**
-   - **Option A (Autonomous Internal Construction — Standard Production):** The caller provides `recoveryOptions?: EngineRecoveryOptions` in `LeaderlessSyncEngineConfig`. The engine constructs its own `RecoveryCoordinator`, mints an unforgeable in-process `RecoveryInstallationCapability` (branded with a module-private Symbol), binds itself to the coordinator via `coordinator.bindEngine(engine, capability)`, and retains private ownership.
-   - **Option B (External Coordinator Injection — Advanced Testing):** The caller provides an already constructed `recoveryCoordinator?: IRuntimeRecoveryCoordinator` and an authorized `authorizedRecoveryCapability?: RecoveryInstallationCapability`. The engine binds to the injected coordinator during initialization.
-   - **Mutual Exclusion Invariant:** Supplying *both* `recoveryCoordinator` and `recoveryOptions` throws `SyncEngineError('INVALID_CONFIG', 'Cannot supply both recoveryCoordinator and recoveryOptions')`.
-2. **Single-Attachment Invariant:** A `RecoveryCoordinator` can be bound to at most one engine. Calling `coordinator.bindEngine(engine, capability)` when already bound throws `SyncEngineError('ALREADY_BOUND')`. A coordinator cannot be detached, replaced, or swapped across engines at runtime. Sharing one coordinator across multiple engines is strictly prohibited. If attachment fails during engine construction (e.g. invalid capability or already bound), capability custody is revoked, engine construction throws, and the coordinator remains in its prior state.
-3. **Lifecycle Ownership After Attachment:** Once successfully bound, the engine assumes **exclusive lifecycle ownership** of the coordinator. Invoking `engine.dispose()` synchronously disposes the attached `RecoveryCoordinator`.
-4. **Disposal Semantics:** Coordinator disposal is **synchronous and idempotent**. Multiple invocations of `dispose()` are safe no-ops. On disposal, the coordinator immediately cancels all active attempt and reconciliation timers, releases buffer memory, clears listeners, and transitions permanently to `DISPOSED`. Unreachable reference cycles between engine and coordinator are safely reclaimed by the JavaScript garbage collector.
+1. **Custody & Object Identity:**
+   - `LeaderlessSyncEngine` creates and stores `private readonly authorizedRecoveryCapability?: RecoveryInstallationCapability;`.
+   - `replaceCoreStateAtomic(candidate, capability)` enforces strict object-reference identity: `if (capability !== this.authorizedRecoveryCapability) throw new SyncEngineError('UNAUTHORIZED')`.
+   - No dynamic revocation token or membrane exists in the accepted baseline; security rests strictly on in-process reference confinement.
+2. **Construction Options:**
+   - **Option A (Autonomous Internal Construction — Standard Production):** The engine constructs its own `RecoveryCoordinator`, mints an authorized capability via `createRecoveryInstallationCapability()`, binds the coordinator via `coordinator.bindEngine(engine, capability)`, and retains private custody.
+   - **Option B (External Coordinator Injection — Advanced Testing):** The caller provides an already constructed `recoveryCoordinator` and authorized capability. The engine binds to it during initialization. Supplying both `recoveryOptions` and `recoveryCoordinator` throws `SyncEngineError('INVALID_CONFIG')`.
+3. **Attachment Lifecycle Matrix:**
+   - **Invalid Capability:** If `capability !== this.authorizedRecoveryCapability`, `replaceCoreStateAtomic` rejects immediately with `SyncEngineError('UNAUTHORIZED')`.
+   - **Already-Bound Coordinator:** Calling `coordinator.bindEngine()` when already attached throws `SyncEngineError('ALREADY_BOUND')`. A coordinator cannot be re-bound or shared across multiple engines.
+   - **Successful Binding:** Coordinator stores the engine reference and authorized capability in private fields.
+   - **Failure During Engine Construction:** If engine initialization throws after `bindEngine()` has run (e.g. invalid configuration or constructor failure), engine construction unwinds; the engine reference is never published, and the partially constructed engine is reclaimed by garbage collection. An externally injected coordinator bound during a failed constructor call cannot be safely reused and must be discarded.
+   - **Engine Disposal:** Invoking `engine.dispose()` invokes `coordinator.dispose()`. Calling `replaceCoreStateAtomic` on a disposed engine throws `SyncEngineError('ENGINE_DISPOSED')`, effectively dead-ending the capability even if a reference is retained externally.
 
 ---
 
-## 3. Authoritative Lifecycle & Admission Policy (Closing F1, F3, R2-C2, R2-H2)
+## 3. Authoritative Lifecycle vs. Operational Recovery Mode (Closing F1, F3, R2-C2, R3-03)
 
-To ensure the engine and coordinator never maintain divergent lifecycle state, Milestone M5 defines three strictly separated concepts:
+To prevent contradictory or duplicate recovery authorities, Milestone M5 defines three strictly distinguished tiers:
 
-1. **`recoveryState`:** The authoritative state owned exclusively by `RecoveryCoordinator.stateMachine.state`:
-   - `'ACTIVE'` — Normal operational replication.
-   - `'RECOVERING'` — Snapshot transfer, verification, staging, and atomic commit in progress.
-   - `'RECONCILING'` — Post-snapshot quarantine draining in progress.
-   - `'DEGRADED'` — Terminal recovery failure, partition conflict, or buffer overflow; requires application-level reset.
-   - `'DISPOSED'` — Engine or coordinator has been permanently shut down.
-2. **`isRecoveryInProgress()`:** A derived boolean helper returning `true` **if and only if** `recoveryState === 'RECOVERING' || recoveryState === 'RECONCILING'`. (`isRecoveryActive()` is retained purely as a backward-compatible alias of `isRecoveryInProgress()`).
-3. **`admissionPolicy`:** A comprehensive, deterministic decision matrix enforced across all five lifecycle states.
+```mermaid
+flowchart TD
+    subgraph Tier1 ["Tier 1: Authoritative Recovery Lifecycle"]
+        RC_State["RecoveryCoordinator.stateMachine.state<br/>('ACTIVE' | 'RECOVERING' | 'RECONCILING' | 'DEGRADED' | 'DISPOSED')<br/><b>SOLE AUTHORITATIVE LIFECYCLE STATE</b>"]
+    end
 
-### 3.1 Comprehensive Lifecycle Admission Matrix
+    subgraph Tier2 ["Tier 2: Public Engine Recovery Queries"]
+        LSE_State["engine.recoveryState -> delegates to coordinator.state<br/>engine.isRecoveryInProgress() -> true iff RECOVERING or RECONCILING<br/>engine.isRecoveryActive() -> alias of isRecoveryInProgress()"]
+    end
+
+    subgraph Tier3 ["Tier 3: Internal Engine Operational Mode"]
+        LSE_Flag["engine.recoveryActive (boolean)<br/><b>RESTRICTED SLAVE OPERATIONAL SWITCH</b><br/>Gates notifyStateChange() -> pushes to deferredStateChanges<br/>Gates notifyDecision() -> pushes to deferredDecisions<br/>Toggled strictly via engine.setRecoveryMode(boolean)"]
+    end
+
+    RC_State -->|authoritative query| LSE_State
+    RC_State -.->|drives operational switch| LSE_Flag
+```
+
+### 3.1 Strict Separation of Lifecycle State and Operational Mode (R3-03)
+1. **Tier 1 — Authoritative Coordinator Lifecycle State (`coordinator.stateMachine.state`):** The sole system authority for recovery state (`ACTIVE`, `RECOVERING`, `RECONCILING`, `DEGRADED`, `DISPOSED`). Owns state transitions, recovery substates, attempt sequence IDs, and timeout controllers.
+2. **Tier 2 — Public Engine State Queries:**
+   - `engine.recoveryState`: Readonly getter delegating directly to `coordinator.stateMachine.state` (or `'ACTIVE'` if unattached, `'DISPOSED'` if engine is disposed).
+   - `engine.isRecoveryInProgress()`: Derived boolean helper returning `true` **if and only if** `recoveryState === 'RECOVERING' || recoveryState === 'RECONCILING'`.
+   - `engine.isRecoveryActive()`: Retained strictly as a backward-compatible alias of `isRecoveryInProgress()`.
+3. **Tier 3 — Internal Operational Mode (`this.recoveryActive` in `LeaderlessSyncEngine`):**
+   - An engine-internal operational switch that gates event notification dispatch.
+   - When `this.recoveryActive === true`, `notifyStateChange` buffers into `this.deferredStateChanges` and `notifyDecision` buffers into `this.deferredDecisions`.
+   - **No Lifecycle Authority:** `this.recoveryActive` has zero awareness of `RECOVERING` vs `RECONCILING` vs `DEGRADED`. It is strictly a slave operational gate toggled by the coordinator via `engine.setRecoveryMode(boolean)`. No independently mutable engine boolean may serve as a second recovery lifecycle authority.
+
+### 3.2 Comprehensive Lifecycle Admission Matrix
 
 | Lifecycle State (`recoveryState`) | Local Intent Policy (`submit` / `receiveLocal`) | Remote Event Ingestion Policy (`receive`) | Public Ingestion Outcome |
 |---|---|---|---|
-| **`ACTIVE`** | **Admitted.** Sequenced contiguously ($S_{\text{local}} += 1$), advances Lamport clock, captures causal context, reduces into log. | **Admitted.** Synchronous $O(1)$ check ($\le 5\,\mu\text{s}$). Passes directly to `receiveRemote()`, admitted to log, reduces state. | `ADMIT_ACTIVE` |
+| **`ACTIVE`** | **Admitted.** Sequenced contiguously ($S_{\text{local}} += 1$), advances Lamport clock, captures causal context, reduces into log. | **Admitted.** Synchronous $O(1)$ check. Passes directly to `receiveRemote()`, admitted to log, reduces state. | `ADMIT_ACTIVE` |
 | **`RECOVERING`** | **Synchronously Rejected.** Throws `SyncEngineError('REJECTED_RECOVERING')`. Zero sequence advance, zero clock advance. Local intent fails closed. | **Intercepted & Segregated.**<br/>• Current Epoch $\to$ `QuarantineBuffer`<br/>• Future Epoch ($E > E_{\text{local}}$) $\to$ `FutureEpochBuffer` (5s grace)<br/>• Obsolete Epoch ($E < E_{\text{local}}$) $\to$ Discarded<br/>• In-flight duplicate $\to$ Dropped<br/>Zero mutation of operation log or active playback state. | `QUARANTINED`<br/>`BUFFERED_FUTURE_EPOCH`<br/>`DISCARDED_OBSOLETE_EPOCH`<br/>`DROPPED_DRAINER_DUPLICATE` |
-| **`RECONCILING`** | **Synchronously Rejected.** Throws `SyncEngineError('REJECTED_RECOVERING')`. Zero sequence advance, zero clock advance. | **Intercepted & Segregated.** Identical to `RECOVERING`. Newly arriving events enter the active generation of `QuarantineBuffer` while the detached generation is drained. | `QUARANTINED`<br/>`BUFFERED_FUTURE_EPOCH`<br/>`DISCARDED_OBSOLETE_EPOCH`<br/>`DROPPED_DRAINER_DUPLICATE` |
+| **`RECONCILING`** | **Synchronously Rejected.** Throws `SyncEngineError('REJECTED_RECOVERING')`. Zero sequence advance, zero clock advance. | **Intercepted & Segregated.** Identical to `RECOVERING`. Newly arriving events enter active generation of `QuarantineBuffer` while detached generation is drained. | `QUARANTINED`<br/>`BUFFERED_FUTURE_EPOCH`<br/>`DISCARDED_OBSOLETE_EPOCH`<br/>`DROPPED_DRAINER_DUPLICATE` |
 | **`DEGRADED`** | **Synchronously Rejected.** Throws `SyncEngineError('REJECTED_DEGRADED')`. Engine is halted; requires explicit application session reset. | **Intercepted & Dropped.** Dropped immediately with decision `REJECTED_DEGRADED`. Zero buffer allocation, zero log insertion. | `REJECTED_DEGRADED` |
 | **`DISPOSED`** | **Synchronously Rejected.** Throws `SyncEngineError('DISPOSED')`. | **Rejected.** Engine is shut down. Zero activity. | `REJECTED_DISPOSED` |
 
-### 3.2 Discriminated Interception Result & Unified Overflow Contract (Closing F3, F9, R2-H2)
-
-The interception contract between `LeaderlessSyncEngine` and `RecoveryCoordinator` is structured as follows:
+### 3.3 Complete Overflow Decision Contract Across Boundaries (R2-H2, R3-04)
 
 ```typescript
 export type RemoteAdmissionDecision =
@@ -122,11 +149,22 @@ export type RemoteAdmissionDecision =
   | { readonly outcome: 'REJECTED_DISPOSED' };
 ```
 
-#### Unified Overflow Handling Across Boundaries (R2-H2)
-To eliminate any conflict between thrown exceptions and returned decision outcomes:
-1. **`QuarantineBuffer.enqueue(op)` and `FutureEpochBuffer.enqueue(op)`:** When capacity or aggregate byte boundaries are exceeded, the buffer throws `SyncEngineError('QUARANTINE_OVERFLOW')` or `SyncEngineError('FUTURE_EPOCH_OVERFLOW')`.
-2. **`RecoveryCoordinator.interceptRemoteEvent()`:** Catches `QUARANTINE_OVERFLOW` / `FUTURE_EPOCH_OVERFLOW`, autonomously aborts active recovery via `this.abortRecovery(failureReason, err.message)` (driving the state machine to `DEGRADED`), and re-throws the `SyncEngineError`. Overflow is an exceptional fault condition, not a normal admission decision.
-3. **`LeaderlessSyncEngine.receive()`:** Preserves the Phase 7.2/7.4 remote error isolation invariant. Remote events **never throw** unhandled exceptions to transport callers. The engine catches `QUARANTINE_OVERFLOW` / `FUTURE_EPOCH_OVERFLOW`, isolates the error, maps it to a rejection decision `code: 'REJECTED_CAPACITY'`, and records it via `recordDecision()`. Local actions (`receiveLocal` / `submit`) synchronously throw `SyncEngineError('REJECTED_DEGRADED')`.
+#### Precise Boundary Exception & Return Behavior (R3-04)
+1. **Buffer Boundary (`QuarantineBuffer` / `FutureEpochBuffer`):**
+   - On limit breach (count > 1000 or aggregate bytes > 4 MiB for quarantine; count > 100 or bytes > 512 KiB for future epoch), `enqueue()` throws `SyncEngineError('QUARANTINE_OVERFLOW')` or `SyncEngineError('FUTURE_EPOCH_OVERFLOW')`.
+   - **Zero Retention Proof:** The rejected operation is rejected *before* array push and identity indexing. Retained byte counters (`_activeBytes`) and count counters (`totalRetainedCount`) are not incremented. The operation is not retained or partially owned by the buffer.
+2. **Coordinator Boundary (`RecoveryCoordinator.interceptRemoteEvent()`):**
+   - Catches `QUARANTINE_OVERFLOW` / `FUTURE_EPOCH_OVERFLOW`.
+   - Autonomously transitions to `DEGRADED`: calls `this.abortRecovery(failureReason, err.message)`.
+   - Re-throws the `SyncEngineError`, preserving complete diagnostic context (error code, message, active byte totals, and breached threshold).
+   - For non-overflow paths, returns one of the 7 declared `RemoteAdmissionDecision` outcomes above.
+3. **Engine Boundary (`LeaderlessSyncEngine.receive()`):**
+   - Preserves remote error isolation: remote operations **never throw** unhandled exceptions out of `receive()`.
+   - Catches `SyncEngineError('QUARANTINE_OVERFLOW')` / `FUTURE_EPOCH_OVERFLOW`.
+   - Maps the error to an `EngineDecision`: `accepted: false`, `code: 'REJECTED_CAPACITY'`, with message and diagnostic details preserved from the caught error.
+   - Records the decision via `recordDecision(event, decision)` and drops the remote event.
+   - **Contract Clarity:** `REJECTED_CAPACITY` is a declared `EngineDecision.code` emitted by the engine, NOT a variant of `RemoteAdmissionDecision`.
+   - For local user actions (`receiveLocal` / `submit`), local inputs **do throw** `SyncEngineError('REJECTED_DEGRADED')` synchronously.
 
 ---
 
@@ -158,12 +196,12 @@ export interface EngineCoreState {
 ### 4.1 Authoritative Mapping Against Accepted Baseline (R2-C1)
 - **12 Stored Properties:** `state`, `baseSnapshot`, `baseSnapshotFrontier`, `operationLog`, `clockManager`, `pendingQueue`, `replicationVector`, `localCausalContext`, `localOriginSequence`, `currentEpoch`, `lastAppliedEventId`, `stateVersion`.
 - **1 Referential Alias:** `playbackState === state`. `createEngineCoreState(params)` enforces `core.playbackState = core.state` and seals the root container via `Object.seal()`.
-- **Encapsulation & Readers/Writers:** All engine property getters and setters (`this.state`, `this.baseSnapshot`, `this.operationLog`, `this.clockManager`, `this.replicationVector`, etc.) delegate exclusively to `this.core.*`. Zero duplicate state exists outside `this.core`.
-- **Omitted Non-Core Fields:** Infrastructure fields (`sessionId`, `localPeerId`, `clock`, `conflictResolver`, `logCapacity`, `eventListeners`, `disposed`) and ephemeral recovery state (`recoveryActive`, `quarantineDrainer`) are intentionally excluded from `EngineCoreState` because they are immutable configuration or connection lifecycle variables.
+- **Encapsulation & Readers/Writers:** All engine property getters and setters delegate exclusively to `this.core.*`. Zero duplicate state exists outside `this.core`.
+- **Omitted Non-Core Fields:** Infrastructure fields (`sessionId`, `localPeerId`, `clock`, `conflictResolver`, `logCapacity`, `eventListeners`, `disposed`) and ephemeral recovery state (`recoveryActive`, `quarantineDrainer`) are excluded from `EngineCoreState` as they are immutable configuration or connection lifecycle variables.
 
 ### 4.2 Preservation of M4.3b Opaque Staged-Handle Architecture (R2-C1)
 To ensure memory safety and prevent live reference leaking:
-1. `SnapshotInstaller.stage()` constructs candidate operational collections (`candidateLog`, `candidateClock`, `candidatePendingQueue`) and candidate `EngineCoreState` completely out-of-band.
+1. `SnapshotInstaller.stage()` constructs candidate collections and candidate `EngineCoreState` completely out-of-band.
 2. The candidate `EngineCoreState` is stored in a module-private `WeakMap<StagedSnapshotInstallation, EngineCoreState>()` owned by `SnapshotInstaller`.
 3. The method returns ONLY the immutable, opaque `StagedSnapshotInstallation` handle (`handleId`, `sessionId`, `targetEpoch`, `targetFrontier`, `canonicalDigest`, `maxLogicalTimestamp`).
 4. External callers, including `RecoveryCoordinator`, never receive, hold, or inspect the mutable candidate `EngineCoreState`.
@@ -171,19 +209,15 @@ To ensure memory safety and prevent live reference leaking:
 
 ### 4.3 Precise Atomicity Semantics (R2-M2)
 Snapshot state replacement executes via `replaceCoreStateAtomic(candidateCore, capability)` as **one synchronous root-reference replacement (`this.core = candidateCore;`) under JavaScript run-to-completion semantics, with no intermediate root visible to other JavaScript tasks**.
-Under JavaScript's single-threaded event loop, run-to-completion guarantees that no microtask, macrotask, or callback can interleave during this reference assignment. This provides absolute task-level atomicity without claiming multi-threaded hardware transaction locking.
+Under JavaScript's single-threaded event loop, run-to-completion guarantees that no microtask, macrotask, or callback can interleave during this reference assignment.
 
 ---
 
-## 5. Supplier Selection, Lattice Ordering & Trust Model (Closing F4, R2-C3, R2-C4, R2-H1)
+## 5. Supplier Selection, Lattice Ordering & Safe Incomparable Recovery (Closing F4, R2-C3, R2-C4, R2-H1, R3-02, R3-05)
 
-Snapshot replication frontiers form a product lattice ($\mathbb{N}^k$) under component-wise ordering, which is only a **partial order**. Two vectors $V_1, V_2$ may be:
-- Strictly ordered: $V_1 < V_2$ ($V_1 \le V_2 \land V_1 \ne V_2$)
-- Equal: $V_1 = V_2$
-- Incomparable: $V_1 \parallel V_2$ ($\exists p_1, p_2 : V_1[p_1] < V_2[p_1] \land V_1[p_2] > V_2[p_2]$)
-
-### 5.1 Protocol-Stable Peer-ID Comparison (R2-H1)
-To prevent platform- or locale-dependent ordering discrepancies, peer IDs are compared strictly using deterministic, locale-independent UTF-16 code unit comparison:
+### 5.1 Protocol-Stable Peer-ID Domain & Ordinal ASCII Ordering (R2-H1, R3-05)
+1. **Character Domain:** All peer IDs across SyncPlay are strictly validated against `ASCII_IDENTIFIER_REGEX = /^[a-zA-Z0-9_.:-]+$/` (`packages/protocol/src/constants.ts:87`), with lengths bounded between 1 and 64 or 128 characters.
+2. **Ordinal ASCII Comparison:** Because peer IDs are strictly constrained to this printable ASCII subset, peer ID comparison is defined as **ordinal ASCII code point comparison**:
 ```typescript
 export function comparePeerIds(a: string, b: string): number {
   return a < b ? -1 : (a > b ? 1 : 0);
@@ -191,31 +225,49 @@ export function comparePeerIds(a: string, b: string): number {
 ```
 `String.prototype.localeCompare()` is strictly prohibited across all protocol and selection logic.
 
-### 5.2 Lattice Evaluation & Candidate Eligibility Taxonomy (R2-C3)
-Incomparable vectors ($V_A \parallel V_B$) are **not automatically treated as proven forks**. In a leaderless system, incomparable vectors naturally arise from concurrent operational progress across independent peers.
+### 5.2 Safe Incomparable-Compatible Recovery & History Preservation (R2-C3, R3-02)
+Vector frontiers form a product lattice ($\mathbb{N}^k$). In a leaderless system, incomparable frontiers ($V_A \parallel V_B$) naturally arise from concurrent progress across independent peers.
 
-Milestone M5 classifies candidate offers across seven distinct architectural cases:
+**Fundamental Safety Invariant:** A snapshot must NEVER replace active state if doing so would discard compatible local operations! If local node has operations that the candidate snapshot lacks, blindly overwriting state with the snapshot would irreversibly wipe out local progress.
+
+#### Normative Procedure for Incomparable Frontiers (R3-02)
+1. **Priority 1 — Anti-Entropy Log Repair (Delta Catch-Up):**
+   If the missing operations from the remote candidate fall within the active log horizon ($\text{gap} \le \text{logCapacity}$), the engine **must not** perform snapshot replacement. Instead, it delegates to `RepairRequestPipeline` to fetch only the missing delta operations. When applied, local vector advances without overwriting local progress.
+2. **Priority 2 — Compatible History Reconciliation (Local Operation Stashing):**
+   If the missing remote operations exceed the log horizon and snapshot recovery is strictly necessary:
+   - The engine extracts all local operations whose sequence numbers are ahead of the candidate snapshot's frontier ($S_{\text{local}} > S_{\text{snapshot}}$) from `OrderedOperationLog`.
+   - These local operations are stashed into a temporary reconciliation queue or prepended to `QuarantineBuffer`.
+   - The candidate snapshot is installed atomically via `replaceCoreStateAtomic()`.
+   - During the subsequent quarantine drain pass, the stashed local operations are re-admitted via `admitDrainedOperation()`. Because their dependencies are satisfied by the snapshot, they reduce cleanly on top of the snapshot base, preserving all local operations without loss.
+3. **Rigorous Evidence Requirement for History Compatibility (R3-02):**
+   A matching frontier fingerprint alone is NOT proof of historical identity! To establish history compatibility across shared prefix ranges:
+   - Full checkpoint hash chain verification (`compactedCheckpoints` SHA-256 chain), or
+   - Bit-exact matching frontier timestamps (`originFrontierTimestamps`) across all shared origins, or
+   - Verified operation digest chains across the shared prefix range are required.
+   If common prefix history cannot be verified, the candidate is classified as `INSUFFICIENT_EVIDENCE` and cannot overwrite local state.
+4. **Proven Conflict Forks:** If divergent operations are detected for the same origin and sequence ($H(op_A) \ne H(op_B)$), the histories are conflicting forks. Recovery aborts deterministically to `DEGRADED` (`FORK_DETECTED_INCOMPARABLE`).
+
+### 5.3 Candidate Eligibility Taxonomy
 
 | Case | Relationship | Condition | Architectural Action |
 |---|---|---|---|
 | **Case 1** | `IDENTICAL` | $V_P = V_{\text{local}}$ and intermediate checkpoint history verified (or $k \le 1$). | Installation unnecessary. Candidate discarded. |
 | **Case 2** | `FRONTIER_AGREEMENT_ONLY` | $V_P = V_{\text{local}}$ at $k > 1$, but intermediate history unverified. | Cannot overwrite local state without proof. Candidate discarded. |
 | **Case 3** | `STRICTLY_DOMINATES` | $V_P \ge V_{\text{local}}$ on all origins, and $V_P > V_{\text{local}}$ on at least one origin. | **Eligible candidate.** Ranked by strict domination; tie-break by RTT, then `comparePeerIds`. |
-| **Case 4** | `INCOMPARABLE_COMPATIBLE` | $V_P \parallel V_{\text{local}}$ or $V_A \parallel V_B$, but common-prefix history is identical ($H(op_A) == H(op_B)$ for all shared sequences). | Concurrent branches are compatible. If candidate subsumes missing history or is repairable, proceed with recovery or delta sync. |
+| **Case 4** | `INCOMPARABLE_COMPATIBLE` | $V_P \parallel V_{\text{local}}$, common prefixes verified compatible ($H(op_A) == H(op_B)$). | Priority 1: log repair. Priority 2: local operation stashing before snapshot install. No local loss. |
 | **Case 5** | `REPAIRABLE_WITHIN_HORIZON` | Missing operation gap $\le \text{logCapacity}$ (e.g. $\le 256$ ops). | Bypass snapshot transfer; delegate to `RepairRequestPipeline` anti-entropy log repair. |
-| **Case 6** | `PROVEN_CONFLICT_FORK` | Common prefix history diverges for same origin and sequence ($H(op_A) \ne H(op_B)$), or conflicting unresolvable snapshots under recovery policy. | **True causal fork.** Abort recovery deterministically to `DEGRADED` (`FORK_DETECTED_INCOMPARABLE`). |
+| **Case 6** | `PROVEN_CONFLICT_FORK` | Common prefix history diverges for same origin and sequence ($H(op_A) \ne H(op_B)$). | **True causal fork.** Abort recovery deterministically to `DEGRADED` (`FORK_DETECTED_INCOMPARABLE`). |
 | **Case 7** | `DOMINATED` / `INSUFFICIENT_EVIDENCE` | $V_P < V_{\text{local}}$, epoch is older, or evidence is outside repair horizon without verifiable ancestry. | Candidate rejected; retry discovery or degrade if no candidates remain. |
 
-### 5.3 Cryptographic Digest & Trust Model Clarification (R2-C4)
-To eliminate any ambiguity regarding security and verification guarantees:
+### 5.4 Cryptographic Digest & Trust Model Clarification (R2-C4)
 1. **SHA-256 Byte Integrity:** Slice digests and snapshot canonical digests (RFC 8785) verify **byte-level transfer integrity** against network corruption and reassembly errors.
-2. **Session & Epoch Binding:** Verified by inspecting header metadata (`sessionId`, `membershipEpoch`, `connectionGeneration`) to ensure payloads belong to the active cluster configuration.
+2. **Session & Epoch Binding:** Verified by inspecting header metadata (`sessionId`, `membershipEpoch`, `connectionGeneration`).
 3. **Historical Consistency:** Verified by validating compacted checkpoint chains and frontier timestamps.
-4. **Cooperative Non-Byzantine Trust Model:** The SyncPlay protocol operates under a **cooperative non-Byzantine trust model**. The system assumes cluster participants are authorized and non-malicious. **SHA-256 digests do NOT provide digital signatures, non-repudiation, or cryptographic author authentication.** SHA-256 proves payload consistency and formatting, but does not prove semantic correctness or authentic provenance against an active Byzantine attacker.
+4. **Cooperative Non-Byzantine Trust Model:** SyncPlay operates under a **cooperative non-Byzantine trust model**. Cluster participants are trusted to be authorized and non-malicious. **SHA-256 digests do NOT provide digital signatures, non-repudiation, or cryptographic author authentication against an active Byzantine adversary.**
 
 ---
 
-## 6. End-to-End Snapshot Recovery Integration Boundary (Closing F10, R2-C2, R2-H4, R2-H6)
+## 6. End-to-End Recovery Boundary & Drain Ownership (Closing F10, R2-C2, R2-H4, R2-H6, R3-06)
 
 ```mermaid
 sequenceDiagram
@@ -273,31 +325,34 @@ sequenceDiagram
 ```
 
 ### 6.1 Separate Timer Ownership & Lifecycle Fencing (R2-H4)
-Timers are categorized into four distinct ownership classes:
 1. **Snapshot-Attempt Timers:** `overallTimer` (`overallRecoveryTimeoutMs`). Scoped to `activeAttemptId`. Cancelled on attempt success, retry, abort to `DEGRADED`, transition to `ACTIVE`, or disposal.
 2. **Reconciliation Timers:** `reconciliationTimer` (`reconciliationTimeoutMs`). Scoped to post-install drain. Cancelled on drain completion, abort to `DEGRADED`, transition to `ACTIVE`, or disposal.
 3. **Offer/Transfer Timers:** `offerAwaitTimer` (`offerAwaitTimeoutMs`). Scoped to offer discovery. Cancelled on offer selection, transfer initiation, abort to `DEGRADED`, or disposal.
-4. **Future-Epoch Convergence Timers:** `futureEpochGraceTimer` (`futureEpochGracePeriodMs`, 5s). Owned by `FutureEpochBuffer`. **Crucial Invariant:** This timer is scoped to target epoch convergence and is **completely independent of snapshot attempts**. It is NOT cancelled when a snapshot attempt completes, resets, or retries. It is cancelled ONLY when local epoch advances to match/exceed the target epoch, when grace period expires (triggering `UNRESOLVED_FUTURE_EPOCH`), or upon coordinator disposal.
-- **Fencing:** Attempt-scoped callbacks verify `attemptId === coordinator.activeAttemptId`. Epoch-scoped callbacks verify `targetEpoch === buffer.targetEpoch`.
+4. **Future-Epoch Convergence Timers:** `futureEpochGraceTimer` (`futureEpochGracePeriodMs`, 5s). Owned by `FutureEpochBuffer`. **Crucial Invariant:** Scoped to epoch identity; **independent of snapshot attempts**. NOT cancelled when a snapshot attempt completes, resets, or retries. Cancelled ONLY when local epoch advances $\ge$ target epoch, on grace expiration, or upon disposal.
 
-### 6.2 Bounded In-Flight Drain Ownership (R2-H6)
-Quarantine draining strictly adheres to the accepted M4.3c protocol:
-- **Single In-Flight Cardinality:** At most one operation ($N_{\text{in-flight}} \le 1$) is in flight between `QuarantineDrainer` and `LeaderlessSyncEngine`.
-- **Destination Receipts:** The engine returns typed `DestinationAcceptanceReceipt` (`ACCEPTED_REDUCED`, `ACCEPTED_PENDING`, `ALREADY_REPRESENTED`, `ALREADY_OWNED_DUPLICATE`, `TERMINALLY_REJECTED`, `CAPACITY_REJECTED`).
-- **Bounded Pending Queue:** If `pendingQueue` capacity is exhausted, the engine returns `CAPACITY_REJECTED`. The operation is preserved in `inFlightRecord`, drain halts immediately (`haltedOnCapacity = true`), and recovery aborts to `DEGRADED`.
-- **Zero Loss / No Eager Dequeue:** An operation is never marked applied merely because it was dequeued from quarantine. Ownership transitions only upon receipt confirmation.
+### 6.2 Bounded In-Flight Drain Ownership & Pending-Queue Capacity (R2-H6, R3-06)
+- **Single In-Flight Rule:** Exactly $N_{\text{in-flight}} \le 1$ operation in flight between `QuarantineDrainer` and `LeaderlessSyncEngine`. No dequeue alone implies acceptance.
+- **Destination Acceptance Receipts:**
+  - `ACCEPTED_REDUCED`: Admitted to `operationLog`. Vector advanced. `inFlightRecord` cleared.
+  - `ACCEPTED_PENDING`: Admitted to `PendingDependencyQueue`. Vector not advanced. `inFlightRecord` cleared.
+  - `ALREADY_REPRESENTED`: Covered by base snapshot frontier. `inFlightRecord` cleared.
+  - `ALREADY_OWNED_DUPLICATE`: Already present in log or pending queue. `inFlightRecord` cleared.
+  - `TERMINALLY_REJECTED`: Fails validation or obsolete epoch. `inFlightRecord` cleared.
+  - `CAPACITY_REJECTED`: Destination queue full. Operation preserved in `inFlightRecord` (`destinationStatus: 'CAPACITY_REJECTED'`). Drain halts immediately (`haltedOnCapacity = true`), and recovery transitions safely to `DEGRADED`.
+- **Pending-Queue Bound Inspection & Identified Open Design Issue (R3-06):**
+  - Accepted source inspection of `PendingDependencyQueue` (`packages/sync-engine/src/log/pending-dependency-queue.ts`) reveals a strict **count bound** (`capacity: number = 256`, set from `engineConfig.logCapacity`).
+  - **Identified Open Design Issue:** `PendingDependencyQueue` enforces **NO aggregate byte limit** (unlike `QuarantineBuffer` which enforces both count and 4 MiB aggregate bytes). This missing byte bound on `PendingDependencyQueue` is formally documented as an open design issue for post-M5 hardening.
 
 ---
 
 ## 7. Authoritative Transition & Notification Sequence (Closing F7, R2-C2)
 
 To preserve the accepted M4.3c listener-observation guarantee:
-
 1. **Quarantine Drain Completes:** `quarantineBuffer.totalRetainedCount === 0`.
 2. **Recovery Bookkeeping Completes:** `drainEndMs = nowFn()`, metrics compiled.
 3. **Clear Engine Recovery Mode:** `this.engine.setRecoveryMode(false)`.
 4. **Transition Coordinator to `ACTIVE`:** `this.stateMachine.transition('ACTIVE', 'Recovery completed', 'IDLE')`.
-   - **Failure Rollback:** If clearing recovery mode or the state transition throws, the catch block immediately reverts `this.engine.setRecoveryMode(true)`, aborts recovery, and re-throws. Staged completion notifications are **never flushed on a failed handoff**.
+   - **Failure Rollback:** If clearing recovery mode or the state transition throws, the catch block immediately restores `this.engine.setRecoveryMode(true)`, aborts recovery, and re-throws. Staged completion notifications are **never flushed on a failed handoff**.
 5. **Clear Timers & Dispatch Notifications:** Coordinator invokes `this.clearTimers()` and `this.engine.flushDeferredNotifications()` strictly **after** state is `'ACTIVE'` and engine recovery mode is cleared.
 6. **Notification Guarantees:**
    - Any `onStateChange` listener observing `'ACTIVE'` is guaranteed to observe `engine.isRecoveryActive() === false`.
@@ -306,23 +361,22 @@ To preserve the accepted M4.3c listener-observation guarantee:
 
 ---
 
-## 8. Measurable Active-State Performance Requirement (Closing F6, R2-M1)
+## 8. Measurable Active-State Performance Requirement (Closing F6, R2-M1, R3-08)
 
 Invariant `INV-M5-01` is governed by a rigorous performance measurement contract:
-- **Reference Hardware:** Standard 4 vCPU / 8 GiB RAM environment (cloud runner or modern developer workstation).
-- **Runtime Environment:** Node.js 20 LTS (or 22 LTS), V8 TurboFan JIT enabled.
+- **Reference Target Environment (R3-08):** The $\le 5\,\mu\text{s}$ p99 execution overhead target applies strictly to **Node.js LTS on a dedicated reference CI runner / developer workstation (4 vCPU / 8 GiB RAM, V8 TurboFan tier-up)**.
+- **Browser Runtime Characterization (R3-08):** In browser execution contexts, execution latency varies with hardware capabilities, mobile throttling, and UI thread contention; browser targets are characterized by non-blocking synchronous execution rather than fixed microsecond guarantees.
 - **Event Shape & Size:** Canonical 512-byte `SyncOperationPayload` / `ControlSyncEvent`.
 - **Warm-Up:** 10,000 warm-up iterations to allow JIT tier-up.
 - **Benchmark Iterations:** 100,000 consecutive remote events evaluated in `ACTIVE` state.
 - **Measurement Method:** High-resolution timing via `process.hrtime.bigint()`.
-- **Target Overhead:** p99 execution overhead $\le 5\,\mu\text{s}$ per event (mean overhead $\le 2\,\mu\text{s}$).
-- **Queue Allocation Constraint:** Zero quarantine buffer array or wrapper heap allocations in the active state fast-path. (Hardware-specific benchmark figures represent reference targets and are not universal runtime guarantees across arbitrary constrained devices).
+- **Queue Allocation Constraint (R3-08):** In the `ACTIVE` fast path, `interceptRemoteEvent()` performs synchronous state checks without allocating entries in `QuarantineBuffer` or `FutureEpochBuffer`, without pushing to internal arrays, and without retaining buffer wrapper heap objects. Short-lived result descriptors are subject to V8 escape analysis or young-generation reclamation.
 
 ---
 
-## 9. Memory Bounds & Accounting Contract (Closing R2-H3)
+## 9. Browser-Compatible Exact Byte Accounting Contract (Closing R2-H3, R3-01)
 
-All recovery buffers enforce strict, verifiable memory bounds:
+All recovery buffers enforce strict, verifiable memory bounds using browser-compatible byte accounting:
 
 ### 9.1 Explicit Buffer Boundaries
 | Buffer Component | Maximum Operation Count | Maximum Aggregate Bytes | Maximum Individual Event Size | Expiration Grace Period |
@@ -330,9 +384,11 @@ All recovery buffers enforce strict, verifiable memory bounds:
 | **QuarantineBuffer** | **1,000 operations** | **4 MiB** (4,194,304 bytes) | **4 KiB** (4,096 bytes) | None (drained post-commit) |
 | **FutureEpochBuffer** | **100 operations** | **512 KiB** (524,288 bytes) | **4 KiB** (4,096 bytes) | **5,000 ms** (autonomous timer) |
 
-### 9.2 Byte Representation & Lifecycle Accounting
-1. **Byte Representation:** Sized according to raw UTF-8 serialized JSON length: `Buffer.byteLength(rawJson, 'utf8')` or supplied `rawSerializedLength`.
-2. **Admission Accounting:** Retained byte counters (`_activeBytes`) increment immediately upon valid admission.
+### 9.2 Browser-Compatible Wire Byte Accounting (R3-01)
+1. **Preserving Original Transport Wire Size:**
+   - The transport layer delivers raw wire bytes or UTF-8 strings. The original byte size is captured at network ingestion (`rawSerializedLength` from WebRTC `ArrayBuffer`, `Uint8Array`, or `new TextEncoder().encode(wireString).length`).
+   - **No Parse & Reserialize:** The engine **does NOT re-serialize** parsed JSON messages with `JSON.stringify()` to compute byte lengths. Re-serialization alters key ordering, whitespace, and Unicode formatting, falsifying byte accounting. Original transport wire length is passed directly through admission and buffering.
+2. **Admission Accounting:** Retained byte counters (`_activeBytes`) increment immediately upon valid admission using `rawSerializedLength`.
 3. **Release Accounting:** Bytes are decremented upon dequeue/drain (`_drainBytes -= size`), upon generational clearing, or upon buffer disposal.
 4. **Duplicate Handling:** Duplicates detected via identity index are rejected without incrementing retained bytes or operation counts.
 5. **Rejection & Overflow:** Operations exceeding individual event size (4 KiB) or causing aggregate byte/count breaches are rejected before queue insertion, retaining 0 bytes and throwing `SyncEngineError`.
