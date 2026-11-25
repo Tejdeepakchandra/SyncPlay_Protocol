@@ -1,6 +1,6 @@
 # Phase 7.5 Milestone M5 — Engine Runtime Recovery Integration Architecture
 
-**Status:** APPROVED ARCHITECTURAL SPECIFICATION (MILESTONE M5.0-R14 AMENDED)
+**Status:** APPROVED ARCHITECTURAL SPECIFICATION (MILESTONE M5.0-R15 AMENDED)
 **Date:** 2026-11-25
 **Authoritative Starting Baseline:** `40b11fdafcd247c7a289723f90ec0e2029c94f64` (Phase 7.5 M4.3d Formally Accepted)
 **Accepted Baselines:** M4.3c (`eab2428`), M4.3b (`f3c29b6`), Approved Architecture (`2bb117c`), Frozen M4.2d (`aafa366`)
@@ -94,7 +94,7 @@ To preserve exact capability custody and single-attachment guarantees without cl
    - **Failure During Engine Construction:** If engine initialization throws after `bindEngine()` has run (e.g. invalid configuration or constructor failure), engine construction unwinds; the engine reference is never published, and the partially constructed engine is reclaimed by garbage collection. An externally injected coordinator bound during a failed constructor call cannot be safely reused and must be discarded.
    - **Engine Disposal:** Invoking `engine.dispose()` invokes `coordinator.dispose()`. Calling `replaceCoreStateAtomic` on a disposed engine throws `SyncEngineError('ENGINE_DISPOSED')`, effectively dead-ending the capability even if a reference is retained externally.
 
-#### 2.1.2 Drain Admission Context Capabilities: Unforgeable Provenance & Package-Boundary Contract (Closing R6-01, R7-01, R8-05, R9-07, R10-01, R10-03, R11-A, R11-B, R12-C, R13-A–R13-E, R14-A–R14-E)
+#### 2.1.2 Drain Admission Context Capabilities: Unforgeable Provenance & Package-Boundary Contract (Closing R6-01, R7-01, R8-05, R9-07, R10-01, R10-03, R11-A, R11-B, R12-C, R13-A–R13-E, R14-A–R14-E, R15-A–R15-G)
 A typed string (`'LOCAL_REPLAY' | 'REPAIR_BATCH'`) is a declaration of context, not proof of provenance: any caller can supply a string. To prevent accidental trust escalation where untrusted remote operations bypass arrival-rate limits and clock-inflation checks, post-snapshot drain admission is capability-gated:
 
 ```typescript
@@ -234,7 +234,7 @@ export type RemoteAdmissionDecision =
    - **Contract Clarity:** `REJECTED_CAPACITY` is a declared `EngineDecision.code` emitted by the engine, NOT a variant of `RemoteAdmissionDecision`.
    - For local user actions (`receiveLocal` / `submit`), local inputs **do throw** `SyncEngineError('REJECTED_DEGRADED')` synchronously.
 
-### 3.4 Administrative Recovery Reset Semantics, Canonical Entry Accounting, Composite Identity & Publication Atomicity (Closing R6-02, R7-02, R8-01–R8-05, R9-01–R9-06, R10-01–R10-04, R11-A–R11-D, R12-A–R12-D, R13-A–R13-E, R14-A–R14-E)
+### 3.4 Administrative Recovery Reset Semantics, Canonical Entry Accounting, Composite Identity & Publication Atomicity (Closing R6-02, R7-02, R8-01–R8-05, R9-01–R9-06, R10-01–R10-04, R11-A–R11-D, R12-A–R12-D, R13-A–R13-E, R14-A–R14-E, R15-A–R15-G)
 
 `resetRecovery()` exists strictly as an administrative recovery reset, NOT as a general-purpose escape hatch to clear degradation while leaving incomplete or corrupted state in place.
 
@@ -278,7 +278,7 @@ export type RemoteAdmissionDecision =
   5. The new attempt remains current, authorized, and non-terminal.
   A barrier resolution alone NEVER authorizes a reset continuation; continuation requires current attempt authorization.
 
-#### 3. Complete 10-Step Lifecycle Sequence for Administrative Reset (R12-B, R13-B, R13-E, R14-A, R14-C)
+#### 3. Complete 10-Step Lifecycle Sequence for Administrative Reset (R12-B, R13-B, R13-E, R14-A, R14-C, R15-A–R15-E)
 
 To reconcile asynchronous settlement with the settlement barrier, canonical entry accounting, transactional retirement, and clean-reset commit, the protocol specifies an authoritative 10-step sequence:
 
@@ -301,7 +301,7 @@ To reconcile asynchronous settlement with the settlement barrier, canonical entr
 6. **Step 6: Settlement Barrier Resolution:** The barrier promise resolves. The in-flight slot is verified empty ($N_{\text{in-flight}} == 0$).
    - If the attempt was previously latched as `TIMED_OUT` or `INVALIDATED`, continuation execution terminates immediately with zero side-effects.
    - If valid, coordinator transitions `attempt.status = 'SETTLED'`.
-7. **Step 7: Transactional Quarantine Ownership Transfer (R13-A, R14-A, R14-B, R14-C):**
+7. **Step 7: Transactional Quarantine Ownership Transfer (R13-A, R14-A, R14-B, R14-C, R15-A–R15-E):**
    - Under `REINITIALIZE_CLEAN`, executes the 11-stage canonical retirement transaction (Section 3.4.4): discovers composite operation identities, stages complete `TerminalQuarantineEntry` records, measures canonical RFC 8785 UTF-8 entry bytes, pre-reserves archive capacity against the exact complete entry byte total, atomically commits the batch under `retirementTransactionId`, retires source operations, and verifies zero remaining retirement set entries.
    - Under `PURGE_AND_RETRY`, operations remain safely in `QuarantineBuffer` for the new recovery attempt.
 8. **Step 8: State Replacement (Irrevocable Single Root Pointer Replacement):**
@@ -313,139 +313,267 @@ To reconcile asynchronous settlement with the settlement barrier, canonical entr
 10. **Step 10: Notification Release:**
     - Under `REINITIALIZE_CLEAN`, `engine.flushDeferredNotifications()` dispatches deferred notifications via non-throwing dispatch (delivering 0 notifications if none were enqueued, preserving the zero-notification contract).
 
-#### 4. R14-A — Canonical Terminal-Entry Byte Accounting & R14-B — Composite Retirement Identity
+#### 4. R15-E — Composite Retirement Identity, Length-Prefixed Key Encoding & Conflict Rejection, and R15-G — Portable Canonical Byte Ownership
 
-##### Problem Statement
-In R13, byte measurement in Stage 4 was performed on original operations before terminal archive entry construction in Stage 6. However, `TerminalQuarantineEntry` includes additional terminal metadata (`id`, `rejectionStatus`, `archivedAtMs`, `originalEpoch`, `peerId`, `logicalEventId`, `error`, `reason`). Measuring only the original operation's bytes underestimated archive capacity consumption, creating potential capacity overflows. Furthermore, identifying operations solely by `logicalEventId` failed to reflect the protocol's distributed causal identity model.
+##### Source Grounding & Schema Reconciliation (R15-E)
+In accepted source code (`packages/sync-engine/src/recovery/quarantine-buffer.ts:43-50, 167-172` and `packages/sync-engine/src/engine/leaderless-sync-engine.ts:982-995`), operation identity operates at two distinct layers:
+1. **Existing Quarantine Custody Index:** `QuarantineBuffer` indexes retained operations by generating peer and monotonic sequence counter: `const key = `${op.originPeerId}:${op.sequenceNumber}`` (`this.identityIndex = new Map<string, number>()`).
+2. **Existing Epoch Fencing:** Operations carry `op.membershipEpoch` and are evaluated against `this.currentEpoch` (`epoch < this.currentEpoch` triggers obsolete rejection; `epoch > this.currentEpoch` triggers unestablished future rejection).
+3. **Payload Logical Identity:** The contained sync event carries `op.event.message.logicalEventId`, which uniquely identifies the event domain instance.
 
-##### Composite Operation Identity (R14-B)
-Grounded in `quarantine-buffer.ts:43-50` and `leaderless-sync-engine.ts:982-995`, an operation in the SyncPlay protocol is authoritatively identified by a 4-field composite tuple:
+To eliminate field-naming divergence, the immutable retirement identity explicitly preserves the source schema property `sequenceNumber` (directly mapped from `op.sequenceNumber`, eliminating any ambiguous renaming to `originSequence`):
+
 ```typescript
 export interface CompositeOperationIdentity {
-  readonly originPeerId: string;    // Generating peer domain identifier
-  readonly originSequence: number;  // Strictly monotonic sequence counter for originPeerId
-  readonly membershipEpoch: number; // Membership configuration epoch
-  readonly logicalEventId: string;  // Unique logical event identifier
+  readonly originPeerId: string;    // Generating peer domain identifier (op.originPeerId)
+  readonly sequenceNumber: number;  // Strictly monotonic sequence counter for originPeerId (op.sequenceNumber)
+  readonly membershipEpoch: number; // Membership configuration epoch (op.membershipEpoch)
+  readonly logicalEventId: string;  // Unique logical event identifier (op.event.message.logicalEventId)
 }
 ```
-- **Canonical Serialized String Key:**
-  `canonicalIdentityKey(id: CompositeOperationIdentity): string`
-  Produces the deterministic format:
-  `op-id:${originPeerId}:${originSequence}:${membershipEpoch}:${logicalEventId}` (e.g. `op-id:peer-A:42:1:evt_9a8b7c`).
-- **Identity Properties:**
-  1. *Immutable and Canonically Serializable:* Fully serializable under RFC 8785.
-  2. *Stable Across Transport Retries:* Independent of transient forwarding peer (`senderPeerId`).
-  3. *Consistent with Deduplication Semantics:* Aligns with `OrderedOperationLog` frontier indexing (`originPeerId`, `originSequence`) and membership epoch fencing (`membershipEpoch`).
-  4. *Audit Trail Traceability:* Incorporates `logicalEventId` for deterministic debugging.
-- **Single-Batch Duplicate Conflict Handling:** If duplicate composite identities or conflicting records for the same `(originPeerId, originSequence, membershipEpoch)` appear within one retirement set, the transaction **rejects ambiguous conflicting records fail-closed** (throws `SyncEngineError('RETIREMENT_BATCH_CONFLICT')`) rather than silently selecting one.
 
-##### Explicit Idempotent Retirement Transaction Record (R14-A, R14-B)
+##### Length-Prefixed Canonical Key Encoding (R15-E)
+Delimiter-based key serialization (such as colon-separated strings) is vulnerable to delimiter collision if `originPeerId` or `logicalEventId` contain colons or slashes. The canonical operation key uses an unambiguous, length-prefixed encoding:
+
 ```typescript
-export interface QuarantineRetirementTransaction {
-  readonly retirementTransactionId: string; // e.g. "retire-tx-${quarantineGen}-${attemptId}-${uuid}"
-  readonly quarantineGeneration: number;     // Exact generation of QuarantineBuffer being retired
-  readonly operationIdentities: readonly CompositeOperationIdentity[]; // Composite identities
-  readonly entryCount: number;               // Exact count of complete terminal entries in batch
-  readonly completeArchiveEntryBytes: number;// Exact sum of RFC 8785 UTF-8 bytes of complete entries
-  readonly archiveReservationId: string;     // Reservation token returned by TerminalQuarantineArchive
-  readonly batchDigest: string;              // SHA-256 digest of canonically serialized staged entries
-  status:
-    | 'PREPARING'
-    | 'RESERVED'
-    | 'STAGED'
-    | 'COMMITTED_ARCHIVE'
-    | 'RETIRED_SOURCE'
-    | 'COMPLETED'
-    | 'FAILED'
-    | 'ROLLED_BACK';
-  terminalOutcome?:
-    | 'SUCCESS'
-    | 'CAPACITY_INSUFFICIENT'
-    | 'GENERATION_MISMATCH'
-    | 'INSERTION_FAILED'
-    | 'ATTEMPT_FENCED'
-    | 'TIMEOUT';
+export function canonicalOperationIdentityKey(id: CompositeOperationIdentity): string {
+  return `opid:${id.originPeerId.length}:${id.originPeerId}/${id.sequenceNumber}/${id.membershipEpoch}/${id.logicalEventId.length}:${id.logicalEventId}`;
 }
 ```
+*Example:* For `originPeerId = "peer-A"` (length 6), `sequenceNumber = 42`, `membershipEpoch = 1`, `logicalEventId = "evt_9a8b7c"` (length 10), the canonical string key evaluates to:
+`opid:6:peer-A/42/1/10:evt_9a8b7c`
+This representation is deterministic, delimiter-collision-proof, and universally parseable without schema ambiguity.
 
-##### Authoritative 11-Stage Transaction Lifecycle (R14-A)
+##### Rigorous Batch Conflict Handling Rules (R15-E)
+When staging or committing retirement operations, composite identities are validated against the following fail-closed rules:
+- **Same originPeerId & sequenceNumber, same membershipEpoch, same logicalEventId:** Exact duplicate identity $\to$ treated idempotently without dual allocation or duplicate entry creation.
+- **Same originPeerId & sequenceNumber, same membershipEpoch, different logicalEventId:** Divergent / split-brain operation generated under the same sequence slot $\to$ **REJECTS FAIL-CLOSED** with `SyncEngineError('RETIREMENT_BATCH_CONFLICT')`. Clean reset is aborted, quarantine custody is retained, and no operations are discarded.
+- **Same originPeerId & sequenceNumber, different membershipEpoch:** Epoch transition conflict for the same sequence slot $\to$ **REJECTS FAIL-CLOSED** with `SyncEngineError('RETIREMENT_BATCH_CONFLICT')`.
+- **Duplicate complete composite identity within a single retirement batch:** Redundant duplicate records $\to$ deduplicated into a single unique canonical entry or rejected fail-closed with `SyncEngineError('RETIREMENT_BATCH_CONFLICT')`.
+- **Retirement record conflicting with existing quarantine custody index:** If any identity in the retirement set does not correspond to an operation currently held in `QuarantineBuffer` custody $\to$ **REJECTS FAIL-CLOSED** with `SyncEngineError('RETIREMENT_SOURCE_MISMATCH')`. Quarantine custody is unconditionally preserved.
+
+##### Portable Canonical Wire Byte Ownership (R15-G)
+1. **Browser-Portable UTF-8 Byte Measurement:**
+   Rather than assuming a Node.js global `Buffer.byteLength(str, 'utf8')`, byte measurement is strictly specified using the universal Web standard:
+   ```typescript
+   const wireByteLength = new TextEncoder().encode(canonicalJson).length;
+   ```
+   This guarantees identical, platform-independent byte measurement across Node.js LTS, modern Web browsers, and WebWorker environments.
+2. **Private Canonical Wire Byte Ownership:**
+   `TerminalQuarantineEntry` privately owns the serialized canonical wire bytes as an immutable `Uint8Array`:
+   ```typescript
+   export interface TerminalQuarantineEntry {
+     readonly id: string;                        // Canonical operation identity key (canonicalOperationIdentityKey)
+     readonly originPeerId: string;              // Generating peer domain identifier
+     readonly sequenceNumber: number;            // Monotonic sequence number
+     readonly membershipEpoch: number;           // Membership configuration epoch
+     readonly logicalEventId: string;            // Unique logical event identifier
+     readonly canonicalWireBytes: Uint8Array;    // Privately owned immutable canonical wire bytes (RFC 8785 UTF-8)
+     readonly byteLength: number;                // Exact byte length (new TextEncoder().encode(canonicalJson).length <= 4096)
+     readonly rejectionStatus: TerminalRejectionStatus;
+     readonly reason: string;
+     readonly error?: string;
+     readonly archivedAtMs: number;
+   }
+   ```
+   To ensure archived content cannot be mutated by external callers, all accessor methods, queries, and export batch builders return defensive detached clones:
+   ```typescript
+   const exposedBytes = new Uint8Array(entry.canonicalWireBytes);
+   ```
+3. **Single Immutable Staged Representation:**
+   The exact byte length measurement, the SHA-256 digest computation (`crypto.subtle.digest('SHA-256', stagedBytes)`), and the bytes committed to `TerminalQuarantineArchive` are derived from the **exact same immutable staged `Uint8Array`**.
+4. **RFC 8785 Determinism vs. Object Immutability:**
+   RFC 8785 JSON Canonicalization Scheme (JCS) deterministically formats and sorts JSON keys, but does not render mutable JavaScript objects immutable. Shallow and deep immutability (`Object.freeze`) and detached byte array allocation are enforced at every trust boundary.
+5. **Strict 4,096-Byte Entry Boundary & Oversized Quarantining:**
+   - Individual complete serialized entries cannot exceed 4,096 canonical wire bytes (`MAX_TERMINAL_ENTRY_SERIALIZED_BYTES = 4096`).
+   - If an operation produces a complete terminal entry exceeding 4,096 bytes, it **CANNOT** be admitted to `TerminalQuarantineArchive`.
+   - Any oversized entry remains safely quarantined in `QuarantineBuffer` and causes administrative clean reset (`REINITIALIZE_CLEAN`) to fail closed with `SyncEngineError('RESET_PREREQUISITE_FAILED')`.
+   - Oversized operations are **NEVER truncated, corrupted, or silently discarded**.
+   - Dual archive bounds remain strictly enforced: max 500 entries (`MAX_TERMINAL_ARCHIVE_ENTRIES = 500`), max 2 MiB aggregate wire bytes (`MAX_TERMINAL_ARCHIVE_TOTAL_BYTES = 2097152`), max 4,096 bytes per entry (`MAX_TERMINAL_ENTRY_SERIALIZED_BYTES = 4096`).
+
+##### Authoritative 11-Stage Transaction Lifecycle (R14-A, R15-A–R15-G)
 1. **Stage 1 (Quarantine Generation Freeze):** Coordinator freezes the current quarantine generation (`quarantineBuffer.freezeGeneration()`).
-2. **Stage 2 (Settle All In-Flight Work):** Confirms Step 6 has resolved and $N_{\text{in-flight}} == 0$. Restored in-flight operations are locked inside the frozen generation.
+2. **Stage 2 (Settle All In-Flight Work):** Confirms Step 6 settlement has completed and $N_{\text{in-flight}} == 0$. Restored in-flight operations are locked inside the frozen generation.
 3. **Stage 3 (Retirement Set Discovery):** Constructs an immutable snapshot of all operations in the frozen generation without mutating buffer ownership.
-4. **Stage 4 (Composite Identity & Metadata Validation):** Validates each operation's `CompositeOperationIdentity`. Asserts uniqueness; duplicate or conflicting records throw `RETIREMENT_BATCH_CONFLICT`.
+4. **Stage 4 (Composite Identity & Metadata Validation):** Validates each operation's `CompositeOperationIdentity` (`sequenceNumber`, `originPeerId`, `membershipEpoch`, `logicalEventId`). Computes length-prefixed `canonicalOperationIdentityKey`. Conflicting records fail closed with `RETIREMENT_BATCH_CONFLICT`.
 5. **Stage 5 (Complete Detached Entry Construction):** Constructs complete detached `TerminalQuarantineEntry` records (`rejectionStatus: 'REINITIALIZE_CLEAN_PURGED'`), incorporating all envelope metadata.
 6. **Stage 6 (Canonical Serialization):** Canonically serializes each complete `TerminalQuarantineEntry` using RFC 8785 JCS (`canonicalEntryJson = canonicalize(entry)`).
-7. **Stage 7 (Exact UTF-8 Byte Measurement):** Measures exact wire bytes of each complete entry (`byteLength = Buffer.byteLength(canonicalEntryJson, 'utf8')`). Multi-byte Unicode characters are handled correctly.
-8. **Stage 8 (Individual Entry Boundary Check):** Asserts that each complete entry satisfies `byteLength <= MAX_TERMINAL_ENTRY_BYTES` (4096). An entry exceeding 4096 bytes fails closed (`TERMINAL_ENTRY_OVERSIZED`). No identity field is truncated to fit!
-9. **Stage 9 (Aggregate Byte Calculation):** Computes `completeArchiveEntryBytes = sum(byteLength)`. Computes `batchDigest = sha256(canonicalBatchJson)`.
-10. **Stage 10 (Capacity Pre-Reservation):** Requests reservation from archive using exact measurements:
-    `reservationId = terminalArchive.reserveCapacity(entryCount, completeArchiveEntryBytes, terminalArchive.archiveGeneration)`.
-    If available entries ($500 - \text{size}$) or available bytes ($2\text{ MiB} - \text{totalBytes}$) are insufficient, throws `CAPACITY_INSUFFICIENT`.
-11. **Stage 11 (Idempotent Archive Batch Commit & Acknowledged Retirement):** Commits the exact staged records whose sizes were measured. Upon confirmation, buffer retires exactly `operationIdentities`. Coordinator asserts zero remaining entries in buffer custody.
+7. **Stage 7 (Portable UTF-8 Byte Measurement):** Measures exact wire bytes using `new TextEncoder().encode(canonicalEntryJson).length`. Asserts each entry $\le 4096$ bytes. Computes aggregate complete entry bytes $B_{\text{complete}} = \sum b_i$.
+8. **Stage 8 (Immutable Wire Bytes Packaging):** Encodes canonical JSON into private `Uint8Array` stored in `entry.canonicalWireBytes`.
+9. **Stage 9 (Archive Pre-Reservation):** Invokes `archive.reserveCapacity(N, B_{\text{complete}}, currentArchiveGen)` to obtain `reservationId`. Asserts $N \le 500$ and $B_{\text{complete}} \le 2097152$.
+10. **Stage 10 (Candidate-Root Archive Commit):** Invokes `archive.commitRetirementBatch(retirementTxId, batchDigest, reservationId, stagedBatch)`. Publishes candidate root via single synchronous pointer replacement.
+11. **Stage 11 (Atomic Source Retirement & Custody Verification):** Invokes `quarantineBuffer.retireCommittedBatch(operationIdentities, capability)` under Option A (atomic source retirement). Asserts buffer custody is completely cleared ($N_{\text{retired}} == N$).
 
-##### Retention & Reserialization Proof
-- The archive retains the immutable detached `TerminalQuarantineEntry` records along with their pre-computed `canonicalSerializedBytes` and pre-rendered canonical UTF-8 bytes (`canonicalWireBytes: Uint8Array`).
-- **Reserialization Determinism Proof:** Because RFC 8785 (JSON Canonicalization Scheme) specifies strict lexicographical key sorting, IEEE 754 number canonicalization, and deterministic UTF-8 escaping, canonical serialization is an idempotent mathematical function: $f(f(x)) = f(x)$. If reserialization ever occurs, the resulting byte sequence and UTF-8 byte length are bit-for-bit identical to the measured bytes at Stage 7.
+#### 5. R15-A — Exception-Atomic Archive Publication, R15-B — Idempotent Commit Ordering, R15-C — Atomic Source Retirement & R15-D — Uncertain Outcome Reconciliation
 
-#### 5. R14-C — Atomic Archive Batch Publication, Uncertain Outcomes & Reservation Lifecycle
+##### Candidate-Root Archive Publication Model (R15-A)
+Sequential Map or Array mutations (e.g. `entries.push()` followed by `committedTransactions.set()`) are not exception-atomic. If an allocation failure (OOM) or unexpected runtime exception occurs between mutations, the archive is left in a corrupted intermediate state.
 
-##### Archive-Side Commit Contract
-1. **Reservation Validation:** Validates `reservationId` against active reservations. Asserts `reservation.archiveGeneration === this.archiveGeneration` and reservation lease has not expired.
-2. **Exact Size Match:** Asserts `stagedBatch.length === reservation.entryCount` and `batchBytes === reservation.byteCount` bit-for-bit. Any mismatch rejects the commit without publication.
-3. **Idempotent Transaction ID Reconciliation:**
-   - If `retirementTransactionId` was already committed with matching `batchDigest`: returns original `TerminalBatchCommitReceipt` without inserting duplicates.
-   - If `retirementTransactionId` was already committed with a *different* `batchDigest`: throws `SyncEngineError('TRANSACTION_ID_DIGEST_MISMATCH')`.
-4. **Single-Tick Atomic Publication:** In-memory insertion of all batch entries into `this._entries` and recording of the transaction in `this._committedTransactions` occur synchronously within one JavaScript execution turn. No partially published batch is externally observable.
-5. **Reservation Consumption & Generation Increment:** Deletes active reservation and increments `this._archiveGeneration += 1`.
-6. **Pre-Publication Failure Atomicity:** If any assertion fails or allocation throws prior to publication, reservation is cancelled or marked failed; zero batch entries appear in `this._entries`; no committed transaction record is published.
-7. **Source Retirement Gating:** Source operations are removed from `QuarantineBuffer` strictly after receiving the committed receipt.
-
-##### Explicit Transaction Outcomes
+`TerminalQuarantineArchive` implements a private **candidate-root publication model**:
 ```typescript
-export type QuarantineRetirementTransactionOutcome =
-  | 'NOT_COMMITTED'                       // Initial state before commit invocation
-  | 'COMMITTED'                           // Batch and transaction record published atomically
-  | 'COMMIT_OUTCOME_UNKNOWN'              // Exception/timeout during commit; requires query
-  | 'COMMITTED_SOURCE_RETIREMENT_PENDING' // Archive committed; source retirement executing
-  | 'COMPLETED'                           // Source retired, zero-custody verified
-  | 'FAILED';                             // Terminal failure; transaction aborted
+export interface TerminalArchiveCoreState {
+  readonly entries: ReadonlyArray<TerminalQuarantineEntry>;
+  readonly committedTransactions: ReadonlyMap<string, QuarantineRetirementTransactionRecord>;
+  readonly totalBytes: number;
+  readonly size: number;
+  readonly archiveGeneration: number;
+}
 ```
 
-##### Uncertain Outcome Reconciliation
-If an unhandled exception or timeout occurs while invoking `commitRetirementBatch()`, the coordinator enters `COMMIT_OUTCOME_UNKNOWN`:
-1. Coordinator invokes `receipt = terminalArchive.getTransaction(retirementTransactionId)`.
-2. **If Record Exists (`COMMITTED`):** Coordinator verifies `receipt.batchDigest === myBatchDigest`. Advances to `COMMITTED_SOURCE_RETIREMENT_PENDING` and executes source retirement (Stage 11).
-3. **If Record Missing (`NOT_COMMITTED`):** Coordinator cancels reservation, marks transaction `FAILED`, and aborts to `DEGRADED`. A subsequent retry begins afresh from Stage 1.
+1. **Private Candidate Construction:**
+   The entire candidate state is constructed privately in temporary memory:
+   - Fresh entry array: `[...this._core.entries, ...stagedBatch]`.
+   - Fresh committed transactions map: `new Map(this._core.committedTransactions).set(txId, txRecord)`.
+   - Incremented size: `this._core.size + stagedBatch.length`.
+   - Incremented wire bytes: `this._core.totalBytes + stagedBatchBytes`.
+   - Incremented generation: `this._core.archiveGeneration + 1`.
+2. **Pre-Publication Validation:**
+   Every potentially throwing check (capacity bounds, entry size verification, SHA-256 digest validation, reservation matching) is evaluated *prior* to publication.
+3. **Single Synchronous Pointer Replacement:**
+   Publication occurs via a single atomic reference assignment:
+   ```typescript
+   this._core = candidateCore;
+   ```
+   Observers run-to-completion in JavaScript and can never witness a partially published candidate state.
+4. **Failure Semantics:**
+   If candidate construction or validation throws, the old `this._core` remains 100% authoritative and unmodified. Zero transactions are committed, zero entries are appended. The reservation remains active and can be safely retried or explicitly cancelled via `cancelReservation(reservationId, capability)`.
+5. **Delineation of Core vs. External Ephemeral State:**
+   - **Inside Core Root (Atomically Replaced):** `entries`, `committedTransactions`, `totalBytes`, `size`, `archiveGeneration`.
+   - **External to Core Root (Operational / Lease State):** `activeReservations: Map<string, ArchiveReservationRecord>`, `activeExportLease: ArchiveExportLease | null`, `tombstones: Map<string, ArchiveExportTombstone>`.
+   When candidate publishes, the consumed reservation is removed from `activeReservations` synchronously with the root pointer replacement. No hidden mutable state can disagree with the published root.
 
-##### Reservation Lifecycle
-- **Identity & Ownership:** `reservationId = res-${archiveGeneration}-${sequence}-${cryptoRandomHex(16)}`. Bound to `retirementTransactionId`.
-- **Generation Fencing:** Valid strictly for the `archiveGeneration` at which it was minted. If archive generation changes before commit, reservation is invalidated (`GENERATION_MISMATCH`).
-- **Reservation Lease Timeout:** `RESERVATION_LEASE_TIMEOUT_MS = 10000` (10 seconds). An uncommitted reservation expires after 10s.
-- **Active Capacity Accounting:** Active reservations deduct from available archive capacity:
-  $$\text{Available Entries} = MAX\_ENTRIES - \text{size} - \sum \text{reservedEntries}$$
-  $$\text{Available Bytes} = MAX\_BYTES - \text{totalBytes} - \sum \text{reservedBytes}$$
-  This strictly prevents two concurrent reservations from consuming the same headroom!
-- **Cancellation:** Explicitly cancelled via `cancelReservation(reservationId, capability)` or on transaction abort.
+##### Idempotent Transaction Reconciliation Before Reservation Validation (R15-B)
+To ensure retried commit requests succeed even if their reservation has been consumed or expired, `commitRetirementBatch` enforces strict lookup-first ordering:
 
-##### Complete Transaction Failure Recovery Matrix (R14-C)
+```typescript
+commitRetirementBatch(
+  retirementTransactionId: string,
+  batchDigest: string,
+  reservationId: string,
+  stagedBatch: readonly TerminalQuarantineEntry[],
+): TerminalBatchCommitReceipt {
+  // 1. Authoritative lookup in committed transactions
+  const existingRecord = this._core.committedTransactions.get(retirementTransactionId);
+  if (existingRecord) {
+    // 2. Matching digest -> return existing receipt immediately
+    if (existingRecord.batchDigest === batchDigest) {
+      return {
+        committed: true,
+        alreadyCommitted: true,
+        transactionId: retirementTransactionId,
+        entryCount: existingRecord.entryCount,
+        totalSerializedBytes: existingRecord.totalSerializedBytes,
+        archiveGeneration: this._core.archiveGeneration,
+        batchDigest: existingRecord.batchDigest,
+      };
+    }
+    // Conflicting digest for same transaction ID -> reject fail-closed
+    throw new SyncEngineError(
+      'TRANSACTION_ID_DIGEST_MISMATCH',
+      `Transaction ${retirementTransactionId} already committed with different digest`,
+    );
+  }
 
-| Failure Scenario | Engine Core State | QuarantineBuffer State | TerminalArchive State | Outcome Status | Recovery Behavior |
-|---|---|---|---|---|---|
-| **1. Capacity reservation failure** | Untouched | Retains all operations ($N$) | Untouched (0 reserved) | `FAILED` (`CAPACITY_INSUFFICIENT`) | Aborts to `DEGRADED`; zero buffer mutation; diagnostic logged |
-| **2. Archive generation changed after reservation** | Untouched | Retains all operations ($N$) | Reservation invalidated | `FAILED` (`GENERATION_MISMATCH`) | Releases reservation; restarts transaction afresh at Stage 5 |
-| **3. Quarantine generation changed after staging** | Untouched | Gated / preserved | Untouched | `FAILED` (`GENERATION_MISMATCH`) | Aborts transaction; verifies buffer invariants; transitions `DEGRADED` |
-| **4. Archive insertion throws before commit** | Untouched | Retains all operations ($N$) | Batch discarded; reservation freed | `FAILED` (`INSERTION_FAILED`) | Aborts to `DEGRADED` (`TERMINAL_ARCHIVE_INSERTION_FAILED`); zero loss |
-| **5. Archive commit succeeds but source retirement throws** | Untouched | Retains operations | Batch committed under `retirementTxId` | `COMMITTED_SOURCE_RETIREMENT_PENDING` | Retry queries `getTransaction(txId)`; skips duplicate archive insert; retries Stage 11 source retirement |
-| **6. Duplicate transaction submission** | Untouched | Intact | Returns existing receipt | `COMPLETED` | Idempotent; zero duplicate entries; returns success |
-| **7. Transaction ID reused with different digest** | Untouched | Retains operations | Rejects with conflict | `FAILED` (`TRANSACTION_ID_DIGEST_MISMATCH`) | Throws error; preserves archive and buffer; prevents corruption |
-| **8. Uncertain commit outcome (timeout/exception)** | Untouched | Retains operations | Query via `getTransaction()` | `COMMIT_OUTCOME_UNKNOWN` | Reconciles via query: if committed $\to$ retires source; if uncommitted $\to$ restarts Stage 1 |
-| **9. Attempt invalidation during preparation** | Untouched | Retains operations | Reservation cancelled | `FAILED` (`ATTEMPT_FENCED`) | Stale continuation aborts immediately; zero mutations |
-| **10. Conflicting composite identity in batch** | Untouched | Retains operations | Untouched | `FAILED` (`RETIREMENT_BATCH_CONFLICT`) | Rejects batch fail-closed; preserves buffer; halts reset |
-| **11. Process termination before source retirement** | Heap destroyed | Heap destroyed | Heap destroyed | Process death | Node process restart reboots from clean baseline; memory limitation stated directly |
+  // 3. Only if transaction is absent, validate reservation
+  const reservation = this.activeReservations.get(reservationId);
+  if (!reservation) {
+    throw new SyncEngineError('RESERVATION_NOT_FOUND', `Reservation ${reservationId} not found`);
+  }
+  if (Date.now() > reservation.expiresAtMs) {
+    throw new SyncEngineError('RESERVATION_EXPIRED', `Reservation ${reservationId} has expired`);
+  }
+  if (reservation.archiveGeneration !== this._core.archiveGeneration) {
+    throw new SyncEngineError('GENERATION_MISMATCH', 'Archive generation has advanced since reservation');
+  }
+
+  // 4. Validate staged batch integrity and counts
+  if (stagedBatch.length !== reservation.reservedCount) {
+    throw new SyncEngineError('BATCH_COUNT_MISMATCH', 'Staged batch count does not match reservation');
+  }
+  let batchBytes = 0;
+  for (const entry of stagedBatch) {
+    if (entry.byteLength > MAX_TERMINAL_ENTRY_SERIALIZED_BYTES) {
+      throw new SyncEngineError('ENTRY_SIZE_EXCEEDED', `Entry ${entry.id} exceeds 4096 bytes`);
+    }
+    batchBytes += entry.byteLength;
+  }
+  if (batchBytes !== reservation.reservedBytes) {
+    throw new SyncEngineError('BATCH_BYTE_MISMATCH', 'Staged batch byte total does not match reservation');
+  }
+
+  // 5. Construct candidate root privately and swap atomically
+  const candidateCore: TerminalArchiveCoreState = Object.freeze({
+    entries: Object.freeze([...this._core.entries, ...stagedBatch]),
+    committedTransactions: new Map(this._core.committedTransactions).set(retirementTransactionId, {
+      transactionId: retirementTransactionId,
+      outcome: 'COMMITTED',
+      entryCount: stagedBatch.length,
+      totalSerializedBytes: batchBytes,
+      batchDigest,
+      committedAtMs: Date.now(),
+    }),
+    totalBytes: this._core.totalBytes + batchBytes,
+    size: this._core.size + stagedBatch.length,
+    archiveGeneration: this._core.archiveGeneration + 1,
+  });
+
+  this._core = candidateCore;
+  this.activeReservations.delete(reservationId);
+
+  return {
+    committed: true,
+    alreadyCommitted: false,
+    transactionId: retirementTransactionId,
+    entryCount: stagedBatch.length,
+    totalSerializedBytes: batchBytes,
+    archiveGeneration: candidateCore.archiveGeneration,
+    batchDigest,
+  };
+}
+```
+*Duplicate Submission Safety:* Due to JavaScript run-to-completion, any concurrent or reentrant invocation with the same `(retirementTransactionId, batchDigest)` hits Step 1/2 and returns the original receipt without creating duplicate entries or transaction records.
+
+##### Option A — Atomic Source Retirement (R15-C)
+To guarantee that operations cannot be partially retired from `QuarantineBuffer`, the subsystem adopts **Option A — Atomic source retirement**:
+- **All-or-Nothing Retirement:** The entire identity set is retired, or none is.
+- `quarantineBuffer.retireCommittedBatch(identities: readonly CompositeOperationIdentity[], capability: RecoveryInstallationCapability): void`:
+  1. Validates that every identity in `identities` exists in buffer custody (`drainBatch` or `activeQueue`) and in `this.identityIndex`.
+  2. Computes candidate `drainBatch`, candidate `drainBytes`, candidate `activeQueue`, candidate `activeBytes`, and candidate `identityIndex` privately without modifying active buffer properties.
+  3. If any identity is missing, mismatched, or corrupted: throws `SyncEngineError('RETIREMENT_SOURCE_MISMATCH')` before performing any mutation. The buffer remains 100% authoritative and untouched.
+  4. Publishes candidate state through single synchronous reference assignment.
+- An exception before publication leaves the original quarantine buffer completely intact. Partial source progress is structurally prevented.
+
+##### Uncertain Commit Query Semantics & 3-Outcome Resolution (R15-D)
+If an unexpected exception (e.g. out of memory) or timer interruption occurs while awaiting `commitRetirementBatch`, the coordinator transitions the transaction to `status: 'COMMIT_OUTCOME_UNKNOWN'`.
+
+To resolve this uncertainty, the coordinator queries `archive.getTransaction(retirementTransactionId)`:
+1. **Outcome 1 — Found with Matching Digest (`outcome === 'COMMITTED'`):**
+   The batch was successfully published into the archive root before the interruption. The coordinator transitions the transaction to `COMMITTED_SOURCE_RETIREMENT_PENDING` and resumes Stage 11 source retirement.
+2. **Outcome 2 — Authoritatively Absent (`undefined` returned from authoritative query):**
+   The batch was NOT committed to the archive root. The transaction outcome is `NOT_COMMITTED`. The coordinator can safely cancel the pending reservation via `archive.cancelReservation(reservationId, capability)` or re-stage the batch under a fresh attempt.
+3. **Outcome 3 — Query Fails, Times Out, or Produces Inconclusive Result:**
+   The coordinator **MUST REMAIN in `COMMIT_OUTCOME_UNKNOWN`**. It must NOT retire source operations, must NOT cancel potentially committed reservations, and must NOT begin a replacement transaction. The coordinator retries the query with exponential backoff.
+- *Preservation of Identity & Digest:* All retries preserve the exact same `retirementTransactionId` and `batchDigest`, preventing duplicate entry creation or split transactions.
+
+##### Complete Transaction Failure Recovery Matrix (R14-C, R15-A–R15-G)
+
+| Failure Scenario | Engine State | QuarantineBuffer Custody | TerminalQuarantineArchive Custody | Coordinator Transaction State | Recovery Action |
+|:---|:---|:---|:---|:---|:---|
+| **1. Reservation capacity insufficient ($> 500$ entries or $> 2$ MiB)** | Untouched | Retains operations ($N$) | Rejects reservation | `FAILED` (`CAPACITY_INSUFFICIENT`) | Aborts clean reset; enters `DEGRADED` (`RESET_PREREQUISITE_FAILED`); zero loss |
+| **2. Oversized entry ($> 4096$ canonical bytes)** | Untouched | Retains operations ($N$) | Rejects batch staging | `FAILED` (`ENTRY_SIZE_EXCEEDED`) | Aborts clean reset; enters `DEGRADED` (`RESET_PREREQUISITE_FAILED`); entry never truncated |
+| **3. Generation mismatch at reservation commit** | Untouched | Retains operations ($N$) | Rejects commit | `FAILED` (`GENERATION_MISMATCH`) | Cancels reservation; re-reads generation; re-stages batch |
+| **4. Exception during candidate root construction** | Untouched | Retains operations ($N$) | Old root remains authoritative; zero entries added | `PREPARING` / `FAILED` | Old archive root intact; reservation preserved for retry or cancellation |
+| **5. Archive commit succeeds but source retirement throws (Option A validation failure)** | Untouched | Retains operations ($N$) | Batch committed under `retirementTxId` | `COMMITTED_SOURCE_RETIREMENT_PENDING` | Source buffer untouched; coordinator queries `getTransaction()`; skips archive commit; retries Stage 11 source retirement |
+| **6. Duplicate transaction submission** | Untouched | Intact | Returns existing receipt via Step 1 lookup | `COMPLETED` | Idempotent; zero duplicate entries; returns success receipt |
+| **7. Transaction ID reused with different digest** | Untouched | Retains operations ($N$) | Rejects with conflict | `FAILED` (`TRANSACTION_ID_DIGEST_MISMATCH`) | Throws error; preserves archive and buffer; prevents corruption |
+| **8. Uncertain commit outcome (timeout/exception)** | Untouched | Retains operations ($N$) | Query via `getTransaction()` | `COMMIT_OUTCOME_UNKNOWN` | 3-way query: if committed $\to$ retires source; if absent $\to$ cancels reservation; if fails $\to$ remains unknown |
+| **9. Attempt invalidation during preparation** | Untouched | Retains operations ($N$) | Reservation cancelled | `FAILED` (`ATTEMPT_FENCED`) | Stale continuation aborts immediately; zero mutations |
+| **10. Conflicting composite identity in batch** | Untouched | Retains operations ($N$) | Untouched | `FAILED` (`RETIREMENT_BATCH_CONFLICT`) | Rejects batch fail-closed; preserves buffer; halts reset |
+| **11. Export lease expiration racing with acknowledgement** | Untouched | N/A | Expiration wins or acknowledgement wins | `ARCHIVE_EXPORT_EXPIRED` if expired | Expired lease clears zero entries; acknowledgement clears entries only if valid |
 
 **Hard Invariant:** Clean-root installation is strictly forbidden until every operation in the retirement set has unambiguous terminal custody.
 
-#### 6. R14-D — Export Acknowledgement Tombstone and Lease Governance
+#### 6. R15-F — Export Lease, Generation-Independent Acknowledgement & Tombstone Governance
 
 ##### Dedicated Capability Contract
 Archive administration requires `TerminalArchiveAdministrationCapability` (`TERMINAL_ARCHIVE_BRAND`). Possession of `RecoveryInstallationCapability` does NOT grant archive export authority.
@@ -454,11 +582,22 @@ Archive administration requires `TerminalArchiveAdministrationCapability` (`TERM
 - `TerminalQuarantineArchive` enforces at most **one** active export lease at any time.
 - Calling `prepareArchiveExport()` while an unacknowledged lease exists is rejected with `SyncEngineError('ARCHIVE_EXPORT_IN_PROGRESS')`.
 
-##### Export Lease Expiration & Abandoned Lease Recovery
-- **Lease Timeout:** `EXPORT_LEASE_TIMEOUT_MS = 30000` (30 seconds).
-- If an administrative caller prepares an export but does not acknowledge or cancel within 30s, the lease expires.
-- **Inviolable Invariant:** Lease expiration does NOT delete or mutate archive entries! All entries remain safely retained. An expired batch can be prepared again under a new export ID without losing any data.
-- An abandoned lease can be explicitly released via `cancelArchiveExport(exportId, capability)`.
+##### Generation-Independent Export Acknowledgement (R15-F)
+When an export batch is prepared at archive generation $G$, it captures an immutable snapshot of entries and assigns an `ArchiveExportLease`.
+If subsequent retirement transactions commit to the archive before export acknowledgement, the archive's internal generation advances to $G' > G$.
+
+**Inviolable Invariant:** Export acknowledgement is validated against the **immutable export lease record** (`lease.exportId`, `lease.batchDigest`, `lease.leaseExpiryMs`), **NOT** blindly against the archive's current generation `this._core.archiveGeneration`!
+- Acknowledgement succeeds if:
+  1. The export lease exists and has not expired: `currentTime <= lease.leaseExpiryMs`.
+  2. The acknowledgement matches `lease.exportId` and `lease.batchDigest`.
+  3. The exact entries captured in the export lease are still present in `this._core.entries`.
+- **Surgical Entry Eviction:** On valid acknowledgement, the archive constructs a candidate root that removes **strictly and exclusively the captured entries**. Any entries appended at $G' > G$ remain completely untouched.
+- Archive generation advances to $G'' = G' + 1$ upon acknowledgement.
+
+##### Deterministic Race Between Acknowledgement and Lease Expiry (R15-F)
+Under single-threaded JavaScript execution, either the lease expiration callback executes first, or the acknowledgement call executes first:
+- **Case 1 (Expiration Executes First):** The active lease is marked expired. A subsequent `acknowledgeArchiveExport()` call detects `now > lease.leaseExpiryMs`, clears zero entries, and throws `SyncEngineError('ARCHIVE_EXPORT_EXPIRED')`. **An expired lease NEVER clears archive entries.**
+- **Case 2 (Acknowledgement Executes First):** The lease is verified active, entries are purged via candidate root swap, `activeExportLease` is set to `null`, and a tombstone is recorded. When the later expiration timer callback runs, it observes `activeExportLease === null` and safely no-ops.
 
 ##### Acknowledgement Tombstones & Deterministic Eviction
 - When an export is acknowledged, a tombstone record is recorded:
@@ -478,10 +617,10 @@ Archive administration requires `TerminalArchiveAdministrationCapability` (`TERM
 - **Repeated Acknowledgement Semantics:**
   - Repeated acknowledgement while tombstone exists returns idempotent receipt: `{ acknowledged: true, alreadyAcknowledged: true, clearedCount: 0 }`.
   - Repeated acknowledgement after tombstone eviction returns `SyncEngineError('ARCHIVE_EXPORT_UNKNOWN')` or `SyncEngineError('ARCHIVE_EXPORT_EXPIRED')`.
-- **Generation-Fenced Acknowledgement:** Acknowledgement validates `batch.archiveGeneration === archive.archiveGenerationAtExport`. Clears strictly and exclusively the exact composite identities captured in that immutable batch.
 - **Preservation Boundary:** Protocol guarantees in-memory custody until explicit acknowledgement. External durability remains the responsibility of the administrative caller.
 
-#### 7. R14-E — Reset Continuation and Ownership Consistency
+
+#### 7. Reset Continuation, Timeout Fencing & Ownership Consistency (R14-E, R15-B)
 - **Latched Timeout Preservation:** When `SETTLEMENT_BARRIER_TIMEOUT_MS = 5000` expires, `attempt.status` is permanently latched to `TIMED_OUT`. The in-flight slot remains owned ($N_{\text{in-flight}} = 1$); the timeout does not cancel the underlying Promise and does not clear the slot.
 - **Late Settlement Halts:** When the slow operation settles later, continuation observes `TIMED_OUT`, resolves custody to buffer head, releases the slot ($N_{\text{in-flight}} \to 0$), and strictly terminates with zero lifecycle continuation.
 - **New Attempt Independent Verification:** A new attempt must independently verify: (1) old async work settled, (2) old custody resolved, (3) old slot empty, (4) old continuations fenced, (5) new attempt current, authorized, and non-terminal.
@@ -489,7 +628,7 @@ Archive administration requires `TerminalArchiveAdministrationCapability` (`TERM
 - **Preservation of M4.3c Notification Sequence:**
   Quarantine draining/retirement $\to$ Bookkeeping $\to$ `setRecoveryMode(false)` $\to$ Coordinator to `ACTIVE` $\to$ `flushDeferredNotifications()`.
 
-#### 8. Enforceable Memory Bounds & Heap Limitations (R13-D, R14-A)
+#### 8. Enforceable Memory Bounds & Heap Limitations (R13-D, R14-A, R15-G)
 
 ##### Explicit Hard Bound Constants
 | Metric | Hard Bound Constant | Value | Description |
@@ -555,7 +694,7 @@ Archive administration requires `TerminalArchiveAdministrationCapability` (`TERM
 | `CAPACITY_REJECTED` | Transient Backpressure | No | No (Zero mutation) | `QuarantineBuffer` (head via `unshiftDrain`) | Releases slot after acknowledged transfer; halts drain (`HALTED_CAPACITY`) |
 | `TERMINALLY_REJECTED` | Permanent Validation Failure | No | No (Zero mutation) | `TerminalQuarantineArchive` | Releases slot after acknowledged archive; continues drain |
 
-#### 11. Reset-Policy Quarantine Fate Matrix (R11-D, R12-A, R13-A, R14-A, R14-B)
+#### 11. Reset-Policy Quarantine Fate Matrix (R11-D, R12-A, R13-A, R14-A, R14-B, R15-C)
 
 | Reset Strategy | In-Flight Un-linearized Operation Fate | QuarantineBuffer Pending Operations Fate | Already-Linearized Log Operations Fate | When Can Draining Resume? |
 |---|---|---|---|---|

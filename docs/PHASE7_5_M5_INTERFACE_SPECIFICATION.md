@@ -1,6 +1,6 @@
 # Phase 7.5 Milestone M5 — Interface Specification
 
-**Status:** APPROVED ARCHITECTURAL SPECIFICATION (MILESTONE M5.0-R14 AMENDED)
+**Status:** APPROVED ARCHITECTURAL SPECIFICATION (MILESTONE M5.0-R15 AMENDED)
 **Date:** 2026-11-25
 **Authoritative Starting Baseline:** `40b11fdafcd247c7a289723f90ec0e2029c94f64` (Phase 7.5 M4.3d Formally Accepted)
 **Accepted Baselines:** M4.3c (`eab2428`), M4.3b (`f3c29b6`), Approved Architecture (`2bb117c`), Frozen M4.2d (`aafa366`)
@@ -531,7 +531,7 @@ export type RemoteAdmissionDecision =
 
 ---
 
-### 3.3 Terminal Quarantine Archive Governance, Atomic Retirement & Export Contracts (R12-A–R12-D, R13-A–R13-D, R14-A–R14-E)
+### 3.3 Terminal Quarantine Archive Governance, Atomic Retirement & Export Contracts (R12-A–R12-D, R13-A–R13-D, R14-A–R14-E, R15-A–R15-G)
 
 ```typescript
 // ── Module Branding & Custody Symbols [PROPOSED — M5.1] ─────────────────────
@@ -546,18 +546,19 @@ export interface TerminalArchiveAdministrationCapability {
 
 // ── Composite Operation Identity [PROPOSED — M5.1] ──────────────────────────
 export interface CompositeOperationIdentity {
-  readonly originPeerId: string;    // Generating peer domain identifier
-  readonly originSequence: number;  // Strictly monotonic sequence counter for originPeerId
-  readonly membershipEpoch: number; // Membership configuration epoch
-  readonly logicalEventId: string;  // Unique logical event identifier
+  readonly originPeerId: string;    // Generating peer domain identifier (op.originPeerId)
+  readonly sequenceNumber: number;  // Strictly monotonic sequence counter for originPeerId (op.sequenceNumber)
+  readonly membershipEpoch: number; // Membership configuration epoch (op.membershipEpoch)
+  readonly logicalEventId: string;  // Unique logical event identifier (op.event.message.logicalEventId)
 }
 
 /**
- * Returns deterministic canonical string representation:
- * op-id:${originPeerId}:${originSequence}:${membershipEpoch}:${logicalEventId}
+ * Returns deterministic length-prefixed canonical string representation:
+ * opid:${originPeerId.length}:${originPeerId}/${sequenceNumber}/${membershipEpoch}/${logicalEventId.length}:${logicalEventId}
+ * Example: opid:6:peer-A/42/1/10:evt_9a8b7c
  */
 export function canonicalOperationIdentityKey(id: CompositeOperationIdentity): string {
-  return `op-id:${id.originPeerId}:${id.originSequence}:${id.membershipEpoch}:${id.logicalEventId}`;
+  return `opid:${id.originPeerId.length}:${id.originPeerId}/${id.sequenceNumber}/${id.membershipEpoch}/${id.logicalEventId.length}:${id.logicalEventId}`;
 }
 
 // ── Reset Attempt Lifecycle Tracking Types [PROPOSED — M5.1] ────────────────
@@ -577,6 +578,35 @@ export interface ResetAttemptRecord {
   readonly initiatedAtMs: number;
   settledAtMs?: number;
   completedAtMs?: number;
+}
+
+// ── Terminal Quarantine Entry & Candidate Root State [PROPOSED — M5.1] ──────
+export type TerminalRejectionStatus =
+  | 'REINITIALIZE_CLEAN_PURGED'
+  | 'PERMANENTLY_INVALID'
+  | 'MEMBERSHIP_EPOCH_MISMATCH'
+  | 'UNRESOLVABLE_CAUSAL_DEPENDENCY';
+
+export interface TerminalQuarantineEntry {
+  readonly id: string;                        // Canonical operation identity key (canonicalOperationIdentityKey)
+  readonly originPeerId: string;              // Generating peer domain identifier
+  readonly sequenceNumber: number;            // Monotonic sequence number
+  readonly membershipEpoch: number;           // Membership configuration epoch
+  readonly logicalEventId: string;            // Unique logical event identifier
+  readonly canonicalWireBytes: Uint8Array;    // Privately owned immutable canonical wire bytes (RFC 8785 UTF-8)
+  readonly byteLength: number;                // Exact byte length (new TextEncoder().encode(canonicalJson).length <= 4096)
+  readonly rejectionStatus: TerminalRejectionStatus;
+  readonly reason: string;
+  readonly error?: string;
+  readonly archivedAtMs: number;
+}
+
+export interface TerminalArchiveCoreState {
+  readonly entries: ReadonlyArray<TerminalQuarantineEntry>;
+  readonly committedTransactions: ReadonlyMap<string, QuarantineRetirementTransactionRecord>;
+  readonly totalBytes: number;
+  readonly size: number;
+  readonly archiveGeneration: number;
 }
 
 // ── Quarantine Retirement Transaction Types [PROPOSED — M5.1] ───────────────
@@ -689,11 +719,16 @@ export interface ITerminalQuarantineArchive {
 
   /**
    * Idempotently commits a staged retirement batch under retirementTransactionId.
+   * Checks committed transaction record first; if matching digest exists, returns
+   * existing receipt immediately without requiring active reservation.
+   * Only if absent, validates reservation, constructs candidate root, and publishes
+   * via single synchronous pointer replacement.
    */
   commitRetirementBatch(
+    retirementTransactionId: string,
+    batchDigest: string,
     reservationId: string,
     stagedBatch: readonly TerminalQuarantineEntry[],
-    retirementTransactionId: string,
   ): TerminalBatchCommitReceipt;
 
   /**
@@ -718,6 +753,7 @@ export interface ITerminalQuarantineArchive {
 
   /**
    * Acknowledges export and clears ONLY the exact entry IDs included in the batch.
+   * Validated against immutable lease record rather than current archive generation.
    */
   acknowledgeArchiveExport(
     exportId: string,
@@ -733,10 +769,25 @@ export interface ITerminalQuarantineArchive {
   ): void;
 }
 
+// ── Quarantine Buffer Atomic Retirement Extension [PROPOSED — M5.1] ────────
+export interface IQuarantineBufferRetirementExtension {
+  /**
+   * Atomically retires a set of committed composite identities under Option A.
+   * All identities must exist in buffer; constructs candidate state privately
+   * and publishes via single atomic reference swap.
+   * Throws RETIREMENT_SOURCE_MISMATCH if any identity is missing (zero buffer mutation).
+   */
+  retireCommittedBatch(
+    identities: readonly CompositeOperationIdentity[],
+    capability: RecoveryInstallationCapability,
+  ): void;
+}
+
 // ── Enforceable Numeric Constants [PROPOSED — M5.1] ─────────────────────────
 export const MAX_TERMINAL_ARCHIVE_ENTRIES = 500;
 export const MAX_TERMINAL_ARCHIVE_TOTAL_BYTES = 2097152; // 2.0 MiB
-export const MAX_TERMINAL_ENTRY_BYTES = 4096;           // 4.0 KiB
+export const MAX_TERMINAL_ENTRY_SERIALIZED_BYTES = 4096; // 4.0 KiB per complete entry (wire bytes)
+export const MAX_TERMINAL_ENTRY_BYTES = 4096;           // Backward-compatible alias
 export const MAX_TERMINAL_ERROR_LENGTH = 512;
 export const MAX_TERMINAL_REASON_LENGTH = 256;
 export const MAX_TERMINAL_PEER_ID_LENGTH = 128;
