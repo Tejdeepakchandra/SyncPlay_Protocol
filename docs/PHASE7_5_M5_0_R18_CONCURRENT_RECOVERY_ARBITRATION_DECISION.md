@@ -1,46 +1,56 @@
-# Phase 7.5 M5.0-R18-R27 — Final Deep-Immutability and Leadership-Fencing Closure
+# Phase 7.5 M5.0-R18-R28 — Final Deep-Immutability and Authoritative Publication Contract Correction
 **Concurrent Recovery Arbitration & Authoritative Settlement Architecture Decision**
 
 **Status:** PROPOSED ARCHITECTURAL AMENDMENT TO FROZEN M5.0 SPECIFICATIONS (DECISION DOCUMENT ONLY)
 **Author:** Principal TypeScript Distributed-Systems Architect and Independent Recovery-Systems Auditor
-**Baseline Commit:** `863a6ec0dd063ebc75214d8a1a45e24facf1ed0f` (M5.0-R18-R26)
-**Direct Parent Commit:** `863a6ec0dd063ebc75214d8a1a45e24facf1ed0f`
-**Authorization Scope:** M5.0-R18-R27 is strictly a documentation-only architectural proposal. No production source code, tests, configuration, package manifests, or frozen M5.0 specifications may be modified. Implementation of Milestone M5.1, including M5.1a, remains **STRICTLY BLOCKED AND UNAUTHORIZED**.
+**Baseline Commit:** `f1a49ab7f4881558593b9b5d181905d8b8338305` (M5.0-R18-R27)
+**Direct Parent Commit:** `f1a49ab7f4881558593b9b5d181905d8b8338305`
+**Authorization Scope:** M5.0-R18-R28 is strictly a documentation-only architectural proposal. No production source code, tests, configuration, package manifests, or frozen M5.0 specifications may be modified. Implementation of Milestone M5.1, including M5.1a, remains **STRICTLY BLOCKED AND UNAUTHORIZED**.
 
 ---
 
-## 1. Problem Statement & R18-R27 Objectives
+## 1. Problem Statement & R18-R28 Objectives
 
-In Phase 7.5 Sub-Milestone M5.0-R18-R26, we encapsulated collection backing storage using ECMAScript `#private` fields and introduced single-writer lease fencing. However, the subsequent independent architectural review identified two remaining concrete correctness blockers and requested targeted adversarial test expansion:
+In Phase 7.5 Sub-Milestone M5.0-R18-R27, we introduced an authoritative boundary fencing model and a restricted custody-value universe. However, the subsequent independent architectural review identified subtle correctness gaps in the cloning contract, callback safety, and store-level linearizability:
 
-1. **Restricted Custody-Value Universe and Deep Cloning Contract (R27-A):**
-   - *Previous Defect:* The R26 `deepCloneAndFreezeValue()` helper did not safely support all object forms it accepted: symbol-keyed properties were copied by reference; custom class prototypes were stripped to plain objects; property accessors (getters/setters) could execute during cloning; non-enumerable properties were silently dropped; arrays with non-index properties were unhandled; cyclic references caused unhandled recursion; `Uint8Array` instances were incorrectly described as frozen; and unsupported binary or temporal types (`Date`, `ArrayBuffer`, `DataView`, non-Uint8Array typed arrays) were not explicitly rejected.
-   - *Architectural Resolution in R27:*
-     - Define a deliberately restricted and enforceable custody-value universe:
-       - **Supported Primitives:** `string`, finite safe `number` (NaN and $\pm\infty$ rejected), `boolean`, `null`, `undefined`.
-       - **Plain Records:** strictly objects whose prototype is `Object.prototype` or `null`. All own properties (strings and symbols) must be enumerable data properties (no accessors).
-       - **Plain Arrays:** strictly `Array.prototype` instances with index-only elements and no custom properties.
-       - **Byte Arrays:** `Uint8Array` cloned to fresh buffers on ingress and egress. Explicitly documented that egress copies are detached, mutable `Uint8Array` buffers whose modification has zero effect on custody storage.
-     - Enforce cycle detection via `WeakSet<object>`, failing closed with `CIRCULAR_REFERENCE_DETECTED`.
-     - Inspect property descriptors via `Object.getOwnPropertyDescriptor()`: reject getters/setters with `ACCESSOR_PROPERTIES_PROHIBITED` without executing them; reject non-enumerable properties with `NON_ENUMERABLE_PROPERTY_PROHIBITED`.
-     - Symbol-keyed properties are recursively cloned and defined as non-writable, non-configurable own data properties.
-     - Fail closed on unsupported types: `Map`, `Set`, `Date`, `RegExp`, `ArrayBuffer`, `SharedArrayBuffer`, `DataView`, non-Uint8Array typed arrays, and functions.
-     - Apply equivalent rigor across `ImmutableMap` and `ImmutableSet`.
+1. **Restricted Custody-Value Universe & Cloning Contract Corrections (R28-A):**
+   - *Previous Defects:*
+     - Functions could potentially bypass rejection if evaluated in certain primitive check branches.
+     - The primitive value universe did not explicitly document the treatment of `undefined`, `bigint`, and `symbol` values.
+     - Cycle detection used a global visited set that falsely rejected acyclic directed graphs (DAGs) containing shared object references.
+     - Objects were not removed from the active recursion path upon completing branch traversal.
+     - Sparse arrays (arrays with missing indices) were not explicitly detected or rejected.
+     - Prototype validation accessed `proto.constructor`, which could execute hostile user-defined getters on adversarial prototypes.
+     - Typed array handling did not explicitly define policies for subclasses, proxies, or `SharedArrayBuffer`-backed views.
+     - Symbol-keyed properties created an unaddressed incompatibility with RFC 8785 JSON Canonicalization Scheme (JCS) snapshot hashing.
+   - *Architectural Resolution in R28:*
+     - Place function rejection (`typeof val === 'function'`) at the absolute top of `deepCloneAndFreezeValue()`, guaranteeing immediate fail-closed rejection.
+     - Restrict the primitive universe strictly to: `string`, finite `number` (safe integers and finite floats), `boolean`, and `null`. Explicitly reject `undefined`, `bigint`, and `symbol` values with documented error codes.
+     - Refactor cycle detection into a two-level mechanism: an active ancestor path stack (`activeStack: Set<object>`) to detect true back-edge cycles, combined with a memoization map (`cloneMap: WeakMap<object, any>`) that preserves reference identity across shared acyclic subgraphs. Objects are removed from `activeStack` in a `finally` block upon branch completion.
+     - Enforce array density: verify that every index $0 \le i < \text{length}$ has an own, enumerable data property descriptor; reject sparse arrays with `SPARSE_ARRAY_PROHIBITED`.
+     - Validate object prototypes strictly by reference (`proto === Object.prototype || proto === null`) without reading `proto.constructor` or invoking any prototype property accessors.
+     - Restrict byte arrays strictly to direct `Uint8Array` instances (`val.constructor === Uint8Array`), rejecting subclasses, proxies, and `SharedArrayBuffer`-backed views. Egress copies are newly allocated detached mutable buffers.
+     - Enforce canonical serialization compatibility: symbol-keyed properties are strictly prohibited in all values subject to canonical snapshot hashing (`SYMBOL_PROPERTIES_PROHIBITED_IN_CANONICAL_VALUES`). Proprietary brands are restricted to internal wrapper brand checks.
 
-2. **Authoritative Boundary Fencing & Linearization Closure (R27-B):**
-   - *Previous Defect:* In R26, local lease validation and local pointer swap were separate sequential operations within the coordinator process. JavaScript run-to-completion prevents microtask interleaving, but does not prevent operating system thread preemption, hypervisor scheduling pauses, or garbage collection stalls from letting monotonic time elapse past lease expiry before the pointer swap. Furthermore, a process-local `#publicationLock` cannot serialize independent coordinator processes.
-   - *Architectural Resolution in R27:*
-     - Specify the **Authoritative Boundary Fencing Model**: authoritative custody state is owned by an Authoritative Custody Store (`IAuthoritativeCustodyStore`) backed by cluster consensus or durable shared storage.
-     - Every candidate root mutation carries a compound fencing token $\langle \mathbf{clusterTerm}, \mathbf{bootGeneration}, \mathbf{bootInstanceId}, \mathbf{publicationSequence} \rangle$.
-     - The authoritative store performs an **Atomic Fenced Compare-and-Swap (CAS)**: if the coordinator's lease has expired, its term has been superseded by election of a newer leader, or another coordinator committed a higher term/sequence, the authoritative store atomically rejects the mutation with `STALE_COORDINATOR_LEADERSHIP_FENCED`.
-     - The local coordinator instance's pointer swap `this.#custodyRoot = candidateRoot` occurs **if and only if** the authoritative store confirms atomic fenced commitment.
-     - Local single-writer fencing enforces that `commitFn` is strictly synchronous: returning a Promise or yielding to the event loop is rejected with `ASYNCHRONOUS_COMMIT_CALLBACK_PROHIBITED`.
-     - Local lease checks incorporate a configurable safety margin $\Delta_{\text{guard}}$ ($\text{monotonicNow} + \Delta_{\text{guard}} < \mathbf{leaseExpiresAtMonotonicMs}$), bounding local execution against thread pause jitter.
-     - Formally define all assumptions regarding monotonic clocks, drift, lease duration, renewal, pause bounds, and the authoritative mutation boundary.
+2. **Complete Authoritative Publication Semantics & Two-Phase Publication (R28-B):**
+   - *Previous Defects:*
+     - Publication pseudocode relied on an unsafe caller-provided `commitFn` callback and attempted to detect Promise returns post-invocation, which cannot cancel asynchronous side effects that have already commenced.
+     - Authoritative store fencing lacked explicit semantics for 4-dimensional fencing tokens $\langle \mathbf{clusterTerm}, \mathbf{bootGeneration}, \mathbf{bootInstanceId}, \mathbf{publicationSequence} \rangle$, outcome classification (committed, rejected, uncertain), lost-response reconciliation, and silent divergence prevention.
+   - *Architectural Resolution in R28:*
+     - Remove arbitrary caller commit callbacks completely. Replace with an explicit internal two-phase publication contract:
+       1. **Phase 1 (Asynchronous Authoritative Persistence):** The coordinator submits candidate root and compound fencing token to `IAuthoritativeCustodyStore.publishFencedRoot()`. The store atomically validates the complete 4-dimensional token against cluster consensus state.
+       2. **Phase 2 (Synchronous Local Pointer Replacement):** Strictly following confirmed authoritative commitment, the coordinator synchronously updates its local cached pointer `this.#custodyRoot = candidateRoot`.
+     - Explicitly define the Authoritative Store Fencing Contract:
+       - **Stale Term Rejection:** Store enforces $\mathbf{fencingToken.clusterTerm} \ge \mathbf{store.highestCommittedTerm}$.
+       - **Instance Identity Validation:** Store verifies $\mathbf{bootGeneration}$ and $\mathbf{bootInstanceId}$ match the active leader for the term.
+       - **Sequence Monotonicity:** Store verifies $\mathbf{publicationSequence} == \mathbf{store.expectedPublicationSequence}$ (strictly monotonic $1, 2, 3, \dots$).
+       - **Outcome Classification:** Classifies outcomes as `COMMITTED`, `FENCED_REJECTED`, or `UNCERTAIN`.
+       - **Ambiguous Response Handling:** On `UNCERTAIN` outcomes, local root replacement is withheld; coordinator enters `RECONCILING_CUSTODY` and queries the authoritative store before taking action.
+     - Clarify that the coordinator-local `#publicationLock` is strictly a process-local mutual exclusion lock and not the distributed fencing authority.
 
-3. **Targeted Adversarial Verification Expansion (R27-C):**
-   - Expand the deterministic failure matrix from 54 to 66 cases (Cases 55–66).
-   - Codify sixty-six deterministic future test specifications (`Test R18-R27-T01` through `Test R18-R27-T66`), providing exact initial states, injected faults, expected outcomes, protected invariants, and custody ownership dispositions.
+3. **Targeted Adversarial Verification Expansion (R28-C):**
+   - Expand the failure matrix from 66 to 74 deterministic cases (Cases 67–74).
+   - Codify seventy-four deterministic future test specifications (`Test R18-R28-T01` through `Test R18-R28-T74`), adding T67–T74 covering shared acyclic references, sparse array rejection, function rejection, prototype constructor getter non-execution, canonical symbol policy, asynchronous publication linearizability, uncertain publication reconciliation, and 4-dimensional token component validation.
 
 ---
 
@@ -208,55 +218,62 @@ To guarantee that resource identifiers are mathematically non-reusable across pr
 - **Boot Generation ($\mathbf{bootGeneration}$):** Monotonically increasing sequence number persisted and fsynced to Write-Ahead Log (WAL) or consensus state before coordinator traffic admission. Guarantees non-reusability across process restarts on the same or migrating node.
 - **Boot Instance ID ($\mathbf{bootInstanceId}$):** Cryptographically secure, collision-resistant UUIDv4 uniquely identifying the in-memory process execution lifetime.
 
-#### The Dual-Tier Fencing Architecture:
-Distributed recovery cannot rely on local in-memory checks alone to fence out stale leaders. The architecture enforces two complementary fencing tiers:
+#### The Authoritative Store as the Distributed Fencing Boundary:
+In distributed recovery, a process-local check or in-memory lock cannot serve as the distributed fencing authority. The architecture defines the Authoritative Custody Store (`IAuthoritativeCustodyStore`) as the final fencing boundary:
 
-1. **Tier 1: Authoritative Boundary Fencing (Authoritative Shared State):**
-   - The authoritative custody state is governed by an Authoritative Custody Store (`IAuthoritativeCustodyStore`) backed by cluster consensus (e.g. Raft state machine) or durable shared storage.
-   - Every candidate root mutation carries a compound fencing token:
-     $$\mathbf{fencingToken} = \langle \mathbf{clusterTerm},\; \mathbf{bootGeneration},\; \mathbf{bootInstanceId},\; \mathbf{publicationSequence} \rangle$$
-   - The authoritative store enforces **Atomic Fenced Compare-and-Swap (CAS)**:
-     $$\mathbf{store.publishFencedRoot}(\mathbf{fencingToken},\; \mathbf{candidateRoot})$$
-   - If the coordinator's term has been superseded ($\mathbf{clusterTerm} < \mathbf{store.highestCommittedTerm}$), its lease in consensus has expired, or another leader committed a publication, the authoritative store atomically rejects the mutation with `STALE_COORDINATOR_LEADERSHIP_FENCED`.
-   - Even if a coordinator process experiences an uncoordinated operating system suspension, hypervisor pause, or garbage collection stall of arbitrary duration and resumes after its lease has expired, its write is rejected at the authoritative boundary.
-   - The local coordinator instance updates its cached pointer `this.#custodyRoot = candidateRoot` **if and only if** the authoritative store confirms atomic fenced commitment.
+1. **The 4-Dimensional Fencing Token:**
+   Every publication request submitted by a coordinator carries a complete 4-dimensional fencing token:
+   $$\mathbf{fencingToken} = \langle \mathbf{clusterTerm},\; \mathbf{bootGeneration},\; \mathbf{bootInstanceId},\; \mathbf{publicationSequence} \rangle$$
 
-2. **Tier 2: Coordinator-Local In-Memory Fencing & Single-Writer Execution:**
-   - **Process-Local Mutual Exclusion:** All publications on a coordinator instance execute inside `LeadershipEpochFence.executeFencedPublication()`, which acquires a non-reentrant single-writer execution lock (`#publicationLock`). Concurrent calls within the same process fail immediately with `CONCURRENT_PUBLICATION_LOCK_ACQUISITION_VIOLATION`.
-   - **Strictly Synchronous Commit Function:** `commitFn` must be strictly synchronous. Any callback returning a Promise or yielding to the event loop is rejected with `ASYNCHRONOUS_COMMIT_CALLBACK_PROHIBITED`.
-   - **Immutable Candidate Root:** The candidate root is fully constructed and frozen before validation. Callbacks receive an immutable reference and cannot mutate the candidate root after validation.
-   - **Guard Margin ($\Delta_{\text{guard}}$):** Local lease assertion checks:
-     $$\text{monotonicNow} + \Delta_{\text{guard}} < \mathbf{leaseExpiresAtMonotonicMs}$$
-     where $\Delta_{\text{guard}}$ (default 1,000ms) accounts for bounded local event-loop scheduling latency.
+2. **Authoritative Atomic Validation Rules:**
+   The authoritative store atomically evaluates the fencing token against cluster consensus state before committing candidate records:
+   - **Stale Term Rejection:** The store checks $\mathbf{fencingToken.clusterTerm} \ge \mathbf{store.highestCommittedTerm}$. If the token's term is strictly lower, the mutation is rejected with `STALE_COORDINATOR_LEADERSHIP_FENCED`.
+   - **Boot Identity Validation:**
+     - If $\mathbf{fencingToken.clusterTerm} == \mathbf{store.highestCommittedTerm}$, the store verifies that $\mathbf{bootGeneration} == \mathbf{store.activeBootGeneration}$ and $\mathbf{bootInstanceId} == \mathbf{store.activeBootInstanceId}$. Any discrepancy indicates a superseded or partitioned coordinator instance and is rejected with `SUPERSEDED_COORDINATOR_INSTANCE_FENCED`.
+     - If $\mathbf{fencingToken.clusterTerm} > \mathbf{store.highestCommittedTerm}$, the store registers the newly elected leader epoch: it updates `highestCommittedTerm = token.clusterTerm`, `activeBootGeneration = token.bootGeneration`, `activeBootInstanceId = token.bootInstanceId`, and initializes `expectedPublicationSequence = 1`.
+   - **Publication Sequence Monotonicity:** Within an established term and instance, the store verifies that $\mathbf{fencingToken.publicationSequence} == \mathbf{store.expectedPublicationSequence}$ (strictly contiguous increment $1, 2, 3, \dots$). Sequence gaps, duplicates, or out-of-order writes are rejected with `OUT_OF_ORDER_PUBLICATION_SEQUENCE`. Upon successful commit, `store.expectedPublicationSequence` is incremented.
 
-#### Formal System Assumptions for Split-Brain Exclusion:
-Split-brain publication exclusion is guaranteed under the following explicit distributed systems model:
-1. **Monotonic Clocks:** Local lease tracking uses `performance.now()`, which is monotonic, non-decreasing, and unaffected by NTP wall-clock steps or leap seconds.
-2. **Bounded Clock Drift Rate:** Maximum clock drift between cluster nodes is bounded by $\rho \le 10^{-4}$ (standard quartz oscillator drift $< 100\,\mu\text{s/s}$).
-3. **Consensus Lease Non-Overlap Invariant:** The cluster consensus quorum strictly enforces that no candidate for Term $T+1$ can be elected or receive a leadership lease until:
+3. **Outcome Classification:**
+   The authoritative store classifies publication outcomes into three mutually exclusive categories:
+   - `COMMITTED`: The fencing token was validated, and the candidate root was durably committed to consensus quorum storage.
+   - `FENCED_REJECTED`: The fencing token was invalid, stale, superseded, or out of sequence. The candidate root is discarded, and the write is permanently rejected.
+   - `UNCERTAIN`: The commit outcome is ambiguous due to network timeouts, transport partition, or cluster consensus unavailability before acknowledgement is received.
+
+4. **Ambiguous Outcome (`UNCERTAIN`) & Reconciliation Handling:**
+   - **Withholding Local Pointer Replacement:** The coordinator strictly **withholds** local cached pointer replacement (`this.#custodyRoot = candidateRoot`) until a confirmed `COMMITTED` outcome is received. Replacing the local pointer before confirmed store commitment would expose uncommitted state to local queries, violating linearizability.
+   - **Reconciliation Procedure:** Upon receiving an `UNCERTAIN` result or transport timeout:
+     - The coordinator immediately latches its gate into `RECONCILING_CUSTODY`.
+     - The coordinator executes a reconciliation query against the authoritative store (`store.getAuthoritativeRoot()`).
+     - If the store confirms that sequence $S$ was committed, the coordinator safely advances its local `#custodyRoot`.
+     - If the store confirms that sequence $S$ was not committed and the coordinator's leadership lease remains valid with guard margin, the coordinator may retry publication with the identical token.
+     - If the store reports that a newer term or coordinator instance was committed, the local coordinator transitions to `CUSTODY_RECONCILIATION_BLOCKED`, marks in-flight custody as degraded, and leaves the settlement barrier unresolved.
+
+5. **Role of Process-Local Fencing:**
+   The coordinator-local `#publicationLock` is strictly a process-local mutual exclusion lock designed to serialize concurrent event-loop callbacks within a single Node.js realm. It is **not** the distributed fencing authority. Distributed safety is established solely by the Authoritative Custody Store CAS boundary.
+
+#### Explicit Distributed Systems Model Assumptions:
+The guarantees established by this architecture hold under the following explicitly qualified assumptions:
+1. **Monotonic Clocks:** Local lease tracking uses `performance.now()`, which is strictly non-decreasing and immune to NTP step adjustments or leap seconds.
+2. **Bounded Clock Drift Rate:** Maximum clock drift rate between cluster nodes is bounded by $\rho \le 10^{-4}$ (standard quartz oscillator drift $< 100\,\mu\text{s/s}$).
+3. **Consensus Lease Non-Overlap Invariant:** The consensus cluster quorum guarantees that no candidate for Term $T+1$ can be granted a leadership lease until:
    $$t \ge t_{\text{term } T\text{ lease granted}} + \tau_{\text{lease}} + \epsilon_{\text{drift}}$$
    where $\tau_{\text{lease}}$ is the consensus lease duration (default 5,000ms) and $\epsilon_{\text{drift}}$ is the maximum drift allowance.
-4. **Authoritative Boundary Enforcement:** Any state mutation that commits custody transition must be acknowledged by a quorum of consensus nodes validating $\mathbf{fencingToken.clusterTerm} \ge \mathbf{quorum.currentTerm}$. Stale terms are rejected.
-5. **Failure Disposition:** When fencing fails at either tier:
-   - The candidate root is discarded.
-   - `this.#custodyRoot` remains strictly untouched.
-   - In-flight custody is retained locally as degraded.
-   - The settlement barrier is left unresolved.
-   - The coordinator transitions to `CUSTODY_RECONCILIATION_BLOCKED`.
+4. **Local Guard Margin:** The coordinator checks that $\text{monotonicNow} + \Delta_{\text{guard}} < \mathbf{leaseExpiresAtMonotonicMs}$, where $\Delta_{\text{guard}} = 1,000\,\text{ms}$, protecting against local execution jitter.
+5. **Process Suspension Handling:** If a coordinator process is suspended (e.g. OS thread descheduling, VM migration, or GC pause) for longer than its remaining lease, any write attempt after resuming will be rejected either locally via elapsed monotonic time or by the Authoritative Custody Store CAS.
 
 #### Adversarial Interleaving Scenario: Partitioned Stale Leader Race
 
-The following concrete timeline illustrates how the dual-tier fencing model prevents a stale partitioned coordinator from committing a publication after a newer term becomes authoritative:
+The following concrete timeline illustrates how the authoritative store boundary prevents a stale partitioned coordinator from committing a publication after a newer term becomes authoritative:
 
 | Time | Coordinator A (Term 1 Leader) | Cluster Consensus Quorum | Coordinator B (Term 2 Candidate) | Authoritative Custody Store | System Safety State |
 |---|---|---|---|---|---|
-| $t_0$ | Holds active lease for Term 1 until $t_0 + 5000\text{ms}$. | Quorum recognizes Coord A as leader for Term 1. | Follower in Term 1. | Highest committed term = 1. | Normal operation under Term 1. |
-| $t_1$ | Network partition isolates Coord A. Dequeues op $g=2$; constructs `candidateRoot`. | Heartbeats from Coord A lost. | Awaiting election timeout. | Highest committed term = 1. | Partition active; Coord A preparing root. |
-| $t_2$ | Enters OS process suspension / GC pause (duration 6,500ms). | Election timeout expires ($t_2 = t_0 + 5100\text{ms}$). Lease for Term 1 has definitively elapsed ($> 5000\text{ms}$). | Initiates election for Term 2. | Highest committed term = 1. | **Lease Non-Overlap Invariant holds:** Coord A lease expired before Term 2 granted. |
-| $t_3$ | Still suspended. | Quorum elects Coord B leader for Term 2; grants lease valid $t_3 \to t_3 + 5000\text{ms}$. | Elected leader for Term 2. | Highest committed term updated to 2. | Coord B is sole valid cluster leader. |
-| $t_4$ | Suspension ends at $t_4 = t_0 + 6500\text{ms}$. Resumes execution and invokes `executeFencedPublication(expectedTerm: 1)`. | Active in Term 2 under Coord B. | Processing admissions in Term 2. | Highest committed term = 2. | Coord A attempts to publish stale candidate. |
-| $t_5$ | **Tier 1 / Local Check:** `monotonicNow` ($t_4$) exceeds `#leaseExpiresAtMonotonicMs` ($t_0 + 5000\text{ms}$). Throws `STALE_COORDINATOR_LEADERSHIP_FENCED`. | Active in Term 2. | Active in Term 2. | Highest committed term = 2. | **Local Fencing:** Candidate discarded; `#custodyRoot` untouched. |
-| $t_{5\text{alt}}$ | *(Alternative: local clock stalled)* Coord A bypasses local check and submits CAS to Authoritative Store. | Quorum in Term 2. | Active in Term 2. | **Authoritative Store CAS:** Rejects token Term 1 < Current Term 2 with `STALE_COORDINATOR_LEADERSHIP_FENCED`. | **Authoritative Fencing:** Write rejected; store untouched; split-brain impossible. |
+| $t_0$ | Holds active lease for Term 1 until $t_0 + 5000\text{ms}$. | Quorum recognizes Coord A as leader for Term 1. | Follower in Term 1. | Highest committed term = 1; expected seq = 2. | Normal operation under Term 1. |
+| $t_1$ | Network partition isolates Coord A. Dequeues op $g=2$; constructs `candidateRoot`. | Heartbeats from Coord A lost. | Awaiting election timeout. | Highest committed term = 1; expected seq = 2. | Partition active; Coord A preparing root. |
+| $t_2$ | Enters OS process suspension / GC pause (duration 6,500ms). | Election timeout expires ($t_2 = t_0 + 5100\text{ms}$). Lease for Term 1 has definitively elapsed ($> 5000\text{ms}$). | Initiates election for Term 2. | Highest committed term = 1; expected seq = 2. | **Lease Non-Overlap Invariant holds:** Coord A lease expired before Term 2 granted. |
+| $t_3$ | Still suspended. | Quorum elects Coord B leader for Term 2; grants lease valid $t_3 \to t_3 + 5000\text{ms}$. | Elected leader for Term 2. | Quorum establishes Term 2; highest committed term = 2; expected seq = 1. | Coord B is sole valid cluster leader. |
+| $t_4$ | Suspension ends at $t_4 = t_0 + 6500\text{ms}$. Resumes execution and invokes `executeFencedPublication()`. | Active in Term 2 under Coord B. | Processing admissions in Term 2. | Highest committed term = 2; expected seq = 1. | Coord A attempts to publish stale candidate. |
+| $t_5$ | **Local Guard Check:** `monotonicNow` ($t_4$) exceeds `#leaseExpiresAtMonotonicMs` ($t_0 + 5000\text{ms}$). Throws `STALE_COORDINATOR_LEADERSHIP_FENCED`. | Active in Term 2. | Active in Term 2. | Highest committed term = 2; expected seq = 1. | **Local Fencing:** Candidate discarded; `#custodyRoot` untouched. |
+| $t_{5\text{alt}}$ | *(Alternative: local clock stalled)* Coord A submits CAS token $\langle 1, 1, \text{uuid-A}, 2 \rangle$ to Authoritative Store. | Quorum in Term 2. | Active in Term 2. | **Authoritative Store CAS:** Evaluates token Term 1 < Store Term 2. Rejects write with `STALE_COORDINATOR_LEADERSHIP_FENCED`. | **Authoritative Fencing:** Write rejected; store untouched; split-brain impossible. |
 
 ### 8.3 Empty-Cache and Generation-Floor Semantics
 
@@ -459,154 +476,208 @@ A value $v$ is an admissible custody value if and only if it belongs to one of f
    - Finite `number` (`Number.isFinite(v) === true`; `NaN`, `+Infinity`, and `-Infinity` are strictly rejected with `INVALID_NUMERIC_VALUE`)
    - `boolean`
    - `null`
-   - `undefined`
+   - *Explicit Primitive Exclusions:*
+     - `undefined`: prohibited as values in custody records (`UNSUPPORTED_PRIMITIVE_TYPE: undefined values prohibited; use explicit null or omit property`).
+     - `bigint`: prohibited as values in custody records (`UNSUPPORTED_PRIMITIVE_TYPE: bigint values prohibited; use safe integer numbers or canonical strings`).
+     - `symbol` values: prohibited as values in custody records (`UNSUPPORTED_PRIMITIVE_TYPE: symbol values prohibited in custody records`).
 2. **Byte Arrays (`Uint8Array`):**
-   - Strictly `instanceof Uint8Array`.
-   - On ingress and copy-on-write, the underlying buffer is cloned to a newly allocated `Uint8Array`.
+   - Strictly `instanceof Uint8Array` with direct constructor equality (`v.constructor === Uint8Array`). Subclasses and proxies are rejected with `UNSUPPORTED_BINARY_VALUE_TYPE`.
+   - Buffers backed by `SharedArrayBuffer` are rejected with `UNSUPPORTED_BINARY_VALUE_TYPE`.
+   - On ingress and copy-on-write, the underlying buffer slice is copied into a newly allocated `Uint8Array`.
    - On egress (`.get()`, `.values()`, `.entries()`, iterators), a detached, newly allocated mutable `Uint8Array` copy is returned.
    - *Architectural Distinction:* The returned byte array is a detached mutable copy. Callers may modify its bytes without mutating or affecting the internal authoritative custody root backing store.
-3. **Plain Arrays:**
+3. **Plain Dense Arrays:**
    - Strictly `Object.getPrototypeOf(v) === Array.prototype`.
    - Array length must be a non-negative safe integer.
-   - All own property keys of the array must be valid index strings (`0`, `1`, ..., `length - 1`) or `'length'`. Any non-index property (string or symbol) is rejected with `UNSUPPORTED_ARRAY_PROPERTY`.
+   - Array density is strictly enforced: every index $0 \le i < \text{length}$ must have an own data-property descriptor (`Object.prototype.hasOwnProperty.call(v, String(i)) === true`). Sparse arrays with missing indices or holes (e.g. `[1, , 3]` or `new Array(5)`) are rejected with `SPARSE_ARRAY_PROHIBITED`.
+   - All own property keys of the array must strictly be valid index strings (`0`, `1`, ..., `length - 1`) or `'length'`. Any non-index property (string or symbol) is rejected with `UNSUPPORTED_ARRAY_PROPERTY`.
    - Every element must recursively belong to the restricted custody-value universe.
    - The array is frozen with `Object.freeze()`.
 4. **Plain Structural Records:**
-   - Strictly `Object.getPrototypeOf(v) === Object.prototype` or `Object.getPrototypeOf(v) === null`. Custom prototypes or class instances (e.g. `EventEmitter`, `Error`, custom domain classes) are rejected with `UNSUPPORTED_PROTOTYPE_INSTANCE`.
+   - Strictly `Object.getPrototypeOf(v) === Object.prototype` or `Object.getPrototypeOf(v) === null`. Custom prototypes or class instances are rejected with `UNSUPPORTED_PROTOTYPE_INSTANCE` by reference comparison, without reading `proto.constructor` or invoking any prototype property accessors.
    - Property descriptors are inspected via `Object.getOwnPropertyDescriptor()`:
      - Accessors (`descriptor.get !== undefined || descriptor.set !== undefined`) are rejected with `ACCESSOR_PROPERTIES_PROHIBITED` without executing getter functions.
      - Non-enumerable properties are rejected with `NON_ENUMERABLE_PROPERTY_PROHIBITED`.
-   - Symbol-keyed properties are inspected, their values are recursively cloned and frozen, and they are defined on the copy as non-writable, non-configurable own data properties.
+   - Canonical Serialization Compatibility (RFC 8785): Symbol-keyed properties are strictly prohibited in all data values subject to canonical snapshot hashing (`SYMBOL_PROPERTIES_PROHIBITED_IN_CANONICAL_VALUES`).
    - All property values must recursively belong to the restricted custody-value universe.
    - The resulting record is frozen with `Object.freeze()`.
 
 #### 2. Strictly Prohibited Types (Fail-Closed Rejections):
 Any value containing the following types triggers an immediate synchronous throw:
+- Functions, generator functions, async functions $\to$ `UNSUPPORTED_FUNCTION_VALUE_TYPE`
 - Native `Map` or `Set` $\to$ `UNSUPPORTED_MUTABLE_COLLECTION_VALUE`
 - `Date` $\to$ `UNSUPPORTED_TEMPORAL_VALUE_TYPE` (monotonic timestamp numbers required)
 - `RegExp` $\to$ `UNSUPPORTED_REGEXP_VALUE_TYPE`
 - `ArrayBuffer`, `SharedArrayBuffer`, `DataView`, or non-Uint8Array typed arrays (`Int8Array`, `Uint16Array`, `Float32Array`, etc.) $\to$ `UNSUPPORTED_BINARY_VALUE_TYPE`
-- Functions, generator functions, async functions $\to$ `UNSUPPORTED_FUNCTION_VALUE_TYPE`
-- Cyclic object graphs $\to$ `CIRCULAR_REFERENCE_DETECTED` (detected via `WeakSet<object>`)
+- True cyclic object graphs $\to$ `CIRCULAR_REFERENCE_DETECTED` (detected via active ancestor path tracking)
 
 ```typescript
 /**
  * Recursively validates, clones, and freezes all nested structural records and byte arrays
  * within the Restricted Custody-Value Universe.
  *
- * Enforces cycle detection, accessor prohibition, prototype verification,
- * array index purity, and symbol-value cloning.
+ * Enforces cycle detection without rejecting acyclic shared DAG references,
+ * accessor prohibition without getter invocation, prototype verification without
+ * constructor reading, array density, and canonical serialization compliance.
  */
-export function deepCloneAndFreezeValue<T>(val: T, seen: WeakSet<object> = new WeakSet()): T {
-  // 1. Primitive handling
+export function deepCloneAndFreezeValue<T>(
+  val: T,
+  activeStack: Set<object> = new Set(),
+  cloneMap: WeakMap<object, any> = new WeakMap()
+): T {
+  // 1. Function rejection at the absolute entry boundary
+  if (typeof val === 'function') {
+    throw new Error('UNSUPPORTED_FUNCTION_VALUE_TYPE: functions cannot be stored in custody records');
+  }
+
+  // 2. Primitive handling & explicit primitive universe validation
   if (val === null || typeof val !== 'object') {
+    if (val === undefined) {
+      throw new Error('UNSUPPORTED_PRIMITIVE_TYPE: undefined values prohibited in custody records; use explicit null or omit property');
+    }
+    if (typeof val === 'bigint') {
+      throw new Error('UNSUPPORTED_PRIMITIVE_TYPE: bigint values prohibited in custody records; use safe integer numbers or canonical strings');
+    }
+    if (typeof val === 'symbol') {
+      throw new Error('UNSUPPORTED_PRIMITIVE_TYPE: symbol values prohibited in custody records');
+    }
     if (typeof val === 'number' && !Number.isFinite(val)) {
       throw new Error(`INVALID_NUMERIC_VALUE: non-finite number '${String(val)}' prohibited in custody records`);
-    }
-    if (typeof val === 'function') {
-      throw new Error('UNSUPPORTED_FUNCTION_VALUE_TYPE: functions cannot be stored in custody records');
     }
     return val;
   }
 
-  // 2. Cycle detection
-  if (seen.has(val as object)) {
+  const objVal = val as object;
+
+  // 3. Cycle Detection vs. Acyclic Shared Reference Handling
+  // If present in activeStack, this is a true back-edge cycle
+  if (activeStack.has(objVal)) {
     throw new Error('CIRCULAR_REFERENCE_DETECTED: circular object graph cannot be cloned into custody storage');
   }
-  seen.add(val as object);
 
-  // 3. Byte Array Handling (Uint8Array)
-  if (val instanceof Uint8Array) {
-    const copy = new Uint8Array(val.length);
-    copy.set(val);
-    return copy as unknown as T;
+  // If already cloned along a disjoint path in a DAG, return the memoized clone
+  if (cloneMap.has(objVal)) {
+    return cloneMap.get(objVal) as T;
   }
 
-  // 4. Fail-closed rejection of prohibited binary and temporal types
-  if (
-    val instanceof ArrayBuffer ||
-    (typeof SharedArrayBuffer !== 'undefined' && val instanceof SharedArrayBuffer) ||
-    (ArrayBuffer.isView(val) && !(val instanceof Uint8Array))
-  ) {
-    throw new Error('UNSUPPORTED_BINARY_VALUE_TYPE: only Uint8Array is supported for binary custody data');
-  }
-
-  if (val instanceof Date) {
-    throw new Error('UNSUPPORTED_TEMPORAL_VALUE_TYPE: Date objects prohibited; use monotonic timestamp numbers');
-  }
-
-  if (val instanceof RegExp) {
-    throw new Error('UNSUPPORTED_REGEXP_VALUE_TYPE: RegExp objects prohibited in custody records');
-  }
-
-  if (val instanceof Map || val instanceof Set) {
-    throw new Error('UNSUPPORTED_MUTABLE_COLLECTION_VALUE: native Map/Set cannot be nested inside immutable collections');
-  }
-
-  // 5. Plain Array Handling
-  if (Array.isArray(val)) {
-    if (Object.getPrototypeOf(val) !== Array.prototype) {
-      throw new Error('UNSUPPORTED_PROTOTYPE_INSTANCE: array with custom prototype prohibited');
+  activeStack.add(objVal);
+  try {
+    // 4. Byte Array Handling (Uint8Array)
+    if (ArrayBuffer.isView(objVal) && !(objVal instanceof Uint8Array)) {
+      throw new Error('UNSUPPORTED_BINARY_VALUE_TYPE: only Uint8Array is supported for binary custody data');
+    }
+    if (objVal instanceof Uint8Array) {
+      if (objVal.constructor !== Uint8Array) {
+        throw new Error('UNSUPPORTED_BINARY_VALUE_TYPE: Uint8Array subclasses are prohibited');
+      }
+      if (typeof SharedArrayBuffer !== 'undefined' && objVal.buffer instanceof SharedArrayBuffer) {
+        throw new Error('UNSUPPORTED_BINARY_VALUE_TYPE: SharedArrayBuffer-backed Uint8Array is prohibited');
+      }
+      const copy = new Uint8Array(objVal.byteLength);
+      copy.set(new Uint8Array(objVal.buffer, objVal.byteOffset, objVal.byteLength));
+      cloneMap.set(objVal, copy);
+      return copy as unknown as T;
     }
 
-    // Verify index purity: no non-index properties or symbol properties
-    for (const key of Reflect.ownKeys(val)) {
-      if (key === 'length') continue;
-      if (typeof key === 'symbol' || !/^\d+$/.test(key) || Number(key) >= val.length) {
-        throw new Error(`UNSUPPORTED_ARRAY_PROPERTY: array contains non-index property '${String(key)}'`);
+    // 5. Fail-closed rejection of prohibited binary, temporal, and collection types
+    if (
+      objVal instanceof ArrayBuffer ||
+      (typeof SharedArrayBuffer !== 'undefined' && objVal instanceof SharedArrayBuffer)
+    ) {
+      throw new Error('UNSUPPORTED_BINARY_VALUE_TYPE: ArrayBuffer cannot be stored directly; use Uint8Array');
+    }
+    if (objVal instanceof Date) {
+      throw new Error('UNSUPPORTED_TEMPORAL_VALUE_TYPE: Date objects prohibited; use monotonic timestamp numbers');
+    }
+    if (objVal instanceof RegExp) {
+      throw new Error('UNSUPPORTED_REGEXP_VALUE_TYPE: RegExp objects prohibited in custody records');
+    }
+    if (objVal instanceof Map || objVal instanceof Set) {
+      throw new Error('UNSUPPORTED_MUTABLE_COLLECTION_VALUE: native Map/Set cannot be nested inside immutable collections');
+    }
+
+    // 6. Plain Dense Array Handling
+    if (Array.isArray(objVal)) {
+      if (Object.getPrototypeOf(objVal) !== Array.prototype) {
+        throw new Error('UNSUPPORTED_PROTOTYPE_INSTANCE: array with custom prototype prohibited');
       }
-      const desc = Object.getOwnPropertyDescriptor(val, key)!;
+
+      const len = objVal.length;
+      // Enforce array density: verify every index has an own property
+      for (let i = 0; i < len; i++) {
+        const key = String(i);
+        if (!Object.prototype.hasOwnProperty.call(objVal, key)) {
+          throw new Error(`SPARSE_ARRAY_PROHIBITED: sparse arrays with missing index '${key}' are prohibited in custody records`);
+        }
+        const desc = Object.getOwnPropertyDescriptor(objVal, key)!;
+        if (desc.get !== undefined || desc.set !== undefined) {
+          throw new Error(`ACCESSOR_PROPERTIES_PROHIBITED: array index '${key}' has accessor descriptor`);
+        }
+        if (!desc.enumerable) {
+          throw new Error(`NON_ENUMERABLE_PROPERTY_PROHIBITED: array index '${key}' must be enumerable`);
+        }
+      }
+
+      // Verify no non-index properties or symbol properties exist
+      for (const key of Reflect.ownKeys(objVal)) {
+        if (key === 'length') continue;
+        if (typeof key === 'symbol' || !/^\d+$/.test(key) || Number(key) >= len) {
+          throw new Error(`UNSUPPORTED_ARRAY_PROPERTY: array contains non-index property '${String(key)}'`);
+        }
+      }
+
+      const copy = new Array(len);
+      cloneMap.set(objVal, copy);
+      for (let i = 0; i < len; i++) {
+        copy[i] = deepCloneAndFreezeValue(objVal[i], activeStack, cloneMap);
+      }
+      return Object.freeze(copy) as unknown as T;
+    }
+
+    // 7. Plain Record Handling
+    const proto = Object.getPrototypeOf(objVal);
+    if (proto !== Object.prototype && proto !== null) {
+      throw new Error('UNSUPPORTED_PROTOTYPE_INSTANCE: objects with custom prototypes are prohibited in custody values');
+    }
+
+    const copy: Record<string, unknown> = proto === null ? Object.create(null) : {};
+    cloneMap.set(objVal, copy);
+
+    // Inspect own properties
+    for (const key of Reflect.ownKeys(objVal)) {
+      // Enforce RFC 8785 Canonical Serialization Compatibility: reject arbitrary symbol keys
+      if (typeof key === 'symbol') {
+        throw new Error('SYMBOL_PROPERTIES_PROHIBITED_IN_CANONICAL_VALUES: symbol-keyed properties are prohibited in RFC 8785 canonical serialization');
+      }
+
+      const desc = Object.getOwnPropertyDescriptor(objVal, key);
+      if (!desc) continue;
+
+      // Reject accessors without invoking getters
       if (desc.get !== undefined || desc.set !== undefined) {
-        throw new Error(`ACCESSOR_PROPERTIES_PROHIBITED: array index '${String(key)}' has accessor descriptor`);
+        throw new Error(`ACCESSOR_PROPERTIES_PROHIBITED: property '${String(key)}' has getter/setter accessors which are forbidden in custody records`);
       }
+
+      // Reject non-enumerable properties
       if (!desc.enumerable) {
-        throw new Error(`NON_ENUMERABLE_PROPERTY_PROHIBITED: array index '${String(key)}' must be enumerable`);
+        throw new Error(`NON_ENUMERABLE_PROPERTY_PROHIBITED: property '${String(key)}' is non-enumerable; all custody record properties must be standard enumerable data properties`);
       }
+
+      const clonedValue = deepCloneAndFreezeValue(desc.value, activeStack, cloneMap);
+
+      Object.defineProperty(copy, key, {
+        value: clonedValue,
+        enumerable: true,
+        writable: false,
+        configurable: false,
+      });
     }
 
-    const copy = new Array(val.length);
-    for (let i = 0; i < val.length; i++) {
-      copy[i] = deepCloneAndFreezeValue(val[i], seen);
-    }
-    return Object.freeze(copy) as unknown as T;
+    return Object.freeze(copy) as T;
+  } finally {
+    // Remove object from active recursion stack upon branch completion
+    activeStack.delete(objVal);
   }
-
-  // 6. Plain Record Handling
-  const proto = Object.getPrototypeOf(val);
-  if (proto !== Object.prototype && proto !== null) {
-    const typeName = proto?.constructor?.name ?? 'custom';
-    throw new Error(`UNSUPPORTED_PROTOTYPE_INSTANCE: objects with custom prototypes of type '${typeName}' are prohibited in custody values`);
-  }
-
-  const copy: Record<string | symbol, unknown> = proto === null ? Object.create(null) : {};
-
-  // Inspect all own string and symbol keys
-  for (const key of Reflect.ownKeys(val)) {
-    const desc = Object.getOwnPropertyDescriptor(val, key);
-    if (!desc) continue;
-
-    // Reject accessors without invoking getters
-    if (desc.get !== undefined || desc.set !== undefined) {
-      throw new Error(`ACCESSOR_PROPERTIES_PROHIBITED: property '${String(key)}' has getter/setter accessors which are forbidden in custody records`);
-    }
-
-    // Reject non-enumerable properties
-    if (!desc.enumerable) {
-      throw new Error(`NON_ENUMERABLE_PROPERTY_PROHIBITED: property '${String(key)}' is non-enumerable; all custody record properties must be standard enumerable data properties`);
-    }
-
-    // Recursively clone and freeze property value
-    const clonedValue = deepCloneAndFreezeValue(desc.value, seen);
-
-    Object.defineProperty(copy, key, {
-      value: clonedValue,
-      enumerable: true,
-      writable: false,
-      configurable: false,
-    });
-  }
-
-  return Object.freeze(copy) as T;
 }
 
 export class ImmutableMap<K extends string | number, V> implements Iterable<[K, V]> {
@@ -825,13 +896,32 @@ export interface CustodyFencingToken {
   readonly publicationSequence: number;
 }
 
+export type AuthoritativePublicationOutcome =
+  | { readonly status: 'COMMITTED'; readonly committedSequence: number }
+  | { readonly status: 'FENCED_REJECTED'; readonly reason: string }
+  | { readonly status: 'UNCERTAIN'; readonly reason: string };
+
 export interface IAuthoritativeCustodyStore {
   /**
-   * Atomically evaluates the fencing token against the authoritative consensus state
-   * and persists candidateRoot. If term is stale, lease is expired, or a higher term
-   * committed, throws STALE_COORDINATOR_LEADERSHIP_FENCED.
+   * Atomically evaluates the complete 4-dimensional fencing token against consensus state
+   * and persists candidateRoot.
    */
-  publishFencedRoot(fencingToken: CustodyFencingToken, candidateRoot: AuthoritativeCustodyRoot): void;
+  publishFencedRoot(
+    fencingToken: CustodyFencingToken,
+    candidateRoot: AuthoritativeCustodyRoot
+  ): Promise<AuthoritativePublicationOutcome>;
+
+  /**
+   * Retrieves the authoritative cluster custody root and metadata for reconciliation.
+   */
+  getAuthoritativeRoot(): Promise<{
+    readonly root: AuthoritativeCustodyRoot;
+    readonly highestCommittedTerm: number;
+    readonly activeBootGeneration: number;
+    readonly activeBootInstanceId: string;
+    readonly lastCommittedSequence: number;
+  }>;
+
   getHighestCommittedTerm(): number;
 }
 
@@ -866,17 +956,14 @@ export class LeadershipEpochFence {
   #leaseExpiresAtMonotonicMs: number;
   #guardMarginMs: number;
   #isSteppedDown: boolean = false;
-  #authoritativeStore: IAuthoritativeCustodyStore;
 
   public constructor(
     initialTerm: number,
     initialLeaseDurationMs: number,
-    authoritativeStore: IAuthoritativeCustodyStore,
     guardMarginMs: number = 1000
   ) {
     this.#currentTerm = initialTerm;
     this.#leaseExpiresAtMonotonicMs = performance.now() + initialLeaseDurationMs;
-    this.#authoritativeStore = authoritativeStore;
     this.#guardMarginMs = guardMarginMs;
   }
 
@@ -910,54 +997,29 @@ export class LeadershipEpochFence {
     return this.#leaseExpiresAtMonotonicMs;
   }
 
-  /**
-   * Serialized Single-Writer Lease-Guarded Fencing Execution (R27-B).
-   *
-   * Coordinates local candidate-root validation, local lease non-expiry check with guard margin,
-   * atomic fenced CAS at the Authoritative Custody Store, and strictly synchronous
-   * local pointer replacement under a non-reentrant single-writer execution lock.
-   */
-  public executeFencedPublication<T>(
-    fencingToken: CustodyFencingToken,
-    candidateRoot: AuthoritativeCustodyRoot,
-    commitFn: (root: AuthoritativeCustodyRoot) => T
-  ): T {
+  public acquirePublicationLock(): void {
     if (this.#publicationLock) {
       throw new Error('CONCURRENT_PUBLICATION_LOCK_ACQUISITION_VIOLATION: publication lock is already held');
     }
     this.#publicationLock = true;
-    try {
-      // Step 1: Pre-publication candidate root invariant verification (R25-5 / R27-A)
-      AuthoritativeCustodyCoordinator.validateCandidateRootPrePublicationInvariants(candidateRoot);
+  }
 
-      // Step 2: Linearized Consensus Leadership Fencing Check (Local Pre-Check with Guard Margin)
-      if (this.#isSteppedDown) {
-        throw new Error('STALE_COORDINATOR_LEADERSHIP_FENCED: coordinator has stepped down');
-      }
-      if (this.#currentTerm !== fencingToken.clusterTerm) {
-        throw new Error(`STALE_COORDINATOR_LEADERSHIP_FENCED: term mismatch (expected ${fencingToken.clusterTerm}, current ${this.#currentTerm})`);
-      }
-      const monotonicNow = performance.now();
-      if (monotonicNow + this.#guardMarginMs >= this.#leaseExpiresAtMonotonicMs) {
-        throw new Error(
-          `STALE_COORDINATOR_LEADERSHIP_FENCED: leadership lease expired or within guard margin (now ${monotonicNow}ms + guard ${this.#guardMarginMs}ms >= expiry ${this.#leaseExpiresAtMonotonicMs}ms)`
-        );
-      }
+  public releasePublicationLock(): void {
+    this.#publicationLock = false;
+  }
 
-      // Step 3: Authoritative Boundary Fencing (Tier 1: Atomic CAS at Consensus / Store Boundary)
-      this.#authoritativeStore.publishFencedRoot(fencingToken, candidateRoot);
-
-      // Step 4: Run-to-Completion Local Pointer Update (Strictly Synchronous Commit Function)
-      const result = commitFn(candidateRoot);
-
-      // Prohibit asynchronous callbacks escaping the protected publication boundary
-      if (result !== null && typeof result === 'object' && typeof (result as Promise<unknown>).then === 'function') {
-        throw new Error('ASYNCHRONOUS_COMMIT_CALLBACK_PROHIBITED: commit callback must be strictly synchronous');
-      }
-
-      return result;
-    } finally {
-      this.#publicationLock = false;
+  public assertLocalLeaseValid(expectedTerm: number): void {
+    if (this.#isSteppedDown) {
+      throw new Error('STALE_COORDINATOR_LEADERSHIP_FENCED: coordinator has stepped down');
+    }
+    if (this.#currentTerm !== expectedTerm) {
+      throw new Error(`STALE_COORDINATOR_LEADERSHIP_FENCED: term mismatch (expected ${expectedTerm}, current ${this.#currentTerm})`);
+    }
+    const monotonicNow = performance.now();
+    if (monotonicNow + this.#guardMarginMs >= this.#leaseExpiresAtMonotonicMs) {
+      throw new Error(
+        `STALE_COORDINATOR_LEADERSHIP_FENCED: leadership lease expired or within guard margin (now ${monotonicNow}ms + guard ${this.#guardMarginMs}ms >= expiry ${this.#leaseExpiresAtMonotonicMs}ms)`
+      );
     }
   }
 }
@@ -1129,15 +1191,16 @@ export interface ReleaseRetryLeaseParams {
 }
 ```
 
-#### Authoritative Boundary Fencing (R27-B):
+#### Authoritative Boundary Fencing & Two-Phase Publication (R28-B):
 
-To guarantee that split-brain partitioned coordinators can never commit stale mutations:
-1. Every custody root mutation must validate active consensus lease ownership inside `LeadershipEpochFence.executeFencedPublication()`.
-2. Mutual exclusion is enforced via `#publicationLock`: concurrent attempts to publish fail immediately with `CONCURRENT_PUBLICATION_LOCK_ACQUISITION_VIOLATION`.
-3. If leadership was lost or superseded (e.g. `clusterTerm` advanced by cluster election, lease expired, or within $\Delta_{\text{guard}}$), the local check throws `STALE_COORDINATOR_LEADERSHIP_FENCED`.
-4. Even if an uncoordinated process pause occurs after the local check, the Authoritative Custody Store (`IAuthoritativeCustodyStore`) performs atomic fenced compare-and-swap on `publishFencedRoot(fencingToken, candidateRoot)`, rejecting stale writes.
-5. The candidate root is discarded; `#custodyRoot` is untouched; local in-flight custody is marked degraded; the settlement barrier is left unresolved; callers are redirected to the new leader.
-6. The commit callback `commitFn` is strictly synchronous; returning a Promise or yielding to the event loop is prohibited and rejected with `ASYNCHRONOUS_COMMIT_CALLBACK_PROHIBITED`.
+To guarantee linearizability without exposing uncommitted state or unsafe callbacks:
+1. Every custody root mutation carries a complete 4-dimensional fencing token $\langle \mathbf{clusterTerm}, \mathbf{bootGeneration}, \mathbf{bootInstanceId}, \mathbf{publicationSequence} \rangle$.
+2. Mutual exclusion within the process is enforced via `#publicationLock`.
+3. Publication executes strictly as an internal two-phase sequence without arbitrary caller callbacks:
+   - **Phase 1 (Asynchronous Authoritative Commit):** The coordinator submits candidate root and token to `IAuthoritativeCustodyStore.publishFencedRoot()`. The store validates term, boot generation, instance, and sequence monotonicity against cluster consensus.
+   - **Phase 2 (Synchronous Local Pointer Replacement):** Only when the store returns `{ status: 'COMMITTED' }` does the coordinator synchronously execute `this.#custodyRoot = candidateRoot`.
+4. If the store returns `FENCED_REJECTED`, the candidate root is discarded, `#custodyRoot` is untouched, local custody enters `CUSTODY_RECONCILIATION_BLOCKED`, and the barrier is left unresolved.
+5. If the store returns `UNCERTAIN`, the coordinator withholds local pointer replacement, transitions to `RECONCILING_CUSTODY`, and verifies state via `store.getAuthoritativeRoot()` before proceeding.
 
 #### Cross-Restart Retirement Semantics (R25-3):
 
@@ -1276,6 +1339,43 @@ export class AuthoritativeCustodyCoordinator {
       bootInstanceId: this.#coordinatorBootEpoch.bootInstanceId,
       publicationSequence: ++this.#publicationSequenceCounter,
     });
+  }
+
+  /**
+   * Internal Two-Phase Publication Contract (R28-B).
+   *
+   * Executes candidate invariant verification, local lease assertion, asynchronous
+   * store-level fenced compare-and-swap, and strictly post-commit synchronous local pointer update.
+   */
+  private async _executeTwoPhasePublication(
+    fencingToken: CustodyFencingToken,
+    candidateRoot: AuthoritativeCustodyRoot
+  ): Promise<void> {
+    this.#leadershipFence.acquirePublicationLock();
+    try {
+      // Step 1: Pre-publication candidate root invariant verification (R25-5 / R28-A)
+      AuthoritativeCustodyCoordinator.validateCandidateRootPrePublicationInvariants(candidateRoot);
+
+      // Step 2: Linearized Consensus Leadership Fencing Check (Local Pre-Check with Guard Margin)
+      this.#leadershipFence.assertLocalLeaseValid(fencingToken.clusterTerm);
+
+      // Step 3: Phase 1 - Asynchronous Authoritative Store Persistence (Distributed Fencing Boundary)
+      const outcome = await this.#authoritativeStore.publishFencedRoot(fencingToken, candidateRoot);
+
+      if (outcome.status === 'FENCED_REJECTED') {
+        throw new Error(`STALE_COORDINATOR_LEADERSHIP_FENCED: authoritative store rejected publication: ${outcome.reason}`);
+      }
+
+      if (outcome.status === 'UNCERTAIN') {
+        // Withhold local pointer update; latch into reconciliation
+        throw new Error(`PUBLICATION_OUTCOME_UNCERTAIN: store response ambiguous: ${outcome.reason}`);
+      }
+
+      // Step 4: Phase 2 - Synchronous Local Pointer Replacement (Post-Commit Linearization Point)
+      this.#custodyRoot = candidateRoot;
+    } finally {
+      this.#leadershipFence.releasePublicationLock();
+    }
   }
 
   public static validateCandidateRootPrePublicationInvariants(candidateRoot: AuthoritativeCustodyRoot): void {
@@ -1598,7 +1698,7 @@ export class AuthoritativeCustodyCoordinator {
     return { candidateLeases, leaseId };
   }
 
-  public releaseRetryLease(params: ReleaseRetryLeaseParams): { leaseId: string; status: 'RELEASED' | 'ALREADY_RELEASED' } {
+  public async releaseRetryLease(params: ReleaseRetryLeaseParams): Promise<{ leaseId: string; status: 'RELEASED' | 'ALREADY_RELEASED' }> {
     const { leaseId, consumerId, clientRequestId, callerToken, transactionId, operationIdentity, barrierIdentity } = params;
 
     if (leaseId.startsWith('pin:')) {
@@ -1700,18 +1800,15 @@ export class AuthoritativeCustodyCoordinator {
 
     const token = this._nextFencingToken();
 
-    // Authoritative Boundary Fenced Publication (R27-B)
-    return this.#leadershipFence.executeFencedPublication(
-      token,
-      candidateRoot,
-      (root) => {
-        this.#custodyRoot = root;
-        return { leaseId, status: 'RELEASED' as const };
-      }
-    );
+    // Execute internal two-phase publication (R28-B)
+    await this._executeTwoPhasePublication(token, candidateRoot);
+    return { leaseId, status: 'RELEASED' };
   }
 
-  public releaseSettlementPin(pinId: string, settlementEvidence: AuthoritativeSettlementEvidence): { pinId: string; status: 'RELEASED' | 'ALREADY_RELEASED' } {
+  public async releaseSettlementPin(
+    pinId: string,
+    settlementEvidence: AuthoritativeSettlementEvidence
+  ): Promise<{ pinId: string; status: 'RELEASED' | 'ALREADY_RELEASED' }> {
     if (pinId.startsWith('lease:')) {
       throw new Error('PIN_TYPE_MISMATCH: identifier is a retry lease, not a settlement pin');
     }
@@ -1825,23 +1922,17 @@ export class AuthoritativeCustodyCoordinator {
 
     const token = this._nextFencingToken();
 
-    // Authoritative Boundary Fenced Publication (R27-B)
-    return this.#leadershipFence.executeFencedPublication(
-      token,
-      candidateRoot,
-      (root) => {
-        this.#custodyRoot = root;
-        return { pinId, status: 'RELEASED' as const };
-      }
-    );
+    // Execute internal two-phase publication (R28-B)
+    await this._executeTwoPhasePublication(token, candidateRoot);
+    return { pinId, status: 'RELEASED' };
   }
 
-  public publishReleaseAndObligation(
+  public async publishReleaseAndObligation(
     preparedEvidence: PreparedEvidenceContext,
     expectedOwner: CustodyOwnershipToken,
     barrierIdentity: string,
     retryContext?: RetryRequestContext,
-  ): PublicationResponse {
+  ): Promise<PublicationResponse> {
     const currentRoot = this.#custodyRoot;
     const g = preparedEvidence.releasedCustodyGeneration;
 
@@ -1895,13 +1986,7 @@ export class AuthoritativeCustodyCoordinator {
             activeRetryLeases: candidateLeases,
           });
           const token = this._nextFencingToken();
-          this.#leadershipFence.executeFencedPublication(
-            token,
-            nextRoot,
-            (root) => {
-              this.#custodyRoot = root;
-            }
-          );
+          await this._executeTwoPhasePublication(token, nextRoot);
         }
 
         return { publicationResult: cachedResult, retryLeaseId: leaseId };
@@ -1949,13 +2034,7 @@ export class AuthoritativeCustodyCoordinator {
             activeRetryLeases: candidateLeases,
           });
           const token = this._nextFencingToken();
-          this.#leadershipFence.executeFencedPublication(
-            token,
-            nextRoot,
-            (root) => {
-              this.#custodyRoot = root;
-            }
-          );
+          await this._executeTwoPhasePublication(token, nextRoot);
         }
 
         return { publicationResult: cachedResult, retryLeaseId: leaseId };
@@ -2174,15 +2253,9 @@ export class AuthoritativeCustodyCoordinator {
 
     const token = this._nextFencingToken();
 
-    // Authoritative Boundary Fenced Publication (R27-B)
-    return this.#leadershipFence.executeFencedPublication(
-      token,
-      candidateRoot,
-      (root) => {
-        this.#custodyRoot = root;
-        return { publicationResult, retryLeaseId: null };
-      }
-    );
+    // Execute internal two-phase publication (R28-B)
+    await this._executeTwoPhasePublication(token, candidateRoot);
+    return { publicationResult, retryLeaseId: null };
   }
 }
 ```
@@ -2194,9 +2267,9 @@ export class AuthoritativeCustodyCoordinator {
 Under single-realm JavaScript execution:
 - Candidate-root preparation, invariant verification, and reference replacement occur synchronously within one microtask turn.
 - Mutual exclusion is enforced via `#publicationLock`: concurrent calls within the same process fail deterministically with `CONCURRENT_PUBLICATION_LOCK_ACQUISITION_VIOLATION`.
-- The commit callback `commitFn` is strictly synchronous; returning a Promise or yielding to the event loop throws `ASYNCHRONOUS_COMMIT_CALLBACK_PROHIBITED`.
-- Zero async turns exist between local lease validation, authoritative CAS publication, and local reference replacement `this.#custodyRoot = root`.
-- No other event loop callback can observe or mutate `this.#custodyRoot` between the check and the replacement.
+- Publication operates via a two-phase commit: Phase 1 asynchronously awaits Authoritative Custody Store fenced CAS confirmation; Phase 2 executes the synchronous local pointer replacement `this.#custodyRoot = candidateRoot`.
+- No arbitrary caller callbacks are exposed or executed within the publication lock.
+- No other event loop callback can observe or mutate `this.#custodyRoot` between confirmed authoritative commit and local replacement.
 - Retry lease acquisition, settlement pin acquisition, and FIFO eviction are mutually serialized, preventing race conditions that could expose an evicted result as active.
 
 ---
@@ -2279,7 +2352,7 @@ Protocol B handles cancelled or uncommitted operations:
 
 ---
 
-## 15. Exhaustive Failure and Retry Matrix (66 Deterministic Cases)
+## 15. Exhaustive Failure and Retry Matrix (74 Deterministic Cases)
 
 | Case | Scenario | Gate State | Custody Owner | Barrier State | Correct Action | Forbidden Action |
 |---|---|---|---|---|---|---|
@@ -2335,20 +2408,28 @@ Protocol B handles cancelled or uncommitted operations:
 | **50** | Caller mutates bytes of retrieved `ownerSignature` or `evidenceDigest` | `ANY` | Any | ANY | Egress defensive cloning keeps internal buffer pristine | Shared buffer corruption of custody root |
 | **51** | Caller attempts collection mutation via `entries()` or `values()` iterator | `ANY` | Any | ANY | Iterators yield deeply frozen defensive clones; root untouched | In-place collection corruption via iterator |
 | **52** | Non-primitive key or element passed to `ImmutableMap` or `ImmutableSet` | `ANY` | Any | ANY | Throw `INVALID_COLLECTION_KEY_TYPE` / `ELEMENT_TYPE` | Admit mutable reference as key/element |
-| **53** | Concurrent publication attempted during active `executeFencedPublication` | `PUBLISHING` | Coordinator | PENDING | Throw `CONCURRENT_PUBLICATION_LOCK_ACQUISITION_VIOLATION` | Interleave concurrent candidate roots |
-| **54** | Expired lease or stepdown during `executeFencedPublication` | `PUBLISHING` | Fenced Leader | PENDING | Throw `STALE_COORDINATOR_LEADERSHIP_FENCED`; root untouched | Commit stale root after lease expiry |
+| **53** | Concurrent publication attempted during active publication lock | `PUBLISHING` | Coordinator | PENDING | Throw `CONCURRENT_PUBLICATION_LOCK_ACQUISITION_VIOLATION` | Interleave concurrent candidate roots |
+| **54** | Expired lease or stepdown during publication | `PUBLISHING` | Fenced Leader | PENDING | Throw `STALE_COORDINATOR_LEADERSHIP_FENCED`; root untouched | Commit stale root after lease expiry |
 | **55** | Symbol-keyed property holds mutable record or array | `ANY` | Any | ANY | Recursively clone and freeze symbol property value | Copy symbol property by reference |
 | **56** | Object instance with custom prototype passed to custody collection | `ANY` | Any | ANY | Throw `UNSUPPORTED_PROTOTYPE_INSTANCE` | Strip prototype or treat as plain record |
 | **57** | Object containing getter/setter accessors passed to custody collection | `ANY` | Any | ANY | Reject with `ACCESSOR_PROPERTIES_PROHIBITED` without executing getter | Execute getter or store accessor |
-| **58** | Cyclic object graph passed to custody cloning | `ANY` | Any | ANY | Detect cycle via `WeakSet` and throw `CIRCULAR_REFERENCE_DETECTED` | Infinite recursion / call stack overflow |
+| **58** | Cyclic object graph passed to custody cloning | `ANY` | Any | ANY | Detect cycle via `activeStack` and throw `CIRCULAR_REFERENCE_DETECTED` | Infinite recursion / call stack overflow |
 | **59** | Prohibited binary/temporal types (`Date`, `ArrayBuffer`, `DataView`) passed | `ANY` | Any | ANY | Throw `UNSUPPORTED_BINARY_VALUE_TYPE` or `UNSUPPORTED_TEMPORAL_VALUE_TYPE` | Store empty record or raw buffer |
 | **60** | Egress `Uint8Array` copy mutated by caller | `ANY` | Any | ANY | Egress is detached mutable copy; root backing store unaffected | Mutate internal custody byte buffer |
 | **61** | Lease expires after local check but before publication | `PUBLISHING` | Coordinator | PENDING | Authoritative Store CAS rejects write; local custody degraded | Commit stale write to authoritative store |
 | **62** | Coordinator resumes after OS process pause with expired lease | `PUBLISHING` | Coordinator | PENDING | Local check or Authoritative Store rejects with `STALE_COORDINATOR_LEADERSHIP_FENCED` | Execute publication with expired lease |
 | **63** | Two independent coordinator instances attempt publication under different terms | `PUBLISHING` | Coordinator | PENDING | Authoritative Store CAS commits higher term; rejects lower term | Allow split-brain dual publication |
-| **64** | Asynchronous commit callback passed to `executeFencedPublication` | `PUBLISHING` | Coordinator | PENDING | Throw `ASYNCHRONOUS_COMMIT_CALLBACK_PROHIBITED`; lock released cleanly | Asynchronous escape from publication lock |
+| **64** | Asynchronous commit callback passed to publication execution | `PUBLISHING` | Coordinator | PENDING | Replaced with internal two-phase publication; zero caller callbacks | Asynchronous escape from publication lock |
 | **65** | Leadership term changes during candidate root preparation | `PUBLISHING` | Coordinator | PENDING | Authoritative Store CAS detects term mismatch; rejects publication | Overwrite newly elected leader's state |
 | **66** | Stale coordinator attempts post-term recovery mutation | `BLOCKED` | Stale Leader | PENDING | Authoritative Store rejects token; coordinator latches `CUSTODY_RECONCILIATION_BLOCKED` | Stale mutation of shared recovery state |
+| **67** | Shared acyclic references (DAG) passed to deep cloning | `ANY` | Any | ANY | Memoize clone via `cloneMap`; preserve reference identity; clone cleanly | False rejection as circular reference |
+| **68** | Sparse array with missing indices passed to custody cloning | `ANY` | Any | ANY | Verify index density; reject holes with `SPARSE_ARRAY_PROHIBITED` | Admit uninitialized array holes |
+| **69** | Function value passed in any position | `ANY` | Any | ANY | Immediate upfront check rejects with `UNSUPPORTED_FUNCTION_VALUE_TYPE` | Bypass rejection and store function |
+| **70** | Custom prototype defines hostile getter on constructor | `ANY` | Any | ANY | Reference check rejects without reading `proto.constructor`; getter uncalled | Invoke hostile getter during validation |
+| **71** | Arbitrary symbol-keyed properties in canonical snapshot payloads | `ANY` | Any | ANY | Reject with `SYMBOL_PROPERTIES_PROHIBITED_IN_CANONICAL_VALUES` | Produce invalid/unmapped RFC 8785 digest |
+| **72** | Asynchronous authoritative store write delayed in flight | `PUBLISHING` | Coordinator | PENDING | Local pointer replacement withheld until confirmed `COMMITTED` outcome | Prematurely replace local cached pointer |
+| **73** | Authoritative store returns `UNCERTAIN` or `FENCED_REJECTED` | `PUBLISHING` | Coordinator | PENDING | Local root unchanged; latch `RECONCILING_CUSTODY` or `BLOCKED` | Silently diverge local and store state |
+| **74** | Candidate presents invalid term, boot generation, or sequence gap | `PUBLISHING` | Coordinator | PENDING | Authoritative store validates all 4 token dimensions; rejects invalid write | Admit out-of-order or superseded write |
 
 ---
 
@@ -2391,12 +2472,12 @@ Protocol B handles cancelled or uncommitted operations:
 16. **Watchdog Pin and Lease Immunity Invariant:**
    Watchdog timeouts CANNOT release retention pins or retry leases whose underlying operations remain unresolved.
 17. **Single In-Flight Drain Invariant:** A second drain **CANNOT** dequeue an operation while `this.#custodyRoot.inFlightRecord !== null` ($N_{\text{in-flight}} \le 1$).
-18. **Restricted Custody-Value Universe & Deep Immutability Invariant:**
-   All custody root collections (`publicationResults`, `generationAuditHistory`, `activeSettlementPins`, `activeRetryLeases`, `retiredRetryLeases`, `retiredSettlementPins`, `consumedSettlementEvidence`, `pendingSettlementObligations`) enforce runtime `#private` backing storage (`#inner`), primitive keys and elements (`string` or finite safe `number`), deep recursive freezing on ingress (`deepCloneAndFreezeValue`), cycle detection, accessor prohibition, custom prototype rejection, and detached mutable byte array cloning on egress. No consumer-visible reference can mutate authoritative custody storage.
+18. **Restricted Custody-Value Universe, DAG Cycle Detection & Canonical Serialization Invariant:**
+   All custody root collections (`publicationResults`, `generationAuditHistory`, `activeSettlementPins`, `activeRetryLeases`, `retiredRetryLeases`, `retiredSettlementPins`, `consumedSettlementEvidence`, `pendingSettlementObligations`) enforce runtime `#private` backing storage (`#inner`), strictly admissible primitives (string, finite number, boolean, null), array density (zero holes), prototype verification without constructor reading, accessor prohibition without getter execution, cycle detection without false rejection of shared acyclic DAG references, detached mutable byte array cloning on egress, and strict prohibition of symbol-keyed properties in canonical snapshot payloads.
 19. **Complete Structured Owner-Token Identity Invariant:**
    Every active and retired resource binds and verifies the complete structured `CustodyOwnershipToken` (`recoveryAttemptId`, `custodyGeneration`, `drainerOwnershipGeneration`, `transactionId`, `operationIdentity`, `barrierIdentity`, `leaseTerm`, `ownerSignature`) using `isEquivalentOwnerToken()`.
-20. **Authoritative Boundary Fencing & Linearized Single-Writer Invariant:**
-   All custody root publications execute strictly inside `LeadershipEpochFence.executeFencedPublication()` using `CustodyFencingToken`. The Authoritative Custody Store enforces atomic fenced CAS across cluster partitions, rejecting stale terms and expired leases. The local coordinator instance enforces process-local single-writer mutual exclusion via `#publicationLock`, verifies local lease non-expiry with guard margin $\Delta_{\text{guard}}$, strictly prohibits asynchronous commit callbacks, and updates local `#custodyRoot` only upon authoritative CAS confirmation.
+20. **Authoritative Boundary Fencing & Two-Phase Publication Invariant:**
+   All custody root publications execute strictly via internal two-phase publication using complete 4-dimensional tokens $\langle \mathbf{clusterTerm}, \mathbf{bootGeneration}, \mathbf{bootInstanceId}, \mathbf{publicationSequence} \rangle$. The Authoritative Custody Store enforces atomic fenced CAS across cluster partitions, validating term, instance identity, and sequence monotonicity. The local coordinator instance enforces process-local single-writer mutual exclusion via `#publicationLock`, verifies local lease non-expiry with guard margin $\Delta_{\text{guard}}$, and updates local `#custodyRoot` strictly following confirmed authoritative store commitment (`COMMITTED`). No arbitrary caller commit callbacks are exposed.
 21. **Cross-Restart Retirement Idempotency & Active Boot Isolation Invariant:**
    Active collections initialize empty across process restarts; unreleased active resources from prior epochs fail closed as `RESOURCE_NOT_FOUND`. Retired records restored from persistent checkpoints remain authoritative and return `ALREADY_RELEASED` when presented with matching boot epoch, 7-dimensional identity, and evidence digest.
 
@@ -2425,27 +2506,27 @@ The proposal excises all references to `forceEmergencyReset(capability)`:
 
 ## 19. Deterministic Failure Scenarios and Future Test Requirements
 
-The following sixty-six deterministic future test specifications are formally codified for Sub-Milestone M5.1:
+The following seventy-four deterministic future test specifications are formally codified for Sub-Milestone M5.1:
 
-### Test R18-R27-T01: Retry Acquisition Without Stable Request Context
+### Test R18-R28-T01: Retry Acquisition Without Stable Request Context
 - **Initial Authoritative Root:** Settled result at $g=1$; `activeRetryLeases.size === 0`.
 - **Operation Sequence:** Call `publishReleaseAndObligation` presenting retry token for $g=1$ with `retryContext === undefined`.
 - **Expected Final Root:** Unchanged; zero leases allocated.
 - **Expected Result / Error:** Throws `INVALID_RETRY_REQUEST_CONTEXT`.
 
-### Test R18-R27-T02: Retry Acquisition With Malformed or Empty Request Context
+### Test R18-R28-T02: Retry Acquisition With Malformed or Empty Request Context
 - **Initial Authoritative Root:** Settled result at $g=1$; `activeRetryLeases.size === 0`.
 - **Operation Sequence:** Call `publishReleaseAndObligation` presenting retry token for $g=1$ with `retryContext = { consumerId: "   ", clientRequestId: "" }`.
 - **Expected Final Root:** Unchanged; zero leases allocated.
 - **Expected Result / Error:** Throws `MALFORMED_RETRY_REQUEST_CONTEXT`.
 
-### Test R18-R27-T03: Retry Acquisition With Oversized Request Context
+### Test R18-R28-T03: Retry Acquisition With Oversized Request Context
 - **Initial Authoritative Root:** Settled result at $g=1$; `activeRetryLeases.size === 0`.
 - **Operation Sequence:** Call `publishReleaseAndObligation` with `consumerId` of length 257 characters.
 - **Expected Final Root:** Unchanged; zero leases allocated.
 - **Expected Result / Error:** Throws `RETRY_REQUEST_CONTEXT_OVERSIZED`.
 
-### Test R18-R27-T04: Lost-Response Retransmission Recovers Original Lease Idempotently
+### Test R18-R28-T04: Lost-Response Retransmission Recovers Original Lease Idempotently
 - **Initial Authoritative Root:** Settled result at $g=1$; `activeRetryLeases.size === 0`.
 - **Operation Sequence:**
   1. Consumer 1 acquires lease for $g=1$ with `clientRequestId = "req-101"`; receives `leaseId_A`.
@@ -2453,13 +2534,13 @@ The following sixty-six deterministic future test specifications are formally co
 - **Expected Final Root:** `activeRetryLeases.size === 1`, containing `leaseId_A`.
 - **Expected Result / Error:** Second call returns existing `leaseId_A` idempotently.
 
-### Test R18-R27-T05: Repeated Retry Acquisition With Conflicting Operation Identity
+### Test R18-R28-T05: Repeated Retry Acquisition With Conflicting Operation Identity
 - **Initial Authoritative Root:** Settled result at $g=1$; lease active for `(consumer1, req-101)`.
 - **Operation Sequence:** Consumer 1 submits request with `clientRequestId = "req-101"` but altered `operationIdentity`.
 - **Expected Final Root:** Unchanged.
 - **Expected Result / Error:** Throws `IDEMPOTENT_RETRY_IDENTITY_CONFLICT`.
 
-### Test R18-R27-T06: Two Distinct Consumers Acquire Independent Leases Under Same Recovery Owner Token
+### Test R18-R28-T06: Two Distinct Consumers Acquire Independent Leases Under Same Recovery Owner Token
 - **Initial Authoritative Root:** Settled result at $g=1$; `activeRetryLeases.size === 0`.
 - **Operation Sequence:**
   1. Consumer 1 requests lease for $g=1$ with `consumerId = "c1"`.
@@ -2467,13 +2548,13 @@ The following sixty-six deterministic future test specifications are formally co
 - **Expected Final Root:** `activeRetryLeases.size === 2`, containing `leaseId_1` and `leaseId_2`.
 - **Expected Result / Error:** Both acquire distinct leases successfully.
 
-### Test R18-R27-T07: Consumer 1 Attempting to Release Consumer 2's Lease Fails Closed
+### Test R18-R28-T07: Consumer 1 Attempting to Release Consumer 2's Lease Fails Closed
 - **Initial Authoritative Root:** Active leases for Consumer 1 (`leaseId_1`) and Consumer 2 (`leaseId_2`).
 - **Operation Sequence:** Consumer 1 invokes `releaseRetryLease` passing `leaseId_2` with `consumerId = "c1"`.
 - **Expected Final Root:** Unchanged; both leases remain active.
 - **Expected Result / Error:** Throws `UNAUTHORIZED_CROSS_CONSUMER_LEASE_RELEASE`.
 
-### Test R18-R27-T08: Duplicate Lease Release by Authorized Consumer Against Retired Record Is Idempotent
+### Test R18-R28-T08: Duplicate Lease Release by Authorized Consumer Against Retired Record Is Idempotent
 - **Initial Authoritative Root:** Active lease `leaseId_1` for Consumer 1.
 - **Operation Sequence:**
   1. Consumer 1 calls `releaseRetryLease` with all matching parameters; returns `{ status: 'RELEASED' }`.
@@ -2481,7 +2562,7 @@ The following sixty-six deterministic future test specifications are formally co
 - **Expected Final Root:** `activeRetryLeases.has(leaseId_1) === false`; `retiredRetryLeases.has(leaseId_1) === true`.
 - **Expected Result / Error:** Second call matches retired record and returns `{ status: 'ALREADY_RELEASED' }` idempotently.
 
-### Test R18-R27-T09: First Publication With Option A Lifecycle Model
+### Test R18-R28-T09: First Publication With Option A Lifecycle Model
 - **Initial Authoritative Root:** `publishedGeneration = 0`, `auditTombstoneFloor = 0`, `custodyGenerationFloor = 0`.
 - **Operation Sequence:** Call `publishReleaseAndObligation` for $g=1$.
 - **Expected Final Root:**
@@ -2491,13 +2572,13 @@ The following sixty-six deterministic future test specifications are formally co
   - `generationAuditHistory.get(1).kind === 'PENDING_PUBLICATION'`.
 - **Expected Result / Error:** Success; contiguity invariant holds unconditionally.
 
-### Test R18-R27-T10: Pending-to-Terminal Audit History Transition
+### Test R18-R28-T10: Pending-to-Terminal Audit History Transition
 - **Initial Authoritative Root:** Generation $g=1$ published; audit record is `PENDING_PUBLICATION`.
 - **Operation Sequence:** Barrier for $g=1$ settles with `AuthoritativeSettlementEvidence` (`CONFIRMED_COMMITTED`).
 - **Expected Final Root:** `generationAuditHistory.get(1).kind === 'TERMINAL_SETTLEMENT'`.
 - **Expected Result / Error:** Success; record upgraded in place.
 
-### Test R18-R27-T11: Eviction and Compact Tombstone Conversion
+### Test R18-R28-T11: Eviction and Compact Tombstone Conversion
 - **Initial Authoritative Root:** Result at $g=1$ settled (`TERMINAL_SETTLEMENT`); 1,000 results retained.
 - **Operation Sequence:** Publish $g=1001$; triggers FIFO eviction of $g=1$.
 - **Expected Final Root:**
@@ -2507,25 +2588,25 @@ The following sixty-six deterministic future test specifications are formally co
   - `generationAuditHistory.get(1).evidenceDigest` is 32-byte SHA-256.
 - **Expected Result / Error:** Success.
 
-### Test R18-R27-T12: Tombstone Retirement Blocked by Active Settlement Pin
+### Test R18-R28-T12: Tombstone Retirement Blocked by Active Settlement Pin
 - **Initial Authoritative Root:** 5,000 tombstones retained; oldest tombstone $g=1$ has an active settlement pin.
 - **Operation Sequence:** Next result eviction attempts to retire tombstone $g=1$.
 - **Expected Final Root:** Unchanged; zero tombstones deleted; zero results evicted.
 - **Expected Result / Error:** Throws `TOMBSTONE_CAPACITY_EXHAUSTED`.
 
-### Test R18-R27-T13: Tombstone Retirement Blocked by Active Retry Lease
+### Test R18-R28-T13: Tombstone Retirement Blocked by Active Retry Lease
 - **Initial Authoritative Root:** 5,000 tombstones retained; oldest tombstone $g=1$ has an active retry lease.
 - **Operation Sequence:** Next result eviction attempts to retire tombstone $g=1$.
 - **Expected Final Root:** Unchanged; zero tombstones deleted; zero results evicted.
 - **Expected Result / Error:** Throws `TOMBSTONE_CAPACITY_EXHAUSTED`.
 
-### Test R18-R27-T14: Tombstone Retirement Blocked by Pending Settlement Obligation
+### Test R18-R28-T14: Tombstone Retirement Blocked by Pending Settlement Obligation
 - **Initial Authoritative Root:** 5,000 tombstones retained; oldest tombstone $g=1$ references pending obligation.
 - **Operation Sequence:** Next result eviction attempts to retire tombstone $g=1$.
 - **Expected Final Root:** Unchanged.
 - **Expected Result / Error:** Throws `TOMBSTONE_CAPACITY_EXHAUSTED`.
 
-### Test R18-R27-T15: Normal FIFO Tombstone Retirement at 5,000 Capacity
+### Test R18-R28-T15: Normal FIFO Tombstone Retirement at 5,000 Capacity
 - **Initial Authoritative Root:** 5,000 tombstones retained ($[1 \dots 5000]$); zero pins/leases on $g=1$.
 - **Operation Sequence:** Publish new generation causing eviction and tombstone retirement.
 - **Expected Final Root:**
@@ -2534,85 +2615,85 @@ The following sixty-six deterministic future test specifications are formally co
   - Total tombstones remaining: 5,000 ($[2 \dots 5001]$).
 - **Expected Result / Error:** Success; contiguity preserved over $[2 \dots publishedGeneration]$.
 
-### Test R18-R27-T16: Pre-Existing Tombstone Count Above Cap Fails Closed
+### Test R18-R28-T16: Pre-Existing Tombstone Count Above Cap Fails Closed
 - **Initial Authoritative Root:** Artificially injected root with 5,005 tombstones.
 - **Operation Sequence:** Call `publishReleaseAndObligation`.
 - **Expected Final Root:** Unchanged; zero bulk deletions performed.
 - **Expected Result / Error:** Throws `TOMBSTONE_CAPACITY_CORRUPTED`.
 
-### Test R18-R27-T17: Missing Tombstone Inside Promised Horizon Fails Closed
+### Test R18-R28-T17: Missing Tombstone Inside Promised Horizon Fails Closed
 - **Initial Authoritative Root:** `auditTombstoneFloor = 10`, `custodyGenerationFloor = 20`; tombstone $g=15$ deleted.
 - **Operation Sequence:** Call `assertAuditHistoryContiguity`.
 - **Expected Final Root:** Unchanged.
 - **Expected Result / Error:** Throws `STATE_INCONSISTENT_AUDIT_KEY_GAP`.
 
-### Test R18-R27-T18: Expiry Below Tombstone Floor Returns Historical Expiry
+### Test R18-R28-T18: Expiry Below Tombstone Floor Returns Historical Expiry
 - **Initial Authoritative Root:** `auditTombstoneFloor = 50`.
 - **Operation Sequence:** Query generation $g=30$.
 - **Expected Final Root:** Unchanged.
 - **Expected Result / Error:** Returns `CUSTODY_RECEIPT_EXPIRED` with `horizonExpired: true`.
 
-### Test R18-R27-T19: Floor Order Invariant Violation Fails Closed
+### Test R18-R28-T19: Floor Order Invariant Violation Fails Closed
 - **Initial Authoritative Root:** Artificially set `auditTombstoneFloor = 50`, `custodyGenerationFloor = 40`.
 - **Operation Sequence:** Call `assertAuditHistoryContiguity`.
 - **Expected Final Root:** Unchanged.
 - **Expected Result / Error:** Throws `STATE_INCONSISTENT_FLOOR_ORDER_VIOLATION`.
 
-### Test R18-R27-T20: Audit Record With Mismatched Generation Fails Closed
+### Test R18-R28-T20: Audit Record With Mismatched Generation Fails Closed
 - **Initial Authoritative Root:** Audit history key is 5, but record payload has `generation: 4`.
 - **Operation Sequence:** Call `assertAuditHistoryContiguity`.
 - **Expected Final Root:** Unchanged.
 - **Expected Result / Error:** Throws `AUDIT_RECORD_GENERATION_MISMATCH`.
 
-### Test R18-R27-T21: Audit Record With Mismatched Owner Token Fails Closed
+### Test R18-R28-T21: Audit Record With Mismatched Owner Token Fails Closed
 - **Initial Authoritative Root:** Audit record at $g=1$ has altered `membershipEpoch`.
 - **Operation Sequence:** Call `assertAuditHistoryContiguity` with publicationResults.
 - **Expected Final Root:** Unchanged.
 - **Expected Result / Error:** Throws `STATE_INCONSISTENT_AUDIT_RESULT_IDENTITY_MISMATCH`.
 
-### Test R18-R27-T22: Audit Record With Mismatched Drainer Ownership Generation Fails Closed
+### Test R18-R28-T22: Audit Record With Mismatched Drainer Ownership Generation Fails Closed
 - **Initial Authoritative Root:** Audit record at $g=1$ has altered `drainerOwnershipGeneration`.
 - **Operation Sequence:** Call `assertAuditHistoryContiguity` with publicationResults.
 - **Expected Final Root:** Unchanged.
 - **Expected Result / Error:** Throws `STATE_INCONSISTENT_AUDIT_RESULT_IDENTITY_MISMATCH`.
 
-### Test R18-R27-T23: Cross-Generation Settlement Evidence Replay Rejected
+### Test R18-R28-T23: Cross-Generation Settlement Evidence Replay Rejected
 - **Initial Authoritative Root:** Active pin for $g=2$; evidence constructed for $g=1$.
 - **Operation Sequence:** Call `releaseSettlementPin("pin:...:g2:...", evidence_g1)`.
 - **Expected Final Root:** Unchanged; pin remains active.
 - **Expected Result / Error:** Throws `SETTLEMENT_EVIDENCE_IDENTITY_MISMATCH`.
 
-### Test R18-R27-T24: Cross-Obligation Settlement Evidence Replay Rejected via Atomic In-Root Registry
+### Test R18-R28-T24: Cross-Obligation Settlement Evidence Replay Rejected via Atomic In-Root Registry
 - **Initial Authoritative Root:** Evidence for $g=1$ already consumed on `pin_1`; `consumedSettlementEvidence.has("1:barrier:pin_1") === true`.
 - **Operation Sequence:** Attempt to reuse identical evidence on `pin_2`.
 - **Expected Final Root:** Unchanged; `pin_2` remains active.
 - **Expected Result / Error:** Throws `SETTLEMENT_EVIDENCE_REPLAY_DETECTED`.
 
-### Test R18-R27-T25: Caller-Constructed Mock Evidence Rejected by Provenance Check
+### Test R18-R28-T25: Caller-Constructed Mock Evidence Rejected by Provenance Check
 - **Initial Authoritative Root:** Active pin for $g=1$.
 - **Operation Sequence:** Caller constructs object matching `AuthoritativeSettlementEvidence` schema without factory.
 - **Expected Final Root:** Unchanged; pin remains active.
 - **Expected Result / Error:** Throws `INVALID_SETTLEMENT_EVIDENCE_PROVENANCE`.
 
-### Test R18-R27-T26: Watchdog Timeout Cannot Release Settlement Pin
+### Test R18-R28-T26: Watchdog Timeout Cannot Release Settlement Pin
 - **Initial Authoritative Root:** Barrier pending for $g=1$; watchdog fires after 5,000 ms.
 - **Operation Sequence:** Watchdog handler attempts to call `releaseSettlementPin` with watchdog receipt.
 - **Expected Final Root:** Pin remains active; gate state latches `DEGRADED`.
 - **Expected Result / Error:** Throws `INVALID_SETTLEMENT_EVIDENCE_PROVENANCE`.
 
-### Test R18-R27-T27: Retry Lease ID Passed to Settlement Pin Release Fails Closed
+### Test R18-R28-T27: Retry Lease ID Passed to Settlement Pin Release Fails Closed
 - **Initial Authoritative Root:** Active lease `lease:1:1:c1:1`.
 - **Operation Sequence:** Call `releaseSettlementPin("lease:1:1:c1:1", evidence)`.
 - **Expected Final Root:** Unchanged.
 - **Expected Result / Error:** Throws `PIN_TYPE_MISMATCH`.
 
-### Test R18-R27-T28: Settlement Pin ID Passed to Retry Lease Release Fails Closed
+### Test R18-R28-T28: Settlement Pin ID Passed to Retry Lease Release Fails Closed
 - **Initial Authoritative Root:** Active pin `pin:1:1:b1:1`.
 - **Operation Sequence:** Call `releaseRetryLease({ leaseId: "pin:1:1:b1:1", ... })`.
 - **Expected Final Root:** Unchanged.
 - **Expected Result / Error:** Throws `LEASE_TYPE_MISMATCH`.
 
-### Test R18-R27-T29: Genuinely Unknown Identifier Passed to Release APIs Fails Closed (Blocker B1)
+### Test R18-R28-T29: Genuinely Unknown Identifier Passed to Release APIs Fails Closed (Blocker B1)
 - **Initial Authoritative Root:** Clean root; active and retired maps empty.
 - **Operation Sequence:**
   1. Call `releaseRetryLease` with never-issued `leaseId = "lease:999:unknown"`.
@@ -2620,7 +2701,7 @@ The following sixty-six deterministic future test specifications are formally co
 - **Expected Final Root:** Unchanged.
 - **Expected Result / Error:** Both calls fail closed with `RESOURCE_NOT_FOUND` (neither returns `ALREADY_RELEASED`).
 
-### Test R18-R27-T30: Duplicate Release Against Retired Pin With Matching Provenance and Digest Returns Already Released
+### Test R18-R28-T30: Duplicate Release Against Retired Pin With Matching Provenance and Digest Returns Already Released
 - **Initial Authoritative Root:** Active pin `pin_1` for $g=1$.
 - **Operation Sequence:**
   1. Release `pin_1` with valid evidence; returns `{ status: 'RELEASED' }`.
@@ -2628,13 +2709,13 @@ The following sixty-six deterministic future test specifications are formally co
 - **Expected Final Root:** `activeSettlementPins.has("pin_1") === false`; `retiredSettlementPins.has("pin_1") === true`.
 - **Expected Result / Error:** Second call validates provenance and digest, returning `{ status: 'ALREADY_RELEASED' }` idempotently.
 
-### Test R18-R27-T31: Settlement Pin Release With Mismatched Drainer Generation Fails Closed (Blocker C1)
+### Test R18-R28-T31: Settlement Pin Release With Mismatched Drainer Generation Fails Closed (Blocker C1)
 - **Initial Authoritative Root:** Active pin for $g=1$ with `drainerOwnershipGeneration = 2`.
 - **Operation Sequence:** Caller presents `AuthoritativeSettlementEvidence` with `drainerOwnershipGeneration = 1`.
 - **Expected Final Root:** Unchanged; pin remains active; evidence remains unconsumed.
 - **Expected Result / Error:** Throws `SETTLEMENT_EVIDENCE_IDENTITY_MISMATCH`.
 
-### Test R18-R27-T32: Pre-Publication Throw During Pin Release Leaves Evidence Usable for Retry (Blocker C2)
+### Test R18-R28-T32: Pre-Publication Throw During Pin Release Leaves Evidence Usable for Retry (Blocker C2)
 - **Initial Authoritative Root:** Active pin for $g=1$; `consumedSettlementEvidence.size === 0`.
 - **Operation Sequence:**
   1. Initiate `releaseSettlementPin`; candidate root construction simulates memory allocation exception before pointer swap.
@@ -2642,43 +2723,43 @@ The following sixty-six deterministic future test specifications are formally co
 - **Expected Final Root:** Second call succeeds; `pin_1` retired; evidence replay key added to `consumedSettlementEvidence`.
 - **Expected Result / Error:** First call throws error without consuming evidence in authoritative root; second call completes release cleanly.
 
-### Test R18-R27-T33: Duplicate Release on Retired Lease With Altered Transaction ID Fails Closed (Blocker B1)
+### Test R18-R28-T33: Duplicate Release on Retired Lease With Altered Transaction ID Fails Closed (Blocker B1)
 - **Initial Authoritative Root:** Retired lease `lease_1` recorded for `transactionId = "tx-100"`.
 - **Operation Sequence:** Call `releaseRetryLease` passing `lease_1` with `transactionId = "tx-200"`.
 - **Expected Final Root:** Unchanged.
 - **Expected Result / Error:** Throws `LEASE_TRANSACTION_ID_MISMATCH`.
 
-### Test R18-R27-T34: Duplicate Release on Retired Pin With Unverified Provenance Fails Closed (Blocker C2)
+### Test R18-R28-T34: Duplicate Release on Retired Pin With Unverified Provenance Fails Closed (Blocker C2)
 - **Initial Authoritative Root:** Retired pin `pin_1` recorded for $g=1$.
 - **Operation Sequence:** Caller constructs mock evidence object with matching fields but without factory issuance.
 - **Expected Final Root:** Unchanged.
 - **Expected Result / Error:** Throws `INVALID_SETTLEMENT_EVIDENCE_PROVENANCE`.
 
-### Test R18-R27-T35: Pre-Existing Retired Pins Overflow Rejection
+### Test R18-R28-T35: Pre-Existing Retired Pins Overflow Rejection
 - **Initial Authoritative Root:** Artificially injected root with 5,005 entries in `retiredSettlementPins`.
 - **Operation Sequence:** Call `releaseSettlementPin` for active pin `pin_A`.
 - **Expected Final Root:** Unchanged; zero entries deleted; zero mutations committed.
 - **Expected Result / Error:** Throws `RETIRED_PINS_CAPACITY_CORRUPTED`.
 
-### Test R18-R27-T36: Pre-Existing Retired Leases Overflow Rejection
+### Test R18-R28-T36: Pre-Existing Retired Leases Overflow Rejection
 - **Initial Authoritative Root:** Artificially injected root with 5,005 entries in `retiredRetryLeases`.
 - **Operation Sequence:** Call `releaseRetryLease` for active lease `lease_A`.
 - **Expected Final Root:** Unchanged; zero entries deleted; zero mutations committed.
 - **Expected Result / Error:** Throws `RETIRED_LEASES_CAPACITY_CORRUPTED`.
 
-### Test R18-R27-T37: Pre-Existing Consumed Evidence Overflow Rejection
+### Test R18-R28-T37: Pre-Existing Consumed Evidence Overflow Rejection
 - **Initial Authoritative Root:** Artificially injected root with 5,005 entries in `consumedSettlementEvidence`.
 - **Operation Sequence:** Call `releaseSettlementPin` for active pin `pin_A`.
 - **Expected Final Root:** Unchanged; zero entries deleted.
 - **Expected Result / Error:** Throws `CONSUMED_EVIDENCE_CAPACITY_CORRUPTED`.
 
-### Test R18-R27-T38: Cross-Restart Delayed Release Rejection for Unretired Active Pin (R25-3)
+### Test R18-R28-T38: Cross-Restart Delayed Release Rejection for Unretired Active Pin (R25-3)
 - **Initial Authoritative Root:** Restarted coordinator with `coordinatorBootEpoch = { clusterTerm: 2, bootGeneration: 5, bootInstanceId: "uuid-new" }`. Active collections empty (`size === 0`).
 - **Operation Sequence:** Caller submits delayed release for unretired pin `pinId = "pin:1.4.uuid-old:1:barrier:100"`.
 - **Expected Final Root:** Unchanged.
 - **Expected Result / Error:** Throws `RESOURCE_NOT_FOUND` (unretired active pins from earlier boot generations cannot be released after restart).
 
-### Test R18-R27-T39: Allocation Interruption Discards Counter Without Collision
+### Test R18-R28-T39: Allocation Interruption Discards Counter Without Collision
 - **Initial Authoritative Root:** `_pinSequenceCounter = 10`.
 - **Operation Sequence:**
   1. Call `publishReleaseAndObligation`; sequence increments to 11; candidate allocation throws out-of-memory.
@@ -2686,7 +2767,7 @@ The following sixty-six deterministic future test specifications are formally co
 - **Expected Final Root:** Active pin published with `seq = 12`; zero active records for `seq = 11`.
 - **Expected Result / Error:** Second call succeeds cleanly; discarded sequence 11 causes zero collisions.
 
-### Test R18-R27-T40: Normal Exactly-At-Capacity Lockstep Retirement at 5,000 Entries
+### Test R18-R28-T40: Normal Exactly-At-Capacity Lockstep Retirement at 5,000 Entries
 - **Initial Authoritative Root:** `retiredSettlementPins.size === 5000`, `consumedSettlementEvidence.size === 5000`. Oldest retired pin has zero active references.
 - **Operation Sequence:** Release active pin `pin_new` with valid evidence.
 - **Expected Final Root:**
@@ -2696,49 +2777,49 @@ The following sixty-six deterministic future test specifications are formally co
   - `consumedSettlementEvidence.size === 5000`.
 - **Expected Result / Error:** Release succeeds cleanly with exact capacity preservation and pre-publication candidate-root validation.
 
-### Test R18-R27-T41: All-Protected Retired Pins Exhaustion Triggers Fail-Closed Backpressure
+### Test R18-R28-T41: All-Protected Retired Pins Exhaustion Triggers Fail-Closed Backpressure
 - **Initial Authoritative Root:** `retiredSettlementPins.size === 5000`. Every single entry in `retiredSettlementPins` is retained by an active retry lease or active pin.
 - **Operation Sequence:** Call `releaseSettlementPin` for active pin `pin_new`.
 - **Expected Final Root:** Unchanged; zero pins evicted; zero state mutations committed.
 - **Expected Result / Error:** Throws `RETENTION_CAPACITY_EXHAUSTED_BACKPRESSURE`.
 
-### Test R18-R27-T42: Replay Key Desynchronization on Eviction Fails Closed
+### Test R18-R28-T42: Replay Key Desynchronization on Eviction Fails Closed
 - **Initial Authoritative Root:** `retiredSettlementPins.size === 5000`. The replay key corresponding to the oldest eligible retired pin is artificially absent from `consumedSettlementEvidence`.
 - **Operation Sequence:** Call `releaseSettlementPin` for active pin `pin_new`.
 - **Expected Final Root:** Unchanged; zero mutations committed.
 - **Expected Result / Error:** Throws `REPLAY_KEY_DESYNCHRONIZATION_CORRUPTED`.
 
-### Test R18-R27-T43: Reference-Independent Byte-for-Byte Digest Match Returns Already Released (R25-4)
+### Test R18-R28-T43: Reference-Independent Byte-for-Byte Digest Match Returns Already Released (R25-4)
 - **Initial Authoritative Root:** Pin `pin_retired` is in `retiredSettlementPins` with recorded digest `[0x01, 0x02, ..., 0x20]`.
 - **Operation Sequence:** Caller invokes `releaseSettlementPin` for `pin_retired` with independently allocated `Uint8Array` containing identical bytes (`digestA !== digestB` by reference, but byte-equal).
 - **Expected Final Root:** Unchanged.
 - **Expected Result / Error:** Returns `{ pinId: 'pin_retired', status: 'ALREADY_RELEASED' }`.
 
-### Test R18-R27-T44: Candidate-Root Pre-Publication Invariant Rejection on Desynchronized Replay State (R25-5)
+### Test R18-R28-T44: Candidate-Root Pre-Publication Invariant Rejection on Desynchronized Replay State (R25-5)
 - **Initial Authoritative Root:** Candidate root construction artificially desynchronizes collection sizes (`retiredSettlementPins.size = 5000`, `consumedSettlementEvidence.size = 5001`).
 - **Operation Sequence:** Candidate root passed to `_validateCandidateRootPrePublicationInvariants()`.
 - **Expected Final Root:** Pointer swap rejected; `this.#custodyRoot` remains unchanged.
 - **Expected Result / Error:** Throws `REPLAY_KEY_BIJECTION_CARDINALITY_MISMATCH`.
 
-### Test R18-R27-T45: ECMAScript #inner Backing Storage Inaccessible at Runtime (R25-1)
+### Test R18-R28-T45: ECMAScript #inner Backing Storage Inaccessible at Runtime (R25-1)
 - **Initial Authoritative Root:** Initialized `AuthoritativeCustodyRoot` with `ImmutableMap` instance.
 - **Operation Sequence:** Caller attempts `(root.activeSettlementPins as any).#inner`, `(root.activeSettlementPins as any)._inner`, or `Object.getOwnPropertySymbols(root.activeSettlementPins)`.
 - **Expected Final Root:** Unchanged.
 - **Expected Result / Error:** Throws `SyntaxError` or returns `undefined`; backing Map is strictly inaccessible.
 
-### Test R18-R27-T46: Consensus Leadership Loss Prior to Pointer Swap Discards Candidate Root (R25-2)
+### Test R18-R28-T46: Consensus Leadership Loss Prior to Pointer Swap Discards Candidate Root (R25-2)
 - **Initial Authoritative Root:** `clusterTerm = 2`. Coordinator prepares candidate root for $g = 2$.
 - **Operation Sequence:** Cluster consensus advances to `term = 3` (new leader elected) before Step 2. `this.#consensusLease.assertActiveLeadership(2)` executes.
 - **Expected Final Root:** Unchanged; candidate root discarded; local custody marked degraded; settlement barrier left unresolved.
 - **Expected Result / Error:** Throws `STALE_COORDINATOR_LEADERSHIP_FENCED`.
 
-### Test R18-R27-T47: Cross-Restart Restored Retired Pin Returns Already Released with Verified Epoch (R25-3)
+### Test R18-R28-T47: Cross-Restart Restored Retired Pin Returns Already Released with Verified Epoch (R25-3)
 - **Initial Authoritative Root:** Coordinator restarted under `clusterTerm = 2`, `bootGeneration = 5`. `retiredSettlementPins` restored from persistent checkpoint, containing `pin:1.4.uuid-old:1:barrier:200` with `allocatedBootEpoch = { clusterTerm: 1, bootGeneration: 4, bootInstanceId: "uuid-old" }`.
 - **Operation Sequence:** Caller submits delayed release for `pinId = "pin:1.4.uuid-old:1:barrier:200"` with matching 7-dimensional token and matching evidence digest.
 - **Expected Final Root:** Unchanged.
 - **Expected Result / Error:** Returns `{ pinId: 'pin:1.4.uuid-old:1:barrier:200', status: 'ALREADY_RELEASED' }`.
 
-### Test R18-R27-T48: Pre-Publication Replay-Key Bijection Violation Fails Closed (R25-5)
+### Test R18-R28-T48: Pre-Publication Replay-Key Bijection Violation Fails Closed (R25-5)
 - **Initial Authoritative Root:** Candidate root constructed with a retired pin whose replay key is absent from `candidateConsumed`.
 - **Operation Sequence:** Candidate root evaluated in `_validateCandidateRootPrePublicationInvariants()`.
 - **Expected Final Root:** Pointer swap aborted; candidate root discarded.
@@ -2746,13 +2827,13 @@ The following sixty-six deterministic future test specifications are formally co
 
 ---
 
-### Test R18-R27-T49: Deep Property Mutation Rejection on Retrieved ImmutableMap Value (R26-1)
+### Test R18-R28-T49: Deep Property Mutation Rejection on Retrieved ImmutableMap Value (R26-1)
 - **Initial Authoritative Root:** Initialized root with published result at $g=1$.
 - **Operation Sequence:** Caller retrieves record via `root.publicationResults.get(1)` and attempts in-place property modification: `(record as any).obligation.transactionId = "corrupted"`.
 - **Expected Final Root:** Unchanged; stored record remains intact with original `transactionId`.
 - **Expected Result / Error:** Throws `TypeError` (frozen object property modification) or fails silently without mutating internal state; subsequent `root.publicationResults.get(1)` returns pristine original `transactionId`.
 
-### Test R18-R27-T50: Defensive Byte Array Cloning Prevents Buffer Tampering on Egress (R26-1)
+### Test R18-R28-T50: Defensive Byte Array Cloning Prevents Buffer Tampering on Egress (R26-1)
 - **Initial Authoritative Root:** Initialized root with active settlement pin containing `ownerToken.ownerSignature = new Uint8Array([0x01, 0x02, 0x03, 0x04])`.
 - **Operation Sequence:**
   1. Caller retrieves pin via `const pin = root.activeSettlementPins.get(pinId)!`.
@@ -2760,7 +2841,7 @@ The following sixty-six deterministic future test specifications are formally co
 - **Expected Final Root:** Internal backing storage unaffected. Subsequent call to `root.activeSettlementPins.get(pinId)` yields buffer with original `ownerSignature[0] === 0x01`.
 - **Expected Result / Error:** Defensive byte cloning on egress ensures caller mutates an isolated detached copy; internal state remains pristine.
 
-### Test R18-R27-T51: Iterator Aliasing and Mutation Immunity on Entries and Values (R26-1)
+### Test R18-R28-T51: Iterator Aliasing and Mutation Immunity on Entries and Values (R26-1)
 - **Initial Authoritative Root:** Published results at $g=1$ and $g=2$ in `publicationResults`.
 - **Operation Sequence:**
   1. Caller iterates using `for (const [k, v] of root.publicationResults.entries())` or `for (const v of root.publicationResults.values())`.
@@ -2768,7 +2849,7 @@ The following sixty-six deterministic future test specifications are formally co
 - **Expected Final Root:** Unchanged; internal root and subsequent iterations produce identical unmodified records.
 - **Expected Result / Error:** Deep defensive cloning on each yielded element guarantees complete reference isolation across all iterator access paths.
 
-### Test R18-R27-T52: Key and Element Type Invariant Rejection on ImmutableMap and ImmutableSet (R26-1)
+### Test R18-R28-T52: Key and Element Type Invariant Rejection on ImmutableMap and ImmutableSet (R26-1)
 - **Initial Authoritative Root:** Initialized `ImmutableMap` and `ImmutableSet`.
 - **Operation Sequence:**
   1. Caller attempts to instantiate `ImmutableMap` with an object key: `new ImmutableMap([[({} as any), "val"]])` or call `.set({} as any, "val")`.
@@ -2776,7 +2857,7 @@ The following sixty-six deterministic future test specifications are formally co
 - **Expected Final Root:** Unchanged; zero elements inserted.
 - **Expected Result / Error:** Throws `INVALID_COLLECTION_KEY_TYPE: keys must be primitive string or number` and `INVALID_COLLECTION_ELEMENT_TYPE: set elements must be primitive string or number`.
 
-### Test R18-R27-T53: Non-Reentrant Single-Writer Execution Lock Prevents Concurrent Publications (R26-2)
+### Test R18-R28-T53: Non-Reentrant Single-Writer Execution Lock Prevents Concurrent Publications (R26-2)
 - **Initial Authoritative Root:** Coordinator initialized with `LeadershipEpochFence`.
 - **Operation Sequence:**
   1. Primary publication begins executing inside `executeFencedPublication()`.
@@ -2784,7 +2865,7 @@ The following sixty-six deterministic future test specifications are formally co
 - **Expected Final Root:** Primary publication completes or rolls back; concurrent attempt is rejected upfront before touching candidate roots.
 - **Expected Result / Error:** Throws `CONCURRENT_PUBLICATION_LOCK_ACQUISITION_VIOLATION`.
 
-### Test R18-R27-T54: Synchronous Leadership Stepdown and Lease Expiry Fencing (R26-2)
+### Test R18-R28-T54: Synchronous Leadership Stepdown and Lease Expiry Fencing (R26-2)
 - **Initial Authoritative Root:** Coordinator with active lease for Term 1 expiring at monotonic $t_{\text{expire}}$.
 - **Operation Sequence:**
   1. Case A: Coordinator receives stepdown notification (`leadershipFence.stepDown()`), then attempts `executeFencedPublication(expectedTerm: 1)`.
@@ -2794,84 +2875,84 @@ The following sixty-six deterministic future test specifications are formally co
 
 ---
 
-### Test R18-R27-T55: Symbol-Keyed Mutable Value Recursively Cloned and Frozen (R27-A)
+### Test R18-R28-T55: Symbol-Keyed Mutable Value Recursively Cloned and Frozen (R27-A)
 - **Initial State:** Authoritative custody root with published result at $g=1$. A candidate record includes a proprietary symbol property `[Symbol('syncplay/ext')] = { payload: new Uint8Array([0xAA, 0xBB]) }`.
 - **Exact Interleaving or Injected Fault:** Candidate record passed to `deepCloneAndFreezeValue()`. Caller subsequently mutates original symbol property: `original[sym].payload[0] = 0x00`.
 - **Expected Result:** Cloned symbol value is deeply cloned and frozen as an own data property (`Object.isFrozen(cloned[sym]) === true`). Internal custody record payload remains `0xAA`.
 - **Which Invariant Is Protected:** Invariant 18 (Restricted Custody-Value Universe & Deep Immutability Invariant).
 - **Custody Disposition:** Custody remains securely owned; zero reference aliasing.
 
-### Test R18-R27-T56: Unsupported Object Prototypes Rejected (R27-A)
+### Test R18-R28-T56: Unsupported Object Prototypes Rejected (R27-A)
 - **Initial State:** Coordinator ready to publish candidate root for $g=2$.
 - **Exact Interleaving or Injected Fault:** Caller attempts to insert an object instance of a custom class (`class CustomTelemetry {}`, `new CustomTelemetry()`) into publication results.
 - **Expected Result:** Throws `UNSUPPORTED_PROTOTYPE_INSTANCE: objects with custom prototypes of type 'CustomTelemetry' are prohibited in custody values`.
 - **Which Invariant Is Protected:** Invariant 18 (Restricted Custody-Value Universe & Deep Immutability Invariant).
 - **Custody Disposition:** Root unchanged; candidate discarded; custody remains in degraded recovery until valid record presented.
 
-### Test R18-R27-T57: Accessor Properties Rejected Without Invoking Getters (R27-A)
+### Test R18-R28-T57: Accessor Properties Rejected Without Invoking Getters (R27-A)
 - **Initial State:** Coordinator ready to publish candidate root for $g=2$.
 - **Exact Interleaving or Injected Fault:** Caller passes an object with a getter accessor: `{ get hostile() { throw new Error('GETTER_INVOKED_SIDE_EFFECT'); } }`.
 - **Expected Result:** Property descriptor inspection detects `desc.get !== undefined` without evaluating `obj.hostile`. Throws `ACCESSOR_PROPERTIES_PROHIBITED: property 'hostile' has getter/setter accessors which are forbidden in custody records`. The getter is never invoked.
 - **Which Invariant Is Protected:** Invariant 18 (Restricted Custody-Value Universe & Deep Immutability Invariant).
 - **Custody Disposition:** Root unchanged; candidate discarded; custody remains in degraded recovery.
 
-### Test R18-R27-T58: Cyclic Structures Fail Closed (R27-A)
+### Test R18-R28-T58: Cyclic Structures Fail Closed (R27-A)
 - **Initial State:** Coordinator ready to publish candidate root for $g=2$.
 - **Exact Interleaving or Injected Fault:** Caller passes a self-referential cyclic object graph (`const cycle: any = {}; cycle.self = cycle;`).
 - **Expected Result:** `WeakSet` cycle detection catches `seen.has(cycle)` and throws `CIRCULAR_REFERENCE_DETECTED: circular object graph cannot be cloned into custody storage`. Zero call stack overflow.
 - **Which Invariant Is Protected:** Invariant 18 (Restricted Custody-Value Universe & Deep Immutability Invariant).
 - **Custody Disposition:** Root unchanged; candidate discarded; custody remains in degraded recovery.
 
-### Test R18-R27-T59: Unsupported Typed Arrays and Binary/Temporal Types Rejected (R27-A)
+### Test R18-R28-T59: Unsupported Typed Arrays and Binary/Temporal Types Rejected (R27-A)
 - **Initial State:** Coordinator ready to publish candidate root for $g=2$.
 - **Exact Interleaving or Injected Fault:** Caller attempts to store `new Float32Array([1.0, 2.0])`, `new ArrayBuffer(16)`, `new DataView(new ArrayBuffer(8))`, or `new Date()`.
 - **Expected Result:** Throws `UNSUPPORTED_BINARY_VALUE_TYPE: only Uint8Array is supported for binary custody data` or `UNSUPPORTED_TEMPORAL_VALUE_TYPE: Date objects prohibited; use monotonic timestamp numbers`.
 - **Which Invariant Is Protected:** Invariant 18 (Restricted Custody-Value Universe & Deep Immutability Invariant).
 - **Custody Disposition:** Root unchanged; candidate discarded; custody remains in degraded recovery.
 
-### Test R18-R27-T60: Byte-Array Egress Mutation Cannot Alter Custody Storage (R27-A)
+### Test R18-R28-T60: Byte-Array Egress Mutation Cannot Alter Custody Storage (R27-A)
 - **Initial State:** Active settlement pin recorded in `activeSettlementPins` with `ownerToken.ownerSignature = new Uint8Array([0x10, 0x20, 0x30])`.
 - **Exact Interleaving or Injected Fault:** Caller invokes `root.activeSettlementPins.get(pinId)!`, receiving detached byte array. Caller mutates `egress.ownerToken.ownerSignature[0] = 0xFF`.
 - **Expected Result:** The returned `Uint8Array` is a detached mutable copy. Backing `#inner` storage is untouched. A subsequent call to `root.activeSettlementPins.get(pinId)!` yields fresh buffer with `ownerSignature[0] === 0x10`.
 - **Which Invariant Is Protected:** Invariant 18 (Restricted Custody-Value Universe & Deep Immutability Invariant).
 - **Custody Disposition:** Custody remains securely owned; internal storage immutable.
 
-### Test R18-R27-T61: Lease Expires After Local Check but Before Authoritative Publication (R27-B)
+### Test R18-R28-T61: Lease Expires After Local Check but Before Authoritative Publication (R27-B)
 - **Initial State:** Coordinator holds lease for Term 1 expiring at $t_{\text{expire}} = t_0 + 5000\text{ms}$. Candidate root prepared at $t_0 + 4900\text{ms}$.
 - **Exact Interleaving or Injected Fault:** An artificial thread pause delays submission to the Authoritative Custody Store until $t_0 + 5100\text{ms}$ (lease expired). Authoritative Custody Store evaluates token against cluster consensus.
 - **Expected Result:** Authoritative Custody Store CAS rejects write with `STALE_COORDINATOR_LEADERSHIP_FENCED`. Local coordinator discards candidate root; `#custodyRoot` untouched.
 - **Which Invariant Is Protected:** Invariant 20 (Authoritative Boundary Fencing & Linearized Single-Writer Invariant).
 - **Custody Disposition:** Local custody enters degraded recovery (`CUSTODY_RECONCILIATION_BLOCKED`); barrier left unresolved.
 
-### Test R18-R27-T62: Coordinator Resumes After Process Suspension and Attempts Publication with Expired Lease (R27-B)
+### Test R18-R28-T62: Coordinator Resumes After Process Suspension and Attempts Publication with Expired Lease (R27-B)
 - **Initial State:** Coordinator holding Term 1 lease prepares candidate root.
 - **Exact Interleaving or Injected Fault:** OS process suspension (SIGSTOP / major GC pause) suspends coordinator for 10 seconds. On resumption at $t_0 + 10000\text{ms}$, coordinator invokes `executeFencedPublication()`.
 - **Expected Result:** Step 2 local fencing check (with guard margin $\Delta_{\text{guard}}$) detects `performance.now() + 1000ms >= leaseExpiresAtMonotonicMs` and throws `STALE_COORDINATOR_LEADERSHIP_FENCED`. Zero write submitted to authoritative store.
 - **Which Invariant Is Protected:** Invariant 20 (Authoritative Boundary Fencing & Linearized Single-Writer Invariant).
 - **Custody Disposition:** Candidate discarded; `#custodyRoot` untouched; custody enters degraded recovery (`CUSTODY_RECONCILIATION_BLOCKED`).
 
-### Test R18-R27-T63: Two Independent Coordinator Instances Attempt Publication Under Different Terms (R27-B)
+### Test R18-R28-T63: Two Independent Coordinator Instances Attempt Publication Under Different Terms (R27-B)
 - **Initial State:** Partitioned Coordinator A operates under Term 1; newly elected Coordinator B operates under Term 2. Authoritative Custody Store has admitted Term 2.
 - **Exact Interleaving or Injected Fault:** Both Coordinator A and Coordinator B submit candidate publications to Authoritative Custody Store.
 - **Expected Result:** Authoritative Custody Store atomically accepts Coordinator B (Term 2) and rejects Coordinator A (Term 1) with `STALE_COORDINATOR_LEADERSHIP_FENCED`.
 - **Which Invariant Is Protected:** Invariant 2 (Single Primary Drainer Invariant) and Invariant 20 (Authoritative Boundary Fencing & Linearized Single-Writer Invariant).
 - **Custody Disposition:** Coordinator B holds valid cluster custody; Coordinator A enters degraded recovery (`CUSTODY_RECONCILIATION_BLOCKED`).
 
-### Test R18-R27-T64: Asynchronous Commit Callback Prohibited and Rejected (R27-B)
+### Test R18-R28-T64: Asynchronous Commit Callback Prohibited and Rejected (R27-B)
 - **Initial State:** Coordinator initialized with `LeadershipEpochFence`.
 - **Exact Interleaving or Injected Fault:** Caller invokes `executeFencedPublication()` passing an `async` function or a callback that returns a Promise (`async (root) => { await delay(10); }`).
 - **Expected Result:** Step 4 detects thenable return and throws `ASYNCHRONOUS_COMMIT_CALLBACK_PROHIBITED: commit callback must be strictly synchronous`. In `finally`, `#publicationLock` is reset to `false`.
 - **Which Invariant Is Protected:** Invariant 20 (Authoritative Boundary Fencing & Linearized Single-Writer Invariant).
 - **Custody Disposition:** Root unchanged; lock released cleanly; zero async escape.
 
-### Test R18-R27-T65: Leadership Changes During Publication Protocol (R27-B)
+### Test R18-R28-T65: Leadership Changes During Publication Protocol (R27-B)
 - **Initial State:** Coordinator A begins candidate root staging for Term 1.
 - **Exact Interleaving or Injected Fault:** Cluster consensus quorum elects Coordinator B for Term 2 and updates `store.highestCommittedTerm = 2` before Coordinator A's CAS arrives.
 - **Expected Result:** Authoritative Custody Store CAS rejects Coordinator A's token with `STALE_COORDINATOR_LEADERSHIP_FENCED`.
 - **Which Invariant Is Protected:** Invariant 20 (Authoritative Boundary Fencing & Linearized Single-Writer Invariant).
 - **Custody Disposition:** Coordinator A's candidate root discarded; barrier unresolved; local custody latched into `CUSTODY_RECONCILIATION_BLOCKED`.
 
-### Test R18-R27-T66: Stale Coordinator Cannot Mutate Shared Recovery State After Term Loss (R27-B)
+### Test R18-R28-T66: Stale Coordinator Cannot Mutate Shared Recovery State After Term Loss (R27-B)
 - **Initial State:** Coordinator A was partitioned and deposed in Term 1; cluster is active in Term 2.
 - **Exact Interleaving or Injected Fault:** Coordinator A attempts post-term recovery mutation (`publishReleaseAndObligation` or `releaseSettlementPin`).
 - **Expected Result:** Authoritative store rejects write with `STALE_COORDINATOR_LEADERSHIP_FENCED`. Coordinator A marks local in-flight custody degraded, leaves barrier pending, and latches `CUSTODY_RECONCILIATION_BLOCKED`.
@@ -2880,43 +2961,109 @@ The following sixty-six deterministic future test specifications are formally co
 
 ---
 
+### Test R18-R28-T67: Shared Acyclic References Are Accepted Without False Cycle Rejection (R28-A)
+- **Initial State:** Authoritative custody root with published result at $g=1$. A candidate record forms a directed acyclic graph (DAG) where sub-object `sharedNode = { data: 'immutable' }` is referenced by both `candidate.branchA.node` and `candidate.branchB.node`.
+- **Exact Interleaving or Injected Fault:** Candidate record passed to `deepCloneAndFreezeValue()`.
+- **Expected Result:** Traversal memoizes `sharedNode` via `cloneMap` and removes ancestors from `activeStack` upon branch completion. Successfully clones and freezes the record. Reference equality is preserved (`cloned.branchA.node === cloned.branchB.node`), and zero false cycle error is thrown.
+- **Which Invariant Is Protected:** Invariant 18 (Restricted Custody-Value Universe & DAG Cycle Detection).
+- **Custody Disposition:** Custody remains securely owned; valid DAG structures accepted without error.
+
+### Test R18-R28-T68: Sparse Arrays with Missing Indices Are Rejected (R28-A)
+- **Initial State:** Coordinator preparing candidate root.
+- **Exact Interleaving or Injected Fault:** Caller attempts to pass a sparse array containing missing indices / uninitialized holes (e.g. `const arr = [1]; arr[3] = 4;` or `new Array(5)`).
+- **Expected Result:** Array density validation detects that `Object.prototype.hasOwnProperty.call(arr, '1') === false`. Throws `SPARSE_ARRAY_PROHIBITED: sparse arrays with missing index '1' are prohibited in custody records`.
+- **Which Invariant Is Protected:** Invariant 18 (Restricted Custody-Value Universe & Array Density).
+- **Custody Disposition:** Root unchanged; candidate discarded; custody enters degraded recovery.
+
+### Test R18-R28-T69: Function Values Are Rejected in All Positions (R28-A)
+- **Initial State:** Coordinator preparing candidate root.
+- **Exact Interleaving or Injected Fault:** Caller attempts to pass a function value at the top level or nested inside a plain record: `{ handler: () => true }`.
+- **Expected Result:** Immediate check at the absolute entry boundary detects `typeof val === 'function'`. Throws `UNSUPPORTED_FUNCTION_VALUE_TYPE: functions cannot be stored in custody records`.
+- **Which Invariant Is Protected:** Invariant 18 (Restricted Custody-Value Universe).
+- **Custody Disposition:** Root unchanged; candidate discarded; custody enters degraded recovery.
+
+### Test R18-R28-T70: Custom Prototype Constructor Getters Are Never Invoked (R28-A)
+- **Initial State:** Coordinator preparing candidate root.
+- **Exact Interleaving or Injected Fault:** Caller constructs an object inheriting from an adversarial custom prototype that defines an active getter on `constructor`:
+  `const hostileProto = Object.create(Object.prototype, { constructor: { get() { throw new Error('HOSTILE_GETTER_SIDE_EFFECT'); } } }); const obj = Object.create(hostileProto);`
+- **Expected Result:** Direct reference comparison detects `Object.getPrototypeOf(obj) !== Object.prototype && proto !== null`. Rejection occurs without reading `proto.constructor` or inspecting prototype properties. Throws `UNSUPPORTED_PROTOTYPE_INSTANCE`. The hostile getter is never executed.
+- **Which Invariant Is Protected:** Invariant 18 (Restricted Custody-Value Universe).
+- **Custody Disposition:** Root unchanged; candidate discarded; hostile side effects completely prevented.
+
+### Test R18-R28-T71: Symbol-Keyed Values Follow Documented Canonical Serialization Policy (R28-A)
+- **Initial State:** Coordinator preparing candidate root for canonical snapshot hashing.
+- **Exact Interleaving or Injected Fault:** Caller passes a record containing arbitrary user-defined symbol keys into a payload intended for RFC 8785 canonical snapshot hashing.
+- **Expected Result:** Key validation detects `typeof key === 'symbol'`. Throws `SYMBOL_PROPERTIES_PROHIBITED_IN_CANONICAL_VALUES: symbol-keyed properties are prohibited in RFC 8785 canonical serialization`.
+- **Which Invariant Is Protected:** Invariant 18 (Canonical Serialization Compatibility).
+- **Custody Disposition:** Root unchanged; candidate discarded; canonical hash integrity guaranteed.
+
+### Test R18-R28-T72: Asynchronous Authoritative Publication Cannot Cause Premature Local Root Replacement (R28-B)
+- **Initial State:** Coordinator holding active lease prepares candidate root for $g=2$.
+- **Exact Interleaving or Injected Fault:** Coordinator initiates `publishReleaseAndObligation()`. Phase 1 submits write to `store.publishFencedRoot()`. While the network request is in flight, an asynchronous concurrent reader inspects `coordinator.custodyRoot`.
+- **Expected Result:** Local `custodyRoot` remains strictly at $g=1$. Local pointer replacement `this.#custodyRoot = candidateRoot` is executed in Phase 2 strictly after `store.publishFencedRoot()` resolves with `{ status: 'COMMITTED' }`.
+- **Which Invariant Is Protected:** Invariant 20 (Authoritative Boundary Fencing & Two-Phase Publication).
+- **Custody Disposition:** Linearizability preserved; zero premature local root exposure.
+
+### Test R18-R28-T73: Rejected or Uncertain Authoritative Publication Cannot Silently Diverge Local and Authoritative Roots (R28-B)
+- **Initial State:** Coordinator prepares candidate root for $g=2$.
+- **Exact Interleaving or Injected Fault:** Authoritative Custody Store returns `{ status: 'UNCERTAIN', reason: 'network_timeout' }` or `{ status: 'FENCED_REJECTED', reason: 'term_superseded' }`.
+- **Expected Result:** Local `#custodyRoot` remains strictly at $g=1$. Pointer update is withheld. For `FENCED_REJECTED`, throws `STALE_COORDINATOR_LEADERSHIP_FENCED` and transitions to `CUSTODY_RECONCILIATION_BLOCKED`. For `UNCERTAIN`, throws `PUBLICATION_OUTCOME_UNCERTAIN` and initiates reconciliation query via `store.getAuthoritativeRoot()`.
+- **Which Invariant Is Protected:** Invariant 20 (Authoritative Boundary Fencing & Linearized Single-Writer Invariant).
+- **Custody Disposition:** Zero silent divergence; custody latched degraded/blocked until authoritative reconciliation completes.
+
+### Test R18-R28-T74: Every Fencing-Token Component Is Validated at the Authoritative Store Boundary (R28-B)
+- **Initial State:** Authoritative Custody Store holding committed Term 2, Boot Generation 3, Boot Instance UUID-B, Sequence 5.
+- **Exact Interleaving or Injected Fault:** Submitting candidate roots with:
+  1. Term 1 (stale term).
+  2. Term 2, Boot Generation 2 (stale generation).
+  3. Term 2, Boot Generation 3, Boot Instance UUID-A (stale instance).
+  4. Term 2, Boot Generation 3, Boot Instance UUID-B, Sequence 7 (sequence gap).
+- **Expected Result:** Authoritative store validates all four dimensions: Case 1 returns `{ status: 'FENCED_REJECTED', reason: 'stale_term' }`; Cases 2 and 3 return `{ status: 'FENCED_REJECTED', reason: 'superseded_instance' }`; Case 4 returns `{ status: 'FENCED_REJECTED', reason: 'out_of_order_sequence' }`. All mutations are rejected before touching persistent state.
+- **Which Invariant Is Protected:** Invariant 20 (Authoritative Boundary Fencing & Complete 4-Dimensional Token Validation).
+- **Custody Disposition:** Authoritative store state protected across all four token dimensions.
+
+---
+
 ## 20. Updated Formal Approval Questions for Engineering Authority
 
 ```
 ================================================================================
-ENGINEERING AUTHORITY APPROVAL QUESTIONS (MILESTONE M5.0-R18-R27):
+ENGINEERING AUTHORITY APPROVAL QUESTIONS (MILESTONE M5.0-R18-R28):
 ================================================================================
-1. [RESTRICTED CUSTODY-VALUE UNIVERSE (R27-A)]: Does the Engineering Authority
-   approve restricting custody values strictly to supported primitives, plain
-   records (Object.prototype/null), index-only arrays, and Uint8Array buffers,
-   while fail-closed rejecting custom prototypes, accessors (without executing
-   getters), non-enumerable properties, circular graphs, and unsupported
-   binary/temporal types?
+1. [RESTRICTED CUSTODY-VALUE UNIVERSE & PRIMITIVE EXCLUSIONS (R28-A)]: Does the
+   Engineering Authority approve restricting custody values strictly to
+   supported primitives (string, finite number, boolean, null), dense arrays,
+   plain records (Object.prototype/null), and direct Uint8Array buffers, while
+   fail-closed rejecting functions upfront, undefined, bigint, symbols, sparse
+   arrays, custom prototypes (without reading proto.constructor), and accessors
+   (without executing getters)?
 
-2. [DETACHED MUTABLE BYTE-ARRAY EGRESS COPIES (R27-A)]: Does the Engineering
-   Authority approve the explicit distinction that returned Uint8Array instances
-   are detached, mutable copies that callers may manipulate freely without
-   altering or affecting the internal runtime-encapsulated custody root?
+2. [DAG CYCLE DETECTION & SHARED ACYCLIC REFERENCES (R28-A)]: Does the
+   Engineering Authority approve separating cycle detection into an active
+   ancestor stack (activeStack) and a memoization map (cloneMap), ensuring that
+   shared acyclic references in a DAG are cleanly preserved without triggering
+   false circular reference errors?
 
-3. [AUTHORITATIVE BOUNDARY FENCING (R27-B)]: Does the Engineering Authority
-   approve enforcing atomic fenced Compare-and-Swap (CAS) at the Authoritative
-   Custody Store (IAuthoritativeCustodyStore) using compound fencing tokens,
-   ensuring that partitioned or paused coordinators are rejected across cluster
-   partitions even if an uncoordinated OS/GC pause elapses after local checks?
+3. [CANONICAL SERIALIZATION COMPATIBILITY (R28-A)]: Does the Engineering
+   Authority approve the strict prohibition of symbol-keyed properties in all
+   values subject to RFC 8785 canonical snapshot hashing, eliminating unencoded
+   symbol representation gaps?
 
-4. [SYNCHRONOUS COMMIT CONSTRAINT & GUARD MARGIN (R27-B)]: Does the Engineering
-   Authority approve enforcing that commitFn must be strictly synchronous
-   (rejecting Promises with ASYNCHRONOUS_COMMIT_CALLBACK_PROHIBITED) and that
-   local lease validation requires a safety margin Delta_guard (1,000ms)?
+4. [AUTHORITATIVE STORE FENCING & 4-DIMENSIONAL TOKENS (R28-B)]: Does the
+   Engineering Authority approve defining the Authoritative Custody Store as the
+   final fencing boundary, atomically validating the complete 4-dimensional
+   fencing token <clusterTerm, bootGeneration, bootInstanceId, publicationSequence>
+   to enforce stale term rejection, instance verification, and sequence
+   monotonicity across cluster partitions?
 
-5. [TARGETED ADVERSARIAL VERIFICATION (R27-C)]: Does the Engineering Authority
-   approve the expanded 66-case failure matrix and 66-case deterministic future
-   test specifications covering symbol cloning, custom prototype rejection,
-   accessor non-execution, cycle detection, egress mutation isolation,
-   post-check lease expiry, OS pauses, and dual coordinator races?
+5. [INTERNAL TWO-PHASE PUBLICATION & UNCERTAIN RECONCILIATION (R28-B)]: Does the
+   Engineering Authority approve excising arbitrary caller commit callbacks in
+   favor of an internal two-phase publication contract where local cached pointer
+   replacement occurs strictly after confirmed authoritative store commitment,
+   and where UNCERTAIN outcomes trigger reconciliation without silent divergence?
 
 6. [CLOSURE OF ALL CORRECTNESS GAPS]: Does the Engineering Authority agree that
-   all review issues from R26 are fully resolved, and that the recovery arbitration
+   all review issues from R27 are fully resolved, and that the recovery arbitration
    architecture is ready for holistic M5.0 final acceptance review?
 ================================================================================
 ```
@@ -2927,15 +3074,15 @@ ENGINEERING AUTHORITY APPROVAL QUESTIONS (MILESTONE M5.0-R18-R27):
 
 ```
 ================================================================================
-M5.0-R18-R27 ARCHITECTURAL DECISION PROPOSAL VERDICT:
+M5.0-R18-R28 ARCHITECTURAL DECISION PROPOSAL VERDICT:
 PASS — READY FOR HOLISTIC M5.0 FINAL ACCEPTANCE REVIEW
 ================================================================================
 ```
 
-This R18-R27 proposal achieves complete architectural closure of the recovery arbitration subsystem. It establishes a strictly restricted and enforceable custody-value universe with comprehensive cycle detection and accessor prohibition, enforces dual-tier authoritative boundary fencing with atomic fenced CAS at the consensus store, qualifies distributed split-brain exclusion under explicit clock drift and lease non-overlap invariants, and codifies sixty-six deterministic future test specifications.
+This R18-R28 proposal achieves complete architectural closure of the recovery arbitration subsystem. It establishes a strictly restricted and enforceable custody-value universe with DAG-aware cycle detection, array density verification, and prototype accessor safety; enforces canonical RFC 8785 serialization compatibility; establishes the Authoritative Custody Store as the distributed fencing boundary with 4-dimensional token validation; implements internal two-phase publication without arbitrary callbacks; and codifies seventy-four deterministic future test specifications.
 
-*Note on Acceptance Discipline:* Completion of Milestone M5.0-R18-R27 constitutes architectural readiness. Formal M5.0 milestone acceptance requires holistic review and explicit Engineering Authority sign-off prior to authorizing Milestone M5.1.
+*Note on Acceptance Discipline:* Completion of Milestone M5.0-R18-R28 constitutes architectural readiness. Formal M5.0 milestone acceptance requires holistic review and explicit Engineering Authority sign-off prior to authorizing Milestone M5.1.
 
 ### Mandatory Implementation Authorization Statement
 
-> "M5.0-R18-R27 is a documentation-only architectural correction. No production implementation has been authorized. M5.1, including M5.1a, remains strictly unauthorized pending holistic M5.0 acceptance and explicit Engineering Authority approval."
+> "M5.0-R18-R28 is a documentation-only architectural correction. No production implementation has been authorized. M5.1, including M5.1a, remains strictly unauthorized pending holistic M5.0 acceptance and explicit Engineering Authority approval."
