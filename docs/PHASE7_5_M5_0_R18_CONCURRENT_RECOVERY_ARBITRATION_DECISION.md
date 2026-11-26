@@ -1,47 +1,32 @@
-# Phase 7.5 M5.0-R18-R34 — Proxy-Safe Binary Custody and Exact Publication Identity Reconciliation
+# Phase 7.5 M5.0-R18-R35 — Private-Brand-First Lexical Checking & Non-Commit Leadership Fencing
 **Concurrent Recovery Arbitration & Authoritative Settlement Architecture Decision**
 
 **Status:** PROPOSED ARCHITECTURAL AMENDMENT TO FROZEN M5.0 SPECIFICATIONS (DECISION DOCUMENT ONLY)
 **Author:** Principal TypeScript Distributed-Systems Architect, Runtime-Semantics Architect & Independent Recovery-Systems Auditor
-**Baseline Commit:** `8347e5c363964dceba4bd1f5363178bdcd28d079` (M5.0-R18-R33)
-**Direct Parent Commit:** `8347e5c363964dceba4bd1f5363178bdcd28d079`
-**Authorization Scope:** M5.0-R18-R34 is strictly a documentation-only architectural proposal. No production source code, tests, configuration, package manifests, or frozen M5.0 specifications may be modified. Implementation of Milestone M5.1, including M5.1a, remains **STRICTLY BLOCKED AND UNAUTHORIZED**.
+**Baseline Commit:** `38b33708657c8a00a55cf97fca64f5c595ef911c` (M5.0-R18-R34)
+**Direct Parent Commit:** `38b33708657c8a00a55cf97fca64f5c595ef911c`
+**Authorization Scope:** M5.0-R18-R35 is strictly a documentation-only architectural proposal. No production source code, tests, configuration, package manifests, or frozen M5.0 specifications may be modified. Implementation of Milestone M5.1, including M5.1a, remains **STRICTLY BLOCKED AND UNAUTHORIZED**.
 
 ---
 
-## 1. Problem Statement & R18-R34 Objectives
+## 1. Problem Statement & R18-R35 Objectives
 
-In Phase 7.5 Sub-Milestone M5.0-R18-R33, we introduced static custody API immutability, freezing `EncapsulatedByteArray` and its prototype, unexported lexical brand checking via an ECMAScript 2022 `static {}` initialization block, full-identity terminal tombstone binding, shared linearizable consensus log ordering, and fail-closed `SharedArrayBuffer` compatibility requirements.
+In Phase 7.5 Sub-Milestone M5.0-R18-R34, we removed the unsafe `instanceof` / `isPrototypeOf` constructor fallback, established two-path binary custody construction, codified the canonical 8-dimensional `PublicationIdentity` tuple, bound complete identities to all reconciliation results, and expanded the verification matrix to 183 cases.
 
-The independent architectural review of R33 identified two concrete correctness blockers:
-1. **Blocker A (Proxy-Safe Rejection in EncapsulatedByteArray Construction):** In R33, while `isLexicallyTrustedEncapsulatedByteArray` safely trapped Proxy exceptions, the constructor still contained an unsafe fallback:
-   ```typescript
-   else if (source instanceof EncapsulatedByteArray || EncapsulatedByteArray.prototype.isPrototypeOf(source)) {
-     throw new TypeError('UNSUPPORTED_BINARY_VALUE_TYPE');
-   }
-   ```
-   For a hostile Proxy whose `getPrototypeOf` trap throws, the lexical checker safely caught the exception and returned `false`, but the constructor immediately executed a second prototype operation (`instanceof` or `isPrototypeOf`). This second operation triggered the hostile trap again and threw an unhandled arbitrary exception. The custody cloner must reject hostile Proxies safely without repeating prototype inspections.
-2. **Blocker B (Exact Publication Identity Binding on Reconciliation Results):** In R33, `CustodyReconciliationResult`'s `RECONCILED_COMMITTED` variant did not carry the 8-dimensional publication identity $\mathbf{publicationIdentity}$. A coordinator cannot safely accept a committed result merely because its sequence or root appears plausible; the result must prove that the authoritative store reconciled the exact 8-dimensional attempt the coordinator is waiting for, sourced directly from durable consensus log records rather than a circular echo.
+The independent architectural review of R34 identified two remaining concrete correctness blockers:
+1. **Blocker A (Lexical Checker Ordering & Proxy Trap Execution):** In R34, `isLexicallyTrustedEncapsulatedByteArray` evaluated `Object.getPrototypeOf(val)` before evaluating `#bytes in val`. For a hostile Proxy whose `getPrototypeOf` trap throws, the trap was executed (and caught) before the private-field check ran. While eventually rejected, the claim that Proxy rejection occurred without executing any Proxy traps was invalidated.
+   *Architectural Solution:* Reverse the lexical check order. In ECMAScript (§13.3.5.1 / §7.3.34), evaluating `#bytes in val` inspects the object's `[[PrivateElements]]` internal slot directly. A Proxy object never possesses private fields from external classes and private-field checks never delegate to a Proxy target or trigger Proxy traps (`getPrototypeOf`, `has`, `get`). Reordering `#bytes in val` first guarantees that any Proxy fails immediately and returns `false` without ever invoking `Object.getPrototypeOf()`. Critical intrinsics (`Object_getPrototypeOf`, `ArrayBuffer_isView`, etc.) are captured at module initialization to prevent runtime prototype poisoning.
+2. **Blocker B (Stale Leadership Root Adoption in NOT_COMMITTED_FINAL):** In R34, `reconcileAuthoritativeCustody()` adopted `result.authoritativeCurrentRoot` under `NOT_COMMITTED_FINAL` without asserting post-await leadership eligibility. Because reconciliation is asynchronous, a coordinator could lose leadership (term advancement, lease expiration, or step-down) while awaiting the store's response. A stale coordinator must not adopt local custody roots. Furthermore, `NOT_COMMITTED_FINAL` lacked verification of the returned current root's sequence and digest against authoritative evidence.
+   *Architectural Solution:* Require the coordinator to call `this.#leadershipFence.assertPostAwaitEligibility(attempt)` before adopting `authoritativeCurrentRoot`. Verify that `_computeRootDigest(authoritativeCurrentRoot) === result.authoritativeCurrentRootDigest` and that `authoritativeCurrentRoot.publishedGeneration === result.authoritativeCurrentSequence`. Stale coordinators withhold root adoption and fail closed in `RECONCILING_CUSTODY`.
 
-Sub-Milestone M5.0-R18-R34 resolves both blockers definitively:
+Sub-Milestone M5.0-R18-R35 resolves both blockers definitively:
 
-- **Objective R34-1 (Proxy-Safe Construction & Removal of Unsafe Fallback - Blocker A):** Remove the unsafe `instanceof` / `isPrototypeOf` fallback entirely from `EncapsulatedByteArray` construction and `deepCloneAndFreezeValue`. The constructor has strictly two conceptual paths: (1) trusted instances recognized via the unexported lexical brand checker, and (2) ordinary supported same-realm `Uint8Array` views validated by `assertValidOrdinaryUint8Array`. Untrusted candidates are rejected without repeating prototype operations.
-- **Objective R34-2 (Explicit Safe Binary Validator Ordering - Blocker A):** Enforce strict safe validation ordering in `assertValidOrdinaryUint8Array`:
-  1. Object check (`typeof val === 'object' && val !== null`).
-  2. Intrinsic brand check `ArrayBuffer.isView(val)`. Rejects non-views, Proxies (which lack `[[ViewedArrayBuffer]]`), and `EncapsulatedByteArray` subclasses immediately without executing ANY Proxy traps.
-  3. Strict same-realm prototype comparison `Object.getPrototypeOf(val) === Uint8Array.prototype` (safe because Proxy candidates are already rejected in Step 2).
-  4. Rejection of own symbol properties and non-index own string properties.
-  5. Buffer, offset, and length extraction via intrinsic `%TypedArray%.prototype` unbound getters.
-  6. SharedArrayBuffer detection via intrinsic `SharedArrayBuffer.prototype.byteLength` internal-slot brand check.
-  7. Defensive copy into private `#bytes` storage.
-- **Objective R34-3 (Canonical Immutable Publication Identity Type - Blocker B):** Define one canonical 8-dimensional immutable type `PublicationIdentity` representing $\langle \mathbf{clusterTerm}, \mathbf{bootGeneration}, \mathbf{bootInstanceId}, \mathbf{publicationSequence}, \mathbf{attemptId}, \mathbf{candidateRootDigest}, \mathbf{expectedPriorSequence}, \mathbf{expectedPriorRootDigest}
-angle$.
-- **Objective R34-4 (Full-Identity Bound Reconciliation Results - Blocker B):** Bind `publicationIdentity` to EVERY attempt-specific variant of `CustodyReconciliationResult` (`RECONCILED_COMMITTED`, `NOT_COMMITTED_FINAL`, `UNKNOWN_IN_PROGRESS`, `RECONCILED_CONFLICT`, `RECONCILED_FENCED_REJECTED`).
-- **Objective R34-5 (Authoritative Evidence Verification & Field-by-Field Coordinator Acceptance - Blocker B):**
-  1. Require that reconciliation results source `publicationIdentity` directly from durable linearizable state (committed publication record or terminal tombstone), never circularly echoing caller queries.
-  2. Implement explicit field-by-field identity comparison `samePublicationIdentity(expected, actual)`.
-  3. Require the coordinator to validate the full 8D identity BEFORE evaluating result status, verify that committed sequence and root digest match attempt identity, and fail closed into `RECONCILING_CUSTODY` on any discrepancy.
-- **Objective R34-6 (Failure Matrix & Test Suite Expansion to 183 Tests):** Expand the failure matrix from 138 to 183 deterministic cases (Cases 1–183) and codify 183 future test specifications (`Test R18-R34-T01` through `Test R18-R34-T183`), adding forty-five targeted specifications (T139–T183) covering binary custody (A1–A15), exact publication identity (B1–B20), and lost-response/ordering races (C21–C30). Explicitly state that future tests were NOT executed.
+- **Objective R35-1 (Private-Brand-First Lexical Checking & Zero Trap Execution - Blocker A):** Reorder `isLexicallyTrustedEncapsulatedByteArray` to evaluate `#bytes in val` BEFORE `Object.getPrototypeOf(val)`. Any Proxy fails `#bytes in val` immediately without executing `getPrototypeOf` or any other trap.
+- **Objective R35-2 (Captured Module Intrinsics & Prototype Poisoning Immunity - Blocker A):** Capture critical intrinsics (`Object_getPrototypeOf = Object.getPrototypeOf`, `ArrayBuffer_isView = ArrayBuffer.isView`, `%TypedArray%.prototype` getters) at module initialization, ensuring application-level prototype tampering cannot hijack binary custody validation.
+- **Objective R35-3 (Post-Await Leadership Fencing in NOT_COMMITTED_FINAL - Blocker B):** Require `this.#leadershipFence.assertPostAwaitEligibility(attempt)` before adopting `authoritativeCurrentRoot` in `NOT_COMMITTED_FINAL`. A stale coordinator losing leadership while awaiting store reconciliation is prohibited from updating its local root and throws `CUSTODY_PUBLICATION_STALE_LEADERSHIP`.
+- **Objective R35-4 (Authoritative Current Root Digest & Sequence Verification - Blocker B):** Require the coordinator to verify that `_computeRootDigest(authoritativeCurrentRoot) === result.authoritativeCurrentRootDigest` and `authoritativeCurrentRoot.publishedGeneration === result.authoritativeCurrentSequence` before root adoption in `NOT_COMMITTED_FINAL`.
+- **Objective R35-5 (CustodyReconciliationResult Specification of Root Digest - Blocker B):** Add `readonly authoritativeCurrentRootDigest: string` to `NOT_COMMITTED_FINAL` in `CustodyReconciliationResult`.
+- **Objective R35-6 (Expansion to 190 Deterministic Cases & Test Specifications):** Expand the failure matrix to 190 deterministic cases (Cases 1–190) and codify 190 future test specifications (`Test R18-R35-T01` through `Test R18-R35-T190`), adding seven targeted specifications (T184–T190) covering Proxy trap counter verification (T184, T185), stale leadership during non-commit reconciliation (T186, T187), authoritative current root mismatch (T188, T189), and captured intrinsics immunity (T190). Explicitly state that future tests were **NOT EXECUTED**.
 
 ## 2. Separation of the Three Independent Conditions
 
@@ -231,7 +216,7 @@ angle$$
    - `FENCED_REJECTED`: The fencing token was invalid, stale, superseded, out of sequence, or presented a digest mismatch. The candidate root is discarded, and the write is permanently rejected.
    - `UNCERTAIN`: The commit outcome is ambiguous due to network timeouts, transport partition, or cluster consensus unavailability before acknowledgement is received.
 
-4. **Authoritative Store Idempotency, Conflict Precedence & Authoritative Evidence Sourcing (R31-5, R31-6, R32-2, R32-6, R33-2, R33-3, R34-4, R34-5):**
+4. **Authoritative Store Idempotency, Conflict Precedence & Authoritative Evidence Sourcing (R31-5, R31-6, R32-2, R32-6, R33-2, R33-3, R34-4, R34-5, R35-3, R35-4):**
    The store's publication and reconciliation contract (`reconcilePublication`) enforces six deterministic linearizable invariants serialized through a shared consensus log or single-partition transactional compare-and-set state machine:
    1. **Identical Query Idempotency & Stored Identity Sourcing (Rule 1):** If `reconcilePublication(query)` or a retransmitted publication request presents the identical $\mathbf{publicationIdentity}$ (same term, boot generation, instance ID, sequence $S$, attempt ID $\mathbf{attemptId}$, candidate root digest $D$, and expected prior sequence/digest), the store returns `COMMITTED` (or `RECONCILED_COMMITTED`) idempotently with the exact original committed root and the stored 8-dimensional identity without re-execution.
    2. **Deterministic Sequence Conflict Precedence (Rule 2 & Rule 2b - R32-6):** When a publication request or reconciliation query presents an already-committed sequence $S$:
@@ -240,7 +225,7 @@ angle$$
 eq D$), the store permanently rejects the operation with `CONFLICTING_DIGEST_AT_SEQUENCE`.
    3. **Strict Sequencing of Uncertainty (Rule 3):** An uncertain attempt must be reconciled before any new logical publication sequence can be allocated by the coordinator. The coordinator gate remains latched in `RECONCILING_CUSTODY`.
    4. **Strict Immutable Retry & Reconciliation Identity (Rule 4):** When a coordinator reconciles an `UNCERTAIN` publication attempt, it MUST reuse the exact immutable $\mathbf{publicationIdentity}$ tuple—including the identical `attemptId`—that was generated for the initial publication attempt.
-   5. **Full-Identity Linearizable Reconciliation Fencing (Rule 5 - Blocker B / R33-2, R33-3):**
+   5. **Full-Identity Linearizable Reconciliation Fencing & Post-Await Guard (Rule 5 - Blocker B / R33-2, R33-3, R35-3, R35-4):**
       The publication commit path and the reconciliation fencing path serialize through the identical linearizable ordering domain:
       - The store maintains two mutually exclusive state-machine sets for each sequence $S$: `committedPublications` and `terminalFencedAttempts`.
       - When `reconcilePublication(query)` executes for an uncommitted sequence (absence of committed record):
@@ -248,12 +233,13 @@ eq D$), the store permanently rejects the operation with `CONFLICTING_DIGEST_AT_
         - The store atomically commits a durable terminal fencing tombstone (`TERMINAL_ATTEMPT_FENCED`) bound to the complete 8-dimensional tuple $\mathbf{publicationIdentity} = \langle \mathbf{clusterTerm}, \mathbf{bootGeneration}, \mathbf{bootInstanceId}, \mathbf{publicationSequence}, \mathbf{attemptId}, \mathbf{candidateRootDigest}, \mathbf{expectedPriorSequence}, \mathbf{expectedPriorRootDigest}
 angle$.
         - Any in-flight or delayed publication request evaluating after this tombstone is committed is guaranteed to be rejected with `ATTEMPT_TERMINALLY_ABORTED_BY_RECONCILIATION` and prohibited from committing.
-        - If the atomic terminal tombstone is successfully persisted, the store returns `NOT_COMMITTED_FINAL` with the full stored publication identity and the current authoritative root.
+        - If the atomic terminal tombstone is successfully persisted, the store returns `NOT_COMMITTED_FINAL` with the full stored publication identity, the authoritative current sequence, the authoritative current root, and `authoritativeCurrentRootDigest`.
+        - The coordinator asserts post-await leadership eligibility before adopting the current root; if leadership was lost while awaiting store response, local root replacement is prohibited and the coordinator throws `CUSTODY_PUBLICATION_STALE_LEADERSHIP`.
         - If the store cannot establish the linearizable outcome (e.g., quorum partition, consensus write timeout, or storage failure), it MUST return `UNKNOWN_IN_PROGRESS`. The coordinator receiving `UNKNOWN_IN_PROGRESS` CANNOT treat the publication as uncommitted; it remains fail-closed in `RECONCILING_CUSTODY` and retries reconciliation.
-   6. **Authoritative Evidence & Durable Identity Sourcing (Rule 6 - Blocker B / R34-4, R34-5):**
+   6. **Authoritative Evidence & Durable Identity Sourcing (Rule 6 - Blocker B / R34-4, R34-5, R35-4):**
       Reconciliation outcomes must derive their complete 8-dimensional `publicationIdentity` directly from durable authoritative storage records, never circularly echoing query inputs:
       - For `RECONCILED_COMMITTED`, the returned identity is read from the durable linearizable commit record, proving that the exact queried attempt was durably committed.
-      - For `NOT_COMMITTED_FINAL`, the returned identity is read from the durable terminal fencing tombstone, proving that the exact attempt was terminally aborted.
+      - For `NOT_COMMITTED_FINAL`, the returned identity is read from the durable terminal fencing tombstone, proving that the exact attempt was terminally aborted. Returned current root digest and sequence are validated against returned root metadata before adoption.
       - For `UNKNOWN_IN_PROGRESS`, `RECONCILED_CONFLICT`, and `RECONCILED_FENCED_REJECTED`, the result carries the queried identity with its explicit reason or higher term, ensuring that all reconciliation results are strictly attempt-bound.
 
 5. **Full Lock Lifecycle Across Leadership Loss & Invalidation (R31-5):**
@@ -580,8 +566,10 @@ Any value containing the following types triggers an immediate synchronous throw
    The architecture explicitly establishes that **Proxy-backed objects are outside the supported ingestion contract**. While ordinary accessor properties on plain objects are detected through property descriptors without invoking getters or setters, reflective JavaScript operations (`Object.getOwnPropertyDescriptor`, `Object.getPrototypeOf`, `Reflect.ownKeys`) unavoidably trigger Proxy traps if a caller supplies an ECMAScript `Proxy`. The custody ingestion trust boundary assumes schema-validated domain data produced by trusted deserialization and rejects untrusted arbitrary Proxy graphs.
 
 ```typescript
-// Intrinsic %TypedArray%.prototype property getters
-const TypedArray_prototype = Object.getPrototypeOf(Uint8Array.prototype);
+// Critical intrinsics captured once at module evaluation to prevent prototype/property poisoning (R35-2)
+const Object_getPrototypeOf = Object.getPrototypeOf;
+const ArrayBuffer_isView = ArrayBuffer.isView;
+const TypedArray_prototype = Object_getPrototypeOf(Uint8Array.prototype);
 const Uint8Array_buffer_get = Object.getOwnPropertyDescriptor(TypedArray_prototype, 'buffer')!.get!;
 const Uint8Array_byteOffset_get = Object.getOwnPropertyDescriptor(TypedArray_prototype, 'byteOffset')!.get!;
 const Uint8Array_byteLength_get = Object.getOwnPropertyDescriptor(TypedArray_prototype, 'byteLength')!.get!;
@@ -596,12 +584,12 @@ export function assertValidOrdinaryUint8Array(val: unknown): asserts val is Uint
   }
 
   // Step 2: Intrinsic brand check: must be a typed array view (rejects Proxies without executing traps)
-  if (!ArrayBuffer.isView(val)) {
+  if (!ArrayBuffer_isView(val)) {
     throw new TypeError('UNSUPPORTED_BINARY_VALUE_TYPE: value is not an ArrayBuffer view');
   }
 
   // Step 3: Strict same-realm prototype comparison (safe because Proxy candidates were rejected in Step 2)
-  if (Object.getPrototypeOf(val) !== Uint8Array.prototype) {
+  if (Reflect.apply(Object_getPrototypeOf, Object, [val]) !== Uint8Array.prototype) {
     throw new TypeError('UNSUPPORTED_BINARY_VALUE_TYPE: only direct Uint8Array instances from current realm are supported; subclasses and cross-realm views prohibited');
   }
 
@@ -655,18 +643,30 @@ export class EncapsulatedByteArray {
   readonly #canonicalHex: string;
 
   static {
-    // ECMAScript static initialization block binds the lexical brand checker (R33-1)
+    // ECMAScript static initialization block binds the lexical brand checker (R33-1, R35-1)
     isLexicallyTrustedEncapsulatedByteArray = function(val: unknown): val is EncapsulatedByteArray {
       if (typeof val !== 'object' || val === null) {
         return false;
       }
       try {
-        if (Object.getPrototypeOf(val) !== EncapsulatedByteArray.prototype) {
+        // Step 1: Private-brand check first (R35-1 - Blocker A).
+        // Per ECMAScript specification (§13.3.5.1 / §7.3.34), evaluating `#bytes in val` checks whether
+        // `val` has the private field `#bytes` directly in its [[PrivateElements]] internal slot.
+        // A Proxy object NEVER has the private field #bytes (private fields are not inherited
+        // by Proxies and are never delegated to the target).
+        // Crucially, the `in` operator for private names does NOT invoke any Proxy traps (not `has`,
+        // not `get`, not `getPrototypeOf`).
+        // Therefore, for any Proxy (whether wrapping a Uint8Array, an EncapsulatedByteArray, or anything else),
+        // `!(#bytes in val)` evaluates to `true` and returns `false` IMMEDIATELY!
+        if (!(#bytes in val)) {
           return false;
         }
-        return #bytes in val;
+
+        // Step 2: Only genuine instances that possess the #bytes internal private brand reach prototype inspection.
+        // Subclasses possess #bytes in val === true, but fail the exact prototype check.
+        return Reflect.apply(Object_getPrototypeOf, Object, [val]) === EncapsulatedByteArray.prototype;
       } catch {
-        return false; // Safely handles throwing Proxy traps or hostile objects without side-effects
+        return false;
       }
     };
   }
@@ -737,11 +737,8 @@ export class EncapsulatedByteArray {
 Object.freeze(EncapsulatedByteArray.prototype);
 Object.freeze(EncapsulatedByteArray);
 
-// Intrinsic accessors extracted once at module evaluation to prevent prototype poisoning
-const TypedArray_prototype = Object.getPrototypeOf(Uint8Array.prototype);
-const Uint8Array_buffer_get = Object.getOwnPropertyDescriptor(TypedArray_prototype, 'buffer')!.get!;
-const Uint8Array_byteOffset_get = Object.getOwnPropertyDescriptor(TypedArray_prototype, 'byteOffset')!.get!;
-const Uint8Array_byteLength_get = Object.getOwnPropertyDescriptor(TypedArray_prototype, 'byteLength')!.get!;
+// Intrinsic accessors extracted once at module evaluation to prevent prototype poisoning (R35-2)
+// (Object_getPrototypeOf, ArrayBuffer_isView, and TypedArray accessors captured at module initialization)
 
 // Intrinsic SharedArrayBuffer byteLength getter for cross-realm internal-slot brand checking (R31-1, R32-3)
 const SharedArrayBuffer_byteLength_get = typeof SharedArrayBuffer !== 'undefined'
@@ -779,14 +776,14 @@ export function assertValidOrdinaryUint8Array(val: unknown): asserts val is Uint
     throw new TypeError('UNSUPPORTED_BINARY_VALUE_TYPE: binary value must be an object');
   }
 
-  // Intrinsic brand check: must be a typed array view
-  if (!ArrayBuffer.isView(val)) {
+  // Step 2: Intrinsic brand check: must be a typed array view (R35-2)
+  if (!ArrayBuffer_isView(val)) {
     throw new TypeError('UNSUPPORTED_BINARY_VALUE_TYPE: value is not an ArrayBuffer view');
   }
 
-  // Strict prototype comparison: supported-input boundary restriction (R31-4)
+  // Step 3: Strict same-realm prototype comparison (R35-2)
   // Input Uint8Array views must originate from the coordinator's current execution realm.
-  if (Object.getPrototypeOf(val) !== Uint8Array.prototype) {
+  if (Reflect.apply(Object_getPrototypeOf, Object, [val]) !== Uint8Array.prototype) {
     throw new TypeError('UNSUPPORTED_BINARY_VALUE_TYPE: only direct Uint8Array instances from current realm are supported; subclasses and cross-realm views prohibited');
   }
 
@@ -1294,7 +1291,7 @@ export interface CustodyReconciliationQuery {
 
 export type CustodyReconciliationResult =
   | { readonly status: 'RECONCILED_COMMITTED'; readonly publicationIdentity: PublicationIdentity; readonly committedSequence: number; readonly committedRoot: AuthoritativeCustodyRoot }
-  | { readonly status: 'NOT_COMMITTED_FINAL'; readonly publicationIdentity: PublicationIdentity; readonly sequence: number; readonly terminalTombstoneId: string; readonly authoritativeCurrentSequence: number; readonly authoritativeCurrentRoot: AuthoritativeCustodyRoot }
+  | { readonly status: 'NOT_COMMITTED_FINAL'; readonly publicationIdentity: PublicationIdentity; readonly sequence: number; readonly terminalTombstoneId: string; readonly authoritativeCurrentSequence: number; readonly authoritativeCurrentRoot: AuthoritativeCustodyRoot; readonly authoritativeCurrentRootDigest: string }
   | { readonly status: 'UNKNOWN_IN_PROGRESS'; readonly publicationIdentity: PublicationIdentity; readonly sequence: number; readonly reason: string }
   | { readonly status: 'RECONCILED_CONFLICT'; readonly publicationIdentity: PublicationIdentity; readonly reason: 'CONFLICTING_DIGEST_AT_SEQUENCE' | 'DUPLICATE_SEQUENCE_CONFLICT' | string }
   | { readonly status: 'RECONCILED_FENCED_REJECTED'; readonly publicationIdentity: PublicationIdentity; readonly higherTerm: number; readonly reason: string };
@@ -1968,7 +1965,29 @@ export class AuthoritativeCustodyCoordinator {
       }
 
       case 'NOT_COMMITTED_FINAL': {
-        // Requires durable terminal tombstone with matching exact identity (already proven in Step 1)
+        // Step 1: Pre-adoption post-await leadership eligibility assertion (R35-3 - Blocker B)
+        // If the coordinator stepped down, leadership term advanced, or lease expired while awaiting store response,
+        // local pointer replacement is strictly prohibited. The coordinator throws CUSTODY_PUBLICATION_STALE_LEADERSHIP
+        // and remains fail-closed in RECONCILING_CUSTODY.
+        this.#leadershipFence.assertPostAwaitEligibility(attempt);
+
+        // Step 2: Verify authoritative current root digest and sequence consistency (R35-4 - Blocker B)
+        const computedCurrentDigest = this._computeRootDigest(result.authoritativeCurrentRoot);
+        if (computedCurrentDigest !== result.authoritativeCurrentRootDigest) {
+          this.#custodyGateState = CustodyGateState.RECONCILING_CUSTODY;
+          throw new Error(
+            `INVALID_RECONCILIATION_CONFIRMATION: authoritative current root digest mismatch (computed '${computedCurrentDigest}' !== returned '${result.authoritativeCurrentRootDigest}')`
+          );
+        }
+
+        if (result.authoritativeCurrentRoot.publishedGeneration !== result.authoritativeCurrentSequence) {
+          this.#custodyGateState = CustodyGateState.RECONCILING_CUSTODY;
+          throw new Error(
+            `INVALID_RECONCILIATION_CONFIRMATION: authoritative current sequence mismatch (root generation ${result.authoritativeCurrentRoot.publishedGeneration} !== sequence ${result.authoritativeCurrentSequence})`
+          );
+        }
+
+        // Only after leadership and root integrity validation may local custody adopt the authoritative current root
         this.#custodyRoot = result.authoritativeCurrentRoot;
         this.#custodyGateState = CustodyGateState.IDLE;
         return;
@@ -2970,7 +2989,7 @@ Protocol B handles cancelled or uncommitted operations:
 
 ---
 
-## 15. Exhaustive Failure and Retry Matrix (183 Deterministic Cases)
+## 15. Exhaustive Failure and Retry Matrix (190 Deterministic Cases)
 
 | Case | Scenario | Gate State | Custody Owner | Barrier State | Correct Action | Forbidden Action |
 |---|---|---|---|---|---|---|
@@ -3158,6 +3177,13 @@ eq B$); throws `INVALID_RECONCILIATION_CONFIRMATION` | Resolve attempt B using e
 | **181** | Terminal tombstone committed for attempt A evaluated against attempt B | `RECONCILING` | Authoritative Store | PENDING | Tombstone binds full 8D tuple including attemptId $A$; attempt B evaluates independently | Fence attempt B using tombstone from attempt A |
 | **182** | Retransmitted publication presents identical 8D tuple to committed publication | `PUBLISHING` | Authoritative Store | PENDING | Store evaluates Rule 1; returns `COMMITTED` idempotently with original committed root; zero side-effects | Duplicate execution or false collision rejection on valid retry |
 | **183** | Retransmitted publication presents committed sequence with conflicting attempt ID | `PUBLISHING` | Authoritative Store | FAILED | Store evaluates Rule 2 Precedence Step 1; rejects with `DUPLICATE_SEQUENCE_CONFLICT` | Overwrite committed sequence or misclassify conflict |
+| **184** | Hostile Proxy with throwing `getPrototypeOf` trap submitted to constructor | `ANY` | Any | ANY | Private brand check `!(#bytes in value)` evaluates first and returns false; `ArrayBuffer_isView` evaluates second and returns false; `getPrototypeOf` trap counter remains strictly ZERO | Execute hostile `getPrototypeOf` trap during lexical inspection |
+| **185** | Proxy wrapping EncapsulatedByteArray submitted to constructor or cloner | `ANY` | Any | ANY | Evaluated against `#bytes in proxy`; returns false immediately without executing Proxy traps; trap counter remains zero | Delegate private-field evaluation to Proxy target or invoke traps |
+| **186** | Coordinator term advances while awaiting reconciliation; store returns `NOT_COMMITTED_FINAL` | `RECONCILING` | Stale Coordinator | PENDING | `assertPostAwaitEligibility` detects term advance; throws `CUSTODY_PUBLICATION_STALE_LEADERSHIP`; local root update withheld | Adopt authoritative current root after losing cluster recovery leadership |
+| **187** | Leadership lease expires while awaiting reconciliation; store returns `NOT_COMMITTED_FINAL` | `RECONCILING` | Expired Leader | PENDING | `assertPostAwaitEligibility` detects lease expiry; throws `CUSTODY_PUBLICATION_STALE_LEADERSHIP`; local root update withheld | Adopt authoritative current root under expired leadership lease |
+| **188** | Store returns `NOT_COMMITTED_FINAL` with mismatched `authoritativeCurrentRootDigest` | `RECONCILING` | Authoritative Store | PENDING | Coordinator computes root digest; detects discrepancy with returned digest; throws `INVALID_RECONCILIATION_CONFIRMATION`; remains fail-closed | Adopt current root with unverified or corrupted content digest |
+| **189** | Store returns `NOT_COMMITTED_FINAL` with mismatched `authoritativeCurrentSequence` | `RECONCILING` | Authoritative Store | PENDING | Coordinator verifies `root.publishedGeneration === sequence`; detects mismatch; throws `INVALID_RECONCILIATION_CONFIRMATION`; remains fail-closed | Adopt current root with inconsistent sequence increment |
+| **190** | Application code poisons global `ArrayBuffer.isView` or `Object.getPrototypeOf` | `ANY` | Host Realm | ANY | Constructor and validator invoke module-scoped captured intrinsics (`ArrayBuffer_isView`, `Object_getPrototypeOf`); poisoning has zero effect | Allow global prototype or method tampering to hijack binary custody validation |
 
 ---
 
@@ -3200,13 +3226,13 @@ eq B$); throws `INVALID_RECONCILIATION_CONFIRMATION` | Resolve attempt B using e
 16. **Watchdog Pin and Lease Immunity Invariant:**
    Watchdog timeouts CANNOT release retention pins or retry leases whose underlying operations remain unresolved.
 17. **Single In-Flight Drain Invariant:** A second drain **CANNOT** dequeue an operation while `this.#custodyRoot.inFlightRecord !== null` ($N_{	ext{in-flight}} \le 1$).
-18. **Restricted Custody-Value Universe, Proxy-Safe Construction & Canonical Binary Encapsulation Invariant (R30-1, R31-1, R31-2, R31-3, R31-4, R32-1, R32-3, R32-4, R32-5, R33-1, R34-1, R34-2):**
-   All custody root collections enforce runtime `#private` backing storage (`#inner`), strictly admissible primitives (string, safe integers, finite floats, null), strict prohibition of `undefined`, `bigint`, and `symbol`, negative-zero canonicalization to `0`, array density (zero holes), prototype verification without constructor reading, accessor prohibition without getter execution, cycle detection without false rejection of shared acyclic DAG references, private binary storage encapsulation via `EncapsulatedByteArray` with direct private-field reading across instances (`#bytes`, `#canonicalHex`) bypassing all public methods, unexported lexical brand checking (`isLexicallyTrustedEncapsulatedByteArray`) completely immune to external monkey-patching, frozen class constructor and frozen prototype (`Object.freeze(EncapsulatedByteArray)`, `Object.freeze(EncapsulatedByteArray.prototype)`), Proxy-safe two-path construction strictly eliminating unsafe `instanceof` or `isPrototypeOf` fallbacks, safe 7-step binary validator ordering with `ArrayBuffer.isView` intrinsic brand checking rejecting Proxies and subclasses without trap execution, supported-input boundary restriction rejecting cross-realm `Uint8Array` views, strict rejection of extra own string properties on typed arrays via `/^(?:0|[1-9]\d*)$/` (`UNSUPPORTED_ARRAY_PROPERTY`), fail-closed detection of cross-realm `SharedArrayBuffer` backing stores via intrinsic `%SharedArrayBuffer%.prototype.byteLength` getter brand checking, canonical lowercase hexadecimal binary serialization (`[0-9a-f]{2*n}`), and strict prohibition of symbol-keyed properties in canonical snapshot payloads.
+18. **Restricted Custody-Value Universe, Private-Brand-First Lexical Checking & Canonical Binary Encapsulation Invariant (R30-1, R31-1, R31-2, R31-3, R31-4, R32-1, R32-3, R32-4, R32-5, R33-1, R34-1, R34-2, R35-1, R35-2):**
+   All custody root collections enforce runtime `#private` backing storage (`#inner`), strictly admissible primitives (string, safe integers, finite floats, null), strict prohibition of `undefined`, `bigint`, and `symbol`, negative-zero canonicalization to `0`, array density (zero holes), prototype verification without constructor reading, accessor prohibition without getter execution, cycle detection without false rejection of shared acyclic DAG references, private binary storage encapsulation via `EncapsulatedByteArray` with direct private-field reading across instances (`#bytes`, `#canonicalHex`) bypassing all public methods, unexported lexical brand checking (`isLexicallyTrustedEncapsulatedByteArray`) executing `#bytes in val` BEFORE `Object_getPrototypeOf(val)` to guarantee zero Proxy trap execution throughout constructor invocation, frozen class constructor and frozen prototype (`Object.freeze(EncapsulatedByteArray)`, `Object.freeze(EncapsulatedByteArray.prototype)`), Proxy-safe two-path construction strictly eliminating unsafe `instanceof` or `isPrototypeOf` fallbacks, module-scoped captured intrinsics (`Object_getPrototypeOf`, `ArrayBuffer_isView`, `%TypedArray%.prototype` getters) immune to global tampering, safe 7-step binary validator ordering rejecting Proxies and subclasses without trap execution, supported-input boundary restriction rejecting cross-realm `Uint8Array` views, strict rejection of extra own string properties on typed arrays via `/^(?:0|[1-9]\d*)$/` (`UNSUPPORTED_ARRAY_PROPERTY`), fail-closed detection of cross-realm `SharedArrayBuffer` backing stores via intrinsic `%SharedArrayBuffer%.prototype.byteLength` getter brand checking, canonical lowercase hexadecimal binary serialization (`[0-9a-f]{2*n}`), and strict prohibition of symbol-keyed properties in canonical snapshot payloads.
 19. **Complete Structured Owner-Token Identity Invariant:**
    Every active and retired resource binds and verifies the complete structured `CustodyOwnershipToken` (`recoveryAttemptId`, `custodyGeneration`, `drainerOwnershipGeneration`, `transactionId`, `operationIdentity`, `barrierIdentity`, `leaseTerm`, `ownerSignature`) using `isEquivalentOwnerToken()`.
-20. **Authoritative Boundary Fencing, Full Lock Lifecycle & Exact-Identity Reconciliation Invariant (R30-3, R30-5, R31-5, R32-2, R33-2, R33-3, R34-3, R34-4, R34-5):**
+20. **Authoritative Boundary Fencing, Full Lock Lifecycle & Post-Await Reconciliation Invariant (R30-3, R30-5, R31-5, R32-2, R33-2, R33-3, R34-3, R34-4, R34-5, R35-3, R35-4):**
    All custody root publications execute strictly via internal two-phase publication using the canonical 8-dimensional `PublicationIdentity` tuple $\langle \mathbf{clusterTerm}, \mathbf{bootGeneration}, \mathbf{bootInstanceId}, \mathbf{publicationSequence}, \mathbf{attemptId}, \mathbf{candidateRootDigest}, \mathbf{expectedPriorSequence}, \mathbf{expectedPriorRootDigest}
-angle$. Reconciling an `UNCERTAIN` publication attempt MUST reuse the exact immutable `PublicationIdentity` tuple including the original `attemptId`. Store publication and reconciliation fencing serialize through the identical shared linearizable consensus log or single-partition transactional compare-and-set state machine. Every attempt-specific reconciliation result carries the complete `PublicationIdentity` sourced directly from durable store records. The coordinator strictly asserts field-by-field identity equality (`samePublicationIdentity`) before evaluating result status, validates committed sequence and root digest against attempt identity, and fails closed into `RECONCILING_CUSTODY` on any mismatch. Reporting non-commitment requires an atomically persisted durable terminal tombstone (`TERMINAL_ATTEMPT_FENCED`) bound to the complete 8D tuple that guarantees in-flight attempts cannot commit, or returns `UNKNOWN_IN_PROGRESS` fail-closed. The local coordinator instance enforces process-local FIFO mutual exclusion via asynchronous `#publicationLock`, immediately purges and rejects queued attempts on step-down (`COORDINATOR_STOPPED`), verifies local lease non-expiry with guard margin $\Delta_{	ext{guard}}$, asserts exact `AuthoritativeCommittedConfirmation` matching including `attemptId`, and enforces post-await completion fencing prohibiting local `#custodyRoot` updates if leadership was lost while awaiting store response.
+angle$. Reconciling an `UNCERTAIN` publication attempt MUST reuse the exact immutable `PublicationIdentity` tuple including the original `attemptId`. Store publication and reconciliation fencing serialize through the identical shared linearizable consensus log or single-partition transactional compare-and-set state machine. Every attempt-specific reconciliation result carries the complete `PublicationIdentity` sourced directly from durable store records. The coordinator strictly asserts field-by-field identity equality (`samePublicationIdentity`) before evaluating result status, validates committed sequence and root digest against attempt identity, and fails closed into `RECONCILING_CUSTODY` on any mismatch. Reporting non-commitment requires an atomically persisted durable terminal tombstone (`TERMINAL_ATTEMPT_FENCED`) bound to the complete 8D tuple that guarantees in-flight attempts cannot commit, or returns `UNKNOWN_IN_PROGRESS` fail-closed. Adopting `authoritativeCurrentRoot` under `NOT_COMMITTED_FINAL` strictly requires pre-adoption post-await leadership eligibility assertion (`assertPostAwaitEligibility`) and verification of returned current sequence and root digest against authoritative evidence; stale coordinators losing leadership while awaiting reconciliation are prohibited from updating local roots and throw `CUSTODY_PUBLICATION_STALE_LEADERSHIP`. The local coordinator instance enforces process-local FIFO mutual exclusion via asynchronous `#publicationLock`, immediately purges and rejects queued attempts on step-down (`COORDINATOR_STOPPED`), verifies local lease non-expiry with guard margin $\Delta_{	ext{guard}}$, asserts exact `AuthoritativeCommittedConfirmation` matching including `attemptId`, and enforces post-await completion fencing prohibiting local `#custodyRoot` updates if leadership was lost while awaiting store response.
 21. **Cross-Restart Retirement Idempotency & Active Boot Isolation Invariant:**
    Active collections initialize empty across process restarts; unreleased active resources from prior epochs fail closed as `RESOURCE_NOT_FOUND`. Retired records restored from persistent checkpoints remain authoritative and return `ALREADY_RELEASED` when presented with matching boot epoch, 7-dimensional identity, and evidence digest.
 22. **Safe Record Own-Property Creation, Array Descriptor Validation & Intrinsic Inspection Invariant (R29-A2, R30-2, R31-1, R31-6, R32-6, R33-5):**
@@ -3239,27 +3265,27 @@ The proposal excises all references to `forceEmergencyReset(capability)`:
 
 ## 19. Deterministic Failure Scenarios and Future Test Requirements
 
-The following one hundred and eighty-three deterministic future test specifications are formally codified for Sub-Milestone M5.1:
+The following one hundred and ninety deterministic future test specifications are formally codified for Sub-Milestone M5.1:
 
-### Test R18-R34-T01: Retry Acquisition Without Stable Request Context
+### Test R18-R35-T01: Retry Acquisition Without Stable Request Context
 - **Initial Authoritative Root:** Settled result at $g=1$; `activeRetryLeases.size === 0`.
 - **Operation Sequence:** Call `publishReleaseAndObligation` presenting retry token for $g=1$ with `retryContext === undefined`.
 - **Expected Final Root:** Unchanged; zero leases allocated.
 - **Expected Result / Error:** Throws `INVALID_RETRY_REQUEST_CONTEXT`.
 
-### Test R18-R34-T02: Retry Acquisition With Malformed or Empty Request Context
+### Test R18-R35-T02: Retry Acquisition With Malformed or Empty Request Context
 - **Initial Authoritative Root:** Settled result at $g=1$; `activeRetryLeases.size === 0`.
 - **Operation Sequence:** Call `publishReleaseAndObligation` presenting retry token for $g=1$ with `retryContext = { consumerId: "   ", clientRequestId: "" }`.
 - **Expected Final Root:** Unchanged; zero leases allocated.
 - **Expected Result / Error:** Throws `MALFORMED_RETRY_REQUEST_CONTEXT`.
 
-### Test R18-R34-T03: Retry Acquisition With Oversized Request Context
+### Test R18-R35-T03: Retry Acquisition With Oversized Request Context
 - **Initial Authoritative Root:** Settled result at $g=1$; `activeRetryLeases.size === 0`.
 - **Operation Sequence:** Call `publishReleaseAndObligation` with `consumerId` of length 257 characters.
 - **Expected Final Root:** Unchanged; zero leases allocated.
 - **Expected Result / Error:** Throws `RETRY_REQUEST_CONTEXT_OVERSIZED`.
 
-### Test R18-R34-T04: Lost-Response Retransmission Recovers Original Lease Idempotently
+### Test R18-R35-T04: Lost-Response Retransmission Recovers Original Lease Idempotently
 - **Initial Authoritative Root:** Settled result at $g=1$; `activeRetryLeases.size === 0`.
 - **Operation Sequence:**
   1. Consumer 1 acquires lease for $g=1$ with `clientRequestId = "req-101"`; receives `leaseId_A`.
@@ -3267,13 +3293,13 @@ The following one hundred and eighty-three deterministic future test specificati
 - **Expected Final Root:** `activeRetryLeases.size === 1`, containing `leaseId_A`.
 - **Expected Result / Error:** Second call returns existing `leaseId_A` idempotently.
 
-### Test R18-R34-T05: Repeated Retry Acquisition With Conflicting Operation Identity
+### Test R18-R35-T05: Repeated Retry Acquisition With Conflicting Operation Identity
 - **Initial Authoritative Root:** Settled result at $g=1$; lease active for `(consumer1, req-101)`.
 - **Operation Sequence:** Consumer 1 submits request with `clientRequestId = "req-101"` but altered `operationIdentity`.
 - **Expected Final Root:** Unchanged.
 - **Expected Result / Error:** Throws `IDEMPOTENT_RETRY_IDENTITY_CONFLICT`.
 
-### Test R18-R34-T06: Two Distinct Consumers Acquire Independent Leases Under Same Recovery Owner Token
+### Test R18-R35-T06: Two Distinct Consumers Acquire Independent Leases Under Same Recovery Owner Token
 - **Initial Authoritative Root:** Settled result at $g=1$; `activeRetryLeases.size === 0`.
 - **Operation Sequence:**
   1. Consumer 1 requests lease for $g=1$ with `consumerId = "c1"`.
@@ -3281,13 +3307,13 @@ The following one hundred and eighty-three deterministic future test specificati
 - **Expected Final Root:** `activeRetryLeases.size === 2`, containing `leaseId_1` and `leaseId_2`.
 - **Expected Result / Error:** Both acquire distinct leases successfully.
 
-### Test R18-R34-T07: Consumer 1 Attempting to Release Consumer 2's Lease Fails Closed
+### Test R18-R35-T07: Consumer 1 Attempting to Release Consumer 2's Lease Fails Closed
 - **Initial Authoritative Root:** Active leases for Consumer 1 (`leaseId_1`) and Consumer 2 (`leaseId_2`).
 - **Operation Sequence:** Consumer 1 invokes `releaseRetryLease` passing `leaseId_2` with `consumerId = "c1"`.
 - **Expected Final Root:** Unchanged; both leases remain active.
 - **Expected Result / Error:** Throws `UNAUTHORIZED_CROSS_CONSUMER_LEASE_RELEASE`.
 
-### Test R18-R34-T08: Duplicate Lease Release by Authorized Consumer Against Retired Record Is Idempotent
+### Test R18-R35-T08: Duplicate Lease Release by Authorized Consumer Against Retired Record Is Idempotent
 - **Initial Authoritative Root:** Active lease `leaseId_1` for Consumer 1.
 - **Operation Sequence:**
   1. Consumer 1 calls `releaseRetryLease` with all matching parameters; returns `{ status: 'RELEASED' }`.
@@ -3295,7 +3321,7 @@ The following one hundred and eighty-three deterministic future test specificati
 - **Expected Final Root:** `activeRetryLeases.has(leaseId_1) === false`; `retiredRetryLeases.has(leaseId_1) === true`.
 - **Expected Result / Error:** Second call matches retired record and returns `{ status: 'ALREADY_RELEASED' }` idempotently.
 
-### Test R18-R34-T09: First Publication With Option A Lifecycle Model
+### Test R18-R35-T09: First Publication With Option A Lifecycle Model
 - **Initial Authoritative Root:** `publishedGeneration = 0`, `auditTombstoneFloor = 0`, `custodyGenerationFloor = 0`.
 - **Operation Sequence:** Call `publishReleaseAndObligation` for $g=1$.
 - **Expected Final Root:**
@@ -3305,13 +3331,13 @@ The following one hundred and eighty-three deterministic future test specificati
   - `generationAuditHistory.get(1).kind === 'PENDING_PUBLICATION'`.
 - **Expected Result / Error:** Success; contiguity invariant holds unconditionally.
 
-### Test R18-R34-T10: Pending-to-Terminal Audit History Transition
+### Test R18-R35-T10: Pending-to-Terminal Audit History Transition
 - **Initial Authoritative Root:** Generation $g=1$ published; audit record is `PENDING_PUBLICATION`.
 - **Operation Sequence:** Barrier for $g=1$ settles with `AuthoritativeSettlementEvidence` (`CONFIRMED_COMMITTED`).
 - **Expected Final Root:** `generationAuditHistory.get(1).kind === 'TERMINAL_SETTLEMENT'`.
 - **Expected Result / Error:** Success; record upgraded in place.
 
-### Test R18-R34-T11: Eviction and Compact Tombstone Conversion
+### Test R18-R35-T11: Eviction and Compact Tombstone Conversion
 - **Initial Authoritative Root:** Result at $g=1$ settled (`TERMINAL_SETTLEMENT`); 1,000 results retained.
 - **Operation Sequence:** Publish $g=1001$; triggers FIFO eviction of $g=1$.
 - **Expected Final Root:**
@@ -3321,25 +3347,25 @@ The following one hundred and eighty-three deterministic future test specificati
   - `generationAuditHistory.get(1).evidenceDigest` is 32-byte SHA-256.
 - **Expected Result / Error:** Success.
 
-### Test R18-R34-T12: Tombstone Retirement Blocked by Active Settlement Pin
+### Test R18-R35-T12: Tombstone Retirement Blocked by Active Settlement Pin
 - **Initial Authoritative Root:** 5,000 tombstones retained; oldest tombstone $g=1$ has an active settlement pin.
 - **Operation Sequence:** Next result eviction attempts to retire tombstone $g=1$.
 - **Expected Final Root:** Unchanged; zero tombstones deleted; zero results evicted.
 - **Expected Result / Error:** Throws `TOMBSTONE_CAPACITY_EXHAUSTED`.
 
-### Test R18-R34-T13: Tombstone Retirement Blocked by Active Retry Lease
+### Test R18-R35-T13: Tombstone Retirement Blocked by Active Retry Lease
 - **Initial Authoritative Root:** 5,000 tombstones retained; oldest tombstone $g=1$ has an active retry lease.
 - **Operation Sequence:** Next result eviction attempts to retire tombstone $g=1$.
 - **Expected Final Root:** Unchanged; zero tombstones deleted; zero results evicted.
 - **Expected Result / Error:** Throws `TOMBSTONE_CAPACITY_EXHAUSTED`.
 
-### Test R18-R34-T14: Tombstone Retirement Blocked by Pending Settlement Obligation
+### Test R18-R35-T14: Tombstone Retirement Blocked by Pending Settlement Obligation
 - **Initial Authoritative Root:** 5,000 tombstones retained; oldest tombstone $g=1$ references pending obligation.
 - **Operation Sequence:** Next result eviction attempts to retire tombstone $g=1$.
 - **Expected Final Root:** Unchanged.
 - **Expected Result / Error:** Throws `TOMBSTONE_CAPACITY_EXHAUSTED`.
 
-### Test R18-R34-T15: Normal FIFO Tombstone Retirement at 5,000 Capacity
+### Test R18-R35-T15: Normal FIFO Tombstone Retirement at 5,000 Capacity
 - **Initial Authoritative Root:** 5,000 tombstones retained ($[1 \dots 5000]$); zero pins/leases on $g=1$.
 - **Operation Sequence:** Publish new generation causing eviction and tombstone retirement.
 - **Expected Final Root:**
@@ -3348,85 +3374,85 @@ The following one hundred and eighty-three deterministic future test specificati
   - Total tombstones remaining: 5,000 ($[2 \dots 5001]$).
 - **Expected Result / Error:** Success; contiguity preserved over $[2 \dots publishedGeneration]$.
 
-### Test R18-R34-T16: Pre-Existing Tombstone Count Above Cap Fails Closed
+### Test R18-R35-T16: Pre-Existing Tombstone Count Above Cap Fails Closed
 - **Initial Authoritative Root:** Artificially injected root with 5,005 tombstones.
 - **Operation Sequence:** Call `publishReleaseAndObligation`.
 - **Expected Final Root:** Unchanged; zero bulk deletions performed.
 - **Expected Result / Error:** Throws `TOMBSTONE_CAPACITY_CORRUPTED`.
 
-### Test R18-R34-T17: Missing Tombstone Inside Promised Horizon Fails Closed
+### Test R18-R35-T17: Missing Tombstone Inside Promised Horizon Fails Closed
 - **Initial Authoritative Root:** `auditTombstoneFloor = 10`, `custodyGenerationFloor = 20`; tombstone $g=15$ deleted.
 - **Operation Sequence:** Call `assertAuditHistoryContiguity`.
 - **Expected Final Root:** Unchanged.
 - **Expected Result / Error:** Throws `STATE_INCONSISTENT_AUDIT_KEY_GAP`.
 
-### Test R18-R34-T18: Expiry Below Tombstone Floor Returns Historical Expiry
+### Test R18-R35-T18: Expiry Below Tombstone Floor Returns Historical Expiry
 - **Initial Authoritative Root:** `auditTombstoneFloor = 50`.
 - **Operation Sequence:** Query generation $g=30$.
 - **Expected Final Root:** Unchanged.
 - **Expected Result / Error:** Returns `CUSTODY_RECEIPT_EXPIRED` with `horizonExpired: true`.
 
-### Test R18-R34-T19: Floor Order Invariant Violation Fails Closed
+### Test R18-R35-T19: Floor Order Invariant Violation Fails Closed
 - **Initial Authoritative Root:** Artificially set `auditTombstoneFloor = 50`, `custodyGenerationFloor = 40`.
 - **Operation Sequence:** Call `assertAuditHistoryContiguity`.
 - **Expected Final Root:** Unchanged.
 - **Expected Result / Error:** Throws `STATE_INCONSISTENT_FLOOR_ORDER_VIOLATION`.
 
-### Test R18-R34-T20: Audit Record With Mismatched Generation Fails Closed
+### Test R18-R35-T20: Audit Record With Mismatched Generation Fails Closed
 - **Initial Authoritative Root:** Audit history key is 5, but record payload has `generation: 4`.
 - **Operation Sequence:** Call `assertAuditHistoryContiguity`.
 - **Expected Final Root:** Unchanged.
 - **Expected Result / Error:** Throws `AUDIT_RECORD_GENERATION_MISMATCH`.
 
-### Test R18-R34-T21: Audit Record With Mismatched Owner Token Fails Closed
+### Test R18-R35-T21: Audit Record With Mismatched Owner Token Fails Closed
 - **Initial Authoritative Root:** Audit record at $g=1$ has altered `membershipEpoch`.
 - **Operation Sequence:** Call `assertAuditHistoryContiguity` with publicationResults.
 - **Expected Final Root:** Unchanged.
 - **Expected Result / Error:** Throws `STATE_INCONSISTENT_AUDIT_RESULT_IDENTITY_MISMATCH`.
 
-### Test R18-R34-T22: Audit Record With Mismatched Drainer Ownership Generation Fails Closed
+### Test R18-R35-T22: Audit Record With Mismatched Drainer Ownership Generation Fails Closed
 - **Initial Authoritative Root:** Audit record at $g=1$ has altered `drainerOwnershipGeneration`.
 - **Operation Sequence:** Call `assertAuditHistoryContiguity` with publicationResults.
 - **Expected Final Root:** Unchanged.
 - **Expected Result / Error:** Throws `STATE_INCONSISTENT_AUDIT_RESULT_IDENTITY_MISMATCH`.
 
-### Test R18-R34-T23: Cross-Generation Settlement Evidence Replay Rejected
+### Test R18-R35-T23: Cross-Generation Settlement Evidence Replay Rejected
 - **Initial Authoritative Root:** Active pin for $g=2$; evidence constructed for $g=1$.
 - **Operation Sequence:** Call `releaseSettlementPin("pin:...:g2:...", evidence_g1)`.
 - **Expected Final Root:** Unchanged; pin remains active.
 - **Expected Result / Error:** Throws `SETTLEMENT_EVIDENCE_IDENTITY_MISMATCH`.
 
-### Test R18-R34-T24: Cross-Obligation Settlement Evidence Replay Rejected via Atomic In-Root Registry
+### Test R18-R35-T24: Cross-Obligation Settlement Evidence Replay Rejected via Atomic In-Root Registry
 - **Initial Authoritative Root:** Evidence for $g=1$ already consumed on `pin_1`; `consumedSettlementEvidence.has("1:barrier:pin_1") === true`.
 - **Operation Sequence:** Attempt to reuse identical evidence on `pin_2`.
 - **Expected Final Root:** Unchanged; `pin_2` remains active.
 - **Expected Result / Error:** Throws `SETTLEMENT_EVIDENCE_REPLAY_DETECTED`.
 
-### Test R18-R34-T25: Caller-Constructed Mock Evidence Rejected by Provenance Check
+### Test R18-R35-T25: Caller-Constructed Mock Evidence Rejected by Provenance Check
 - **Initial Authoritative Root:** Active pin for $g=1$.
 - **Operation Sequence:** Caller constructs object matching `AuthoritativeSettlementEvidence` schema without factory.
 - **Expected Final Root:** Unchanged; pin remains active.
 - **Expected Result / Error:** Throws `INVALID_SETTLEMENT_EVIDENCE_PROVENANCE`.
 
-### Test R18-R34-T26: Watchdog Timeout Cannot Release Settlement Pin
+### Test R18-R35-T26: Watchdog Timeout Cannot Release Settlement Pin
 - **Initial Authoritative Root:** Barrier pending for $g=1$; watchdog fires after 5,000 ms.
 - **Operation Sequence:** Watchdog handler attempts to call `releaseSettlementPin` with watchdog receipt.
 - **Expected Final Root:** Pin remains active; gate state latches `DEGRADED`.
 - **Expected Result / Error:** Throws `INVALID_SETTLEMENT_EVIDENCE_PROVENANCE`.
 
-### Test R18-R34-T27: Retry Lease ID Passed to Settlement Pin Release Fails Closed
+### Test R18-R35-T27: Retry Lease ID Passed to Settlement Pin Release Fails Closed
 - **Initial Authoritative Root:** Active lease `lease:1:1:c1:1`.
 - **Operation Sequence:** Call `releaseSettlementPin("lease:1:1:c1:1", evidence)`.
 - **Expected Final Root:** Unchanged.
 - **Expected Result / Error:** Throws `PIN_TYPE_MISMATCH`.
 
-### Test R18-R34-T28: Settlement Pin ID Passed to Retry Lease Release Fails Closed
+### Test R18-R35-T28: Settlement Pin ID Passed to Retry Lease Release Fails Closed
 - **Initial Authoritative Root:** Active pin `pin:1:1:b1:1`.
 - **Operation Sequence:** Call `releaseRetryLease({ leaseId: "pin:1:1:b1:1", ... })`.
 - **Expected Final Root:** Unchanged.
 - **Expected Result / Error:** Throws `LEASE_TYPE_MISMATCH`.
 
-### Test R18-R34-T29: Genuinely Unknown Identifier Passed to Release APIs Fails Closed (Blocker B1)
+### Test R18-R35-T29: Genuinely Unknown Identifier Passed to Release APIs Fails Closed (Blocker B1)
 - **Initial Authoritative Root:** Clean root; active and retired maps empty.
 - **Operation Sequence:**
   1. Call `releaseRetryLease` with never-issued `leaseId = "lease:999:unknown"`.
@@ -3434,7 +3460,7 @@ The following one hundred and eighty-three deterministic future test specificati
 - **Expected Final Root:** Unchanged.
 - **Expected Result / Error:** Both calls fail closed with `RESOURCE_NOT_FOUND` (neither returns `ALREADY_RELEASED`).
 
-### Test R18-R34-T30: Duplicate Release Against Retired Pin With Matching Provenance and Digest Returns Already Released
+### Test R18-R35-T30: Duplicate Release Against Retired Pin With Matching Provenance and Digest Returns Already Released
 - **Initial Authoritative Root:** Active pin `pin_1` for $g=1$.
 - **Operation Sequence:**
   1. Release `pin_1` with valid evidence; returns `{ status: 'RELEASED' }`.
@@ -3442,13 +3468,13 @@ The following one hundred and eighty-three deterministic future test specificati
 - **Expected Final Root:** `activeSettlementPins.has("pin_1") === false`; `retiredSettlementPins.has("pin_1") === true`.
 - **Expected Result / Error:** Second call validates provenance and digest, returning `{ status: 'ALREADY_RELEASED' }` idempotently.
 
-### Test R18-R34-T31: Settlement Pin Release With Mismatched Drainer Generation Fails Closed (Blocker C1)
+### Test R18-R35-T31: Settlement Pin Release With Mismatched Drainer Generation Fails Closed (Blocker C1)
 - **Initial Authoritative Root:** Active pin for $g=1$ with `drainerOwnershipGeneration = 2`.
 - **Operation Sequence:** Caller presents `AuthoritativeSettlementEvidence` with `drainerOwnershipGeneration = 1`.
 - **Expected Final Root:** Unchanged; pin remains active; evidence remains unconsumed.
 - **Expected Result / Error:** Throws `SETTLEMENT_EVIDENCE_IDENTITY_MISMATCH`.
 
-### Test R18-R34-T32: Pre-Publication Throw During Pin Release Leaves Evidence Usable for Retry (Blocker C2)
+### Test R18-R35-T32: Pre-Publication Throw During Pin Release Leaves Evidence Usable for Retry (Blocker C2)
 - **Initial Authoritative Root:** Active pin for $g=1$; `consumedSettlementEvidence.size === 0`.
 - **Operation Sequence:**
   1. Initiate `releaseSettlementPin`; candidate root construction simulates memory allocation exception before pointer swap.
@@ -3456,43 +3482,43 @@ The following one hundred and eighty-three deterministic future test specificati
 - **Expected Final Root:** Second call succeeds; `pin_1` retired; evidence replay key added to `consumedSettlementEvidence`.
 - **Expected Result / Error:** First call throws error without consuming evidence in authoritative root; second call completes release cleanly.
 
-### Test R18-R34-T33: Duplicate Release on Retired Lease With Altered Transaction ID Fails Closed (Blocker B1)
+### Test R18-R35-T33: Duplicate Release on Retired Lease With Altered Transaction ID Fails Closed (Blocker B1)
 - **Initial Authoritative Root:** Retired lease `lease_1` recorded for `transactionId = "tx-100"`.
 - **Operation Sequence:** Call `releaseRetryLease` passing `lease_1` with `transactionId = "tx-200"`.
 - **Expected Final Root:** Unchanged.
 - **Expected Result / Error:** Throws `LEASE_TRANSACTION_ID_MISMATCH`.
 
-### Test R18-R34-T34: Duplicate Release on Retired Pin With Unverified Provenance Fails Closed (Blocker C2)
+### Test R18-R35-T34: Duplicate Release on Retired Pin With Unverified Provenance Fails Closed (Blocker C2)
 - **Initial Authoritative Root:** Retired pin `pin_1` recorded for $g=1$.
 - **Operation Sequence:** Caller constructs mock evidence object with matching fields but without factory issuance.
 - **Expected Final Root:** Unchanged.
 - **Expected Result / Error:** Throws `INVALID_SETTLEMENT_EVIDENCE_PROVENANCE`.
 
-### Test R18-R34-T35: Pre-Existing Retired Pins Overflow Rejection
+### Test R18-R35-T35: Pre-Existing Retired Pins Overflow Rejection
 - **Initial Authoritative Root:** Artificially injected root with 5,005 entries in `retiredSettlementPins`.
 - **Operation Sequence:** Call `releaseSettlementPin` for active pin `pin_A`.
 - **Expected Final Root:** Unchanged; zero entries deleted; zero mutations committed.
 - **Expected Result / Error:** Throws `RETIRED_PINS_CAPACITY_CORRUPTED`.
 
-### Test R18-R34-T36: Pre-Existing Retired Leases Overflow Rejection
+### Test R18-R35-T36: Pre-Existing Retired Leases Overflow Rejection
 - **Initial Authoritative Root:** Artificially injected root with 5,005 entries in `retiredRetryLeases`.
 - **Operation Sequence:** Call `releaseRetryLease` for active lease `lease_A`.
 - **Expected Final Root:** Unchanged; zero entries deleted; zero mutations committed.
 - **Expected Result / Error:** Throws `RETIRED_LEASES_CAPACITY_CORRUPTED`.
 
-### Test R18-R34-T37: Pre-Existing Consumed Evidence Overflow Rejection
+### Test R18-R35-T37: Pre-Existing Consumed Evidence Overflow Rejection
 - **Initial Authoritative Root:** Artificially injected root with 5,005 entries in `consumedSettlementEvidence`.
 - **Operation Sequence:** Call `releaseSettlementPin` for active pin `pin_A`.
 - **Expected Final Root:** Unchanged; zero entries deleted.
 - **Expected Result / Error:** Throws `CONSUMED_EVIDENCE_CAPACITY_CORRUPTED`.
 
-### Test R18-R34-T38: Cross-Restart Delayed Release Rejection for Unretired Active Pin (R25-3)
+### Test R18-R35-T38: Cross-Restart Delayed Release Rejection for Unretired Active Pin (R25-3)
 - **Initial Authoritative Root:** Restarted coordinator with `coordinatorBootEpoch = { clusterTerm: 2, bootGeneration: 5, bootInstanceId: "uuid-new" }`. Active collections empty (`size === 0`).
 - **Operation Sequence:** Caller submits delayed release for unretired pin `pinId = "pin:1.4.uuid-old:1:barrier:100"`.
 - **Expected Final Root:** Unchanged.
 - **Expected Result / Error:** Throws `RESOURCE_NOT_FOUND` (unretired active pins from earlier boot generations cannot be released after restart).
 
-### Test R18-R34-T39: Allocation Interruption Discards Counter Without Collision
+### Test R18-R35-T39: Allocation Interruption Discards Counter Without Collision
 - **Initial Authoritative Root:** `_pinSequenceCounter = 10`.
 - **Operation Sequence:**
   1. Call `publishReleaseAndObligation`; sequence increments to 11; candidate allocation throws out-of-memory.
@@ -3500,7 +3526,7 @@ The following one hundred and eighty-three deterministic future test specificati
 - **Expected Final Root:** Active pin published with `seq = 12`; zero active records for `seq = 11`.
 - **Expected Result / Error:** Second call succeeds cleanly; discarded sequence 11 causes zero collisions.
 
-### Test R18-R34-T40: Normal Exactly-At-Capacity Lockstep Retirement at 5,000 Entries
+### Test R18-R35-T40: Normal Exactly-At-Capacity Lockstep Retirement at 5,000 Entries
 - **Initial Authoritative Root:** `retiredSettlementPins.size === 5000`, `consumedSettlementEvidence.size === 5000`. Oldest retired pin has zero active references.
 - **Operation Sequence:** Release active pin `pin_new` with valid evidence.
 - **Expected Final Root:**
@@ -3510,49 +3536,49 @@ The following one hundred and eighty-three deterministic future test specificati
   - `consumedSettlementEvidence.size === 5000`.
 - **Expected Result / Error:** Release succeeds cleanly with exact capacity preservation and pre-publication candidate-root validation.
 
-### Test R18-R34-T41: All-Protected Retired Pins Exhaustion Triggers Fail-Closed Backpressure
+### Test R18-R35-T41: All-Protected Retired Pins Exhaustion Triggers Fail-Closed Backpressure
 - **Initial Authoritative Root:** `retiredSettlementPins.size === 5000`. Every single entry in `retiredSettlementPins` is retained by an active retry lease or active pin.
 - **Operation Sequence:** Call `releaseSettlementPin` for active pin `pin_new`.
 - **Expected Final Root:** Unchanged; zero pins evicted; zero state mutations committed.
 - **Expected Result / Error:** Throws `RETENTION_CAPACITY_EXHAUSTED_BACKPRESSURE`.
 
-### Test R18-R34-T42: Replay Key Desynchronization on Eviction Fails Closed
+### Test R18-R35-T42: Replay Key Desynchronization on Eviction Fails Closed
 - **Initial Authoritative Root:** `retiredSettlementPins.size === 5000`. The replay key corresponding to the oldest eligible retired pin is artificially absent from `consumedSettlementEvidence`.
 - **Operation Sequence:** Call `releaseSettlementPin` for active pin `pin_new`.
 - **Expected Final Root:** Unchanged; zero mutations committed.
 - **Expected Result / Error:** Throws `REPLAY_KEY_DESYNCHRONIZATION_CORRUPTED`.
 
-### Test R18-R34-T43: Reference-Independent Byte-for-Byte Digest Match Returns Already Released (R25-4)
+### Test R18-R35-T43: Reference-Independent Byte-for-Byte Digest Match Returns Already Released (R25-4)
 - **Initial Authoritative Root:** Pin `pin_retired` is in `retiredSettlementPins` with recorded digest `[0x01, 0x02, ..., 0x20]`.
 - **Operation Sequence:** Caller invokes `releaseSettlementPin` for `pin_retired` with independently allocated `Uint8Array` containing identical bytes (`digestA !== digestB` by reference, but byte-equal).
 - **Expected Final Root:** Unchanged.
 - **Expected Result / Error:** Returns `{ pinId: 'pin_retired', status: 'ALREADY_RELEASED' }`.
 
-### Test R18-R34-T44: Candidate-Root Pre-Publication Invariant Rejection on Desynchronized Replay State (R25-5)
+### Test R18-R35-T44: Candidate-Root Pre-Publication Invariant Rejection on Desynchronized Replay State (R25-5)
 - **Initial Authoritative Root:** Candidate root construction artificially desynchronizes collection sizes (`retiredSettlementPins.size = 5000`, `consumedSettlementEvidence.size = 5001`).
 - **Operation Sequence:** Candidate root passed to `_validateCandidateRootPrePublicationInvariants()`.
 - **Expected Final Root:** Pointer swap rejected; `this.#custodyRoot` remains unchanged.
 - **Expected Result / Error:** Throws `REPLAY_KEY_BIJECTION_CARDINALITY_MISMATCH`.
 
-### Test R18-R34-T45: ECMAScript #inner Backing Storage Inaccessible at Runtime (R25-1)
+### Test R18-R35-T45: ECMAScript #inner Backing Storage Inaccessible at Runtime (R25-1)
 - **Initial Authoritative Root:** Initialized `AuthoritativeCustodyRoot` with `ImmutableMap` instance.
 - **Operation Sequence:** Caller attempts `(root.activeSettlementPins as any).#inner`, `(root.activeSettlementPins as any)._inner`, or `Object.getOwnPropertySymbols(root.activeSettlementPins)`.
 - **Expected Final Root:** Unchanged.
 - **Expected Result / Error:** Throws `SyntaxError` or returns `undefined`; backing Map is strictly inaccessible.
 
-### Test R18-R34-T46: Consensus Leadership Loss Prior to Pointer Swap Discards Candidate Root (R25-2)
+### Test R18-R35-T46: Consensus Leadership Loss Prior to Pointer Swap Discards Candidate Root (R25-2)
 - **Initial Authoritative Root:** `clusterTerm = 2`. Coordinator prepares candidate root for $g = 2$.
 - **Operation Sequence:** Cluster consensus advances to `term = 3` (new leader elected) before Step 2. `this.#consensusLease.assertActiveLeadership(2)` executes.
 - **Expected Final Root:** Unchanged; candidate root discarded; local custody marked degraded; settlement barrier left unresolved.
 - **Expected Result / Error:** Throws `STALE_COORDINATOR_LEADERSHIP_FENCED`.
 
-### Test R18-R34-T47: Cross-Restart Restored Retired Pin Returns Already Released with Verified Epoch (R25-3)
+### Test R18-R35-T47: Cross-Restart Restored Retired Pin Returns Already Released with Verified Epoch (R25-3)
 - **Initial Authoritative Root:** Coordinator restarted under `clusterTerm = 2`, `bootGeneration = 5`. `retiredSettlementPins` restored from persistent checkpoint, containing `pin:1.4.uuid-old:1:barrier:200` with `allocatedBootEpoch = { clusterTerm: 1, bootGeneration: 4, bootInstanceId: "uuid-old" }`.
 - **Operation Sequence:** Caller submits delayed release for `pinId = "pin:1.4.uuid-old:1:barrier:200"` with matching 7-dimensional token and matching evidence digest.
 - **Expected Final Root:** Unchanged.
 - **Expected Result / Error:** Returns `{ pinId: 'pin:1.4.uuid-old:1:barrier:200', status: 'ALREADY_RELEASED' }`.
 
-### Test R18-R34-T48: Pre-Publication Replay-Key Bijection Violation Fails Closed (R25-5)
+### Test R18-R35-T48: Pre-Publication Replay-Key Bijection Violation Fails Closed (R25-5)
 - **Initial Authoritative Root:** Candidate root constructed with a retired pin whose replay key is absent from `candidateConsumed`.
 - **Operation Sequence:** Candidate root evaluated in `_validateCandidateRootPrePublicationInvariants()`.
 - **Expected Final Root:** Pointer swap aborted; candidate root discarded.
@@ -3560,13 +3586,13 @@ The following one hundred and eighty-three deterministic future test specificati
 
 ---
 
-### Test R18-R34-T49: Deep Property Mutation Rejection on Retrieved ImmutableMap Value (R26-1)
+### Test R18-R35-T49: Deep Property Mutation Rejection on Retrieved ImmutableMap Value (R26-1)
 - **Initial Authoritative Root:** Initialized root with published result at $g=1$.
 - **Operation Sequence:** Caller retrieves record via `root.publicationResults.get(1)` and attempts in-place property modification: `(record as any).obligation.transactionId = "corrupted"`.
 - **Expected Final Root:** Unchanged; stored record remains intact with original `transactionId`.
 - **Expected Result / Error:** Throws `TypeError` (frozen object property modification) or fails silently without mutating internal state; subsequent `root.publicationResults.get(1)` returns pristine original `transactionId`.
 
-### Test R18-R34-T50: Defensive Byte Array Cloning Prevents Buffer Tampering on Egress (R26-1)
+### Test R18-R35-T50: Defensive Byte Array Cloning Prevents Buffer Tampering on Egress (R26-1)
 - **Initial Authoritative Root:** Initialized root with active settlement pin containing `ownerToken.ownerSignature = new Uint8Array([0x01, 0x02, 0x03, 0x04])`.
 - **Operation Sequence:**
   1. Caller retrieves pin via `const pin = root.activeSettlementPins.get(pinId)!`.
@@ -3574,7 +3600,7 @@ The following one hundred and eighty-three deterministic future test specificati
 - **Expected Final Root:** Internal backing storage unaffected. Subsequent call to `root.activeSettlementPins.get(pinId)` yields buffer with original `ownerSignature[0] === 0x01`.
 - **Expected Result / Error:** Defensive byte cloning on egress ensures caller mutates an isolated detached copy; internal state remains pristine.
 
-### Test R18-R34-T51: Iterator Aliasing and Mutation Immunity on Entries and Values (R26-1)
+### Test R18-R35-T51: Iterator Aliasing and Mutation Immunity on Entries and Values (R26-1)
 - **Initial Authoritative Root:** Published results at $g=1$ and $g=2$ in `publicationResults`.
 - **Operation Sequence:**
   1. Caller iterates using `for (const [k, v] of root.publicationResults.entries())` or `for (const v of root.publicationResults.values())`.
@@ -3582,7 +3608,7 @@ The following one hundred and eighty-three deterministic future test specificati
 - **Expected Final Root:** Unchanged; internal root and subsequent iterations produce identical unmodified records.
 - **Expected Result / Error:** Deep defensive cloning on each yielded element guarantees complete reference isolation across all iterator access paths.
 
-### Test R18-R34-T52: Key and Element Type Invariant Rejection on ImmutableMap and ImmutableSet (R26-1)
+### Test R18-R35-T52: Key and Element Type Invariant Rejection on ImmutableMap and ImmutableSet (R26-1)
 - **Initial Authoritative Root:** Initialized `ImmutableMap` and `ImmutableSet`.
 - **Operation Sequence:**
   1. Caller attempts to instantiate `ImmutableMap` with an object key: `new ImmutableMap([[({} as any), "val"]])` or call `.set({} as any, "val")`.
@@ -3590,7 +3616,7 @@ The following one hundred and eighty-three deterministic future test specificati
 - **Expected Final Root:** Unchanged; zero elements inserted.
 - **Expected Result / Error:** Throws `INVALID_COLLECTION_KEY_TYPE: keys must be primitive string or number` and `INVALID_COLLECTION_ELEMENT_TYPE: set elements must be primitive string or number`.
 
-### Test R18-R34-T53: Non-Reentrant Single-Writer Execution Lock Prevents Concurrent Publications (R26-2)
+### Test R18-R35-T53: Non-Reentrant Single-Writer Execution Lock Prevents Concurrent Publications (R26-2)
 - **Initial Authoritative Root:** Coordinator initialized with `LeadershipEpochFence`.
 - **Operation Sequence:**
   1. Primary publication begins executing inside `executeFencedPublication()`.
@@ -3598,7 +3624,7 @@ The following one hundred and eighty-three deterministic future test specificati
 - **Expected Final Root:** Primary publication completes or rolls back; concurrent attempt is rejected upfront before touching candidate roots.
 - **Expected Result / Error:** Throws `CONCURRENT_PUBLICATION_LOCK_ACQUISITION_VIOLATION`.
 
-### Test R18-R34-T54: Synchronous Leadership Stepdown and Lease Expiry Fencing (R26-2)
+### Test R18-R35-T54: Synchronous Leadership Stepdown and Lease Expiry Fencing (R26-2)
 - **Initial Authoritative Root:** Coordinator with active lease for Term 1 expiring at monotonic $t_{	ext{expire}}$.
 - **Operation Sequence:**
   1. Case A: Coordinator receives stepdown notification (`leadershipFence.stepDown()`), then attempts `executeFencedPublication(expectedTerm: 1)`.
@@ -3608,84 +3634,84 @@ The following one hundred and eighty-three deterministic future test specificati
 
 ---
 
-### Test R18-R34-T55: Symbol-Keyed Mutable Value Recursively Cloned and Frozen (R27-A)
+### Test R18-R35-T55: Symbol-Keyed Mutable Value Recursively Cloned and Frozen (R27-A)
 - **Initial State:** Authoritative custody root with published result at $g=1$. A candidate record includes a proprietary symbol property `[Symbol('syncplay/ext')] = { payload: new Uint8Array([0xAA, 0xBB]) }`.
 - **Exact Interleaving or Injected Fault:** Candidate record passed to `deepCloneAndFreezeValue()`. Caller subsequently mutates original symbol property: `original[sym].payload[0] = 0x00`.
 - **Expected Result:** Cloned symbol value is deeply cloned and frozen as an own data property (`Object.isFrozen(cloned[sym]) === true`). Internal custody record payload remains `0xAA`.
 - **Which Invariant Is Protected:** Invariant 18 (Restricted Custody-Value Universe & Deep Immutability Invariant).
 - **Custody Disposition:** Custody remains securely owned; zero reference aliasing.
 
-### Test R18-R34-T56: Unsupported Object Prototypes Rejected (R27-A)
+### Test R18-R35-T56: Unsupported Object Prototypes Rejected (R27-A)
 - **Initial State:** Coordinator ready to publish candidate root for $g=2$.
 - **Exact Interleaving or Injected Fault:** Caller attempts to insert an object instance of a custom class (`class CustomTelemetry {}`, `new CustomTelemetry()`) into publication results.
 - **Expected Result:** Throws `UNSUPPORTED_PROTOTYPE_INSTANCE: objects with custom prototypes of type 'CustomTelemetry' are prohibited in custody values`.
 - **Which Invariant Is Protected:** Invariant 18 (Restricted Custody-Value Universe & Deep Immutability Invariant).
 - **Custody Disposition:** Root unchanged; candidate discarded; custody remains in degraded recovery until valid record presented.
 
-### Test R18-R34-T57: Accessor Properties Rejected Without Invoking Getters (R27-A)
+### Test R18-R35-T57: Accessor Properties Rejected Without Invoking Getters (R27-A)
 - **Initial State:** Coordinator ready to publish candidate root for $g=2$.
 - **Exact Interleaving or Injected Fault:** Caller passes an object with a getter accessor: `{ get hostile() { throw new Error('GETTER_INVOKED_SIDE_EFFECT'); } }`.
 - **Expected Result:** Property descriptor inspection detects `desc.get !== undefined` without evaluating `obj.hostile`. Throws `ACCESSOR_PROPERTIES_PROHIBITED: property 'hostile' has getter/setter accessors which are forbidden in custody records`. The getter is never invoked.
 - **Which Invariant Is Protected:** Invariant 18 (Restricted Custody-Value Universe & Deep Immutability Invariant).
 - **Custody Disposition:** Root unchanged; candidate discarded; custody remains in degraded recovery.
 
-### Test R18-R34-T58: Cyclic Structures Fail Closed (R27-A)
+### Test R18-R35-T58: Cyclic Structures Fail Closed (R27-A)
 - **Initial State:** Coordinator ready to publish candidate root for $g=2$.
 - **Exact Interleaving or Injected Fault:** Caller passes a self-referential cyclic object graph (`const cycle: any = {}; cycle.self = cycle;`).
 - **Expected Result:** `WeakSet` cycle detection catches `seen.has(cycle)` and throws `CIRCULAR_REFERENCE_DETECTED: circular object graph cannot be cloned into custody storage`. Zero call stack overflow.
 - **Which Invariant Is Protected:** Invariant 18 (Restricted Custody-Value Universe & Deep Immutability Invariant).
 - **Custody Disposition:** Root unchanged; candidate discarded; custody remains in degraded recovery.
 
-### Test R18-R34-T59: Unsupported Typed Arrays and Binary/Temporal Types Rejected (R27-A)
+### Test R18-R35-T59: Unsupported Typed Arrays and Binary/Temporal Types Rejected (R27-A)
 - **Initial State:** Coordinator ready to publish candidate root for $g=2$.
 - **Exact Interleaving or Injected Fault:** Caller attempts to store `new Float32Array([1.0, 2.0])`, `new ArrayBuffer(16)`, `new DataView(new ArrayBuffer(8))`, or `new Date()`.
 - **Expected Result:** Throws `UNSUPPORTED_BINARY_VALUE_TYPE: only Uint8Array is supported for binary custody data` or `UNSUPPORTED_TEMPORAL_VALUE_TYPE: Date objects prohibited; use monotonic timestamp numbers`.
 - **Which Invariant Is Protected:** Invariant 18 (Restricted Custody-Value Universe & Deep Immutability Invariant).
 - **Custody Disposition:** Root unchanged; candidate discarded; custody remains in degraded recovery.
 
-### Test R18-R34-T60: Byte-Array Egress Mutation Cannot Alter Custody Storage (R27-A)
+### Test R18-R35-T60: Byte-Array Egress Mutation Cannot Alter Custody Storage (R27-A)
 - **Initial State:** Active settlement pin recorded in `activeSettlementPins` with `ownerToken.ownerSignature = new Uint8Array([0x10, 0x20, 0x30])`.
 - **Exact Interleaving or Injected Fault:** Caller invokes `root.activeSettlementPins.get(pinId)!`, receiving detached byte array. Caller mutates `egress.ownerToken.ownerSignature[0] = 0xFF`.
 - **Expected Result:** The returned `Uint8Array` is a detached mutable copy. Backing `#inner` storage is untouched. A subsequent call to `root.activeSettlementPins.get(pinId)!` yields fresh buffer with `ownerSignature[0] === 0x10`.
 - **Which Invariant Is Protected:** Invariant 18 (Restricted Custody-Value Universe & Deep Immutability Invariant).
 - **Custody Disposition:** Custody remains securely owned; internal storage immutable.
 
-### Test R18-R34-T61: Lease Expires After Local Check but Before Authoritative Publication (R27-B)
+### Test R18-R35-T61: Lease Expires After Local Check but Before Authoritative Publication (R27-B)
 - **Initial State:** Coordinator holds lease for Term 1 expiring at $t_{	ext{expire}} = t_0 + 5000	ext{ms}$. Candidate root prepared at $t_0 + 4900	ext{ms}$.
 - **Exact Interleaving or Injected Fault:** An artificial thread pause delays submission to the Authoritative Custody Store until $t_0 + 5100	ext{ms}$ (lease expired). Authoritative Custody Store evaluates token against cluster consensus.
 - **Expected Result:** Authoritative Custody Store CAS rejects write with `STALE_COORDINATOR_LEADERSHIP_FENCED`. Local coordinator discards candidate root; `#custodyRoot` untouched.
 - **Which Invariant Is Protected:** Invariant 20 (Authoritative Boundary Fencing & Linearized Single-Writer Invariant).
 - **Custody Disposition:** Local custody enters degraded recovery (`CUSTODY_RECONCILIATION_BLOCKED`); barrier left unresolved.
 
-### Test R18-R34-T62: Coordinator Resumes After Process Suspension and Attempts Publication with Expired Lease (R27-B)
+### Test R18-R35-T62: Coordinator Resumes After Process Suspension and Attempts Publication with Expired Lease (R27-B)
 - **Initial State:** Coordinator holding Term 1 lease prepares candidate root.
 - **Exact Interleaving or Injected Fault:** OS process suspension (SIGSTOP / major GC pause) suspends coordinator for 10 seconds. On resumption at $t_0 + 10000	ext{ms}$, coordinator invokes `executeFencedPublication()`.
 - **Expected Result:** Step 2 local fencing check (with guard margin $\Delta_{	ext{guard}}$) detects `performance.now() + 1000ms >= leaseExpiresAtMonotonicMs` and throws `STALE_COORDINATOR_LEADERSHIP_FENCED`. Zero write submitted to authoritative store.
 - **Which Invariant Is Protected:** Invariant 20 (Authoritative Boundary Fencing & Linearized Single-Writer Invariant).
 - **Custody Disposition:** Candidate discarded; `#custodyRoot` untouched; custody enters degraded recovery (`CUSTODY_RECONCILIATION_BLOCKED`).
 
-### Test R18-R34-T63: Two Independent Coordinator Instances Attempt Publication Under Different Terms (R27-B)
+### Test R18-R35-T63: Two Independent Coordinator Instances Attempt Publication Under Different Terms (R27-B)
 - **Initial State:** Partitioned Coordinator A operates under Term 1; newly elected Coordinator B operates under Term 2. Authoritative Custody Store has admitted Term 2.
 - **Exact Interleaving or Injected Fault:** Both Coordinator A and Coordinator B submit candidate publications to Authoritative Custody Store.
 - **Expected Result:** Authoritative Custody Store atomically accepts Coordinator B (Term 2) and rejects Coordinator A (Term 1) with `STALE_COORDINATOR_LEADERSHIP_FENCED`.
 - **Which Invariant Is Protected:** Invariant 2 (Single Primary Drainer Invariant) and Invariant 20 (Authoritative Boundary Fencing & Linearized Single-Writer Invariant).
 - **Custody Disposition:** Coordinator B holds valid cluster custody; Coordinator A enters degraded recovery (`CUSTODY_RECONCILIATION_BLOCKED`).
 
-### Test R18-R34-T64: Asynchronous Commit Callback Prohibited and Rejected (R27-B)
+### Test R18-R35-T64: Asynchronous Commit Callback Prohibited and Rejected (R27-B)
 - **Initial State:** Coordinator initialized with `LeadershipEpochFence`.
 - **Exact Interleaving or Injected Fault:** Caller invokes `executeFencedPublication()` passing an `async` function or a callback that returns a Promise (`async (root) => { await delay(10); }`).
 - **Expected Result:** Step 4 detects thenable return and throws `ASYNCHRONOUS_COMMIT_CALLBACK_PROHIBITED: commit callback must be strictly synchronous`. In `finally`, `#publicationLock` is reset to `false`.
 - **Which Invariant Is Protected:** Invariant 20 (Authoritative Boundary Fencing & Linearized Single-Writer Invariant).
 - **Custody Disposition:** Root unchanged; lock released cleanly; zero async escape.
 
-### Test R18-R34-T65: Leadership Changes During Publication Protocol (R27-B)
+### Test R18-R35-T65: Leadership Changes During Publication Protocol (R27-B)
 - **Initial State:** Coordinator A begins candidate root staging for Term 1.
 - **Exact Interleaving or Injected Fault:** Cluster consensus quorum elects Coordinator B for Term 2 and updates `store.highestCommittedTerm = 2` before Coordinator A's CAS arrives.
 - **Expected Result:** Authoritative Custody Store CAS rejects Coordinator A's token with `STALE_COORDINATOR_LEADERSHIP_FENCED`.
 - **Which Invariant Is Protected:** Invariant 20 (Authoritative Boundary Fencing & Linearized Single-Writer Invariant).
 - **Custody Disposition:** Coordinator A's candidate root discarded; barrier unresolved; local custody latched into `CUSTODY_RECONCILIATION_BLOCKED`.
 
-### Test R18-R34-T66: Stale Coordinator Cannot Mutate Shared Recovery State After Term Loss (R27-B)
+### Test R18-R35-T66: Stale Coordinator Cannot Mutate Shared Recovery State After Term Loss (R27-B)
 - **Initial State:** Coordinator A was partitioned and deposed in Term 1; cluster is active in Term 2.
 - **Exact Interleaving or Injected Fault:** Coordinator A attempts post-term recovery mutation (`publishReleaseAndObligation` or `releaseSettlementPin`).
 - **Expected Result:** Authoritative store rejects write with `STALE_COORDINATOR_LEADERSHIP_FENCED`. Coordinator A marks local in-flight custody degraded, leaves barrier pending, and latches `CUSTODY_RECONCILIATION_BLOCKED`.
@@ -3694,28 +3720,28 @@ The following one hundred and eighty-three deterministic future test specificati
 
 ---
 
-### Test R18-R34-T67: Shared Acyclic References Are Accepted Without False Cycle Rejection (R28-A)
+### Test R18-R35-T67: Shared Acyclic References Are Accepted Without False Cycle Rejection (R28-A)
 - **Initial State:** Authoritative custody root with published result at $g=1$. A candidate record forms a directed acyclic graph (DAG) where sub-object `sharedNode = { data: 'immutable' }` is referenced by both `candidate.branchA.node` and `candidate.branchB.node`.
 - **Exact Interleaving or Injected Fault:** Candidate record passed to `deepCloneAndFreezeValue()`.
 - **Expected Result:** Traversal memoizes `sharedNode` via `cloneMap` and removes ancestors from `activeStack` upon branch completion. Successfully clones and freezes the record. Reference equality is preserved (`cloned.branchA.node === cloned.branchB.node`), and zero false cycle error is thrown.
 - **Which Invariant Is Protected:** Invariant 18 (Restricted Custody-Value Universe & DAG Cycle Detection).
 - **Custody Disposition:** Custody remains securely owned; valid DAG structures accepted without error.
 
-### Test R18-R34-T68: Sparse Arrays with Missing Indices Are Rejected (R28-A)
+### Test R18-R35-T68: Sparse Arrays with Missing Indices Are Rejected (R28-A)
 - **Initial State:** Coordinator preparing candidate root.
 - **Exact Interleaving or Injected Fault:** Caller attempts to pass a sparse array containing missing indices / uninitialized holes (e.g. `const arr = [1]; arr[3] = 4;` or `new Array(5)`).
 - **Expected Result:** Array density validation detects that `Object.prototype.hasOwnProperty.call(arr, '1') === false`. Throws `SPARSE_ARRAY_PROHIBITED: sparse arrays with missing index '1' are prohibited in custody records`.
 - **Which Invariant Is Protected:** Invariant 18 (Restricted Custody-Value Universe & Array Density).
 - **Custody Disposition:** Root unchanged; candidate discarded; custody enters degraded recovery.
 
-### Test R18-R34-T69: Function Values Are Rejected in All Positions (R28-A)
+### Test R18-R35-T69: Function Values Are Rejected in All Positions (R28-A)
 - **Initial State:** Coordinator preparing candidate root.
 - **Exact Interleaving or Injected Fault:** Caller attempts to pass a function value at the top level or nested inside a plain record: `{ handler: () => true }`.
 - **Expected Result:** Immediate check at the absolute entry boundary detects `typeof val === 'function'`. Throws `UNSUPPORTED_FUNCTION_VALUE_TYPE: functions cannot be stored in custody records`.
 - **Which Invariant Is Protected:** Invariant 18 (Restricted Custody-Value Universe).
 - **Custody Disposition:** Root unchanged; candidate discarded; custody enters degraded recovery.
 
-### Test R18-R34-T70: Custom Prototype Constructor Getters Are Never Invoked (R28-A)
+### Test R18-R35-T70: Custom Prototype Constructor Getters Are Never Invoked (R28-A)
 - **Initial State:** Coordinator preparing candidate root.
 - **Exact Interleaving or Injected Fault:** Caller constructs an object inheriting from an adversarial custom prototype that defines an active getter on `constructor`:
   `const hostileProto = Object.create(Object.prototype, { constructor: { get() { throw new Error('HOSTILE_GETTER_SIDE_EFFECT'); } } }); const obj = Object.create(hostileProto);`
@@ -3723,28 +3749,28 @@ The following one hundred and eighty-three deterministic future test specificati
 - **Which Invariant Is Protected:** Invariant 18 (Restricted Custody-Value Universe).
 - **Custody Disposition:** Root unchanged; candidate discarded; hostile side effects completely prevented.
 
-### Test R18-R34-T71: Symbol-Keyed Values Follow Documented Canonical Serialization Policy (R28-A)
+### Test R18-R35-T71: Symbol-Keyed Values Follow Documented Canonical Serialization Policy (R28-A)
 - **Initial State:** Coordinator preparing candidate root for canonical snapshot hashing.
 - **Exact Interleaving or Injected Fault:** Caller passes a record containing arbitrary user-defined symbol keys into a payload intended for RFC 8785 canonical snapshot hashing.
 - **Expected Result:** Key validation detects `typeof key === 'symbol'`. Throws `SYMBOL_PROPERTIES_PROHIBITED_IN_CANONICAL_VALUES: symbol-keyed properties are prohibited in RFC 8785 canonical serialization`.
 - **Which Invariant Is Protected:** Invariant 18 (Canonical Serialization Compatibility).
 - **Custody Disposition:** Root unchanged; candidate discarded; canonical hash integrity guaranteed.
 
-### Test R18-R34-T72: Asynchronous Authoritative Publication Cannot Cause Premature Local Root Replacement (R28-B)
+### Test R18-R35-T72: Asynchronous Authoritative Publication Cannot Cause Premature Local Root Replacement (R28-B)
 - **Initial State:** Coordinator holding active lease prepares candidate root for $g=2$.
 - **Exact Interleaving or Injected Fault:** Coordinator initiates `publishReleaseAndObligation()`. Phase 1 submits write to `store.publishFencedRoot()`. While the network request is in flight, an asynchronous concurrent reader inspects `coordinator.custodyRoot`.
 - **Expected Result:** Local `custodyRoot` remains strictly at $g=1$. Local pointer replacement `this.#custodyRoot = candidateRoot` is executed in Phase 2 strictly after `store.publishFencedRoot()` resolves with `{ status: 'COMMITTED' }`.
 - **Which Invariant Is Protected:** Invariant 20 (Authoritative Boundary Fencing & Two-Phase Publication).
 - **Custody Disposition:** Linearizability preserved; zero premature local root exposure.
 
-### Test R18-R34-T73: Rejected or Uncertain Authoritative Publication Cannot Silently Diverge Local and Authoritative Roots (R28-B)
+### Test R18-R35-T73: Rejected or Uncertain Authoritative Publication Cannot Silently Diverge Local and Authoritative Roots (R28-B)
 - **Initial State:** Coordinator prepares candidate root for $g=2$.
 - **Exact Interleaving or Injected Fault:** Authoritative Custody Store returns `{ status: 'UNCERTAIN', reason: 'network_timeout' }` or `{ status: 'FENCED_REJECTED', reason: 'term_superseded' }`.
 - **Expected Result:** Local `#custodyRoot` remains strictly at $g=1$. Pointer update is withheld. For `FENCED_REJECTED`, throws `STALE_COORDINATOR_LEADERSHIP_FENCED` and transitions to `CUSTODY_RECONCILIATION_BLOCKED`. For `UNCERTAIN`, throws `PUBLICATION_OUTCOME_UNCERTAIN` and initiates reconciliation query via `store.getAuthoritativeRoot()`.
 - **Which Invariant Is Protected:** Invariant 20 (Authoritative Boundary Fencing & Linearized Single-Writer Invariant).
 - **Custody Disposition:** Zero silent divergence; custody latched degraded/blocked until authoritative reconciliation completes.
 
-### Test R18-R34-T74: Every Fencing-Token Component Is Validated at the Authoritative Store Boundary (R28-B)
+### Test R18-R35-T74: Every Fencing-Token Component Is Validated at the Authoritative Store Boundary (R28-B)
 - **Initial State:** Authoritative Custody Store holding committed Term 2, Boot Generation 3, Boot Instance UUID-B, Sequence 5.
 - **Exact Interleaving or Injected Fault:** Submitting candidate roots with:
   1. Term 1 (stale term).
@@ -3757,49 +3783,49 @@ The following one hundred and eighty-three deterministic future test specificati
 
 ---
 
-### Test R18-R34-T75: Non-Empty Uint8Array Ingestion Without Invalid Object.freeze (R29-A1)
+### Test R18-R35-T75: Non-Empty Uint8Array Ingestion Without Invalid Object.freeze (R29-A1)
 - **Preconditions:** Coordinator preparing candidate custody record containing a non-empty `Uint8Array` (e.g. 32-byte cryptographic digest).
 - **Trigger:** Record ingested via `deepCloneAndFreezeValue()`.
 - **Expected Result:** Byte contents copied into an `EncapsulatedByteArray`. The typed array view is NOT passed to `Object.freeze()`, preventing runtime `TypeError`. The internal array is encapsulated privately; egress reads return fresh detached copies.
 - **Invariants Protected:** Invariant 18 (Restricted Custody-Value Universe & Binary Encapsulation).
 - **Classification:** Future M5.1 implementation test (architecture requirement).
 
-### Test R18-R34-T76: Empty Uint8Array Ingestion & Detached Copying (R29-A1)
+### Test R18-R35-T76: Empty Uint8Array Ingestion & Detached Copying (R29-A1)
 - **Preconditions:** Candidate custody record containing a 0-byte `new Uint8Array(0)`.
 - **Trigger:** Ingested via `deepCloneAndFreezeValue()`.
 - **Expected Result:** Clones successfully into a 0-byte `EncapsulatedByteArray`. Public accessors return a 0-byte detached copy.
 - **Invariants Protected:** Invariant 18 (Binary Encapsulation).
 - **Classification:** Future M5.1 implementation test.
 
-### Test R18-R34-T77: Egress Copy Mutation Isolation for Byte Arrays (R29-A1)
+### Test R18-R35-T77: Egress Copy Mutation Isolation for Byte Arrays (R29-A1)
 - **Preconditions:** Authoritative custody root contains byte array `[0x01, 0x02, 0x03]` in a published record.
 - **Trigger:** Caller retrieves the record via `.get()` and mutates the returned byte array: `bytes[0] = 0xFF`.
 - **Expected Result:** Subsequent `.get()` calls on the coordinator return the original unmodified bytes `[0x01, 0x02, 0x03]`. Mutation of the detached egress copy has zero effect on internal custody bytes.
 - **Invariants Protected:** Invariant 18 (Binary Encapsulation & Egress Isolation).
 - **Classification:** Future M5.1 implementation test.
 
-### Test R18-R34-T78: Repeated Shared References to Same Uint8Array in DAG (R29-A1)
+### Test R18-R35-T78: Repeated Shared References to Same Uint8Array in DAG (R29-A1)
 - **Preconditions:** A candidate record defines `{ a: sharedBytes, b: sharedBytes }` referencing the identical `Uint8Array` instance.
 - **Trigger:** Passed to `deepCloneAndFreezeValue()`.
 - **Expected Result:** `cloneMap` memoizes the cloned `EncapsulatedByteArray` on first encounter. Both `cloned.a` and `cloned.b` reference the same instance. No circular reference exception is thrown.
 - **Invariants Protected:** Invariant 18 (DAG Cycle Detection & Binary Encapsulation).
 - **Classification:** Future M5.1 implementation test.
 
-### Test R18-R34-T79: Snapshot Export and Import Byte Equality via Canonical Hex Encoding (R29-A1)
+### Test R18-R35-T79: Snapshot Export and Import Byte Equality via Canonical Hex Encoding (R29-A1)
 - **Preconditions:** Custody record with byte array `new Uint8Array([0xde, 0xad, 0xbe, 0xef])`.
 - **Trigger:** Export snapshot using `encodeCanonicalBinaryHex()` and import into a new coordinator instance.
 - **Expected Result:** Snapshot encodes bytes as lowercase hex `"deadbeef"`. Import reconstructs a detached `Uint8Array` with exact byte equality (`areEqualByteArrays` returns true).
 - **Invariants Protected:** Invariant 18 (Canonical Binary Serialization).
 - **Classification:** Future M5.1 implementation test.
 
-### Test R18-R34-T80: Canonical Digest Stability Across Equivalent Byte Content (R29-A1)
+### Test R18-R35-T80: Canonical Digest Stability Across Equivalent Byte Content (R29-A1)
 - **Preconditions:** Two `Uint8Array` views created from different backing buffers and offsets, but containing identical byte sequences `[1, 2, 3, 4]`.
 - **Trigger:** Compute canonical snapshot digest for both records.
 - **Expected Result:** Both produce identical lowercase hexadecimal representations and identical SHA-256 digests.
 - **Invariants Protected:** Invariant 18 (Canonical Digest Stability).
 - **Classification:** Future M5.1 implementation test.
 
-### Test R18-R34-T81: Rejection of Prohibited Binary Backing Storage (R29-A1)
+### Test R18-R35-T81: Rejection of Prohibited Binary Backing Storage (R29-A1)
 - **Preconditions:** Candidate custody record containing:
   1. A `Uint8Array` backed by a `SharedArrayBuffer`.
   2. A raw `ArrayBuffer`.
@@ -3809,7 +3835,7 @@ The following one hundred and eighty-three deterministic future test specificati
 - **Invariants Protected:** Invariant 18 (Restricted Custody Universe).
 - **Classification:** Future M5.1 implementation test.
 
-### Test R18-R34-T82: Array Index Zero Accessor Rejection Without Getter Execution (R29-A2)
+### Test R18-R35-T82: Array Index Zero Accessor Rejection Without Getter Execution (R29-A2)
 - **Preconditions:** An array defined with an accessor property at index 0:
   `Object.defineProperty([], '0', { get() { getterCalled = true; return 1; }, enumerable: true, configurable: true })`.
 - **Trigger:** Array passed to `deepCloneAndFreezeValue()`.
@@ -3817,7 +3843,7 @@ The following one hundred and eighty-three deterministic future test specificati
 - **Invariants Protected:** Invariant 22 (Array Descriptor Validation Without Getter Execution).
 - **Classification:** Future M5.1 implementation test.
 
-### Test R18-R34-T83: Array Later Index Accessor Rejection Without Getter Execution (R29-A2)
+### Test R18-R35-T83: Array Later Index Accessor Rejection Without Getter Execution (R29-A2)
 - **Preconditions:** An array `[10, 20]` with an accessor defined at index 2:
   `Object.defineProperty(arr, '2', { get() { getterCalled = true; return 30; }, enumerable: true, configurable: true })`.
 - **Trigger:** Array passed to `deepCloneAndFreezeValue()`.
@@ -3825,21 +3851,21 @@ The following one hundred and eighty-three deterministic future test specificati
 - **Invariants Protected:** Invariant 22 (Array Accessor Getter Immunity).
 - **Classification:** Future M5.1 implementation test.
 
-### Test R18-R34-T84: Non-Enumerable Array Index Rejection (R29-A2)
+### Test R18-R35-T84: Non-Enumerable Array Index Rejection (R29-A2)
 - **Preconditions:** An array defined with index 1 set to `enumerable: false`.
 - **Trigger:** Array passed to `deepCloneAndFreezeValue()`.
 - **Expected Result:** Descriptor validation throws `NON_ENUMERABLE_PROPERTY_PROHIBITED: array index '1' must be enumerable`.
 - **Invariants Protected:** Invariant 22 (Array Descriptor Invariants).
 - **Classification:** Future M5.1 implementation test.
 
-### Test R18-R34-T85: Sparse Array Hole Rejection via Descriptor Inspection (R29-A2)
+### Test R18-R35-T85: Sparse Array Hole Rejection via Descriptor Inspection (R29-A2)
 - **Preconditions:** A sparse array with missing indices (e.g. `[1, , 3]` where index 1 is a hole).
 - **Trigger:** Array passed to `deepCloneAndFreezeValue()`.
 - **Expected Result:** `Object.getOwnPropertyDescriptor(arr, '1')` returns `undefined`. Throws `SPARSE_ARRAY_PROHIBITED: sparse arrays with missing index '1' are prohibited`.
 - **Invariants Protected:** Invariant 18 & 22 (Array Density & Hole Prohibition).
 - **Classification:** Future M5.1 implementation test.
 
-### Test R18-R34-T86: Non-Canonical Digit Array Property "01" Rejection (R29-A2)
+### Test R18-R35-T86: Non-Canonical Digit Array Property "01" Rejection (R29-A2)
 - **Preconditions:** An array defined with named property `"01"`:
   `const arr = [1, 2]; (arr as any)['01'] = 'hostile';`.
 - **Trigger:** Array passed to `deepCloneAndFreezeValue()`.
@@ -3847,21 +3873,21 @@ The following one hundred and eighty-three deterministic future test specificati
 - **Invariants Protected:** Invariant 22 (Precise Array Index Property Validation).
 - **Classification:** Future M5.1 implementation test.
 
-### Test R18-R34-T87: Out-of-Range Digit Array Property "4294967295" Rejection (R29-A2)
+### Test R18-R35-T87: Out-of-Range Digit Array Property "4294967295" Rejection (R29-A2)
 - **Preconditions:** An array defined with named property `"4294967295"` ($2^{32}-1$, which is not a valid ECMAScript array index).
 - **Trigger:** Array passed to `deepCloneAndFreezeValue()`.
 - **Expected Result:** Index boundary check `u32 !== 0xFFFFFFFF` rejects with `UNSUPPORTED_ARRAY_PROPERTY`.
 - **Invariants Protected:** Invariant 22 (Array Index Domain Bounds).
 - **Classification:** Future M5.1 implementation test.
 
-### Test R18-R34-T88: Valid Dense Arrays with Nested Records and Shared DAG References (R29-A2)
+### Test R18-R35-T88: Valid Dense Arrays with Nested Records and Shared DAG References (R29-A2)
 - **Preconditions:** A dense array `[ { id: 1 }, sharedObj, [ sharedObj ] ]` where `sharedObj = { val: 'safe' }`.
 - **Trigger:** Array passed to `deepCloneAndFreezeValue()`.
 - **Expected Result:** Successfully clones all elements using `Object.defineProperty`. Reference identity of `sharedObj` is preserved across branches. Cloned array is frozen with `Object.freeze()`.
 - **Invariants Protected:** Invariant 18 & 22 (Dense Array Cloning & DAG Preservation).
 - **Classification:** Future M5.1 implementation test.
 
-### Test R18-R34-T89: Own Data Property '__proto__' Preserved via Object.defineProperty Without Mutating Prototype (R29-A3)
+### Test R18-R35-T89: Own Data Property '__proto__' Preserved via Object.defineProperty Without Mutating Prototype (R29-A3)
 - **Preconditions:** An input object created with an own data property named `'__proto__'`:
   `const obj = Object.defineProperty({}, '__proto__', { value: { payload: 'safe' }, enumerable: true, writable: true, configurable: true });`.
 - **Trigger:** Passed to `deepCloneAndFreezeValue()`.
@@ -3869,7 +3895,7 @@ The following one hundred and eighty-three deterministic future test specificati
 - **Invariants Protected:** Invariant 22 (Safe Record Own-Property Creation & Prototype Isolation).
 - **Classification:** Future M5.1 implementation test.
 
-### Test R18-R34-T90: Own Data Properties 'constructor' and 'prototype' Preserved Without Invoking Hostile Getters (R29-A3)
+### Test R18-R35-T90: Own Data Properties 'constructor' and 'prototype' Preserved Without Invoking Hostile Getters (R29-A3)
 - **Preconditions:** An input record containing own data properties:
   `{ constructor: 'custom-constructor', prototype: 'custom-prototype' }`.
 - **Trigger:** Passed to `deepCloneAndFreezeValue()`.
@@ -3877,56 +3903,56 @@ The following one hundred and eighty-three deterministic future test specificati
 - **Invariants Protected:** Invariant 22 (Safe Own-Property Creation).
 - **Classification:** Future M5.1 implementation test.
 
-### Test R18-R34-T91: Numeric Negative Zero (-0) Canonicalized to Positive Zero (0) for RFC 8785 Stability (R29-A4)
+### Test R18-R35-T91: Numeric Negative Zero (-0) Canonicalized to Positive Zero (0) for RFC 8785 Stability (R29-A4)
 - **Preconditions:** A candidate record containing property `count: -0`.
 - **Trigger:** Passed to `deepCloneAndFreezeValue()`.
 - **Expected Result:** Cloner detects `Object.is(val, -0)` and returns `0`. `Object.is(cloned.count, 0) === true` and `Object.is(cloned.count, -0) === false`. Snapshot digest matches positive zero record.
 - **Invariants Protected:** Invariant 18 (Canonical Numeric Serialization).
 - **Classification:** Future M5.1 implementation test.
 
-### Test R18-R34-T92: Safe Integer Boundary Ingestion (R29-A4)
+### Test R18-R35-T92: Safe Integer Boundary Ingestion (R29-A4)
 - **Preconditions:** Candidate records containing `Number.MAX_SAFE_INTEGER` ($9007199254740991$) and `Number.MIN_SAFE_INTEGER` ($-9007199254740991$).
 - **Trigger:** Passed to `deepCloneAndFreezeValue()`.
 - **Expected Result:** Both numbers pass `Number.isSafeInteger(val)` and are preserved without modification.
 - **Invariants Protected:** Invariant 18 (Exact Numeric Contract).
 - **Classification:** Future M5.1 implementation test.
 
-### Test R18-R34-T93: Unsafe Integer Rejection Outside Safe Integer Range (R29-A4)
+### Test R18-R35-T93: Unsafe Integer Rejection Outside Safe Integer Range (R29-A4)
 - **Preconditions:** Candidate record containing `Number.MAX_SAFE_INTEGER + 1` ($9007199254740992$) or unsafe integer $2^{60}$.
 - **Trigger:** Passed to `deepCloneAndFreezeValue()`.
 - **Expected Result:** Throws `UNSAFE_INTEGER_PROHIBITED: integer exceeds safe integer range`.
 - **Invariants Protected:** Invariant 18 (Unsafe Integer Prohibition).
 - **Classification:** Future M5.1 implementation test.
 
-### Test R18-R34-T94: Finite Fractional Floating-Point Numbers Accepted (R29-A4)
+### Test R18-R35-T94: Finite Fractional Floating-Point Numbers Accepted (R29-A4)
 - **Preconditions:** Candidate record containing finite floats: `3.141592653589793`, `0.00001`, `-123.456`.
 - **Trigger:** Passed to `deepCloneAndFreezeValue()`.
 - **Expected Result:** All pass `Number.isFinite(val)` and are preserved accurately.
 - **Invariants Protected:** Invariant 18 (Finite Float Ingestion).
 - **Classification:** Future M5.1 implementation test.
 
-### Test R18-R34-T95: Non-Finite Numbers (NaN, +Infinity, -Infinity) Rejected (R29-A4)
+### Test R18-R35-T95: Non-Finite Numbers (NaN, +Infinity, -Infinity) Rejected (R29-A4)
 - **Preconditions:** Candidate records containing `NaN`, `+Infinity`, `-Infinity`.
 - **Trigger:** Passed to `deepCloneAndFreezeValue()`.
 - **Expected Result:** All three values throw `INVALID_NUMERIC_VALUE: non-finite number prohibited`.
 - **Invariants Protected:** Invariant 18 (Non-Finite Numeric Rejection).
 - **Classification:** Future M5.1 implementation test.
 
-### Test R18-R34-T96: Cross-Realm Uint8Array Brand Check Recognition and Detached Cloning (R29-A6)
+### Test R18-R35-T96: Cross-Realm Uint8Array Brand Check Recognition and Detached Cloning (R29-A6)
 - **Preconditions:** A `Uint8Array` instance instantiated in a separate V8 context (`vm.createContext()`).
 - **Trigger:** Passed to `deepCloneAndFreezeValue()`.
 - **Expected Result:** `ArrayBuffer.isView(val)` recognizes the typed view; bytes are copied into an `EncapsulatedByteArray` belonging to the host coordinator realm.
 - **Invariants Protected:** Invariant 18 (Cross-Realm Binary Recognition & Realm Isolation).
 - **Classification:** Future M5.1 implementation test.
 
-### Test R18-R34-T97: Hostile ECMAScript Proxy Ingestion Trust Boundary Enforcement (R29-A6)
+### Test R18-R35-T97: Hostile ECMAScript Proxy Ingestion Trust Boundary Enforcement (R29-A6)
 - **Preconditions:** Caller constructs a `new Proxy({}, { get() { ... }, getOwnPropertyDescriptor() { ... } })`.
 - **Trigger:** Passed to `deepCloneAndFreezeValue()`.
 - **Expected Result:** Documented boundary: Reflective operations invoke Proxy traps; Proxy objects are outside the supported ingestion contract. Ingestion assumes trusted schema-validated inputs.
 - **Invariants Protected:** Invariant 18 & 22 (Documented Proxy Ingestion Trust Boundary).
 - **Classification:** Architecture-level specification requirement.
 
-### Test R18-R34-T98: Leadership Term Advances While Asynchronous Store Persistence is Awaited (R29-B1)
+### Test R18-R35-T98: Leadership Term Advances While Asynchronous Store Persistence is Awaited (R29-B1)
 - **Preconditions:** Coordinator A (Term 1) initiates publication sequence 10; invokes `await store.publishFencedRoot()`.
 - **Trigger:** While store request is pending, consensus quorum elects Coordinator B for Term 2; Coordinator A's `leadershipFence.stepDown(2)` is invoked. Store then returns `COMMITTED`.
 - **Expected Result:** Coordinator A's post-await completion check `assertPostAwaitEligibility()` detects term advance ($1
@@ -3934,42 +3960,42 @@ eq 2$). Throws `CUSTODY_PUBLICATION_STALE_LEADERSHIP`. Local `#custodyRoot` is N
 - **Invariants Protected:** Invariant 20 (Post-Await Leadership Completion Fencing).
 - **Classification:** Future M5.1 implementation test.
 
-### Test R18-R34-T99: Successful Store Commit with Delayed Response Arriving After Leadership Lease Expiry (R29-B1)
+### Test R18-R35-T99: Successful Store Commit with Delayed Response Arriving After Leadership Lease Expiry (R29-B1)
 - **Preconditions:** Coordinator A (Term 1) submits publication sequence 12 to authoritative store. Store commits candidate root. Response is delayed across a 6,000ms network pause.
 - **Trigger:** Coordinator A's monotonic clock passes `#leaseExpiresAtMonotonicMs` during the pause. Store response `COMMITTED` arrives.
 - **Expected Result:** Post-await check detects that `performance.now() + guardMargin >= leaseExpiresAtMonotonicMs`. Throws `CUSTODY_PUBLICATION_STALE_LEADERSHIP`. Local `#custodyRoot` is untouched. Newly elected Term 2 leader recovers committed root from store.
 - **Invariants Protected:** Invariant 20 (Post-Await Lease Fencing & Local Pointer Isolation).
 - **Classification:** Future M5.1 implementation test.
 
-### Test R18-R34-T100: Stale Partitioned Coordinator Receives Delayed COMMITTED Confirmation (R29-B1)
+### Test R18-R35-T100: Stale Partitioned Coordinator Receives Delayed COMMITTED Confirmation (R29-B1)
 - **Preconditions:** Partitioned coordinator whose lease has definitively elapsed receives a late `COMMITTED` confirmation.
 - **Trigger:** Coordinator resumes execution turn.
 - **Expected Result:** Post-await fence rejects the confirmation; coordinator steps down. Zero stale local pointer modification occurs.
 - **Invariants Protected:** Invariant 20 (Stale Partitioned Leader Discard).
 - **Classification:** Future M5.1 implementation test.
 
-### Test R18-R34-T101: Store Commits Sequence S but Response is Lost; Reconciliation Recovers Committed Root (R29-B2)
+### Test R18-R35-T101: Store Commits Sequence S but Response is Lost; Reconciliation Recovers Committed Root (R29-B2)
 - **Preconditions:** Store durably commits publication sequence 15, but network drop causes the coordinator's await to time out (`status: 'UNCERTAIN'`).
 - **Trigger:** Coordinator latches into `RECONCILING_CUSTODY` and executes `reconcileAuthoritativeCustody()`.
 - **Expected Result:** `store.reconcilePublication(query)` returns `{ status: 'RECONCILED_COMMITTED', committedRoot }`. Coordinator verifies post-await eligibility, updates `#custodyRoot = committedRoot`, and returns gate state to `IDLE`.
 - **Invariants Protected:** Invariant 23 (Idempotent Store Reconciliation for Lost Responses).
 - **Classification:** Future M5.1 implementation test.
 
-### Test R18-R34-T102: Idempotent Publication Retry with Identical Fencing Token, Sequence, and Root Digest (R29-B2)
+### Test R18-R35-T102: Idempotent Publication Retry with Identical Fencing Token, Sequence, and Root Digest (R29-B2)
 - **Preconditions:** Store committed sequence 18 for candidate root digest $D$.
 - **Trigger:** Coordinator retries publication with identical token, sequence 18, and digest $D$.
 - **Expected Result:** Store recognizes idempotent retry; returns original `COMMITTED` confirmation without creating a second logical publication or throwing sequence collision error.
 - **Invariants Protected:** Invariant 23 (Deterministic Idempotent Retry).
 - **Classification:** Future M5.1 implementation test.
 
-### Test R18-R34-T103: Conflicting Publication Attempt with Same Token and Sequence but Differing Root Digest (R29-B2)
+### Test R18-R35-T103: Conflicting Publication Attempt with Same Token and Sequence but Differing Root Digest (R29-B2)
 - **Preconditions:** Store committed sequence 20 with candidate root digest $D_1$.
 - **Trigger:** A publication request arrives with sequence 20 but differing root digest $D_2$.
 - **Expected Result:** Authoritative store detects state inconsistency; permanently rejects the attempt with `CONFLICTING_DIGEST_AT_SEQUENCE`.
 - **Invariants Protected:** Invariant 20 & 23 (Publication Digest Invariant).
 - **Classification:** Future M5.1 implementation test.
 
-### Test R18-R34-T104: Store Confirmation with Mismatched Sequence Rejected (R29-B3)
+### Test R18-R35-T104: Store Confirmation with Mismatched Sequence Rejected (R29-B3)
 - **Preconditions:** Coordinator submits publication sequence 25.
 - **Trigger:** Authoritative store returns `{ status: 'COMMITTED', committedSequence: 24, ... }`.
 - **Expected Result:** Confirmation validation detects sequence discrepancy ($24
@@ -3977,70 +4003,70 @@ eq 25$). Throws `INVALID_COMMITTED_CONFIRMATION: authoritative store returned in
 - **Invariants Protected:** Invariant 20 (Exact Confirmation Validation).
 - **Classification:** Future M5.1 implementation test.
 
-### Test R18-R34-T105: Store Confirmation with Mismatched Candidate Root Digest Rejected (R29-B3)
+### Test R18-R35-T105: Store Confirmation with Mismatched Candidate Root Digest Rejected (R29-B3)
 - **Preconditions:** Coordinator submits candidate root with digest $D_{	ext{cand}}$.
 - **Trigger:** Store returns `COMMITTED` confirmation with `committedRootDigest: "corrupted_digest"`.
 - **Expected Result:** Digest validation fails. Throws `INVALID_COMMITTED_CONFIRMATION`. Coordinator latches into `RECONCILING_CUSTODY`; local pointer update withheld.
 - **Invariants Protected:** Invariant 20 (Exact Candidate Digest Confirmation).
 - **Classification:** Future M5.1 implementation test.
 
-### Test R18-R34-T106: Store Confirmation with Mismatched Expected Prior Sequence or Digest Rejected (R29-B3)
+### Test R18-R35-T106: Store Confirmation with Mismatched Expected Prior Sequence or Digest Rejected (R29-B3)
 - **Preconditions:** Coordinator captures prior sequence 10 and prior digest $D_{	ext{prior}}$.
 - **Trigger:** Store returns `COMMITTED` with `expectedPriorSequence: 9`.
 - **Expected Result:** Prior version validation fails. Throws `INVALID_COMMITTED_CONFIRMATION`. Latches into `RECONCILING_CUSTODY`.
 - **Invariants Protected:** Invariant 20 (Prior Version Contiguity Confirmation).
 - **Classification:** Future M5.1 implementation test.
 
-### Test R18-R34-T107: Concurrent Asynchronous Publication Attempts Serialized by #publicationLock FIFO Queue (R29-B4)
+### Test R18-R35-T107: Concurrent Asynchronous Publication Attempts Serialized by #publicationLock FIFO Queue (R29-B4)
 - **Preconditions:** Two concurrent asynchronous operations invoke `_executeTwoPhasePublication` in the same event loop tick.
 - **Trigger:** Operation 1 enters Phase 1 and acquires lock; awaits store persistence. Operation 2 invokes `acquirePublicationLock()`.
 - **Expected Result:** Operation 2 is enqueued in `#waitQueue` without throwing or busy-waiting. When Operation 1 completes its `finally` block, Operation 2's promise resolves in FIFO order. Both publications execute contiguously without interleaving.
 - **Invariants Protected:** Invariant 20 (Process-Local Publication Lock Lifecycle).
 - **Classification:** Future M5.1 implementation test.
 
-### Test R18-R34-T108: Publication Lock Guaranteed Release in finally After Unexpected Exception (R29-B4)
+### Test R18-R35-T108: Publication Lock Guaranteed Release in finally After Unexpected Exception (R29-B4)
 - **Preconditions:** Publication attempt active under `#publicationLock`.
 - **Trigger:** Store throws an unhandled network error or rejection during `publishFencedRoot()`.
 - **Expected Result:** `_executeTwoPhasePublication` catches error, clears `#activePublicationAttempt`, and executes `releasePublicationLock()` in `finally`. Next queued caller acquires lock cleanly; lock is never orphaned.
 - **Invariants Protected:** Invariant 20 (Publication Lock Exception Safety).
 - **Classification:** Future M5.1 implementation test.
 
-### Test R18-R34-T109: Coordinator Process Crashes and Restarts During In-Flight Store Persistence (R29-B4)
+### Test R18-R35-T109: Coordinator Process Crashes and Restarts During In-Flight Store Persistence (R29-B4)
 - **Preconditions:** Coordinator crashes while a store publication request is in flight.
 - **Trigger:** Node restarts coordinator on same host; boots with persisted WAL `bootGeneration = G + 1` and fresh `bootInstanceId`.
 - **Expected Result:** In-memory queue and active attempt are wiped cleanly. Uncommitted local root candidate is discarded. Coordinator runs `getAuthoritativeRoot()` to synchronize with store before admitting new traffic.
 - **Invariants Protected:** Invariant 21 (Cross-Restart Boot Isolation & Clean Slate).
 - **Classification:** Future M5.1 implementation test.
 
-### Test R18-R34-T110: Store Unavailability During Reconciliation Remains Fail-Closed in RECONCILING_CUSTODY (R29-B5)
+### Test R18-R35-T110: Store Unavailability During Reconciliation Remains Fail-Closed in RECONCILING_CUSTODY (R29-B5)
 - **Preconditions:** Coordinator latched in `RECONCILING_CUSTODY`.
 - **Trigger:** `reconcileAuthoritativeCustody()` fails due to store connection timeout.
 - **Expected Result:** Gate state remains strictly in `RECONCILING_CUSTODY`. Zero automated fallback to local cache, zero timeout-based gate clearance, zero peer report clearance. Fail-closed isolation upheld.
 - **Invariants Protected:** Invariant 23 (Fail-Closed Reconciliation Gate).
 - **Classification:** Future M5.1 implementation test.
 
-### Test R18-R34-T111: Recovery Operations Attempted During RECONCILING_CUSTODY Rejected Fail-Closed (R29-B5)
+### Test R18-R35-T111: Recovery Operations Attempted During RECONCILING_CUSTODY Rejected Fail-Closed (R29-B5)
 - **Preconditions:** Coordinator latched in `RECONCILING_CUSTODY`.
 - **Trigger:** External callers invoke `publishReleaseAndObligation()`, `releaseRetryLease()`, or `releaseSettlementPin()`.
 - **Expected Result:** All mutating operations throw `CUSTODY_GATE_RECONCILING: custody state uncertain; mutations prohibited pending authoritative reconciliation` synchronously.
 - **Invariants Protected:** Invariant 23 (Reconciliation Gate Operation Isolation).
 - **Classification:** Future M5.1 implementation test.
 
-### Test R18-R34-T112: Newly Elected Leader Recovers Committed Authoritative Root Before Opening Gate (R29-B5)
+### Test R18-R35-T112: Newly Elected Leader Recovers Committed Authoritative Root Before Opening Gate (R29-B5)
 - **Preconditions:** Coordinator A (Term 1) successfully committed sequence 12 in authoritative store but lost leadership before updating local pointer. Coordinator B elected for Term 2.
 - **Trigger:** Coordinator B initializes recovery subsystem.
 - **Expected Result:** Coordinator B invokes `store.getAuthoritativeRoot()`, installs committed sequence 12 root as its initial `#custodyRoot`, initializes `#publicationSequenceCounter = 12`, and opens the publication gate in Term 2. Zero data loss or state divergence.
 - **Invariants Protected:** Invariant 20 & 23 (New Leader Authoritative State Recovery).
 - **Classification:** Future M5.1 implementation test.
 
-### Test R18-R34-T113: Indexing Mutation on EncapsulatedByteArray Fails to Mutate Underlying Bytes (R30-1)
+### Test R18-R35-T113: Indexing Mutation on EncapsulatedByteArray Fails to Mutate Underlying Bytes (R30-1)
 - **Preconditions:** Candidate custody record containing a byte array is cloned via `deepCloneAndFreezeValue()`.
 - **Trigger:** Caller obtains the frozen cloned record and attempts to mutate byte contents via indexed assignment: `cloned.payload[0] = 0xff;`.
 - **Expected Result:** `cloned.payload` is an `EncapsulatedByteArray`. The assignment fails to alter the underlying `#bytes` storage (in strict mode, throws a `TypeError` because the wrapper is frozen via `Object.freeze()`; in non-strict mode, has zero effect). Calling `cloned.payload.asDetachedUint8Array()` returns the original unmodified bytes.
 - **Invariants Protected:** Invariant 18 (Restricted Custody Universe & Encapsulated Binary Storage).
 - **Classification:** Future M5.1 implementation test (architecture requirement).
 
-### Test R18-R34-T114: Typed-Array Instance with Own Symbol.toStringTag Accessor Getter Rejected Without Getter Execution (R30-2)
+### Test R18-R35-T114: Typed-Array Instance with Own Symbol.toStringTag Accessor Getter Rejected Without Getter Execution (R30-2)
 - **Preconditions:** Caller constructs a `Uint8Array` instance and defines an own `Symbol.toStringTag` accessor property with a hostile getter:
   `const u8 = new Uint8Array(4); Object.defineProperty(u8, Symbol.toStringTag, { get() { getterCalled = true; return 'Uint8Array'; }, configurable: true });`.
 - **Trigger:** Passed to `deepCloneAndFreezeValue()`.
@@ -4048,7 +4074,7 @@ eq 25$). Throws `INVALID_COMMITTED_CONFIRMATION: authoritative store returned in
 - **Invariants Protected:** Invariant 18 & 22 (Intrinsic Typed-Array Inspection & Getter Immunity).
 - **Classification:** Future M5.1 implementation test.
 
-### Test R18-R34-T115: Typed-Array Instance with Own Shadowed Buffer Properties Evaluated via Intrinsic Prototype Accessors (R30-2)
+### Test R18-R35-T115: Typed-Array Instance with Own Shadowed Buffer Properties Evaluated via Intrinsic Prototype Accessors (R30-2)
 - **Preconditions:** A `Uint8Array` instance defines an own property shadowing `'buffer'` with a hostile getter:
   `const u8 = new Uint8Array(4); Object.defineProperty(u8, 'buffer', { get() { getterCalled = true; throw new Error('HOSTILE_GETTER'); }, configurable: true });`.
 - **Trigger:** Passed to `deepCloneAndFreezeValue()`.
@@ -4056,7 +4082,7 @@ eq 25$). Throws `INVALID_COMMITTED_CONFIRMATION: authoritative store returned in
 - **Invariants Protected:** Invariant 22 (Typed-Array Property Shadowing Prohibition).
 - **Classification:** Future M5.1 implementation test.
 
-### Test R18-R34-T116: Typed-Array Subclass Rejected via Prototype Identity Check (R30-2)
+### Test R18-R35-T116: Typed-Array Subclass Rejected via Prototype Identity Check (R30-2)
 - **Preconditions:** Caller constructs an instance of a `Uint8Array` subclass:
   `class CustomBuffer extends Uint8Array {} const custom = new CustomBuffer(8);`.
 - **Trigger:** Passed to `deepCloneAndFreezeValue()`.
@@ -4064,42 +4090,42 @@ eq 25$). Throws `INVALID_COMMITTED_CONFIRMATION: authoritative store returned in
 - **Invariants Protected:** Invariant 18 & 22 (Subclass Rejection & Prototype Strictness).
 - **Classification:** Future M5.1 implementation test.
 
-### Test R18-R34-T117: Cross-Realm SharedArrayBuffer Backing Store Rejected via Intrinsic Brand Check (R30-2)
+### Test R18-R35-T117: Cross-Realm SharedArrayBuffer Backing Store Rejected via Intrinsic Brand Check (R30-2)
 - **Preconditions:** A `Uint8Array` instance created over a `SharedArrayBuffer` originating from a separate execution realm.
 - **Trigger:** Passed to `deepCloneAndFreezeValue()`.
 - **Expected Result:** Intrinsic brand check evaluates `Object.prototype.toString.call(buffer) === '[object SharedArrayBuffer]'`. Throws `UNSUPPORTED_BINARY_VALUE_TYPE: SharedArrayBuffer-backed views are prohibited`.
 - **Invariants Protected:** Invariant 18 (Prohibited Shared Memory).
 - **Classification:** Future M5.1 implementation test.
 
-### Test R18-R34-T118: Authoritative Commit Confirmation Mismatch on attemptId Triggers Fail-Closed Invalidation (R30-3)
+### Test R18-R35-T118: Authoritative Commit Confirmation Mismatch on attemptId Triggers Fail-Closed Invalidation (R30-3)
 - **Preconditions:** Coordinator submits publication attempt with `attemptId = "att:uuid-A:10"`.
 - **Trigger:** Authoritative store returns a delayed `AuthoritativeCommittedConfirmation` containing `attemptId = "att:uuid-A:9"` (from a superseded attempt).
 - **Expected Result:** Coordinator confirmation validation detects `outcome.attemptId !== attemptContext.attemptId`. Throws `INVALID_COMMITTED_CONFIRMATION: authoritative store returned inconsistent commit confirmation`. Coordinator latches into `RECONCILING_CUSTODY`; local `#custodyRoot` update is withheld.
 - **Invariants Protected:** Invariant 20 (Exact 8-Dimensional Publication Identity Binding).
 - **Classification:** Future M5.1 implementation test.
 
-### Test R18-R34-T119: Queued Publication Callers in Wait Queue Immediately Rejected with COORDINATOR_STOPPED on Step-Down (R30-5)
+### Test R18-R35-T119: Queued Publication Callers in Wait Queue Immediately Rejected with COORDINATOR_STOPPED on Step-Down (R30-5)
 - **Preconditions:** Coordinator has one active in-flight publication and two callers queued in `#waitQueue` awaiting `#publicationLock`.
 - **Trigger:** Consensus leadership is lost; coordinator executes `leadershipFence.stepDown(newTerm)`.
 - **Expected Result:** `stepDown()` immediately iterates `#waitQueue`, rejects all queued callers with `COORDINATOR_STOPPED: coordinator stepped down while awaiting publication lock`, and clears the queue. Zero queued attempts are executed under the old or subsequent term.
 - **Invariants Protected:** Invariant 20 (Lock Lifecycle Queue Purging on Step-Down).
 - **Classification:** Future M5.1 implementation test.
 
-### Test R18-R34-T120: In-Flight Store Persistence Arrives After Leadership Lease Expiry and is Safely Discarded (R30-5)
+### Test R18-R35-T120: In-Flight Store Persistence Arrives After Leadership Lease Expiry and is Safely Discarded (R30-5)
 - **Preconditions:** Coordinator dispatches store persistence call under Term 1. Store commits candidate root. Response is delayed across a network pause exceeding the coordinator's lease duration.
 - **Trigger:** Delayed store confirmation arrives after monotonic clock exceeds `#leaseExpiresAtMonotonicMs`.
 - **Expected Result:** Post-await completion check `assertPostAwaitEligibility()` detects lease expiration. Throws `CUSTODY_PUBLICATION_STALE_LEADERSHIP`. Local `#custodyRoot` is NOT updated. Coordinator steps down; new leader recovers committed root from store.
 - **Invariants Protected:** Invariant 20 (Post-Await Lease Expiry Fencing).
 - **Classification:** Future M5.1 implementation test.
 
-### Test R18-R34-T121: Authoritative Reconciliation Proves Candidate Root Digest Equality and Rejects Mismatched Sequences (R30-4)
+### Test R18-R35-T121: Authoritative Reconciliation Proves Candidate Root Digest Equality and Rejects Mismatched Sequences (R30-4)
 - **Preconditions:** Store contains committed sequence 15 with digest $D_{15}$. An uncertain attempt is queried for sequence 14 with digest $D_{14}$.
 - **Trigger:** Coordinator runs `reconcilePublication(query)` for sequence 14.
 - **Expected Result:** Store verifies that queried sequence 14 with digest $D_{14}$ does not match active committed sequence 15. Returns `RECONCILED_NOT_COMMITTED` for sequence 14 with `authoritativeCurrentSequence = 15`. Coordinator does not misclassify sequence 14 as committed merely because sequence 15 exists.
 - **Invariants Protected:** Invariant 23 (Unambiguous Reconciliation Identity Semantics).
 - **Classification:** Future M5.1 implementation test.
 
-### Test R18-R34-T122: Authoritative Store Rejects Conflicting Candidate Digest at Same Sequence with CONFLICTING_DIGEST_AT_SEQUENCE (R30-4)
+### Test R18-R35-T122: Authoritative Store Rejects Conflicting Candidate Digest at Same Sequence with CONFLICTING_DIGEST_AT_SEQUENCE (R30-4)
 - **Preconditions:** Store durably committed sequence 20 with candidate root digest $D_{	ext{alpha}}$.
 - **Trigger:** A delayed or retried request arrives with sequence 20 but candidate root digest $D_{	ext{beta}}
 eq D_{	ext{alpha}}$.
@@ -4107,28 +4133,28 @@ eq D_{	ext{alpha}}$.
 - **Invariants Protected:** Invariant 20 & 23 (Publication Digest Immutability & Conflict Rejection).
 - **Classification:** Future M5.1 implementation test.
 
-### Test R18-R34-T123: Cross-Realm SharedArrayBuffer Backing Store Rejection via Intrinsic Getter (R31-1)
+### Test R18-R35-T123: Cross-Realm SharedArrayBuffer Backing Store Rejection via Intrinsic Getter (R31-1)
 - **Preconditions:** Caller constructs a `SharedArrayBuffer` in another JavaScript realm (e.g. via `vm.createContext()` or worker context) and wraps it in a local `Uint8Array` view.
 - **Trigger:** Submitted to `deepCloneAndFreezeValue()`.
 - **Expected Result:** Prototype equality check passes (view was wrapped in current realm), but `assertValidOrdinaryUint8Array` extracts backing buffer and invokes intrinsic `%SharedArrayBuffer%.prototype.byteLength` getter via `Reflect.apply`. Succeeded call detects `[[SharedArrayBufferData]]` internal slot across realm boundaries. Throws `TypeError('UNSUPPORTED_BINARY_VALUE_TYPE: SharedArrayBuffer backing stores prohibited')`.
 - **Invariants Protected:** Invariant 18 (Cross-Realm Binary Encapsulation & Shared Memory Prohibition).
 - **Classification:** Future M5.1 implementation test (architecture requirement).
 
-### Test R18-R34-T124: Rejection of Subclassed EncapsulatedByteArray via isTrustedInstance (R31-2)
+### Test R18-R35-T124: Rejection of Subclassed EncapsulatedByteArray via isTrustedInstance (R31-2)
 - **Preconditions:** Caller defines `class CustomBytes extends EncapsulatedByteArray { asDetachedUint8Array() { return new Uint8Array([0xff]); } }` and instantiates `new CustomBytes(new Uint8Array([1, 2, 3]))`.
 - **Trigger:** Submitted to `deepCloneAndFreezeValue()` or passed as source to `new EncapsulatedByteArray(sub)`.
 - **Expected Result:** `EncapsulatedByteArray.isTrustedInstance(sub)` checks prototype identity (`Object.getPrototypeOf(sub) !== EncapsulatedByteArray.prototype`) and returns false. Subclass branch triggers and throws `TypeError('UNSUPPORTED_BINARY_VALUE_TYPE: EncapsulatedByteArray subclasses and untrusted instances prohibited')`. Overridden methods are never invoked.
 - **Invariants Protected:** Invariant 18 (Trusted Binary Value Object Recognition).
 - **Classification:** Future M5.1 implementation test.
 
-### Test R18-R34-T125: Rejection of Uint8Array with Extra Own String Properties (R31-3)
+### Test R18-R35-T125: Rejection of Uint8Array with Extra Own String Properties (R31-3)
 - **Preconditions:** Caller creates `const arr = new Uint8Array([1, 2, 3]); arr.customMetadata = "secret";`.
 - **Trigger:** Submitted to `deepCloneAndFreezeValue()`.
 - **Expected Result:** `assertValidOrdinaryUint8Array` inspects own property names; detects property `'customMetadata'` which does not match canonical integer index pattern `^(?:0|[1-9]\d*)$`. Throws `TypeError("UNSUPPORTED_ARRAY_PROPERTY: extra own string properties on typed arrays prohibited; found 'customMetadata'")`. Metadata is not silently dropped.
 - **Invariants Protected:** Invariant 18 (Typed Array Property Canonicalization).
 - **Classification:** Future M5.1 implementation test.
 
-### Test R18-R34-T126: Store Rejection of Already-Committed Sequence with Differing attemptId (R31-6)
+### Test R18-R35-T126: Store Rejection of Already-Committed Sequence with Differing attemptId (R31-6)
 - **Preconditions:** Store has durably committed publication sequence $S = 40$ under `attemptId = "att-40-A"` with candidate digest $D$.
 - **Trigger:** A new publication request arrives for sequence $S = 40$ presenting the identical candidate digest $D$ but a differing `attemptId = "att-40-B"`.
 - **Expected Result:** Store applies Rule 2b. Rejects request with `DUPLICATE_SEQUENCE_CONFLICT: sequence already committed under different attempt identity`. Coordinator latches into `RECONCILING_CUSTODY`.
@@ -4137,28 +4163,28 @@ eq D_{	ext{alpha}}$.
 
 ---
 
-### Test R18-R34-T127: EncapsulatedByteArray Prototype Method Tampering Immunity (R32-1)
+### Test R18-R35-T127: EncapsulatedByteArray Prototype Method Tampering Immunity (R32-1)
 - **Preconditions:** Hostile caller attempts monkey-patching `EncapsulatedByteArray.prototype.asDetachedUint8Array = () => new Uint8Array([0xff])`.
 - **Trigger:** An authentic instance `source` is passed to `new EncapsulatedByteArray(source)` or `.equals(other)`.
 - **Expected Result:** `Object.freeze(EncapsulatedByteArray.prototype)` prohibits prototype mutation (throws `TypeError` in strict mode). Furthermore, constructor and `equals()` access `source.#bytes` and `source.#canonicalHex` directly via private fields with zero dynamic method dispatch. Overridden prototype methods are never called. Original bytes `[1, 2, 3]` are preserved immutably.
 - **Invariants Protected:** Invariant 18 (Direct Private Field Encapsulation).
 - **Classification:** Future M5.1 implementation test (architecture requirement).
 
-### Test R18-R34-T128: Linearizable Store Reconciliation Fencing Prevents In-Flight Commit (R32-2)
+### Test R18-R35-T128: Linearizable Store Reconciliation Fencing Prevents In-Flight Commit (R32-2)
 - **Preconditions:** Coordinator submits publication sequence $S=50$ (`attemptId = "att-50"`); times out and records `UNCERTAIN`. Original request is still in-flight at authoritative store.
 - **Trigger:** Coordinator invokes `reconcilePublication(query)`. Query sees sequence $S=50$ uncommitted; store atomically persists `TERMINAL_ATTEMPT_FENCED` tombstone for `"att-50"` and returns `NOT_COMMITTED_FINAL`. Subsequently, delayed original publication request finishes execution and attempts to commit sequence 50.
 - **Expected Result:** Store detects durable terminal fencing tombstone; rejects delayed attempt with `ATTEMPT_TERMINALLY_ABORTED_BY_RECONCILIATION`. Local coordinator never misclassifies a committed record.
 - **Invariants Protected:** Invariant 20 & 23 (Linearizable Reconciliation Fencing).
 - **Classification:** Future M5.1 implementation test.
 
-### Test R18-R34-T129: Store Reconciliation Unable to Atomically Fence Returns UNKNOWN_IN_PROGRESS Fail-Closed (R32-2)
+### Test R18-R35-T129: Store Reconciliation Unable to Atomically Fence Returns UNKNOWN_IN_PROGRESS Fail-Closed (R32-2)
 - **Preconditions:** Coordinator invokes `reconcilePublication()` for an uncertain attempt, but store encounters a network partition / disk failure and cannot durably persist the `TERMINAL_ATTEMPT_FENCED` tombstone.
 - **Trigger:** Store executes reconciliation query.
 - **Expected Result:** Store returns `UNKNOWN_IN_PROGRESS: store unable to persist terminal fencing tombstone`. Coordinator throws `CUSTODY_GATE_RECONCILING` and remains strictly fail-closed in `RECONCILING_CUSTODY`. Zero mutations permitted.
 - **Invariants Protected:** Invariant 23 (Fail-Closed Gate State).
 - **Classification:** Future M5.1 implementation test.
 
-### Test R18-R34-T130: Sequence Collision with Differing Attempt ID Takes Precedence Over Digest Mismatch (R32-6)
+### Test R18-R35-T130: Sequence Collision with Differing Attempt ID Takes Precedence Over Digest Mismatch (R32-6)
 - **Preconditions:** Store has durably committed sequence $S=60$ (`attemptId = "att-60-A"`, digest $D_A$).
 - **Trigger:** Publication request arrives for sequence $S=60$ presenting BOTH a differing attempt ID (`attemptId = "att-60-B"`) AND a differing candidate digest ($D_B
 eq D_A$).
@@ -4168,42 +4194,42 @@ eq D_A$).
 
 ---
 
-### Test R18-R34-T131: Static isTrustedInstance Monkey-Patching Blocked and Irrelevant to Internal Custody (R33-1)
+### Test R18-R35-T131: Static isTrustedInstance Monkey-Patching Blocked and Irrelevant to Internal Custody (R33-1)
 - **Preconditions:** Hostile consumer attempts to replace `EncapsulatedByteArray.isTrustedInstance = () => true;`.
 - **Trigger:** Attempt assignment and pass forged plain object to `deepCloneAndFreezeValue()`.
 - **Expected Result:** `Object.freeze(EncapsulatedByteArray)` prohibits assignment (throws `TypeError` in strict mode). Furthermore, `deepCloneAndFreezeValue()` and constructor execute strictly via unexported lexical helper `isLexicallyTrustedEncapsulatedByteArray`, which evaluates `#bytes in val` and exact prototype identity. Forged object is rejected with `UNSUPPORTED_PROTOTYPE_INSTANCE`.
 - **Invariants Protected:** Invariant 18 (Static API Immutability & Lexical Brand Checking).
 - **Classification:** Future M5.1 implementation test (architecture requirement).
 
-### Test R18-R34-T132: Constructor and Prototype Tampering Blocked by Object.freeze (R33-1)
+### Test R18-R35-T132: Constructor and Prototype Tampering Blocked by Object.freeze (R33-1)
 - **Preconditions:** Caller attempts to mutate `EncapsulatedByteArray.prototype.toCanonicalHex = () => "forged"` and `EncapsulatedByteArray.someProp = 123`.
 - **Trigger:** Executed in strict mode.
 - **Expected Result:** Both mutations throw `TypeError: Cannot add/assign property on frozen object`. Original prototype methods and constructor remain strictly immutable.
 - **Invariants Protected:** Invariant 18 (Prototype and Constructor Freezing).
 - **Classification:** Future M5.1 implementation test.
 
-### Test R18-R34-T133: Linearizable Commit Race: Publication Commits Immediately Before Reconciliation (R33-3)
+### Test R18-R35-T133: Linearizable Commit Race: Publication Commits Immediately Before Reconciliation (R33-3)
 - **Preconditions:** Coordinator submits publication sequence $S=70$ (`attemptId = "att-70"`). Times out and triggers `reconcilePublication()`.
 - **Trigger:** Store consensus log commits publication request at log index 100 immediately before reconciliation query evaluates at index 101.
 - **Expected Result:** Reconciliation query reads log index 100; detects committed publication under identical 8D tuple; returns `RECONCILED_COMMITTED` with committed root. Zero misclassification.
 - **Invariants Protected:** Invariant 20 (Linearizable Shared Log Commit Ordering).
 - **Classification:** Future M5.1 implementation test.
 
-### Test R18-R34-T134: Linearizable Fencing Race: Reconciliation Fences Attempt Immediately Before Delayed Commit (R33-3)
+### Test R18-R35-T134: Linearizable Fencing Race: Reconciliation Fences Attempt Immediately Before Delayed Commit (R33-3)
 - **Preconditions:** Coordinator submits publication sequence $S=71$ (`attemptId = "att-71"`). Times out and triggers reconciliation.
 - **Trigger:** Reconciliation query executes at log index 200, observes uncommitted sequence, and commits `TERMINAL_ATTEMPT_FENCED` tombstone. Delayed original publication request evaluates at index 201.
 - **Expected Result:** Delayed publication request detects durable terminal tombstone matching its `attemptId`; permanently rejected with `ATTEMPT_TERMINALLY_ABORTED_BY_RECONCILIATION`. Fenced attempt cannot commit.
 - **Invariants Protected:** Invariant 20 & 23 (Linearizable Reconciliation Fencing).
 - **Classification:** Future M5.1 implementation test.
 
-### Test R18-R34-T135: Lost Publication Response Idempotently Recovered via Reconciliation (R33-3)
+### Test R18-R35-T135: Lost Publication Response Idempotently Recovered via Reconciliation (R33-3)
 - **Preconditions:** Store commits publication sequence $S=72$ under 8D tuple, but acknowledgment is lost over network.
 - **Trigger:** Coordinator records `UNCERTAIN` and invokes `reconcilePublication()` presenting identical 8D tuple.
 - **Expected Result:** Store queries linearizable state; matches identical 8D tuple; returns `RECONCILED_COMMITTED` idempotently with original committed root. Coordinator installs root and recovers cleanly.
 - **Invariants Protected:** Invariant 20 & 22 (Lost-Response Idempotent Recovery).
 - **Classification:** Future M5.1 implementation test.
 
-### Test R18-R34-T136: Sequence Collision with Matching attemptId but Conflicting Candidate Digest (R33-5)
+### Test R18-R35-T136: Sequence Collision with Matching attemptId but Conflicting Candidate Digest (R33-5)
 - **Preconditions:** Store has committed sequence $S=73$ under `attemptId = "att-73"` with digest $D_A$.
 - **Trigger:** Publication request arrives for sequence $S=73$ with `attemptId = "att-73"` but conflicting candidate digest $D_B
 eq D_A$.
@@ -4211,21 +4237,21 @@ eq D_A$.
 - **Invariants Protected:** Invariant 22 (Candidate Digest Collision Precedence).
 - **Classification:** Future M5.1 implementation test.
 
-### Test R18-R34-T137: Delayed Publication Carrying Stale Term After Terminal Fencing (R33-3)
+### Test R18-R35-T137: Delayed Publication Carrying Stale Term After Terminal Fencing (R33-3)
 - **Preconditions:** Coordinator term 1 was terminally fenced with `TERMINAL_ATTEMPT_FENCED` tombstone. Store consensus advances to term 2.
 - **Trigger:** A delayed publication packet from term 1 arrives at the store.
 - **Expected Result:** Evaluated against shared consensus state; rejected with `CUSTODY_PUBLICATION_STALE_LEADERSHIP` and `ATTEMPT_TERMINALLY_ABORTED_BY_RECONCILIATION`. Stale term cannot alter store state.
 - **Invariants Protected:** Invariant 20 (Multi-Epoch Leadership Fencing).
 - **Classification:** Future M5.1 implementation test.
 
-### Test R18-R34-T138: Store Quorum Failure During Reconciliation Fencing Returns UNKNOWN_IN_PROGRESS Fail-Closed (R33-3)
+### Test R18-R35-T138: Store Quorum Failure During Reconciliation Fencing Returns UNKNOWN_IN_PROGRESS Fail-Closed (R33-3)
 - **Preconditions:** Coordinator reconciles uncommitted sequence $S=74$, but store consensus log encounters network partition and loses quorum during terminal tombstone write.
 - **Trigger:** Store executes reconciliation query.
 - **Expected Result:** Store cannot prove linearizable outcome; returns `UNKNOWN_IN_PROGRESS: consensus write failed to achieve quorum`. Coordinator throws `CUSTODY_GATE_RECONCILING` and remains strictly fail-closed in `RECONCILING_CUSTODY`. Zero mutations permitted.
 - **Invariants Protected:** Invariant 23 (Fail-Closed Gate State on Consensus Uncertainty).
 - **Classification:** Future M5.1 implementation test.
 
-### Test R18-R34-T139: Trusted EncapsulatedByteArray Accepted and Copied Directly (R34-1)
+### Test R18-R35-T139: Trusted EncapsulatedByteArray Accepted and Copied Directly (R34-1)
 - **Initial Authoritative Root:** Active custody record containing valid `EncapsulatedByteArray`.
 - **Operation Sequence:** Call copy constructor `new EncapsulatedByteArray(source)` and cloner `deepCloneAndFreezeValue(source)`.
 - **Expected Final Root:** Unchanged; private byte storage copied into new instance.
@@ -4233,7 +4259,7 @@ eq D_A$.
 - **Invariants Protected:** Invariant 18 (Private Byte Encapsulation & Lexical Brand Verification).
 - **Classification:** Future M5.1 implementation test (NOT EXECUTED).
 
-### Test R18-R34-T140: Detached Uint8Array Output Mutation Does Not Mutate Private Custody Bytes (R34-1)
+### Test R18-R35-T140: Detached Uint8Array Output Mutation Does Not Mutate Private Custody Bytes (R34-1)
 - **Initial Authoritative Root:** Active `EncapsulatedByteArray` wrapping `[0x01, 0x02, 0x03]`.
 - **Operation Sequence:** Call `encapsulated.asDetachedUint8Array()`; mutate detached array `detached[0] = 0xff`.
 - **Expected Final Root:** Unchanged; internal bytes remain `[0x01, 0x02, 0x03]`.
@@ -4241,7 +4267,7 @@ eq D_A$.
 - **Invariants Protected:** Invariant 18 (Detached Buffer Defensive Copying).
 - **Classification:** Future M5.1 implementation test (NOT EXECUTED).
 
-### Test R18-R34-T141: Ordinary Supported Same-Realm Uint8Array Accepted and Defensively Copied (R34-1, R34-2)
+### Test R18-R35-T141: Ordinary Supported Same-Realm Uint8Array Accepted and Defensively Copied (R34-1, R34-2)
 - **Initial Authoritative Root:** Direct ordinary `Uint8Array` instance in coordinator realm.
 - **Operation Sequence:** Pass `arr` to cloner / `new EncapsulatedByteArray(arr)`.
 - **Expected Final Root:** Encapsulated within `EncapsulatedByteArray`.
@@ -4249,7 +4275,7 @@ eq D_A$.
 - **Invariants Protected:** Invariant 18 (Supported Same-Realm Binary Ingestion).
 - **Classification:** Future M5.1 implementation test (NOT EXECUTED).
 
-### Test R18-R34-T142: Subclass of Uint8Array Rejected Fail-Closed by Binary Validator (R34-1, R34-2)
+### Test R18-R35-T142: Subclass of Uint8Array Rejected Fail-Closed by Binary Validator (R34-1, R34-2)
 - **Initial Authoritative Root:** Custom subclass `class SubArray extends Uint8Array {}`.
 - **Operation Sequence:** Pass `new SubArray(10)` to cloner / constructor.
 - **Expected Final Root:** Unchanged; zero custody mutation.
@@ -4257,7 +4283,7 @@ eq D_A$.
 - **Invariants Protected:** Invariant 18 (Subclass Prohibition via Direct Prototype Comparison).
 - **Classification:** Future M5.1 implementation test (NOT EXECUTED).
 
-### Test R18-R34-T143: Subclass of EncapsulatedByteArray Rejected Safely Without Second Prototype Operation (R34-1)
+### Test R18-R35-T143: Subclass of EncapsulatedByteArray Rejected Safely Without Second Prototype Operation (R34-1)
 - **Initial Authoritative Root:** Custom subclass `class SubEncapsulated extends EncapsulatedByteArray {}`.
 - **Operation Sequence:** Pass instance of `SubEncapsulated` to constructor / cloner.
 - **Expected Final Root:** Unchanged.
@@ -4265,7 +4291,7 @@ eq D_A$.
 - **Invariants Protected:** Invariant 18 (Proxy-Safe Two-Path Construction).
 - **Classification:** Future M5.1 implementation test (NOT EXECUTED).
 
-### Test R18-R34-T144: Proxy-Wrapped Uint8Array Rejected Safely by ArrayBuffer.isView Brand Check (R34-1, R34-2)
+### Test R18-R35-T144: Proxy-Wrapped Uint8Array Rejected Safely by ArrayBuffer.isView Brand Check (R34-1, R34-2)
 - **Initial Authoritative Root:** `proxy = new Proxy(new Uint8Array(10), { get(t, p) { throw new Error('TRAP_INVOKED'); } })`.
 - **Operation Sequence:** Pass `proxy` to constructor / cloner.
 - **Expected Final Root:** Unchanged.
@@ -4273,7 +4299,7 @@ eq D_A$.
 - **Invariants Protected:** Invariant 18 (Intrinsic Brand Check Trap Immunity).
 - **Classification:** Future M5.1 implementation test (NOT EXECUTED).
 
-### Test R18-R34-T145: Proxy-Wrapped EncapsulatedByteArray Rejected Safely by Brand Check (R34-1, R34-2)
+### Test R18-R35-T145: Proxy-Wrapped EncapsulatedByteArray Rejected Safely by Brand Check (R34-1, R34-2)
 - **Initial Authoritative Root:** `proxy = new Proxy(new EncapsulatedByteArray(new Uint8Array(4)), {})`.
 - **Operation Sequence:** Pass `proxy` to constructor / cloner.
 - **Expected Final Root:** Unchanged.
@@ -4281,15 +4307,15 @@ eq D_A$.
 - **Invariants Protected:** Invariant 18 (Proxy Rejection Fail-Closed).
 - **Classification:** Future M5.1 implementation test (NOT EXECUTED).
 
-### Test R18-R34-T146: Proxy with Throwing getPrototypeOf Trap Rejected Without Second Prototype Operation (R34-1)
-- **Initial Authoritative Root:** `proxy = new Proxy(new Uint8Array(4), { getPrototypeOf() { throw new Error('HOSTILE_GET_PROTOTYPE_OF_TRAP'); } })`.
+### Test R18-R35-T146: Proxy with Throwing getPrototypeOf Trap Rejected with Zero Trap Invocations (R34-1, R35-1)
+- **Initial Authoritative Root:** `let trapCount = 0; const proxy = new Proxy(new Uint8Array(4), { getPrototypeOf() { trapCount++; throw new Error('HOSTILE_GET_PROTOTYPE_OF_TRAP'); } })`.
 - **Operation Sequence:** Pass `proxy` to constructor `new EncapsulatedByteArray(proxy)`.
-- **Expected Final Root:** Unchanged.
-- **Expected Result / Error:** Lexical brand checker catches trap exception and returns false; constructor calls `assertValidOrdinaryUint8Array`; `ArrayBuffer.isView(proxy)` evaluates to false without invoking `getPrototypeOf`; throws standard `TypeError`.
-- **Invariants Protected:** Invariant 18 (No Unsafe Prototype Fallback on Proxy Rejection).
+- **Expected Final Root:** Unchanged; zero custody mutation.
+- **Expected Result / Error:** Lexical brand checker evaluates `!(#bytes in proxy)` first, returning false immediately without executing `getPrototypeOf`; constructor calls `assertValidOrdinaryUint8Array`; `ArrayBuffer_isView(proxy)` evaluates to false without invoking `getPrototypeOf`; throws standard `TypeError`; `trapCount === 0` asserted.
+- **Invariants Protected:** Invariant 18 (Private-Brand-First Zero Trap Execution).
 - **Classification:** Future M5.1 implementation test (NOT EXECUTED).
 
-### Test R18-R34-T147: Proxy with Throwing get Trap Rejected Without Invoking Getter (R34-1, R34-2)
+### Test R18-R35-T147: Proxy with Throwing get Trap Rejected Without Invoking Getter (R34-1, R34-2)
 - **Initial Authoritative Root:** `proxy = new Proxy(new Uint8Array(4), { get(t, p) { throw new Error('HOSTILE_GET_TRAP'); } })`.
 - **Operation Sequence:** Pass `proxy` to cloner.
 - **Expected Final Root:** Unchanged.
@@ -4297,7 +4323,7 @@ eq D_A$.
 - **Invariants Protected:** Invariant 18 (Getter Trap Immunity).
 - **Classification:** Future M5.1 implementation test (NOT EXECUTED).
 
-### Test R18-R34-T148: Proxy with Throwing ownKeys Trap Rejected Before Own-Key Inspection (R34-1, R34-2)
+### Test R18-R35-T148: Proxy with Throwing ownKeys Trap Rejected Before Own-Key Inspection (R34-1, R34-2)
 - **Initial Authoritative Root:** `proxy = new Proxy(new Uint8Array(4), { ownKeys() { throw new Error('HOSTILE_OWN_KEYS_TRAP'); } })`.
 - **Operation Sequence:** Pass `proxy` to cloner.
 - **Expected Final Root:** Unchanged.
@@ -4305,7 +4331,7 @@ eq D_A$.
 - **Invariants Protected:** Invariant 18 (Safe Validator Ordering).
 - **Classification:** Future M5.1 implementation test (NOT EXECUTED).
 
-### Test R18-R34-T149: DataView Instance Rejected Fail-Closed by Prototype Comparison (R34-2)
+### Test R18-R35-T149: DataView Instance Rejected Fail-Closed by Prototype Comparison (R34-2)
 - **Initial Authoritative Root:** `dv = new DataView(new ArrayBuffer(16))`.
 - **Operation Sequence:** Pass `dv` to constructor / cloner.
 - **Expected Final Root:** Unchanged.
@@ -4313,7 +4339,7 @@ eq D_A$.
 - **Invariants Protected:** Invariant 18 (DataView Prohibition).
 - **Classification:** Future M5.1 implementation test (NOT EXECUTED).
 
-### Test R18-R34-T150: Non-Uint8Array Typed Views (Int8Array, Uint16Array) Rejected Fail-Closed (R34-2)
+### Test R18-R35-T150: Non-Uint8Array Typed Views (Int8Array, Uint16Array) Rejected Fail-Closed (R34-2)
 - **Initial Authoritative Root:** `int8 = new Int8Array(8)`.
 - **Operation Sequence:** Pass `int8` to cloner.
 - **Expected Final Root:** Unchanged.
@@ -4321,7 +4347,7 @@ eq D_A$.
 - **Invariants Protected:** Invariant 18 (Strict Uint8Array Prototype Enforcement).
 - **Classification:** Future M5.1 implementation test (NOT EXECUTED).
 
-### Test R18-R34-T151: SharedArrayBuffer-Backed Uint8Array View Rejected Fail-Closed (R34-2)
+### Test R18-R35-T151: SharedArrayBuffer-Backed Uint8Array View Rejected Fail-Closed (R34-2)
 - **Initial Authoritative Root:** `view = new Uint8Array(new SharedArrayBuffer(16))`.
 - **Operation Sequence:** Pass `view` to cloner.
 - **Expected Final Root:** Unchanged.
@@ -4329,7 +4355,7 @@ eq D_A$.
 - **Invariants Protected:** Invariant 18 (SharedArrayBuffer Brand Rejection).
 - **Classification:** Future M5.1 implementation test (NOT EXECUTED).
 
-### Test R18-R34-T152: Unsupported Cross-Realm Uint8Array View Rejected Under Same-Realm Contract (R34-2)
+### Test R18-R35-T152: Unsupported Cross-Realm Uint8Array View Rejected Under Same-Realm Contract (R34-2)
 - **Initial Authoritative Root:** `foreignView` instantiated in foreign vm context.
 - **Operation Sequence:** Pass `foreignView` to cloner.
 - **Expected Final Root:** Unchanged.
@@ -4337,7 +4363,7 @@ eq D_A$.
 - **Invariants Protected:** Invariant 18 (Same-Realm Boundary Restriction).
 - **Classification:** Future M5.1 implementation test (NOT EXECUTED).
 
-### Test R18-R34-T153: Rejected Hostile Input Cannot Mutate Existing Custody Values (R34-1, R34-2)
+### Test R18-R35-T153: Rejected Hostile Input Cannot Mutate Existing Custody Values (R34-1, R34-2)
 - **Initial Authoritative Root:** Valid frozen custody root.
 - **Operation Sequence:** Submit candidate root with hostile binary input.
 - **Expected Final Root:** Completely unchanged; zero partial mutation.
@@ -4345,7 +4371,7 @@ eq D_A$.
 - **Invariants Protected:** Invariant 18 (Atomic Cloner Safety).
 - **Classification:** Future M5.1 implementation test (NOT EXECUTED).
 
-### Test R18-R34-T154: Single-Field Mismatch Rejection: clusterTerm Mismatch (R34-3, R34-5)
+### Test R18-R35-T154: Single-Field Mismatch Rejection: clusterTerm Mismatch (R34-3, R34-5)
 - **Initial Authoritative Root:** Coordinator awaiting reconciliation for attempt $A$.
 - **Operation Sequence:** Store returns result with `clusterTerm: expected.clusterTerm + 1`.
 - **Expected Final Root:** Unchanged; coordinator remains in `RECONCILING_CUSTODY`.
@@ -4353,7 +4379,7 @@ eq D_A$.
 - **Invariants Protected:** Invariant 20 (8D Identity Consensus Term Fencing).
 - **Classification:** Future M5.1 implementation test (NOT EXECUTED).
 
-### Test R18-R34-T155: Single-Field Mismatch Rejection: bootGeneration Mismatch (R34-3, R34-5)
+### Test R18-R35-T155: Single-Field Mismatch Rejection: bootGeneration Mismatch (R34-3, R34-5)
 - **Initial Authoritative Root:** Coordinator awaiting reconciliation for attempt $A$.
 - **Operation Sequence:** Store returns result with `bootGeneration: expected.bootGeneration + 1`.
 - **Expected Final Root:** Unchanged; coordinator remains in `RECONCILING_CUSTODY`.
@@ -4361,7 +4387,7 @@ eq D_A$.
 - **Invariants Protected:** Invariant 20 (8D Identity Boot Generation Fencing).
 - **Classification:** Future M5.1 implementation test (NOT EXECUTED).
 
-### Test R18-R34-T156: Single-Field Mismatch Rejection: bootInstanceId Mismatch (R34-3, R34-5)
+### Test R18-R35-T156: Single-Field Mismatch Rejection: bootInstanceId Mismatch (R34-3, R34-5)
 - **Initial Authoritative Root:** Coordinator awaiting reconciliation for attempt $A$.
 - **Operation Sequence:** Store returns result with differing `bootInstanceId`.
 - **Expected Final Root:** Unchanged; coordinator remains in `RECONCILING_CUSTODY`.
@@ -4369,7 +4395,7 @@ eq D_A$.
 - **Invariants Protected:** Invariant 20 (8D Identity Instance ID Fencing).
 - **Classification:** Future M5.1 implementation test (NOT EXECUTED).
 
-### Test R18-R34-T157: Single-Field Mismatch Rejection: publicationSequence Mismatch (R34-3, R34-5)
+### Test R18-R35-T157: Single-Field Mismatch Rejection: publicationSequence Mismatch (R34-3, R34-5)
 - **Initial Authoritative Root:** Coordinator awaiting reconciliation for attempt $A$.
 - **Operation Sequence:** Store returns result with differing `publicationSequence`.
 - **Expected Final Root:** Unchanged; coordinator remains in `RECONCILING_CUSTODY`.
@@ -4377,7 +4403,7 @@ eq D_A$.
 - **Invariants Protected:** Invariant 20 (8D Identity Sequence Contiguity).
 - **Classification:** Future M5.1 implementation test (NOT EXECUTED).
 
-### Test R18-R34-T158: Single-Field Mismatch Rejection: attemptId Mismatch (R34-3, R34-5)
+### Test R18-R35-T158: Single-Field Mismatch Rejection: attemptId Mismatch (R34-3, R34-5)
 - **Initial Authoritative Root:** Coordinator awaiting reconciliation for attempt $A$.
 - **Operation Sequence:** Store returns result with differing `attemptId`.
 - **Expected Final Root:** Unchanged; coordinator remains in `RECONCILING_CUSTODY`.
@@ -4385,7 +4411,7 @@ eq D_A$.
 - **Invariants Protected:** Invariant 20 (8D Identity Attempt ID Binding).
 - **Classification:** Future M5.1 implementation test (NOT EXECUTED).
 
-### Test R18-R34-T159: Single-Field Mismatch Rejection: candidateRootDigest Mismatch (R34-3, R34-5)
+### Test R18-R35-T159: Single-Field Mismatch Rejection: candidateRootDigest Mismatch (R34-3, R34-5)
 - **Initial Authoritative Root:** Coordinator awaiting reconciliation for attempt $A$.
 - **Operation Sequence:** Store returns result with differing `candidateRootDigest`.
 - **Expected Final Root:** Unchanged; coordinator remains in `RECONCILING_CUSTODY`.
@@ -4393,7 +4419,7 @@ eq D_A$.
 - **Invariants Protected:** Invariant 20 (8D Identity Candidate Digest Verification).
 - **Classification:** Future M5.1 implementation test (NOT EXECUTED).
 
-### Test R18-R34-T160: Single-Field Mismatch Rejection: expectedPriorSequence Mismatch (R34-3, R34-5)
+### Test R18-R35-T160: Single-Field Mismatch Rejection: expectedPriorSequence Mismatch (R34-3, R34-5)
 - **Initial Authoritative Root:** Coordinator awaiting reconciliation for attempt $A$.
 - **Operation Sequence:** Store returns result with differing `expectedPriorSequence`.
 - **Expected Final Root:** Unchanged; coordinator remains in `RECONCILING_CUSTODY`.
@@ -4401,7 +4427,7 @@ eq D_A$.
 - **Invariants Protected:** Invariant 20 (8D Identity Prior Sequence Causality).
 - **Classification:** Future M5.1 implementation test (NOT EXECUTED).
 
-### Test R18-R34-T161: Single-Field Mismatch Rejection: expectedPriorRootDigest Mismatch (R34-3, R34-5)
+### Test R18-R35-T161: Single-Field Mismatch Rejection: expectedPriorRootDigest Mismatch (R34-3, R34-5)
 - **Initial Authoritative Root:** Coordinator awaiting reconciliation for attempt $A$.
 - **Operation Sequence:** Store returns result with differing `expectedPriorRootDigest`.
 - **Expected Final Root:** Unchanged; coordinator remains in `RECONCILING_CUSTODY`.
@@ -4409,7 +4435,7 @@ eq D_A$.
 - **Invariants Protected:** Invariant 20 (8D Identity Prior Root Digest Causality).
 - **Classification:** Future M5.1 implementation test (NOT EXECUTED).
 
-### Test R18-R34-T162: Exact 8-Field Match Accepted and Applied (R34-3, R34-5)
+### Test R18-R35-T162: Exact 8-Field Match Accepted and Applied (R34-3, R34-5)
 - **Initial Authoritative Root:** Coordinator in `RECONCILING_CUSTODY` awaiting attempt $A$.
 - **Operation Sequence:** Store returns `RECONCILED_COMMITTED` with exact matching 8D identity.
 - **Expected Final Root:** Updated to `result.committedRoot`; gate returns to `IDLE`.
@@ -4417,7 +4443,7 @@ eq D_A$.
 - **Invariants Protected:** Invariant 20 & 23 (Exact 8D Identity Reconciliation Acceptance).
 - **Classification:** Future M5.1 implementation test (NOT EXECUTED).
 
-### Test R18-R34-T163: Object Reference Inequality Does Not Invalidate Matching 8-Field Identity (R34-5)
+### Test R18-R35-T163: Object Reference Inequality Does Not Invalidate Matching 8-Field Identity (R34-5)
 - **Initial Authoritative Root:** Coordinator awaiting reconciliation for attempt $A$.
 - **Operation Sequence:** Store returns deserialized result object literal matching all 8 fields.
 - **Expected Final Root:** Updated to committed root.
@@ -4425,7 +4451,7 @@ eq D_A$.
 - **Invariants Protected:** Invariant 20 (Value-Based Identity Semantics).
 - **Classification:** Future M5.1 implementation test (NOT EXECUTED).
 
-### Test R18-R34-T164: Matching Sequence with Differing attemptId Rejected by Store and Coordinator (R34-5)
+### Test R18-R35-T164: Matching Sequence with Differing attemptId Rejected by Store and Coordinator (R34-5)
 - **Initial Authoritative Root:** Sequence $S$ committed under attempt $A_1$.
 - **Operation Sequence:** Query presents sequence $S$ and attempt $A_2$.
 - **Expected Final Root:** Unchanged.
@@ -4433,7 +4459,7 @@ eq D_A$.
 - **Invariants Protected:** Invariant 22 (Precedence Step 1 Attempt Identity Primacy).
 - **Classification:** Future M5.1 implementation test (NOT EXECUTED).
 
-### Test R18-R34-T165: Matching attemptId with Conflicting Candidate Digest Rejected by Store Precedence (R34-5)
+### Test R18-R35-T165: Matching attemptId with Conflicting Candidate Digest Rejected by Store Precedence (R34-5)
 - **Initial Authoritative Root:** Sequence $S$ committed under attempt $A_1$ with digest $D_1$.
 - **Operation Sequence:** Query presents sequence $S$, attempt $A_1$, but conflicting digest $D_2$.
 - **Expected Final Root:** Unchanged.
@@ -4441,7 +4467,7 @@ eq D_A$.
 - **Invariants Protected:** Invariant 22 (Precedence Step 2 Candidate Digest Enforcement).
 - **Classification:** Future M5.1 implementation test (NOT EXECUTED).
 
-### Test R18-R34-T166: Matching Digest with Conflicting Expected Prior Root Rejected by Causality Check (R34-5)
+### Test R18-R35-T166: Matching Digest with Conflicting Expected Prior Root Rejected by Causality Check (R34-5)
 - **Initial Authoritative Root:** Prior committed root $R_{prior}$.
 - **Operation Sequence:** Candidate presents expected prior digest $R_{prior}'
 eq R_{prior}$.
@@ -4450,7 +4476,7 @@ eq R_{prior}$.
 - **Invariants Protected:** Invariant 20 (Linearizable State Machine Causality).
 - **Classification:** Future M5.1 implementation test (NOT EXECUTED).
 
-### Test R18-R34-T167: Matching Identity with Mismatched committedSequence Rejected by Coordinator (R34-5)
+### Test R18-R35-T167: Matching Identity with Mismatched committedSequence Rejected by Coordinator (R34-5)
 - **Initial Authoritative Root:** Coordinator awaiting attempt with `publicationSequence = 5`.
 - **Operation Sequence:** Store returns matching 8D identity, but `committedSequence = 6`.
 - **Expected Final Root:** Unchanged; coordinator remains in `RECONCILING_CUSTODY`.
@@ -4458,7 +4484,7 @@ eq R_{prior}$.
 - **Invariants Protected:** Invariant 20 (Committed Sequence Invariant Verification).
 - **Classification:** Future M5.1 implementation test (NOT EXECUTED).
 
-### Test R18-R34-T168: Matching Identity with Mismatched Committed Root Digest Rejected by Coordinator (R34-5)
+### Test R18-R35-T168: Matching Identity with Mismatched Committed Root Digest Rejected by Coordinator (R34-5)
 - **Initial Authoritative Root:** Coordinator awaiting candidate digest $D_1$.
 - **Operation Sequence:** Store returns matching 8D identity, but `_computeRootDigest(committedRoot) = D_2`.
 - **Expected Final Root:** Unchanged; coordinator remains in `RECONCILING_CUSTODY`.
@@ -4466,7 +4492,7 @@ eq R_{prior}$.
 - **Invariants Protected:** Invariant 20 (Committed Root Digest Verification).
 - **Classification:** Future M5.1 implementation test (NOT EXECUTED).
 
-### Test R18-R34-T169: Caller-Supplied Identity Cannot Manufacture Authoritative Committed Evidence (R34-4)
+### Test R18-R35-T169: Caller-Supplied Identity Cannot Manufacture Authoritative Committed Evidence (R34-4)
 - **Initial Authoritative Root:** Store has no record of requested attempt.
 - **Operation Sequence:** Caller queries `reconcilePublication` for uncommitted attempt.
 - **Expected Final Root:** Store commits `TERMINAL_ATTEMPT_FENCED` tombstone or returns `UNKNOWN_IN_PROGRESS`.
@@ -4474,7 +4500,7 @@ eq R_{prior}$.
 - **Invariants Protected:** Invariant 20 & 23 (Authoritative Evidence Verification).
 - **Classification:** Future M5.1 implementation test (NOT EXECUTED).
 
-### Test R18-R34-T170: Reconciliation Returns Identity Sourced from Durable Authoritative Record (R34-4)
+### Test R18-R35-T170: Reconciliation Returns Identity Sourced from Durable Authoritative Record (R34-4)
 - **Initial Authoritative Root:** Attempt durably committed in store.
 - **Operation Sequence:** Call `reconcilePublication`.
 - **Expected Final Root:** Returns stored 8D identity and committed root.
@@ -4482,7 +4508,7 @@ eq R_{prior}$.
 - **Invariants Protected:** Invariant 20 (Durable Record Identity Sourcing).
 - **Classification:** Future M5.1 implementation test (NOT EXECUTED).
 
-### Test R18-R34-T171: Terminal Tombstone Checked Against Complete 8D Identity Before Acceptance (R34-4, R34-5)
+### Test R18-R35-T171: Terminal Tombstone Checked Against Complete 8D Identity Before Acceptance (R34-4, R34-5)
 - **Initial Authoritative Root:** Coordinator awaiting reconciliation.
 - **Operation Sequence:** Store returns `NOT_COMMITTED_FINAL` with stored tombstone identity.
 - **Expected Final Root:** Updated to `authoritativeCurrentRoot`; gate returns to `IDLE`.
@@ -4490,7 +4516,7 @@ eq R_{prior}$.
 - **Invariants Protected:** Invariant 20 (Terminal Tombstone Identity Validation).
 - **Classification:** Future M5.1 implementation test (NOT EXECUTED).
 
-### Test R18-R34-T172: Committed Result Cannot Be Confused with Later Publication at Higher Sequence (R34-4)
+### Test R18-R35-T172: Committed Result Cannot Be Confused with Later Publication at Higher Sequence (R34-4)
 - **Initial Authoritative Root:** Attempt at sequence $S_1$ pending reconciliation; sequence $S_2 > S_1$ committed.
 - **Operation Sequence:** Call `reconcilePublication` for attempt at $S_1$.
 - **Expected Final Root:** Resolves $S_1$ specifically based on its 8D identity.
@@ -4498,7 +4524,7 @@ eq R_{prior}$.
 - **Invariants Protected:** Invariant 20 (Sequence-Segregated Identity Matching).
 - **Classification:** Future M5.1 implementation test (NOT EXECUTED).
 
-### Test R18-R34-T173: Mismatched Reconciliation Result Leaves Coordinator Fail-Closed in RECONCILING_CUSTODY (R34-5)
+### Test R18-R35-T173: Mismatched Reconciliation Result Leaves Coordinator Fail-Closed in RECONCILING_CUSTODY (R34-5)
 - **Initial Authoritative Root:** Coordinator in `RECONCILING_CUSTODY`.
 - **Operation Sequence:** Store returns corrupt or mismatched identity response.
 - **Expected Final Root:** Gate remains in `RECONCILING_CUSTODY`.
@@ -4506,7 +4532,7 @@ eq R_{prior}$.
 - **Invariants Protected:** Invariant 23 (Fail-Closed Reconciliation Safety).
 - **Classification:** Future M5.1 implementation test (NOT EXECUTED).
 
-### Test R18-R34-T174: Lost Publication Response Idempotently Recovered via Reconciliation with Full Identity (R34-4)
+### Test R18-R35-T174: Lost Publication Response Idempotently Recovered via Reconciliation with Full Identity (R34-4)
 - **Initial Authoritative Root:** Commit succeeds at store log index $K$; ACK dropped by network.
 - **Operation Sequence:** Coordinator queries `reconcilePublication` with identical 8D tuple.
 - **Expected Final Root:** Updated to committed root; gate returns to `IDLE`.
@@ -4514,7 +4540,7 @@ eq R_{prior}$.
 - **Invariants Protected:** Invariant 20 & 22 (Lost-Response Idempotent Recovery).
 - **Classification:** Future M5.1 implementation test (NOT EXECUTED).
 
-### Test R18-R34-T175: Terminal Tombstone Wins Fencing Race Before Delayed Publication Request Arrives (R34-4)
+### Test R18-R35-T175: Terminal Tombstone Wins Fencing Race Before Delayed Publication Request Arrives (R34-4)
 - **Initial Authoritative Root:** Store commits `TERMINAL_ATTEMPT_FENCED` at log index $K$.
 - **Operation Sequence:** Delayed publication request arrives at log index $K+1$.
 - **Expected Final Root:** Unchanged; delayed write rejected.
@@ -4522,7 +4548,7 @@ eq R_{prior}$.
 - **Invariants Protected:** Invariant 20 (Linearizable Shared Log Tombstone Fencing).
 - **Classification:** Future M5.1 implementation test (NOT EXECUTED).
 
-### Test R18-R34-T176: Publication Wins Commit Race Immediately Before Reconciliation Query Evaluates (R34-4)
+### Test R18-R35-T176: Publication Wins Commit Race Immediately Before Reconciliation Query Evaluates (R34-4)
 - **Initial Authoritative Root:** Publication commits at log index $K$.
 - **Operation Sequence:** Reconciliation query evaluates at log index $K+1$.
 - **Expected Final Root:** Committed root installed.
@@ -4530,7 +4556,7 @@ eq R_{prior}$.
 - **Invariants Protected:** Invariant 20 (Linearizable Shared Log Commit Precedence).
 - **Classification:** Future M5.1 implementation test (NOT EXECUTED).
 
-### Test R18-R34-T177: Consensus Quorum Failure During Reconciliation Returns UNKNOWN_IN_PROGRESS (R34-4)
+### Test R18-R35-T177: Consensus Quorum Failure During Reconciliation Returns UNKNOWN_IN_PROGRESS (R34-4)
 - **Initial Authoritative Root:** Store partition prevents atomic tombstone commit.
 - **Operation Sequence:** Call `reconcilePublication`.
 - **Expected Final Root:** Gate remains in `RECONCILING_CUSTODY`.
@@ -4538,7 +4564,7 @@ eq R_{prior}$.
 - **Invariants Protected:** Invariant 20 & 23 (Fail-Closed Store Fencing Uncertainty).
 - **Classification:** Future M5.1 implementation test (NOT EXECUTED).
 
-### Test R18-R34-T178: UNKNOWN_IN_PROGRESS Keeps RECONCILING_CUSTODY Active Fail-Closed (R34-5)
+### Test R18-R35-T178: UNKNOWN_IN_PROGRESS Keeps RECONCILING_CUSTODY Active Fail-Closed (R34-5)
 - **Initial Authoritative Root:** Coordinator received `UNKNOWN_IN_PROGRESS`.
 - **Operation Sequence:** External callers attempt new publications or recovery mutations.
 - **Expected Final Root:** Unchanged; zero operations admitted.
@@ -4546,7 +4572,7 @@ eq R_{prior}$.
 - **Invariants Protected:** Invariant 23 (Fail-Closed Gate Enforcement).
 - **Classification:** Future M5.1 implementation test (NOT EXECUTED).
 
-### Test R18-R34-T179: Stale Coordinator Losing Leadership During Reconciliation Withholds Root Update (R34-5)
+### Test R18-R35-T179: Stale Coordinator Losing Leadership During Reconciliation Withholds Root Update (R34-5)
 - **Initial Authoritative Root:** Term advances while awaiting reconciliation response.
 - **Operation Sequence:** Response arrives; `assertPostAwaitEligibility` evaluates.
 - **Expected Final Root:** Unchanged; stale root update blocked.
@@ -4554,7 +4580,7 @@ eq R_{prior}$.
 - **Invariants Protected:** Invariant 20 (Post-Await Leadership Fencing).
 - **Classification:** Future M5.1 implementation test (NOT EXECUTED).
 
-### Test R18-R34-T180: Reconciliation Result for Attempt A Cannot Resolve Attempt B (R34-5)
+### Test R18-R35-T180: Reconciliation Result for Attempt A Cannot Resolve Attempt B (R34-5)
 - **Initial Authoritative Root:** Coordinator awaiting attempt B.
 - **Operation Sequence:** Delayed response for attempt A arrives.
 - **Expected Final Root:** Unchanged; coordinator remains fail-closed.
@@ -4563,7 +4589,7 @@ eq B$); throws `INVALID_RECONCILIATION_CONFIRMATION`.
 - **Invariants Protected:** Invariant 20 (Attempt-Bound Identity Isolation).
 - **Classification:** Future M5.1 implementation test (NOT EXECUTED).
 
-### Test R18-R34-T181: Terminal Tombstone for Attempt A Cannot Fence Attempt B (R34-4)
+### Test R18-R35-T181: Terminal Tombstone for Attempt A Cannot Fence Attempt B (R34-4)
 - **Initial Authoritative Root:** Tombstone exists for attempt A.
 - **Operation Sequence:** Attempt B evaluated at store.
 - **Expected Final Root:** Evaluates independently based on B's 8D tuple.
@@ -4571,7 +4597,7 @@ eq B$); throws `INVALID_RECONCILIATION_CONFIRMATION`.
 - **Invariants Protected:** Invariant 20 (Granular Attempt Tombstone Fencing).
 - **Classification:** Future M5.1 implementation test (NOT EXECUTED).
 
-### Test R18-R34-T182: Retransmission with Same Identity and Digest Follows Existing Idempotency (Rule 1)
+### Test R18-R35-T182: Retransmission with Same Identity and Digest Follows Existing Idempotency (Rule 1)
 - **Initial Authoritative Root:** Publication committed at sequence $S$.
 - **Operation Sequence:** Retransmit identical 8D tuple.
 - **Expected Final Root:** Unchanged; returns `COMMITTED` idempotently.
@@ -4579,12 +4605,68 @@ eq B$); throws `INVALID_RECONCILIATION_CONFIRMATION`.
 - **Invariants Protected:** Invariant 22 (Rule 1 Store Idempotency).
 - **Classification:** Future M5.1 implementation test (NOT EXECUTED).
 
-### Test R18-R34-T183: Retransmission with Same Sequence and Conflicting Attempt ID Rejects (Rule 2)
+### Test R18-R35-T183: Retransmission with Same Sequence and Conflicting Attempt ID Rejects (Rule 2)
 - **Initial Authoritative Root:** Sequence $S$ committed under attempt $A_1$.
 - **Operation Sequence:** Retransmit sequence $S$ with attempt $A_2$.
 - **Expected Final Root:** Unchanged.
 - **Expected Result / Error:** Store evaluates Precedence Step 1; rejects with `DUPLICATE_SEQUENCE_CONFLICT`.
 - **Invariants Protected:** Invariant 22 (Rule 2 Sequence Conflict Precedence).
+- **Classification:** Future M5.1 implementation test (NOT EXECUTED).
+
+### Test R18-R35-T184: Proxy getPrototypeOf Trap Counter Remains Strictly Zero Throughout Entire Constructor Invocation (R35-1)
+- **Initial Authoritative Root:** Active custody record; `let trapCount = 0; const hostileProxy = new Proxy(new Uint8Array([1, 2, 3]), { getPrototypeOf() { trapCount++; throw new Error('TRAP_INVOKED'); } })`.
+- **Operation Sequence:** Call `new EncapsulatedByteArray(hostileProxy)`.
+- **Expected Final Root:** Unchanged; zero custody mutation.
+- **Expected Result / Error:** Private-brand check `!(#bytes in hostileProxy)` evaluates first and returns false without invoking `getPrototypeOf`; `assertValidOrdinaryUint8Array` evaluates `!ArrayBuffer_isView(hostileProxy)`, which returns false without invoking `getPrototypeOf`; throws `TypeError('UNSUPPORTED_BINARY_VALUE_TYPE: value is not an ArrayBuffer view')`; `trapCount === 0` asserted.
+- **Invariants Protected:** Invariant 18 (Private-Brand-First Lexical Checking & Complete Trap Immunity).
+- **Classification:** Future M5.1 implementation test (NOT EXECUTED).
+
+### Test R18-R35-T185: Proxy Wrapping EncapsulatedByteArray Evaluated with Private Brand #bytes; Trap Counter Remains Zero (R35-1)
+- **Initial Authoritative Root:** `const genuine = new EncapsulatedByteArray(new Uint8Array([1, 2, 3])); let trapCount = 0; const proxy = new Proxy(genuine, { getPrototypeOf() { trapCount++; return EncapsulatedByteArray.prototype; } })`.
+- **Operation Sequence:** Call `new EncapsulatedByteArray(proxy)` and `deepCloneAndFreezeValue(proxy)`.
+- **Expected Final Root:** Unchanged.
+- **Expected Result / Error:** Private name check `!(#bytes in proxy)` evaluates false on the Proxy itself; returns false without executing Proxy `getPrototypeOf` or `has` traps; `ArrayBuffer_isView(proxy)` returns false; throws `TypeError`; `trapCount === 0` asserted.
+- **Invariants Protected:** Invariant 18 (Proxy Receiver Brand Isolation).
+- **Classification:** Future M5.1 implementation test (NOT EXECUTED).
+
+### Test R18-R35-T186: Coordinator Term Advances While Awaiting Store Reconciliation; assertPostAwaitEligibility Throws CUSTODY_PUBLICATION_STALE_LEADERSHIP Under NOT_COMMITTED_FINAL (R35-3)
+- **Initial Authoritative Root:** Coordinator initiates `reconcilePublication` under term $T_1$.
+- **Operation Sequence:** Store returns `NOT_COMMITTED_FINAL`, but cluster term advanced to $T_2 > T_1$ (or step-down occurred) while awaiting response.
+- **Expected Final Root:** Unchanged; coordinator withholds update to `authoritativeCurrentRoot`; remains fail-closed in `RECONCILING_CUSTODY`.
+- **Expected Result / Error:** `assertPostAwaitEligibility` evaluates before root adoption; detects term advance; throws `CUSTODY_PUBLICATION_STALE_LEADERSHIP`.
+- **Invariants Protected:** Invariant 20 (Post-Await Leadership Fencing on Terminal Non-Commit).
+- **Classification:** Future M5.1 implementation test (NOT EXECUTED).
+
+### Test R18-R35-T187: Leadership Lease Expires While Awaiting Store Reconciliation; assertPostAwaitEligibility Withholds Root Update Under NOT_COMMITTED_FINAL (R35-3)
+- **Initial Authoritative Root:** Coordinator initiates `reconcilePublication` under active lease.
+- **Operation Sequence:** Store returns `NOT_COMMITTED_FINAL`, but monotonic clock exceeds `leaseExpiresAtMonotonicMs` while awaiting store response.
+- **Expected Final Root:** Unchanged; coordinator withholds local root replacement; remains fail-closed.
+- **Expected Result / Error:** `assertPostAwaitEligibility` evaluates before root adoption; detects elapsed lease; throws `CUSTODY_PUBLICATION_STALE_LEADERSHIP`.
+- **Invariants Protected:** Invariant 20 (Monotonic Lease Fencing on Non-Commit Outcomes).
+- **Classification:** Future M5.1 implementation test (NOT EXECUTED).
+
+### Test R18-R35-T188: Store Returns NOT_COMMITTED_FINAL with Mismatched authoritativeCurrentRootDigest; Coordinator Throws INVALID_RECONCILIATION_CONFIRMATION (R35-4)
+- **Initial Authoritative Root:** Coordinator awaits reconciliation for attempt $A$.
+- **Operation Sequence:** Store returns `NOT_COMMITTED_FINAL` where `_computeRootDigest(result.authoritativeCurrentRoot) !== result.authoritativeCurrentRootDigest`.
+- **Expected Final Root:** Unchanged; coordinator withholds root adoption; remains fail-closed in `RECONCILING_CUSTODY`.
+- **Expected Result / Error:** Coordinator detects digest discrepancy; throws `INVALID_RECONCILIATION_CONFIRMATION: authoritative current root digest mismatch`.
+- **Invariants Protected:** Invariant 20 & 23 (Authoritative Current Root Digest Verification).
+- **Classification:** Future M5.1 implementation test (NOT EXECUTED).
+
+### Test R18-R35-T189: Store Returns NOT_COMMITTED_FINAL with Mismatched authoritativeCurrentSequence; Coordinator Throws INVALID_RECONCILIATION_CONFIRMATION (R35-4)
+- **Initial Authoritative Root:** Coordinator awaits reconciliation for attempt $A$.
+- **Operation Sequence:** Store returns `NOT_COMMITTED_FINAL` where `result.authoritativeCurrentRoot.publishedGeneration !== result.authoritativeCurrentSequence`.
+- **Expected Final Root:** Unchanged; coordinator withholds root adoption; remains fail-closed in `RECONCILING_CUSTODY`.
+- **Expected Result / Error:** Coordinator detects sequence discrepancy; throws `INVALID_RECONCILIATION_CONFIRMATION: authoritative current sequence mismatch`.
+- **Invariants Protected:** Invariant 20 & 23 (Authoritative Current Root Sequence Verification).
+- **Classification:** Future M5.1 implementation test (NOT EXECUTED).
+
+### Test R18-R35-T190: Captured Module Intrinsics (ArrayBuffer_isView, Object_getPrototypeOf) Immune to Global Property Poisoning (R35-2)
+- **Initial Authoritative Root:** Application code attempts prototype poisoning: `ArrayBuffer.isView = () => true; Object.getPrototypeOf = () => Uint8Array.prototype`.
+- **Operation Sequence:** Submit untrusted objects, subclasses, and Proxy wrappers to `new EncapsulatedByteArray(candidate)` and `assertValidOrdinaryUint8Array`.
+- **Expected Final Root:** Unchanged; all invalid inputs rejected.
+- **Expected Result / Error:** Validation uses module-scoped pre-captured intrinsic functions (`ArrayBuffer_isView`, `Object_getPrototypeOf`); global monkey-patching has zero effect on binary custody validation.
+- **Invariants Protected:** Invariant 18 (Captured Module Intrinsics Immunity).
 - **Classification:** Future M5.1 implementation test (NOT EXECUTED).
 
 ---
@@ -4593,61 +4675,54 @@ eq B$); throws `INVALID_RECONCILIATION_CONFIRMATION`.
 
 ```
 ================================================================================
-M5.0-R18-R34 FORMAL QUESTIONS FOR ENGINEERING AUTHORITY
+M5.0-R18-R35 FORMAL QUESTIONS FOR ENGINEERING AUTHORITY
 ================================================================================
-1. [PROXY-SAFE TWO-PATH BINARY CUSTODY (R34-1 / BLOCKER A)]: Does the Engineering
-   Authority approve removing the unsafe instanceof / isPrototypeOf fallback entirely,
-   restricting EncapsulatedByteArray construction strictly to two conceptual paths:
-   (1) trusted instances verified by isLexicallyTrustedEncapsulatedByteArray, and
-   (2) ordinary supported same-realm Uint8Array views validated by
-   assertValidOrdinaryUint8Array, rejecting untrusted candidates without repeating
-   prototype inspections?
+1. [PRIVATE-BRAND-FIRST LEXICAL CHECKING & ZERO TRAP EXECUTION (R35-1 / BLOCKER A)]:
+   Does the Engineering Authority approve reordering isLexicallyTrustedEncapsulatedByteArray
+   to evaluate #bytes in val BEFORE Object_getPrototypeOf(val), ensuring that Proxy
+   candidates fail the internal private-field check immediately without ever executing
+   getPrototypeOf or any other Proxy trap throughout constructor invocation?
 
-2. [SAFE BINARY VALIDATOR ORDERING & PROXY TRAPPING PREVENTION (R34-2 / BLOCKER A)]:
-   Does the Engineering Authority approve the documented 7-step safe validation
-   ordering in assertValidOrdinaryUint8Array, specifically evaluating the intrinsic
-   brand check ArrayBuffer.isView first to reject Proxies (which lack [[ViewedArrayBuffer]])
-   and subclasses immediately without executing ANY Proxy traps?
+2. [CAPTURED MODULE INTRINSICS IMMUNITY (R35-2 / BLOCKER A)]: Does the Engineering
+   Authority approve capturing critical intrinsics (Object_getPrototypeOf = Object.getPrototypeOf,
+   ArrayBuffer_isView = ArrayBuffer.isView, %TypedArray%.prototype getters) at module
+   evaluation to guarantee that runtime application monkey-patching cannot hijack binary custody?
 
-3. [FULL 8D PUBLICATION IDENTITY BOUND RECONCILIATION (R34-3, R34-4 / BLOCKER B)]:
-   Does the Engineering Authority approve binding the canonical 8-dimensional
-   PublicationIdentity tuple across every attempt-specific CustodyReconciliationResult
-   variant (RECONCILED_COMMITTED, NOT_COMMITTED_FINAL, UNKNOWN_IN_PROGRESS,
-   RECONCILED_CONFLICT, RECONCILED_FENCED_REJECTED) sourced directly from durable store records?
+3. [POST-AWAIT LEADERSHIP FENCING IN NOT_COMMITTED_FINAL (R35-3 / BLOCKER B)]: Does
+   the Engineering Authority approve requiring the coordinator to assert
+   assertPostAwaitEligibility(attempt) before adopting authoritativeCurrentRoot in
+   NOT_COMMITTED_FINAL, ensuring that stale coordinators losing leadership while awaiting
+   store reconciliation withhold local root updates and fail closed?
 
-4. [AUTHORITATIVE EVIDENCE & FIELD-BY-FIELD ACCEPTANCE (R34-5 / BLOCKER B)]:
-   Does the Engineering Authority approve requiring the coordinator to assert
-   samePublicationIdentity(expected, actual) before evaluating status, verify that
-   committed sequence and root digest match attempt identity, and fail closed into
-   RECONCILING_CUSTODY on any mismatch?
+4. [AUTHORITATIVE CURRENT ROOT INTEGRITY VERIFICATION (R35-4, R35-5 / BLOCKER B)]:
+   Does the Engineering Authority approve verifying that _computeRootDigest(authoritativeCurrentRoot)
+   matches authoritativeCurrentRootDigest and root.publishedGeneration matches
+   authoritativeCurrentSequence before root adoption in NOT_COMMITTED_FINAL?
 
-5. [SHARED LINEARIZABLE STORE ORDERING BOUNDARY (R33-3)]: Does the Engineering
+5. [FULL 8D PUBLICATION IDENTITY BOUND RECONCILIATION (R34-3, R34-4)]: Does the
+   Engineering Authority approve binding the canonical 8-dimensional PublicationIdentity
+   tuple across every attempt-specific CustodyReconciliationResult variant sourced
+   directly from durable store records?
+
+6. [FIELD-BY-FIELD IDENTITY ACCEPTANCE (R34-5)]: Does the Engineering Authority
+   approve requiring the coordinator to assert samePublicationIdentity(expected, actual)
+   before evaluating status, and failing closed into RECONCILING_CUSTODY on any mismatch?
+
+7. [SHARED LINEARIZABLE STORE ORDERING BOUNDARY (R33-3)]: Does the Engineering
    Authority approve serializing publication commit and reconciliation fencing through
    the identical shared consensus log / transactional CAS state machine, ensuring
-   publication commit and terminal tombstone cannot both win, rejecting delayed attempts
-   with ATTEMPT_TERMINALLY_ABORTED_BY_RECONCILIATION, and returning UNKNOWN_IN_PROGRESS
-   fail-closed if finality cannot be established?
+   publication commit and terminal tombstone cannot both win?
 
-6. [DETERMINISTIC CONFLICT PRECEDENCE (R32-6)]: Does the Engineering Authority
+8. [DETERMINISTIC CONFLICT PRECEDENCE (R32-6)]: Does the Engineering Authority
    approve that sequence collisions under differing attemptId (DUPLICATE_SEQUENCE_CONFLICT)
    take absolute precedence over candidate digest mismatches (CONFLICTING_DIGEST_AT_SEQUENCE)?
 
-7. [STATIC API IMMUTABILITY & LEXICAL BRAND CHECKING (R33-1)]: Does the Engineering
-   Authority approve executing all internal custody brand checks exclusively via the
-   unexported lexical helper isLexicallyTrustedEncapsulatedByteArray, combined with
-   freezing both the class prototype and constructor API?
+9. [STATIC API IMMUTABILITY & FROZEN CONSTRUCTOR (R33-1)]: Does the Engineering
+   Authority approve freezing both the constructor and prototype (Object.freeze(EncapsulatedByteArray)
+   and Object.freeze(EncapsulatedByteArray.prototype)) alongside unexported lexical brand checking?
 
-8. [FAIL-CLOSED SharedArrayBuffer CAPABILITY BOUNDARY (R32-3)]: Does the
-   Engineering Authority approve the fail-closed boundary throwing
-   UNSUPPORTED_BINARY_VALUE_TYPE if the intrinsic SharedArrayBuffer byteLength
-   getter is unavailable in the host realm?
-
-9. [LOCK QUEUE PURGING ON LEADERSHIP LOSS (R31-5)]: Does the Engineering Authority
-   approve immediately rejecting all queued publication callers with COORDINATOR_STOPPED
-   and purging #waitQueue upon leadership stepDown()?
-
-10. [EXPANDED FAILURE MATRIX & VERIFICATION READINESS (R34-6)]: Does the
-    Engineering Authority approve the expanded 183-case Failure Matrix and 183
+10. [EXPANDED FAILURE MATRIX & HOLISTIC ACCEPTANCE READINESS (R35-6)]: Does the
+    Engineering Authority approve the expanded 190-case Failure Matrix and 190
     future test specifications, and agree that Milestone M5.0 is ready for
     holistic final acceptance review?
 ================================================================================
@@ -4659,15 +4734,15 @@ M5.0-R18-R34 FORMAL QUESTIONS FOR ENGINEERING AUTHORITY
 
 ```
 ================================================================================
-M5.0-R18-R34 ARCHITECTURAL DECISION PROPOSAL VERDICT:
+M5.0-R18-R35 ARCHITECTURAL DECISION PROPOSAL VERDICT:
 PASS — READY FOR HOLISTIC M5.0 FINAL ACCEPTANCE REVIEW
 ================================================================================
 ```
 
-This R18-R34 proposal achieves complete architectural closure of the recovery arbitration subsystem. It establishes Proxy-safe binary custody construction with strictly two conceptual paths, eliminating all unsafe `instanceof` and `isPrototypeOf` fallbacks; formalizes safe 7-step binary validator ordering using `ArrayBuffer.isView` intrinsic brand checking to reject Proxies and subclasses without executing traps; defines the canonical 8-dimensional `PublicationIdentity` tuple; binds complete immutable publication identities to every attempt-specific reconciliation result variant sourced directly from durable store records; establishes field-by-field coordinator verification (`samePublicationIdentity`); preserves shared linearizable store ordering between publication commits and terminal fencing tombstones; enforces deterministic conflict precedence; and codifies one hundred and eighty-three deterministic future test specifications.
+This R18-R35 proposal achieves complete architectural closure of the recovery arbitration subsystem. It establishes private-brand-first lexical checking (`#bytes in val` before `Object_getPrototypeOf(val)`) guaranteeing zero Proxy trap execution throughout constructor invocation; captures critical intrinsics (`Object_getPrototypeOf`, `ArrayBuffer_isView`, `%TypedArray%.prototype` getters) at module initialization; enforces post-await leadership eligibility validation (`assertPostAwaitEligibility`) and root digest/sequence verification before adopting `authoritativeCurrentRoot` under `NOT_COMMITTED_FINAL`; defines the canonical 8-dimensional `PublicationIdentity` tuple; binds complete immutable publication identities to every attempt-specific reconciliation result variant sourced directly from durable store records; establishes field-by-field coordinator verification (`samePublicationIdentity`); preserves shared linearizable store ordering between publication commits and terminal fencing tombstones; enforces deterministic conflict precedence; and codifies one hundred and ninety deterministic future test specifications.
 
-*Note on Acceptance Discipline:* Completion of Milestone M5.0-R18-R34 constitutes architectural readiness. Formal M5.0 milestone acceptance requires holistic review and explicit Engineering Authority sign-off prior to authorizing Milestone M5.1.
+*Note on Acceptance Discipline:* Completion of Milestone M5.0-R18-R35 constitutes architectural readiness. Formal M5.0 milestone acceptance requires holistic review and explicit Engineering Authority sign-off prior to authorizing Milestone M5.1.
 
 ### Mandatory Implementation Authorization Statement
 
-> "M5.0-R18-R34 is a documentation-only architectural correction. No production implementation has been authorized. M5.1, including M5.1a, remains strictly unauthorized pending holistic M5.0 acceptance and explicit Engineering Authority approval."
+> "M5.0-R18-R35 is a documentation-only architectural correction. No production implementation has been authorized. M5.1, including M5.1a, remains strictly unauthorized pending holistic M5.0 acceptance and explicit Engineering Authority approval."
