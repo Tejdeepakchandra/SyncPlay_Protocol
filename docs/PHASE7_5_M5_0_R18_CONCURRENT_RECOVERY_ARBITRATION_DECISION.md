@@ -1,36 +1,34 @@
-# Phase 7.5 M5.0-R18-R21 — Authoritative Resource Retirement, Atomic Evidence Consumption & Complete Identity Verification
+# Phase 7.5 M5.0-R18-R22 — Full Retired-Resource Authorization, Provenance Validation & Bounded Replay Retention
 **Concurrent Recovery Arbitration & Authoritative Settlement Architecture Decision**
 
 **Status:** PROPOSED ARCHITECTURAL AMENDMENT TO FROZEN M5.0 SPECIFICATIONS (DECISION DOCUMENT ONLY)
 **Author:** Principal TypeScript Distributed-Systems Architect and Independent Recovery-Systems Auditor
-**Baseline Commit:** `ecabdc84c478d8337c09d1ca6d260c9d78f4cf5b` (M5.0-R18-R20)
-**Direct Parent Commit:** `ecabdc84c478d8337c09d1ca6d260c9d78f4cf5b`
-**Authorization Scope:** M5.0-R18-R21 is strictly a documentation-only architectural proposal. No production source code, tests, configuration, package manifests, or frozen M5.0 specifications may be modified. Implementation of Milestone M5.1, including M5.1a, remains **STRICTLY BLOCKED AND UNAUTHORIZED**.
+**Baseline Commit:** `28faa5293204465a82e8cb93e93be2a1d4897a1d` (M5.0-R18-R21)
+**Direct Parent Commit:** `28faa5293204465a82e8cb93e93be2a1d4897a1d`
+**Authorization Scope:** M5.0-R18-R22 is strictly a documentation-only architectural proposal. No production source code, tests, configuration, package manifests, or frozen M5.0 specifications may be modified. Implementation of Milestone M5.1, including M5.1a, remains **STRICTLY BLOCKED AND UNAUTHORIZED**.
 
 ---
 
-## 1. Problem Statement & R18-R21 Objectives
+## 1. Problem Statement & R18-R22 Objectives
 
-In Phase 7.5 Sub-Milestone M5.0-R18-R20, we resolved retry lease idempotency, adopted Option A for continuous audit-history contiguity, and introduced the internal settlement evidence factory. However, the subsequent architectural review identified three specific correctness gaps and verification requirements:
+In Phase 7.5 Sub-Milestone M5.0-R18-R21, we unified evidence consumption and pin removal into the authoritative custody root and introduced explicit retired resource records. However, a rigorous architectural review revealed two remaining correctness gaps in the retired-resource release paths and identified an unbounded-state growth risk:
 
-1. **Unknown Resources Incorrectly Treated as Already Released (Blocker B1):**
-   - In R18-R20, `releaseRetryLease` and `releaseSettlementPin` returned `{ status: 'ALREADY_RELEASED' }` whenever an identifier was absent from the active collections. This falsely returned `ALREADY_RELEASED` for arbitrary, never-issued identifiers, directly contradicting the stated specification and creating an internal contradiction with test Test T29.
-   - *Correction:* The authoritative custody root must distinguish known active resources, recognized previously released resources, unknown/never-issued resources, and cross-resource type mismatches. Bounded authoritative retirement maps (`retiredRetryLeases` and `retiredSettlementPins`) are incorporated directly into `AuthoritativeCustodyRoot`. Genuinely unknown identifiers fail closed with `RESOURCE_NOT_FOUND`.
-2. **Evidence Consumption and Custody-Root Publication Not Atomic (Blocker C2):**
-   - In R18-R20, `SettlementEvidenceFactory.consumeEvidence(settlementEvidence, pinId)` mutated an external factory registry before the custody root reference was replaced. If candidate construction or invariant validation threw, the evidence was marked consumed in mutable state while the settlement pin remained active in the authoritative root, permanently breaking retry reachability.
-   - *Correction:* Evidence consumption and pin removal are unified into a single atomic candidate-root publication protocol. Consumed evidence tracking (`consumedSettlementEvidence: ImmutableSet<string>`) resides directly inside `AuthoritativeCustodyRoot`. If candidate construction fails, the candidate root is discarded, the active pin remains held, and the evidence remains unconsumed and usable for retries. Observers never observe split state.
-3. **Settlement-Pin Identity Comparison Omits Drainer Generation (Blocker C1):**
-   - In R18-R20, `releaseSettlementPin` verified generation, owner token, transaction ID, operation identity, and barrier identity, but omitted `drainerOwnershipGeneration`. A settlement receipt from an earlier drainer generation could erroneously authorize release of a pin belonging to a later drainer generation.
-   - *Correction:* `drainerOwnershipGeneration` is explicitly bound into `ImmutableSettlementPin`, verified in `releaseSettlementPin` (`pin.drainerOwnershipGeneration !== settlementEvidence.drainerOwnershipGeneration`), and verified across all record types.
-4. **Complete Verification Pseudocode:**
-   - Provides exhaustive, un-abbreviated pseudocode demonstrating retry acquisition idempotency, six-dimensional structural audit validation, full tombstone retirement checks against all retention references, and complete factory authorization.
+1. **Incomplete Identity Validation on Retired Retry Leases (Blocker B1):**
+   - In R18-R21, `releaseRetryLease()` checked `consumerId`, `clientRequestId`, and `ownerToken` on the retired path, but omitted `transactionId`, `operationIdentity`, and `barrierIdentity`. Consequently, a caller presenting matching consumer and token identities with altered transaction or operation identities would receive `ALREADY_RELEASED`.
+   - *Correction:* The retired retry lease path must enforce the exact same seven-dimensional identity verification (`leaseId`, `consumerId`, `clientRequestId`, `callerToken`, `transactionId`, `operationIdentity`, `barrierIdentity`) as the active lease path. Previously released resources are not exempt from complete identity authorization.
+2. **Provenance Bypass on Retired Settlement Pins (Blocker C2):**
+   - In R18-R21, `releaseSettlementPin()` checked structural identity fields on the retired-pin branch and returned `ALREADY_RELEASED` *before* invoking `SettlementEvidenceFactory.assertAuthoritativeEvidenceProvenance(settlementEvidence)`. Consequently, a caller-constructed object could obtain `ALREADY_RELEASED` without proving authorized factory provenance.
+   - *Correction:* Provenance validation (`assertAuthoritativeEvidenceProvenance`) must execute unconditionally before any identity comparison or return. On the retired path, the coordinator validates factory provenance, verifies complete seven-dimensional identity (including `drainerOwnershipGeneration`), and confirms that `settlementEvidence.evidenceDigest` matches `retiredPin.evidenceDigest`.
+3. **Bounded Replay Retention & Non-Reissuable Pin Sequences:**
+   - In R18-R21, `consumedSettlementEvidence: ImmutableSet<string>` grew indefinitely, violating bounded-memory requirements.
+   - *Correction:* `consumedSettlementEvidence` is strictly bounded to `MAX_RETIRED_RESOURCES = 5000` entries and pruned in lockstep with `retiredSettlementPins` in FIFO order. Global pin sequence counters (`++this._pinSequenceCounter`) ensure pin IDs are strictly monotonic and never reissued; once a retired pin is evicted beyond the 5,000-entry horizon, subsequent release attempts fail closed as `RESOURCE_NOT_FOUND`.
 
-### Core Architectural Guarantees Established in R18-R21:
+### Core Architectural Guarantees Established in R18-R22:
 
-- **Authoritative Retired Resource Lifecycle (B1):** Bounded `retiredRetryLeases` and `retiredSettlementPins` (capped at 5,000 entries each, FIFO managed) distinguish genuinely unknown resources (`RESOURCE_NOT_FOUND`) from recognized released resources (`ALREADY_RELEASED`).
-- **Atomic Evidence Consumption Protocol (C2):** `consumedSettlementEvidence` is encapsulated in `AuthoritativeCustodyRoot`, ensuring evidence consumption linearizes atomically with pin release. Exceptions during publication leave evidence unconsumed.
-- **Strict Seven-Dimensional Settlement Pin Identity (C1):** Binds and checks `drainerOwnershipGeneration` in addition to the six existing identity dimensions on pin release.
-- **Exhaustive Deterministic Test Suite (32 Test Cases):** Codifies thirty-two deterministic future test specifications in Section 19 covering unknown vs. released resources, atomic publication rollbacks, drainer generation fencing, and multi-consumer lease lifecycles.
+- **Universal Seven-Dimensional Identity Authorization (B1):** Active and retired retry lease releases enforce identical 7-dimensional identity verification.
+- **Universal Evidence Provenance & Disposition Verification (C2):** All settlement pin release paths require validated `SettlementEvidenceFactory` provenance and exact evidence digest confirmation against recorded disposition.
+- **Strictly Bounded Replay Retention (`MAX_RETIRED_RESOURCES = 5000`):** `consumedSettlementEvidence` and `retiredSettlementPins` are bounded and trimmed in lockstep. Monotonic non-reissuable pin sequencing guarantees evicted pins fail closed with `RESOURCE_NOT_FOUND`.
+- **Exhaustive Deterministic Test Suite (34 Test Cases):** Codifies thirty-four deterministic future test specifications in Section 19 covering retired identity mismatches, unverified provenance rejection, and bounded replay eviction.
 
 ---
 
@@ -395,7 +393,7 @@ All objects entering `AuthoritativeCustodyRoot` are deeply cloned and frozen on 
 - Out-of-domain values ($g \le 0$, non-integers, NaN, $\infty$) are rejected upfront with `INVALID_GENERATION_DOMAIN`.
 - Sequence exhaustion ($g = \text{Number.MAX\_SAFE\_INTEGER}$) triggers fail-closed `GENERATION_SEQUENCE_EXHAUSTED`.
 
-### 12.12 The Complete Lifecycle Publication, Authoritative Resource Retirement, Atomic Evidence Consumption & Complete Identity Verification
+### 12.12 The Complete Lifecycle Publication, Full Retired-Resource Authorization, Provenance Validation & Bounded Replay Retention
 
 #### The Complete Custody Root State Structure:
 
@@ -449,7 +447,7 @@ export interface ImmutableSettlementPin {
   readonly ownerToken: CustodyOwnershipToken;
   readonly transactionId: string;
   readonly operationIdentity: string;
-  readonly drainerOwnershipGeneration: number; // Block C1: Bound & checked!
+  readonly drainerOwnershipGeneration: number; // Blocker C1: Bound & checked!
   readonly acquiredAtTimestamp: number;
   readonly monotonicAcquiredMs: number;
 }
@@ -563,7 +561,7 @@ export interface AuthoritativeCustodyRoot {
   readonly activeRetryLeases: ImmutableMap<string, ImmutableRetryLease>;
   readonly retiredRetryLeases: ImmutableMap<string, ImmutableRetiredLeaseRecord>;     // B1: Authoritative retired leases
   readonly retiredSettlementPins: ImmutableMap<string, ImmutableRetiredPinRecord>;   // B1: Authoritative retired pins
-  readonly consumedSettlementEvidence: ImmutableSet<string>;                         // C2: In-root atomic replay protection
+  readonly consumedSettlementEvidence: ImmutableSet<string>;                         // C2: Bounded in-root replay protection
 }
 
 export interface ReleaseRetryLeaseParams {
@@ -579,20 +577,23 @@ export interface ReleaseRetryLeaseParams {
 
 #### Authoritative Resource Retirement & Unknown-Resource Resolution (Blocker B1):
 
-To prevent arbitrary identifiers from masquerading as previously released resources:
+To prevent arbitrary identifiers from masquerading as previously released resources and ensure strict authorization equality:
 1. **Four-Way Resource Resolution:**
-   - *Active Resource:* Located in `activeRetryLeases` or `activeSettlementPins`. Authorize, mutate candidate root to remove active entry and add retired entry, publish candidate root.
-   - *Retired Resource:* Located in `retiredRetryLeases` or `retiredSettlementPins`. Validate that caller identity matches the retired record. If matching, return `{ status: 'ALREADY_RELEASED' }` idempotently. If identity mismatches, fail closed (`UNAUTHORIZED_CROSS_CONSUMER_LEASE_RELEASE` or `SETTLEMENT_EVIDENCE_IDENTITY_MISMATCH`).
+   - *Active Resource:* Located in `activeRetryLeases` or `activeSettlementPins`. Authorize against complete identity dimensions, mutate candidate root to remove active entry and add retired entry, publish candidate root.
+   - *Retired Resource:* Located in `retiredRetryLeases` or `retiredSettlementPins`. **Strict Requirement (Blocker B1):** Validate caller identity against the retired record across **all seven identity dimensions** (`consumerId`, `clientRequestId`, `callerToken`, `transactionId`, `operationIdentity`, `barrierIdentity`). If matching, return `{ status: 'ALREADY_RELEASED' }` idempotently. If any identity dimension mismatches, fail closed with the specific mismatch error (`UNAUTHORIZED_CROSS_CONSUMER_LEASE_RELEASE`, `LEASE_CLIENT_REQUEST_MISMATCH`, `UNAUTHORIZED_LEASE_RELEASE_TOKEN_MISMATCH`, `LEASE_TRANSACTION_ID_MISMATCH`, `LEASE_OPERATION_IDENTITY_MISMATCH`, `LEASE_BARRIER_IDENTITY_MISMATCH`). A previously released resource is not exempt from identity verification.
    - *Never-Issued / Unknown Identifier:* Absent from both active and retired maps. Fails closed with `RESOURCE_NOT_FOUND`.
    - *Cross-Resource Type Mismatch:* Identifiers prefixed with `pin:` passed to lease release throw `LEASE_TYPE_MISMATCH`. Identifiers prefixed with `lease:` passed to pin release throw `PIN_TYPE_MISMATCH`.
 2. **Bounded Capacity for Retired Records:** Both `retiredRetryLeases` and `retiredSettlementPins` are bounded to a maximum of 5,000 entries using strict FIFO retirement to ensure bounded memory while maintaining auditability.
 
-#### Atomic Evidence Consumption Protocol (Blocker C2):
+#### Universal Evidence Provenance & Atomic Consumption (Blocker C2):
 
-To eliminate split-publication vulnerabilities between evidence consumption and pin release:
-1. **In-Root Evidence Tracking:** Consumed evidence replay keys (`${generation}:${barrierIdentity}:${pinId}`) are stored in `this.#custodyRoot.consumedSettlementEvidence`.
-2. **Atomic Single-Swap Linearization:** Evidence consumption and settlement pin removal linearize together through a single candidate-root replacement.
-3. **Exception Atomicity & Safe Retries:** If candidate root construction, invariant validation, or pre-allocation throws an exception, the candidate root is discarded. The active settlement pin remains held, and the evidence remains unconsumed in `this.#custodyRoot.consumedSettlementEvidence`. A subsequent retry with the same evidence succeeds cleanly.
+To eliminate split-publication vulnerabilities and provenance bypass:
+1. **Unconditional Provenance Validation:** On `releaseSettlementPin()`, `SettlementEvidenceFactory.assertAuthoritativeEvidenceProvenance(settlementEvidence)` is invoked **first**, before checking whether the pin is active or retired. Caller-constructed mock objects fail closed with `INVALID_SETTLEMENT_EVIDENCE_PROVENANCE` even if they target a retired pin.
+2. **Settlement Disposition Verification on Retired Path:** For a retired pin, the coordinator verifies that `settlementEvidence.evidenceDigest` matches `retiredPin.evidenceDigest` byte-for-byte. If altered evidence is supplied for a retired pin, it throws `SETTLEMENT_EVIDENCE_DIGEST_MISMATCH`.
+3. **In-Root Bounded Replay Retention:** Consumed evidence replay keys (`${generation}:${barrierIdentity}:${pinId}`) are stored directly in `this.#custodyRoot.consumedSettlementEvidence`.
+4. **Lockstep FIFO Replay Pruning:** When `retiredSettlementPins` reaches 5,000 entries, the oldest retired pin is deleted, and its replay key is atomically removed from `consumedSettlementEvidence` in lockstep.
+5. **Globally Monotonic Pin Sequencing:** Pin IDs are generated with strictly monotonic sequence numbers (`++this._pinSequenceCounter`) and are never re-issued. Once a retired pin is evicted beyond the 5,000-entry horizon, its pin ID cannot match any newly allocated active pin, and any subsequent release attempt fails closed as `RESOURCE_NOT_FOUND`.
+6. **Exception Atomicity & Safe Retries:** If candidate root construction, invariant validation, or pre-allocation throws an exception, the candidate root is discarded. The active settlement pin remains held, and the evidence remains unconsumed in `this.#custodyRoot.consumedSettlementEvidence`. A subsequent retry with the same evidence succeeds cleanly.
 
 #### Complete Seven-Dimensional Pin Identity Binding (Blocker C1):
 
@@ -608,6 +609,14 @@ A settlement receipt from an earlier drainer generation cannot authorize release
 const DRAINER_RELEASE_BRAND = Symbol('@syncplay/DrainerCustodyReleaseReceipt');
 const SETTLEMENT_EVIDENCE_BRAND = Symbol('@syncplay/SettlementEvidence');
 const AUTHORIZED_EVIDENCE_REGISTRY = new WeakSet<AuthoritativeSettlementEvidence>();
+
+export function areEqualByteArrays(a: Uint8Array, b: Uint8Array): boolean {
+  if (a.length !== b.length) return false;
+  for (let i = 0; i < a.length; i++) {
+    if (a[i] !== b[i]) return false;
+  }
+  return true;
+}
 
 export function validateRetryRequestContext(ctx: unknown): asserts ctx is RetryRequestContext {
   if (!ctx || typeof ctx !== 'object') {
@@ -1252,6 +1261,7 @@ public releaseRetryLease(params: ReleaseRetryLeaseParams): { leaseId: string; st
   if (!activeLease) {
     const retiredLease = currentRoot.retiredRetryLeases.get(leaseId);
     if (retiredLease) {
+      // Complete 7-dimensional identity validation on retired path (Blocker B1)
       if (retiredLease.consumerId !== consumerId) {
         throw new Error(`UNAUTHORIZED_CROSS_CONSUMER_LEASE_RELEASE: caller consumer '${consumerId}' does not match retired lease owner '${retiredLease.consumerId}'`);
       }
@@ -1261,13 +1271,22 @@ public releaseRetryLease(params: ReleaseRetryLeaseParams): { leaseId: string; st
       if (!isEquivalentOwnerToken(retiredLease.ownerToken, callerToken)) {
         throw new Error('UNAUTHORIZED_LEASE_RELEASE_TOKEN_MISMATCH: caller token does not match retired lease owner token');
       }
+      if (retiredLease.transactionId !== transactionId) {
+        throw new Error(`LEASE_TRANSACTION_ID_MISMATCH: transactionId '${transactionId}' does not match retired lease`);
+      }
+      if (retiredLease.operationIdentity !== operationIdentity) {
+        throw new Error(`LEASE_OPERATION_IDENTITY_MISMATCH: operationIdentity '${operationIdentity}' does not match retired lease`);
+      }
+      if (retiredLease.barrierIdentity !== barrierIdentity) {
+        throw new Error(`LEASE_BARRIER_IDENTITY_MISMATCH: barrierIdentity '${barrierIdentity}' does not match retired lease`);
+      }
       return { leaseId, status: 'ALREADY_RELEASED' };
     }
     // Genuinely unknown or never-issued lease
     throw new Error(`RESOURCE_NOT_FOUND: retry lease '${leaseId}' was never issued or is unknown`);
   }
 
-  // Active Lease Authorization Check
+  // Active Lease Authorization Check across all 7 dimensions
   if (activeLease.consumerId !== consumerId) {
     throw new Error(`UNAUTHORIZED_CROSS_CONSUMER_LEASE_RELEASE: caller consumer ${consumerId} does not own lease ${leaseId} owned by ${activeLease.consumerId}`);
   }
@@ -1329,13 +1348,17 @@ public releaseSettlementPin(pinId: string, settlementEvidence: AuthoritativeSett
     throw new Error(`RESOURCE_NOT_FOUND: unknown settlement pin identifier '${pinId}'`);
   }
 
+  // Blocker C2: Provenance verification MUST happen BEFORE any retired-pin return!
+  SettlementEvidenceFactory.assertAuthoritativeEvidenceProvenance(settlementEvidence);
+
   const currentRoot = this.#custodyRoot;
   const activePin = currentRoot.activeSettlementPins.get(pinId);
 
-  // Authoritative Resource Retirement Resolution (Blocker B1)
+  // Authoritative Resource Retirement Resolution (Blocker B1 & C2)
   if (!activePin) {
     const retiredPin = currentRoot.retiredSettlementPins.get(pinId);
     if (retiredPin) {
+      // Complete 7-dimensional identity validation on retired pin
       if (
         !isEquivalentOwnerToken(retiredPin.ownerToken, settlementEvidence.expectedOwner) ||
         retiredPin.generation !== settlementEvidence.generation ||
@@ -1347,14 +1370,17 @@ public releaseSettlementPin(pinId: string, settlementEvidence: AuthoritativeSett
       ) {
         throw new Error('SETTLEMENT_EVIDENCE_IDENTITY_MISMATCH: evidence does not match retired pin identity');
       }
+
+      // Verify evidence corresponds to the retired record's recorded settlement disposition
+      if (!areEqualByteArrays(retiredPin.evidenceDigest, settlementEvidence.evidenceDigest)) {
+        throw new Error('SETTLEMENT_EVIDENCE_DIGEST_MISMATCH: evidence digest does not match recorded retired pin disposition');
+      }
+
       return { pinId, status: 'ALREADY_RELEASED' };
     }
     // Genuinely unknown or never-issued pin
     throw new Error(`RESOURCE_NOT_FOUND: settlement pin '${pinId}' was never issued or is unknown`);
   }
-
-  // Provenance verification (capability check only)
-  SettlementEvidenceFactory.assertAuthoritativeEvidenceProvenance(settlementEvidence);
 
   // Block C1: Complete 7-dimensional identity validation including drainerOwnershipGeneration
   if (
@@ -1392,13 +1418,19 @@ public releaseSettlementPin(pinId: string, settlementEvidence: AuthoritativeSett
   });
 
   const candidateRetiredPins = new Map(currentRoot.retiredSettlementPins.entries());
+  const candidateConsumed = new Set(currentRoot.consumedSettlementEvidence);
+
+  // Bounded replay retention: FIFO trim in lockstep at MAX_RETIRED_RESOURCES = 5000
   if (candidateRetiredPins.size >= 5000) {
-    const oldestKey = candidateRetiredPins.keys().next().value;
-    if (oldestKey) candidateRetiredPins.delete(oldestKey);
+    const oldestPinEntry = candidateRetiredPins.entries().next().value;
+    if (oldestPinEntry) {
+      const [oldestPinId, oldestRecord] = oldestPinEntry;
+      candidateRetiredPins.delete(oldestPinId);
+      const oldestReplayKey = `${oldestRecord.generation}:${oldestRecord.barrierIdentity}:${oldestPinId}`;
+      candidateConsumed.delete(oldestReplayKey);
+    }
   }
   candidateRetiredPins.set(pinId, retiredPinRecord);
-
-  const candidateConsumed = new Set(currentRoot.consumedSettlementEvidence);
   candidateConsumed.add(replayKey);
 
   // SINGLE ATOMIC PUBLICATION LINEARIZATION POINT (Blocker C2):
@@ -1503,7 +1535,7 @@ Protocol B handles cancelled or uncommitted operations:
 
 ---
 
-## 15. Exhaustive Failure and Retry Matrix (30 Deterministic Cases)
+## 15. Exhaustive Failure and Retry Matrix (32 Deterministic Cases)
 
 | Case | Scenario | Gate State | Custody Owner | Barrier State | Correct Action | Forbidden Action |
 |---|---|---|---|---|---|---|
@@ -1537,6 +1569,8 @@ Protocol B handles cancelled or uncommitted operations:
 | **28** | Retry lease passed to pin release | `ANY` | Any | ANY | Throw `PIN_TYPE_MISMATCH` | Delete lease as pin |
 | **29** | Truly unknown ID passed to release APIs | `ANY` | Any | ANY | Throw `RESOURCE_NOT_FOUND` | Treat as `ALREADY_RELEASED` |
 | **30** | Pin release with mismatched drainer gen | `SETTLED` | Drainer | RESOLVED | Throw `SETTLEMENT_EVIDENCE_IDENTITY_MISMATCH` | Authorize release |
+| **31** | Retired lease release with altered txId | `ANY` | Any | ANY | Throw `LEASE_TRANSACTION_ID_MISMATCH` | Return `ALREADY_RELEASED` |
+| **32** | Retired pin release with unverified provenance| `ANY` | Any | ANY | Throw `INVALID_SETTLEMENT_EVIDENCE_PROVENANCE` | Return `ALREADY_RELEASED` |
 
 ---
 
@@ -1546,26 +1580,26 @@ Protocol B handles cancelled or uncommitted operations:
    $$\mathbf{BARRIER\_RESOLVED}(g) \implies \mathbf{EXECUTION\_SETTLED}(g) \land \mathbf{CUSTODY\_RECONCILED}(g) \land \mathbf{DRAINER\_RELEASED}(g) \land \mathbf{EVIDENCE\_MATCHED}(g)$$
 2. **Capability-Gated Settlement-Pin Release Invariant:**
    $$\mathbf{RELEASE\_SETTLEMENT\_PIN}(pinId) \implies \mathbf{AssertAuthoritativeSettlementEvidence}(evidence) \land (\mathbf{pin.identity} \equiv \mathbf{evidence.identity})$$
-3. **Authoritative Resource Retirement Invariant:**
-   A resource absent from active collections is recognized as `ALREADY_RELEASED` if and only if its identity matches an authoritative entry in `retiredRetryLeases` or `retiredSettlementPins`. Any identifier absent from both active and retired collections must fail closed with `RESOURCE_NOT_FOUND`.
-4. **Atomic Evidence Consumption Invariant:**
-   Evidence consumption disposition (`consumedSettlementEvidence`) and settlement pin removal must linearize together via single atomic candidate-root replacement. If publication throws, evidence remains unconsumed.
-5. **Seven-Dimensional Pin Identity Binding Invariant:**
+3. **Complete Retired-Resource Identity Invariant:**
+   A resource absent from active collections is recognized as `ALREADY_RELEASED` if and only if its identity matches an authoritative entry in `retiredRetryLeases` or `retiredSettlementPins` across all seven dimensions (`consumerId`, `clientRequestId`, `callerToken`, `transactionId`, `operationIdentity`, `barrierIdentity`). Altered identities fail closed.
+4. **Universal Evidence Provenance & Disposition Invariant:**
+   Both active and retired settlement-pin releases unconditionally require validated `SettlementEvidenceFactory` provenance. A retired pin release additionally verifies that `evidence.evidenceDigest` matches the recorded `retiredPin.evidenceDigest`.
+5. **Bounded Replay Retention & Lockstep Eviction Invariant:**
+   `consumedSettlementEvidence` and `retiredSettlementPins` are strictly bounded to `MAX_RETIRED_RESOURCES = 5000` entries and trimmed in lockstep. Monotonic sequence counters prevent pin ID reissuance, guaranteeing that evicted pin IDs fail closed as `RESOURCE_NOT_FOUND`.
+6. **Atomic Evidence Consumption Invariant:**
+   Evidence consumption disposition (`consumedSettlementEvidence`) and settlement pin removal must linearize together via single atomic candidate-root replacement. If publication throws, evidence remains unconsumed and retryable.
+7. **Seven-Dimensional Pin Identity Binding Invariant:**
    Settlement pins bind and enforce exact equality across generation, complete owner token, transaction ID, operation identity, barrier identity, and drainer ownership generation.
-6. **Mandatory Stable Retry Request Identity Invariant:**
+8. **Mandatory Stable Retry Request Identity Invariant:**
    All retry requests must supply non-empty, string-typed `(consumerId, clientRequestId)` bounded to $\le 256$ characters. The coordinator cannot substitute timestamps or nonces.
-7. **Independent Consumer Release Authority Invariant:**
-   A retry lease is releaseable only by the owning consumer matching all seven identity dimensions (`leaseId`, `consumerId`, `clientRequestId`, `callerToken`, `transactionId`, `operationIdentity`, `barrierIdentity`). Cross-consumer release fails closed.
-8. **Option A Audit-History Invariant:**
+9. **Option A Audit-History Invariant:**
    `generationAuditHistory` maintains lifecycle-discriminated records (`PENDING_PUBLICATION`, `TERMINAL_SETTLEMENT`, `COMPACT_TOMBSTONE`) such that $\mathbf{generationAuditHistory.keys()} \equiv \{\mathbf{auditTombstoneFloor} + 1, \dots, \mathbf{publishedGeneration}\}$ holds unconditionally.
-9. **Complete Tombstone Retirement Protection Invariant:**
+10. **Complete Tombstone Retirement Protection Invariant:**
    Oldest tombstone cannot be retired while any active retry lease, settlement pin, or pending obligation references it.
-10. **Strict Capacity Ceiling Invariant:**
+11. **Strict Capacity Ceiling Invariant:**
    `MAX_AUDIT_TOMBSTONES = 5000` is an authoritative ceiling; pre-existing violations fail closed; retirement operates strictly FIFO.
-11. **Monotonic Safe-Integer Floor Invariant:**
+12. **Monotonic Safe-Integer Floor Invariant:**
    $$0 \le \mathbf{auditTombstoneFloor} \le \mathbf{custodyGenerationFloor} \le \mathbf{publishedGeneration}$$
-12. **Evidence Factory Provenance & Replay Invariant:**
-   Level 3 settlement evidence is issued exclusively by `SettlementEvidenceFactory` within `@syncplay/protocol` and is single-use per barrier and obligation.
 13. **Cross-Resource Identifier Distinction Invariant:**
    `releaseRetryLease` rejects settlement pins with `LEASE_TYPE_MISMATCH`. `releaseSettlementPin` rejects retry leases with `PIN_TYPE_MISMATCH`.
 14. **Watchdog Pin and Lease Immunity Invariant:**
@@ -1584,7 +1618,7 @@ The proposal excises all references to `forceEmergencyReset(capability)`:
 - Ordinary recovery APIs cannot bypass `CUSTODY_RECONCILIATION_BLOCKED`.
 - No automated root replacement is permitted while custody remains unresolved.
 - Emergency data abandonment, if ever required, needs a separate architectural decision defining operator authorization, auditability, late-settling Promise behavior, and data-loss semantics.
-- That separate decision is outside the scope of R18-R21 and is **not authorized** by this proposal.
+- That separate decision is outside the scope of R18-R22 and is **not authorized** by this proposal.
 
 ---
 
@@ -1599,27 +1633,27 @@ The proposal excises all references to `forceEmergencyReset(capability)`:
 
 ## 19. Deterministic Failure Scenarios and Future Test Requirements
 
-The following thirty-two deterministic future test specifications are formally codified for Sub-Milestone M5.1:
+The following thirty-four deterministic future test specifications are formally codified for Sub-Milestone M5.1:
 
-### Test R18-R21-T01: Retry Acquisition Without Stable Request Context
+### Test R18-R22-T01: Retry Acquisition Without Stable Request Context
 - **Initial Authoritative Root:** Settled result at $g=1$; `activeRetryLeases.size === 0`.
 - **Operation Sequence:** Call `publishReleaseAndObligation` presenting retry token for $g=1$ with `retryContext === undefined`.
 - **Expected Final Root:** Unchanged; zero leases allocated.
 - **Expected Result / Error:** Throws `INVALID_RETRY_REQUEST_CONTEXT`.
 
-### Test R18-R21-T02: Retry Acquisition With Malformed or Empty Request Context
+### Test R18-R22-T02: Retry Acquisition With Malformed or Empty Request Context
 - **Initial Authoritative Root:** Settled result at $g=1$; `activeRetryLeases.size === 0`.
 - **Operation Sequence:** Call `publishReleaseAndObligation` presenting retry token for $g=1$ with `retryContext = { consumerId: "   ", clientRequestId: "" }`.
 - **Expected Final Root:** Unchanged; zero leases allocated.
 - **Expected Result / Error:** Throws `MALFORMED_RETRY_REQUEST_CONTEXT`.
 
-### Test R18-R21-T03: Retry Acquisition With Oversized Request Context
+### Test R18-R22-T03: Retry Acquisition With Oversized Request Context
 - **Initial Authoritative Root:** Settled result at $g=1$; `activeRetryLeases.size === 0`.
 - **Operation Sequence:** Call `publishReleaseAndObligation` with `consumerId` of length 257 characters.
 - **Expected Final Root:** Unchanged; zero leases allocated.
 - **Expected Result / Error:** Throws `RETRY_REQUEST_CONTEXT_OVERSIZED`.
 
-### Test R18-R21-T04: Lost-Response Retransmission Recovers Original Lease Idempotently
+### Test R18-R22-T04: Lost-Response Retransmission Recovers Original Lease Idempotently
 - **Initial Authoritative Root:** Settled result at $g=1$; `activeRetryLeases.size === 0`.
 - **Operation Sequence:**
   1. Consumer 1 acquires lease for $g=1$ with `clientRequestId = "req-101"`; receives `leaseId_A`.
@@ -1627,13 +1661,13 @@ The following thirty-two deterministic future test specifications are formally c
 - **Expected Final Root:** `activeRetryLeases.size === 1`, containing `leaseId_A`.
 - **Expected Result / Error:** Second call returns existing `leaseId_A` idempotently.
 
-### Test R18-R21-T05: Repeated Retry Acquisition With Conflicting Operation Identity
+### Test R18-R22-T05: Repeated Retry Acquisition With Conflicting Operation Identity
 - **Initial Authoritative Root:** Settled result at $g=1$; lease active for `(consumer1, req-101)`.
 - **Operation Sequence:** Consumer 1 submits request with `clientRequestId = "req-101"` but altered `operationIdentity`.
 - **Expected Final Root:** Unchanged.
 - **Expected Result / Error:** Throws `IDEMPOTENT_RETRY_IDENTITY_CONFLICT`.
 
-### Test R18-R21-T06: Two Distinct Consumers Acquire Independent Leases Under Same Recovery Owner Token
+### Test R18-R22-T06: Two Distinct Consumers Acquire Independent Leases Under Same Recovery Owner Token
 - **Initial Authoritative Root:** Settled result at $g=1$; `activeRetryLeases.size === 0`.
 - **Operation Sequence:**
   1. Consumer 1 requests lease for $g=1$ with `consumerId = "c1"`.
@@ -1641,13 +1675,13 @@ The following thirty-two deterministic future test specifications are formally c
 - **Expected Final Root:** `activeRetryLeases.size === 2`, containing `leaseId_1` and `leaseId_2`.
 - **Expected Result / Error:** Both acquire distinct leases successfully.
 
-### Test R18-R21-T07: Consumer 1 Attempting to Release Consumer 2's Lease Fails Closed
+### Test R18-R22-T07: Consumer 1 Attempting to Release Consumer 2's Lease Fails Closed
 - **Initial Authoritative Root:** Active leases for Consumer 1 (`leaseId_1`) and Consumer 2 (`leaseId_2`).
 - **Operation Sequence:** Consumer 1 invokes `releaseRetryLease` passing `leaseId_2` with `consumerId = "c1"`.
 - **Expected Final Root:** Unchanged; both leases remain active.
 - **Expected Result / Error:** Throws `UNAUTHORIZED_CROSS_CONSUMER_LEASE_RELEASE`.
 
-### Test R18-R21-T08: Duplicate Lease Release by Authorized Consumer Against Retired Record Is Idempotent
+### Test R18-R22-T08: Duplicate Lease Release by Authorized Consumer Against Retired Record Is Idempotent
 - **Initial Authoritative Root:** Active lease `leaseId_1` for Consumer 1.
 - **Operation Sequence:**
   1. Consumer 1 calls `releaseRetryLease` with all matching parameters; returns `{ status: 'RELEASED' }`.
@@ -1655,7 +1689,7 @@ The following thirty-two deterministic future test specifications are formally c
 - **Expected Final Root:** `activeRetryLeases.has(leaseId_1) === false`; `retiredRetryLeases.has(leaseId_1) === true`.
 - **Expected Result / Error:** Second call matches retired record and returns `{ status: 'ALREADY_RELEASED' }` idempotently.
 
-### Test R18-R21-T09: First Publication With Option A Lifecycle Model
+### Test R18-R22-T09: First Publication With Option A Lifecycle Model
 - **Initial Authoritative Root:** `publishedGeneration = 0`, `auditTombstoneFloor = 0`, `custodyGenerationFloor = 0`.
 - **Operation Sequence:** Call `publishReleaseAndObligation` for $g=1$.
 - **Expected Final Root:**
@@ -1665,13 +1699,13 @@ The following thirty-two deterministic future test specifications are formally c
   - `generationAuditHistory.get(1).kind === 'PENDING_PUBLICATION'`.
 - **Expected Result / Error:** Success; contiguity invariant holds unconditionally.
 
-### Test R18-R21-T10: Pending-to-Terminal Audit History Transition
+### Test R18-R22-T10: Pending-to-Terminal Audit History Transition
 - **Initial Authoritative Root:** Generation $g=1$ published; audit record is `PENDING_PUBLICATION`.
 - **Operation Sequence:** Barrier for $g=1$ settles with `AuthoritativeSettlementEvidence` (`CONFIRMED_COMMITTED`).
 - **Expected Final Root:** `generationAuditHistory.get(1).kind === 'TERMINAL_SETTLEMENT'`.
 - **Expected Result / Error:** Success; record upgraded in place.
 
-### Test R18-R21-T11: Eviction and Compact Tombstone Conversion
+### Test R18-R22-T11: Eviction and Compact Tombstone Conversion
 - **Initial Authoritative Root:** Result at $g=1$ settled (`TERMINAL_SETTLEMENT`); 1,000 results retained.
 - **Operation Sequence:** Publish $g=1001$; triggers FIFO eviction of $g=1$.
 - **Expected Final Root:**
@@ -1681,25 +1715,25 @@ The following thirty-two deterministic future test specifications are formally c
   - `generationAuditHistory.get(1).evidenceDigest` is 32-byte SHA-256.
 - **Expected Result / Error:** Success.
 
-### Test R18-R21-T12: Tombstone Retirement Blocked by Active Settlement Pin
+### Test R18-R22-T12: Tombstone Retirement Blocked by Active Settlement Pin
 - **Initial Authoritative Root:** 5,000 tombstones retained; oldest tombstone $g=1$ has an active settlement pin.
 - **Operation Sequence:** Next result eviction attempts to retire tombstone $g=1$.
 - **Expected Final Root:** Unchanged; zero tombstones deleted; zero results evicted.
 - **Expected Result / Error:** Throws `TOMBSTONE_CAPACITY_EXHAUSTED`.
 
-### Test R18-R21-T13: Tombstone Retirement Blocked by Active Retry Lease
+### Test R18-R22-T13: Tombstone Retirement Blocked by Active Retry Lease
 - **Initial Authoritative Root:** 5,000 tombstones retained; oldest tombstone $g=1$ has an active retry lease.
 - **Operation Sequence:** Next result eviction attempts to retire tombstone $g=1$.
 - **Expected Final Root:** Unchanged; zero tombstones deleted; zero results evicted.
 - **Expected Result / Error:** Throws `TOMBSTONE_CAPACITY_EXHAUSTED`.
 
-### Test R18-R21-T14: Tombstone Retirement Blocked by Pending Settlement Obligation
+### Test R18-R22-T14: Tombstone Retirement Blocked by Pending Settlement Obligation
 - **Initial Authoritative Root:** 5,000 tombstones retained; oldest tombstone $g=1$ references pending obligation.
 - **Operation Sequence:** Next result eviction attempts to retire tombstone $g=1$.
 - **Expected Final Root:** Unchanged.
 - **Expected Result / Error:** Throws `TOMBSTONE_CAPACITY_EXHAUSTED`.
 
-### Test R18-R21-T15: Normal FIFO Tombstone Retirement at 5,000 Capacity
+### Test R18-R22-T15: Normal FIFO Tombstone Retirement at 5,000 Capacity
 - **Initial Authoritative Root:** 5,000 tombstones retained ($[1 \dots 5000]$); zero pins/leases on $g=1$.
 - **Operation Sequence:** Publish new generation causing eviction and tombstone retirement.
 - **Expected Final Root:**
@@ -1708,85 +1742,85 @@ The following thirty-two deterministic future test specifications are formally c
   - Total tombstones remaining: 5,000 ($[2 \dots 5001]$).
 - **Expected Result / Error:** Success; contiguity preserved over $[2 \dots publishedGeneration]$.
 
-### Test R18-R21-T16: Pre-Existing Tombstone Count Above Cap Fails Closed
+### Test R18-R22-T16: Pre-Existing Tombstone Count Above Cap Fails Closed
 - **Initial Authoritative Root:** Artificially injected root with 5,005 tombstones.
 - **Operation Sequence:** Call `publishReleaseAndObligation`.
 - **Expected Final Root:** Unchanged; zero bulk deletions performed.
 - **Expected Result / Error:** Throws `TOMBSTONE_CAPACITY_CORRUPTED`.
 
-### Test R18-R21-T17: Missing Tombstone Inside Promised Horizon Fails Closed
+### Test R18-R22-T17: Missing Tombstone Inside Promised Horizon Fails Closed
 - **Initial Authoritative Root:** `auditTombstoneFloor = 10`, `custodyGenerationFloor = 20`; tombstone $g=15$ deleted.
 - **Operation Sequence:** Call `assertAuditHistoryContiguity`.
 - **Expected Final Root:** Unchanged.
 - **Expected Result / Error:** Throws `STATE_INCONSISTENT_AUDIT_KEY_GAP`.
 
-### Test R18-R21-T18: Expiry Below Tombstone Floor Returns Historical Expiry
+### Test R18-R22-T18: Expiry Below Tombstone Floor Returns Historical Expiry
 - **Initial Authoritative Root:** `auditTombstoneFloor = 50`.
 - **Operation Sequence:** Query generation $g=30$.
 - **Expected Final Root:** Unchanged.
 - **Expected Result / Error:** Returns `CUSTODY_RECEIPT_EXPIRED` with `horizonExpired: true`.
 
-### Test R18-R21-T19: Floor Order Invariant Violation Fails Closed
+### Test R18-R22-T19: Floor Order Invariant Violation Fails Closed
 - **Initial Authoritative Root:** Artificially set `auditTombstoneFloor = 50`, `custodyGenerationFloor = 40`.
 - **Operation Sequence:** Call `assertAuditHistoryContiguity`.
 - **Expected Final Root:** Unchanged.
 - **Expected Result / Error:** Throws `STATE_INCONSISTENT_FLOOR_ORDER_VIOLATION`.
 
-### Test R18-R21-T20: Audit Record With Mismatched Generation Fails Closed
+### Test R18-R22-T20: Audit Record With Mismatched Generation Fails Closed
 - **Initial Authoritative Root:** Audit history key is 5, but record payload has `generation: 4`.
 - **Operation Sequence:** Call `assertAuditHistoryContiguity`.
 - **Expected Final Root:** Unchanged.
 - **Expected Result / Error:** Throws `AUDIT_RECORD_GENERATION_MISMATCH`.
 
-### Test R18-R21-T21: Audit Record With Mismatched Owner Token Fails Closed
+### Test R18-R22-T21: Audit Record With Mismatched Owner Token Fails Closed
 - **Initial Authoritative Root:** Audit record at $g=1$ has altered `membershipEpoch`.
 - **Operation Sequence:** Call `assertAuditHistoryContiguity` with publicationResults.
 - **Expected Final Root:** Unchanged.
 - **Expected Result / Error:** Throws `STATE_INCONSISTENT_AUDIT_RESULT_IDENTITY_MISMATCH`.
 
-### Test R18-R21-T22: Audit Record With Mismatched Drainer Ownership Generation Fails Closed
+### Test R18-R22-T22: Audit Record With Mismatched Drainer Ownership Generation Fails Closed
 - **Initial Authoritative Root:** Audit record at $g=1$ has altered `drainerOwnershipGeneration`.
 - **Operation Sequence:** Call `assertAuditHistoryContiguity` with publicationResults.
 - **Expected Final Root:** Unchanged.
 - **Expected Result / Error:** Throws `STATE_INCONSISTENT_AUDIT_RESULT_IDENTITY_MISMATCH`.
 
-### Test R18-R21-T23: Cross-Generation Settlement Evidence Replay Rejected
+### Test R18-R22-T23: Cross-Generation Settlement Evidence Replay Rejected
 - **Initial Authoritative Root:** Active pin for $g=2$; evidence constructed for $g=1$.
 - **Operation Sequence:** Call `releaseSettlementPin("pin:...:g2:...", evidence_g1)`.
 - **Expected Final Root:** Unchanged; pin remains active.
 - **Expected Result / Error:** Throws `SETTLEMENT_EVIDENCE_IDENTITY_MISMATCH`.
 
-### Test R18-R21-T24: Cross-Obligation Settlement Evidence Replay Rejected via Atomic In-Root Registry
+### Test R18-R22-T24: Cross-Obligation Settlement Evidence Replay Rejected via Atomic In-Root Registry
 - **Initial Authoritative Root:** Evidence for $g=1$ already consumed on `pin_1`; `consumedSettlementEvidence.has("1:barrier:pin_1") === true`.
 - **Operation Sequence:** Attempt to reuse identical evidence on `pin_2`.
 - **Expected Final Root:** Unchanged; `pin_2` remains active.
 - **Expected Result / Error:** Throws `SETTLEMENT_EVIDENCE_REPLAY_DETECTED`.
 
-### Test R18-R21-T25: Caller-Constructed Mock Evidence Rejected by Provenance Check
+### Test R18-R22-T25: Caller-Constructed Mock Evidence Rejected by Provenance Check
 - **Initial Authoritative Root:** Active pin for $g=1$.
 - **Operation Sequence:** Caller constructs object matching `AuthoritativeSettlementEvidence` schema without factory.
 - **Expected Final Root:** Unchanged; pin remains active.
 - **Expected Result / Error:** Throws `INVALID_SETTLEMENT_EVIDENCE_PROVENANCE`.
 
-### Test R18-R21-T26: Watchdog Timeout Cannot Release Settlement Protection
+### Test R18-R22-T26: Watchdog Timeout Cannot Release Settlement Pin
 - **Initial Authoritative Root:** Barrier pending for $g=1$; watchdog fires after 5,000 ms.
 - **Operation Sequence:** Watchdog handler attempts to call `releaseSettlementPin` with watchdog receipt.
 - **Expected Final Root:** Pin remains active; gate state latches `DEGRADED`.
 - **Expected Result / Error:** Throws `INVALID_SETTLEMENT_EVIDENCE_PROVENANCE`.
 
-### Test R18-R21-T27: Retry Lease ID Passed to Settlement Pin Release Fails Closed
+### Test R18-R22-T27: Retry Lease ID Passed to Settlement Pin Release Fails Closed
 - **Initial Authoritative Root:** Active lease `lease:1:1:c1:1`.
 - **Operation Sequence:** Call `releaseSettlementPin("lease:1:1:c1:1", evidence)`.
 - **Expected Final Root:** Unchanged.
 - **Expected Result / Error:** Throws `PIN_TYPE_MISMATCH`.
 
-### Test R18-R21-T28: Settlement Pin ID Passed to Retry Lease Release Fails Closed
+### Test R18-R22-T28: Settlement Pin ID Passed to Retry Lease Release Fails Closed
 - **Initial Authoritative Root:** Active pin `pin:1:1:b1:1`.
 - **Operation Sequence:** Call `releaseRetryLease({ leaseId: "pin:1:1:b1:1", ... })`.
 - **Expected Final Root:** Unchanged.
 - **Expected Result / Error:** Throws `LEASE_TYPE_MISMATCH`.
 
-### Test R18-R21-T29: Genuinely Unknown Identifier Passed to Release APIs Fails Closed (Blocker B1)
+### Test R18-R22-T29: Genuinely Unknown Identifier Passed to Release APIs Fails Closed (Blocker B1)
 - **Initial Authoritative Root:** Clean root; active and retired maps empty.
 - **Operation Sequence:**
   1. Call `releaseRetryLease` with never-issued `leaseId = "lease:999:unknown"`.
@@ -1794,21 +1828,21 @@ The following thirty-two deterministic future test specifications are formally c
 - **Expected Final Root:** Unchanged.
 - **Expected Result / Error:** Both calls fail closed with `RESOURCE_NOT_FOUND` (neither returns `ALREADY_RELEASED`).
 
-### Test R18-R21-T30: Duplicate Release Against Retired Pin Returns Already Released
+### Test R18-R22-T30: Duplicate Release Against Retired Pin With Matching Provenance and Digest Returns Already Released
 - **Initial Authoritative Root:** Active pin `pin_1` for $g=1$.
 - **Operation Sequence:**
   1. Release `pin_1` with valid evidence; returns `{ status: 'RELEASED' }`.
   2. Repeat `releaseSettlementPin("pin_1", validEvidence)`.
 - **Expected Final Root:** `activeSettlementPins.has("pin_1") === false`; `retiredSettlementPins.has("pin_1") === true`.
-- **Expected Result / Error:** Second call matches retired record and returns `{ status: 'ALREADY_RELEASED' }` idempotently.
+- **Expected Result / Error:** Second call validates provenance and digest, returning `{ status: 'ALREADY_RELEASED' }` idempotently.
 
-### Test R18-R21-T31: Settlement Pin Release With Mismatched Drainer Generation Fails Closed (Blocker C1)
+### Test R18-R22-T31: Settlement Pin Release With Mismatched Drainer Generation Fails Closed (Blocker C1)
 - **Initial Authoritative Root:** Active pin for $g=1$ with `drainerOwnershipGeneration = 2`.
 - **Operation Sequence:** Caller presents `AuthoritativeSettlementEvidence` with `drainerOwnershipGeneration = 1`.
 - **Expected Final Root:** Unchanged; pin remains active; evidence remains unconsumed.
 - **Expected Result / Error:** Throws `SETTLEMENT_EVIDENCE_IDENTITY_MISMATCH`.
 
-### Test R18-R21-T32: Pre-Publication Throw During Pin Release Leaves Evidence Usable for Retry (Blocker C2)
+### Test R18-R22-T32: Pre-Publication Throw During Pin Release Leaves Evidence Usable for Retry (Blocker C2)
 - **Initial Authoritative Root:** Active pin for $g=1$; `consumedSettlementEvidence.size === 0`.
 - **Operation Sequence:**
   1. Initiate `releaseSettlementPin`; candidate root construction simulates memory allocation exception before pointer swap.
@@ -1816,33 +1850,43 @@ The following thirty-two deterministic future test specifications are formally c
 - **Expected Final Root:** Second call succeeds; `pin_1` retired; evidence replay key added to `consumedSettlementEvidence`.
 - **Expected Result / Error:** First call throws error without consuming evidence in authoritative root; second call completes release cleanly.
 
+### Test R18-R22-T33: Duplicate Release on Retired Lease With Altered Transaction ID Fails Closed (Blocker B1)
+- **Initial Authoritative Root:** Retired lease `lease_1` recorded for `transactionId = "tx-100"`.
+- **Operation Sequence:** Call `releaseRetryLease` passing `lease_1` with `transactionId = "tx-200"`.
+- **Expected Final Root:** Unchanged.
+- **Expected Result / Error:** Throws `LEASE_TRANSACTION_ID_MISMATCH`.
+
+### Test R18-R22-T34: Duplicate Release on Retired Pin With Unverified Provenance Fails Closed (Blocker C2)
+- **Initial Authoritative Root:** Retired pin `pin_1` recorded for $g=1$.
+- **Operation Sequence:** Caller constructs mock evidence object with matching fields but without factory issuance.
+- **Expected Final Root:** Unchanged.
+- **Expected Result / Error:** Throws `INVALID_SETTLEMENT_EVIDENCE_PROVENANCE`.
+
 ---
 
 ## 20. Updated Formal Approval Questions for Engineering Authority
 
 ```
 ================================================================================
-ENGINEERING AUTHORITY APPROVAL QUESTIONS (MILESTONE M5.0-R18-R21):
+ENGINEERING AUTHORITY APPROVAL QUESTIONS (MILESTONE M5.0-R18-R22):
 ================================================================================
-1. [AUTHORITATIVE RESOURCE RETIREMENT & UNKNOWN-ID RESOLUTION]: Does the Engineering
-   Authority approve introducing bounded retiredRetryLeases and retiredSettlementPins
-   in AuthoritativeCustodyRoot, ensuring genuinely unknown identifiers fail closed
-   with RESOURCE_NOT_FOUND while recognized released identifiers return ALREADY_RELEASED?
+1. [FULL RETIRED-RESOURCE IDENTITY AUTHORIZATION]: Does the Engineering Authority
+   approve enforcing identical seven-dimensional identity verification (consumerId,
+   clientRequestId, callerToken, txId, opId, barrierId) across both active and
+   retired retry lease release paths, preventing cross-transaction duplicate releases?
 
-2. [ATOMIC IN-ROOT EVIDENCE CONSUMPTION PROTOCOL]: Does the Engineering Authority
-   approve integrating consumedSettlementEvidence into AuthoritativeCustodyRoot,
-   guaranteeing that evidence consumption and pin release commit via a single atomic
-   root replacement and that pre-publication failures leave evidence unconsumed and
-   retryable?
+2. [UNIVERSAL EVIDENCE PROVENANCE & DISPOSITION CHECK]: Does the Engineering Authority
+   approve requiring SettlementEvidenceFactory provenance validation unconditionally
+   before checking active or retired pin status, and verifying evidenceDigest
+   equality on duplicate retired-pin releases?
 
-3. [SEVEN-DIMENSIONAL PIN IDENTITY BINDING]: Does the Engineering Authority approve
-   binding drainerOwnershipGeneration into ImmutableSettlementPin and validating it
-   authoritatively on pin release, preventing cross-drainer-generation release
-   vulnerabilities?
+3. [BOUNDED REPLAY RETENTION & NON-REISSUABLE SEQUENCING]: Does the Engineering
+   Authority approve bounding consumedSettlementEvidence to 5,000 entries trimmed
+   in lockstep with retiredSettlementPins, with monotonic pin sequencing guaranteeing
+   evicted pins fail closed as RESOURCE_NOT_FOUND?
 
 4. [CLOSURE OF ALL ACCEPTANCE BLOCKERS]: Does the Engineering Authority agree that
-   Blocker B1 (unknown resource handling), Blocker C2 (atomic evidence consumption),
-   and Blocker C1 (drainer generation comparison) are fully closed, and that the
+   all outstanding review blockers are closed, and that the recovery arbitration
    architecture is ready for holistic M5.0 final acceptance review?
 ================================================================================
 ```
@@ -1853,13 +1897,13 @@ ENGINEERING AUTHORITY APPROVAL QUESTIONS (MILESTONE M5.0-R18-R21):
 
 ```
 ================================================================================
-M5.0-R18-R21 ARCHITECTURAL DECISION PROPOSAL VERDICT:
+M5.0-R18-R22 ARCHITECTURAL DECISION PROPOSAL VERDICT:
 DECISION PROPOSAL COMPLETE — READY FOR HOLISTIC M5.0 FINAL ACCEPTANCE REVIEW
 ================================================================================
 ```
 
-This R18-R21 proposal closes all remaining correctness blockers identified in the independent review. It establishes authoritative resource retirement tracking, guarantees atomic in-root evidence consumption, enforces seven-dimensional settlement pin identity verification including drainer generation, and codifies thirty-two deterministic future test specifications.
+This R18-R22 proposal completes the formal recovery arbitration architecture. It establishes full seven-dimensional identity authorization across active and retired leases, enforces universal evidence provenance and settlement disposition checks on retired pins, bounds replay retention in lockstep with retired pin collections, and codifies thirty-four deterministic future test specifications.
 
 ### Mandatory Implementation Authorization Statement
 
-> "M5.0-R18-R21 is an architectural documentation correction only. No production implementation has been started. M5.1, including M5.1a, remains strictly unauthorized pending explicit Engineering Authority approval."
+> "M5.0-R18-R22 is an architectural documentation correction only. No production implementation has been started. M5.1, including M5.1a, remains strictly unauthorized pending explicit Engineering Authority approval."
