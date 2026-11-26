@@ -1,30 +1,56 @@
-# Phase 7.5 M5.0-R18-R19 — Retry Pin Lease Lifetime, Bounded Tombstone Retirement & Complete Evidence Consistency
+# Phase 7.5 M5.0-R18-R20 — Retry Lease Idempotency, Audit Lifecycle Consistency & Evidence Authorization Closure
 **Concurrent Recovery Arbitration & Authoritative Settlement Architecture Decision**
 
 **Status:** PROPOSED ARCHITECTURAL AMENDMENT TO FROZEN M5.0 SPECIFICATIONS (DECISION DOCUMENT ONLY)
 **Author:** Principal TypeScript Distributed-Systems Architect and Independent Recovery-Systems Auditor
-**Baseline Commit:** `6043264b616e46b042f19de287c6e6afbbf14526` (M5.0-R18-R18)
-**Direct Parent Commit:** `6043264b616e46b042f19de287c6e6afbbf14526`
-**Authorization Scope:** M5.0-R18-R19 is strictly a documentation-only architectural proposal. No production source code, tests, configuration, package manifests, or frozen M5.0 specifications may be modified. Implementation of Milestone M5.1, including M5.1a, remains **STRICTLY BLOCKED AND UNAUTHORIZED**.
+**Baseline Commit:** `06c696a45a4cfabec1e2784d1a816d731fdc4dcb` (M5.0-R18-R19)
+**Direct Parent Commit:** `06c696a45a4cfabec1e2784d1a816d731fdc4dcb`
+**Authorization Scope:** M5.0-R18-R20 is strictly a documentation-only architectural proposal. No production source code, tests, configuration, package manifests, or frozen M5.0 specifications may be modified. Implementation of Milestone M5.1, including M5.1a, remains **STRICTLY BLOCKED AND UNAUTHORIZED**.
 
 ---
 
-## 1. Problem Statement & R18-R19 Objectives
+## 1. Problem Statement & R18-R20 Objectives
 
-In Phase 7.5 Sub-Milestone M5.0-R18-R18, we formalized atomic retry pinning, exact retention contiguity, and tombstone creation on eviction. However, an in-depth systems audit revealed four remaining critical lifecycle and consistency gaps:
+In Phase 7.5 Sub-Milestone M5.0-R18-R19, we introduced independent consumer retry leases and bounded tombstone FIFO retirement. However, a rigorous recovery-systems audit revealed four critical architectural blockers in the R18-R19 model:
 
-1. **Shared Pin Identity & Premature Consumer Eviction:** In R18-R18, `_getOrAllocateRetryPin()` returned the same pin ID for all matching requests without distinguishing concurrent consumers. If Consumer A and Consumer B simultaneously queried generation $g$, Consumer A's early completion and release deleted the shared pin from the root, prematurely exposing the entry to FIFO eviction while Consumer B was still reading the result.
-2. **Unbounded Tombstone Retention & Missing Floor Retirement:** R18-R18 staged tombstones on result eviction, but lacked concrete retirement logic and floor advancement for `auditTombstoneFloor`. Without bounded FIFO retirement, tombstones would accumulate indefinitely, violating bounded-memory requirements.
-3. **Incomplete Retained-Record Identity Consistency:** While R18-R18 validated key sequence contiguity, it did not verify structural cross-field consistency (tokens, transaction IDs, operation identities, barrier identities, drainer ownership generations) across all retained entries in `publicationResults` and `generationAuditHistory`.
-4. **Unspecified Evidence Factory Provenance & Verification:** R18-R18 referenced `AuthoritativeSettlementEvidence`, but lacked an explicit factory contract defining how the recovery kernel verifies the 5 core settlement facts against authoritative coordinator state, single-use replay protection, and the handling of post-commit rejections vs. ambiguous pre-commit failures.
+1. **Unstable Retry Request Identity & Cross-Consumer Release Exposure (B1):**
+   - In R18-R19, `publishReleaseAndObligation` permitted `clientRequestId = req-${performance.now()}` when `retryContext` was omitted. This defeated retransmission idempotency because a client retrying after a lost network response would generate a fresh timestamp identifier and allocate redundant leases.
+   - Furthermore, `releaseRetryLease()` checked the caller recovery owner token but failed to independently verify that the caller consumer owns the lease (`lease.consumerId === params.consumerId`). Consequently, Consumer 1 could erroneously release Consumer 2's lease merely because both operated in the same recovery attempt.
+2. **Missing Current-Generation Audit History & Incomplete Tombstone Protection (B2):**
+   - In R18-R19 first publication, `publishReleaseAndObligation` staged `publicationResults` and `pendingSettlementObligations`, and then asserted `generationAuditHistory` contiguity through $g$, without ever inserting generation $g$ into `generationAuditHistory`. This created a contradictory invariant where contiguity assertions either passed falsely or failed closed.
+   - When retiring the oldest tombstone at `auditTombstoneFloor + 1`, R18-R19 checked active retry leases but neglected to check active settlement pins or pending settlement obligations.
+   - Capacity enforcement lacked strict pre-existing error handling, and floor invariants were not bounded by non-negative safe integers.
+3. **Incomplete Retained-Record Identity Consistency (C1):**
+   - While key sequence contiguity was checked, structural identity verification across `generationAuditHistory` did not employ discriminated schemas for pending vs. terminal vs. tombstoned records, leaving historical attempts vulnerable to token identity confusion.
+4. **Unspecified Evidence Factory Authorization & Cross-Resource Semantics (C2 & Cross-Resource):**
+   - R18-R19 referenced `AuthoritativeSettlementEvidence` without defining a private internal capability or registry mechanism within `@syncplay/protocol` to prevent mock or caller-constructed evidence.
+   - Passing a settlement pin ID to `releaseRetryLease` or a retry lease ID to `releaseSettlementPin` was ambiguous or conflated.
 
-### Core Architectural Guarantees Established in R18-R19:
+### Core Architectural Guarantees Established in R18-R20:
 
-- **Independent Consumer Retry Leases (`ImmutableRetryLease`):** Formalizes multi-consumer lease ownership over retained generations. Concurrent consumers receive distinct `leaseId`s. Early release by one consumer removes only its lease, keeping the generation protected until all leases are released. Retransmission by the same consumer is recognized idempotently via `(consumerId, clientRequestId)` without leaking references.
-- **Strictly Bounded Tombstone Lifecycle (`MAX_AUDIT_TOMBSTONES = 5000`):** Implements exact FIFO tombstone retirement and monotonic advancement of `auditTombstoneFloor`. Enforces key contiguity over $\mathbf{generationAuditHistory.keys()} \equiv \{\mathbf{auditTombstoneFloor} + 1, \dots, \mathbf{publishedGeneration}\}$. Lookups within the tombstone horizon verify tombstone existence; missing tombstones fail closed as state corruption.
-- **Complete Retained-Record Identity Consistency:** Enforces strict 6-dimensional identity verification across every retained publication result, obligation, and audit tombstone. Distinguishes attempt-independent publication bindings from coordinator active-attempt evolution.
-- **Auditable Evidence Provenance via `SettlementEvidenceFactory`:** Authorizes the internal `SettlementEvidenceFactory` as the sole issuer of Level 3 evidence. Pre-validates Promise settlement, classified outcomes, archive disposition, custody reconciliation, and drainer release against authoritative coordinator state before settlement pin release. Watchdog timeouts cannot manufacture settlement evidence.
-- **Exhaustive Deterministic Test Suite (30 Test Cases):** Codifies thirty deterministic future test specifications in Section 19 covering multi-consumer lease lifecycles, bounded tombstone retirement, complete identity verification, and evidence provenance.
+- **Mandatory Stable Request Identity & Independent Release Authority (B1):**
+  - `RetryRequestContext` (`consumerId`, `clientRequestId`) is strictly mandatory on retry acquisition. Omitting, mutating, or supplying malformed/oversized (> 256 chars) context fails closed.
+  - `releaseRetryLease()` requires explicit 7-dimensional binding: `leaseId`, `consumerId`, `clientRequestId`, `callerToken`, `transactionId`, `operationIdentity`, and `barrierIdentity`. Consumer 1 is strictly unauthorized to release Consumer 2's lease (`UNAUTHORIZED_CROSS_CONSUMER_LEASE_RELEASE`).
+  - Full lease lifecycle defined across lost responses, retransmissions, timeouts, duplicate releases, and attempt advancement.
+- **Formal Option A Audit-History Model & Complete Tombstone Retirement Protection (B2):**
+  - Formally selects and documents **Option A**: `generationAuditHistory` contains lifecycle-discriminated records: `ImmutablePendingAuditRecord` (`PENDING_PUBLICATION`), `AuthoritativeSettlementEvidence` (`TERMINAL_SETTLEMENT`), and `ImmutableCompactAuditTombstone` (`COMPACT_TOMBSTONE`).
+  - On first publication, `ImmutablePendingAuditRecord` is published atomically into `generationAuditHistory`, guaranteeing unconditional key contiguity $g \in [\mathbf{auditTombstoneFloor} + 1, \dots, \mathbf{publishedGeneration}]$.
+  - Tombstone retirement checks all authoritative references: active retry leases, active settlement pins, and pending settlement obligations. If any reference protects the oldest tombstone, retirement applies fail-closed backpressure (`TOMBSTONE_CAPACITY_EXHAUSTED`).
+  - Strict capacity enforcement (`MAX_AUDIT_TOMBSTONES = 5000`): Pre-existing counts > 5000 fail closed (`TOMBSTONE_CAPACITY_CORRUPTED`). Oldest tombstone must be verified as a compact tombstone before deletion. `auditTombstoneFloor` advances atomically with deletion.
+  - Safe integer floor invariants: $0 \le \mathbf{auditTombstoneFloor} \le \mathbf{custodyGenerationFloor} \le \mathbf{publishedGeneration}$.
+- **Complete Retained-Record Identity Consistency (C1):**
+  - Formal discriminated schemas enforce 6-dimensional verification across map keys, owner tokens, transaction IDs, operation identities, barrier identities, and drainer generations. Historical records remain permanently bound to original publication tokens.
+- **Auditable Evidence Factory Authorization & Single-Use Replay Protection (C2):**
+  - Authorizes `SettlementEvidenceFactory` as the sole internal issuer within `@syncplay/protocol` via private symbol and internal capability registry.
+  - Validates 5 core coordinator facts prior to evidence issuance. Watchdog timeout produces Level 1 receipts and can never manufacture Level 3 settlement evidence.
+  - Enforces single-use replay protection per barrier and obligation ID.
+- **Distinct Cross-Resource Identifier Semantics:**
+  - `releaseRetryLease(pinId)` throws `LEASE_TYPE_MISMATCH`.
+  - `releaseSettlementPin(leaseId)` throws `PIN_TYPE_MISMATCH`.
+  - Unknown or never-issued identifiers throw `RESOURCE_NOT_FOUND`.
+  - Duplicate release by the authorized caller remains an idempotent no-op.
+- **Exhaustive Deterministic Test Suite (30 Test Cases):**
+  - Codifies thirty deterministic future test specifications in Section 19 covering every R18-R20 requirement.
 
 ---
 
@@ -168,8 +194,9 @@ The system enforces strict monotonic ordering of generations:
 - **Publication Generation Counter:** `publishedGeneration` tracks the highest generation published to the custody root. Initialized to `0`. Strictly monotonic ($g_{\text{new}} = g_{\text{current}} + 1$).
 - **Custody Generation Floor:** `custodyGenerationFloor` represents the generation floor below which all detailed publication results have been safely evicted. Initialized to `0`. Strictly non-decreasing ($\mathbf{custodyGenerationFloor}_{\text{new}} \ge \mathbf{custodyGenerationFloor}_{\text{current}}$).
 - **Audit Tombstone Floor:** `auditTombstoneFloor` represents the floor below which compact audit tombstones have been safely evicted. Initialized to `0`. Strictly non-decreasing ($\mathbf{auditTombstoneFloor} \le \mathbf{custodyGenerationFloor} \le \mathbf{publishedGeneration}$).
-- **Core Invariant:**
+- **Core Safe-Integer Floor Invariant:**
   $$0 \le \mathbf{auditTombstoneFloor} \le \mathbf{custodyGenerationFloor} \le \mathbf{publishedGeneration}$$
+  All floors and generations must be non-negative safe integers (`Number.isSafeInteger(x) && x >= 0`).
 
 ### 8.2 Safe Tombstone Eviction & Generation Ordering Invariants
 
@@ -208,10 +235,10 @@ A robust distributed recovery engine must define exact invariants when `publicat
 
 ### 8.4 Protection of Active Reservations, No-Active-Reservations Rule & Strict Backpressure Recovery
 
-- If `MAX_TOMBSTONES = 1000` is reached, eviction selects the lowest generation $g$.
-- If $g$ belongs to an active reservation, eviction is blocked.
+- If `MAX_TOMBSTONES = 1000` is reached in archive or `MAX_AUDIT_TOMBSTONES = 5000` in custody, eviction selects the lowest generation $g$.
+- If $g$ belongs to an active retry lease, settlement pin, or pending obligation, eviction is blocked.
 - **Strict FIFO Preservation:** Eviction **cannot** skip active reservations. Skipping would create generation gaps in the tombstone map and violate monotonic floor invariants.
-- Instead, the coordinator applies **strict backpressure**: new reservation requests are rejected with `TOMBSTONE_CAPACITY_EXHAUSTED` until active operations complete and release their pins.
+- Instead, the coordinator applies **strict backpressure**: new requests are rejected with `TOMBSTONE_CAPACITY_EXHAUSTED` until active operations complete and release their pins or leases.
 
 ---
 
@@ -354,7 +381,7 @@ All four receipts must match across generation $g$, owner token, transaction ID,
   4. Custody reconciliation completed without error.
   5. Drainer custody was relinquished for generation $g$.
   6. All receipts match 1-to-1 against `pendingSettlementObligations.get(g)`.
-- **Replay Protection:** Evidence is single-use for resolving the specific barrier and releasing the specific `SETTLEMENT_BARRIER` pin for generation $g$. Replaying evidence for another generation or obligation is rejected with `SETTLEMENT_EVIDENCE_IDENTITY_MISMATCH`.
+- **Replay Protection:** Evidence is single-use for resolving the specific barrier and releasing the specific `SETTLEMENT_BARRIER` pin for generation $g$. Replaying evidence for another generation or obligation is rejected with `SETTLEMENT_EVIDENCE_REPLAY_DETECTED`.
 
 ### 12.7 Closed Generation-Scoped Barrier Lifecycle
 
@@ -386,7 +413,7 @@ All objects entering `AuthoritativeCustodyRoot` are deeply cloned and frozen on 
 - Out-of-domain values ($g \le 0$, non-integers, NaN, $\infty$) are rejected upfront with `INVALID_GENERATION_DOMAIN`.
 - Sequence exhaustion ($g = \text{Number.MAX\_SAFE\_INTEGER}$) triggers fail-closed `GENERATION_SEQUENCE_EXHAUSTED`.
 
-### 12.12 The Complete Lifecycle Publication, Retry Lease Lifetime, Bounded Tombstone Retirement & Complete Consistency
+### 12.12 The Complete Lifecycle Publication, Retry Lease Idempotency, Bounded Tombstone Retirement & Complete Consistency
 
 #### The Complete Custody Root State Structure:
 
@@ -443,6 +470,11 @@ export interface ImmutableSettlementPin {
   readonly monotonicAcquiredMs: number;
 }
 
+export interface RetryRequestContext {
+  readonly consumerId: string;
+  readonly clientRequestId: string;
+}
+
 export interface ImmutableRetryLease {
   readonly leaseId: string; // lease:${coordinatorInstanceId}:${generation}:${consumerId}:${seq}
   readonly generation: number;
@@ -450,22 +482,63 @@ export interface ImmutableRetryLease {
   readonly clientRequestId: string;
   readonly ownerToken: CustodyOwnershipToken;
   readonly transactionId: string;
+  readonly operationIdentity: string;
   readonly barrierIdentity: string;
   readonly acquiredAtTimestamp: number;
   readonly monotonicAcquiredMs: number;
+  readonly expiresAtMonotonicMs: number;
 }
 
-export interface ImmutableCompactAuditTombstone {
+// Option A: Lifecycle-Discriminated Audit Records
+export interface ImmutablePendingAuditRecord {
+  readonly kind: 'PENDING_PUBLICATION';
   readonly generation: number;
   readonly expectedOwner: CustodyOwnershipToken;
   readonly transactionId: string;
   readonly operationIdentity: string;
   readonly barrierIdentity: string;
+  readonly drainerOwnershipGeneration: number;
+  readonly publishedAtTimestamp: number;
+  readonly monotonicPublishedMs: number;
+}
+
+export interface AuthoritativeSettlementEvidence {
+  readonly kind: 'TERMINAL_SETTLEMENT';
+  readonly [SETTLEMENT_EVIDENCE_BRAND]: true;
+  readonly generation: number;
+  readonly expectedOwner: CustodyOwnershipToken;
+  readonly transactionId: string;
+  readonly operationIdentity: string;
+  readonly barrierIdentity: string;
+  readonly drainerOwnershipGeneration: number;
   readonly terminalOutcome: 'CONFIRMED_COMMITTED' | 'ABORTED_FENCED';
   readonly settledAtTimestamp: number;
   readonly monotonicSettledMs: number;
-  readonly evidenceDigest: Uint8Array; // SHA-256 digest of AuthoritativeSettlementEvidence
+  readonly releaseReceipt: DrainerCustodyReleaseReceipt;
+  readonly reconciliationReceipt: CustodyReconciliationReceipt;
+  readonly archiveReceipt: ArchiveDispositionReceipt;
+  readonly executionReceipt: ExecutionSettlementReceipt;
+  readonly evidenceDigest: Uint8Array;
 }
+
+export interface ImmutableCompactAuditTombstone {
+  readonly kind: 'COMPACT_TOMBSTONE';
+  readonly generation: number;
+  readonly expectedOwner: CustodyOwnershipToken;
+  readonly transactionId: string;
+  readonly operationIdentity: string;
+  readonly barrierIdentity: string;
+  readonly drainerOwnershipGeneration: number;
+  readonly terminalOutcome: 'CONFIRMED_COMMITTED' | 'ABORTED_FENCED';
+  readonly settledAtTimestamp: number;
+  readonly monotonicSettledMs: number;
+  readonly evidenceDigest: Uint8Array;
+}
+
+export type GenerationAuditRecord =
+  | ImmutablePendingAuditRecord
+  | AuthoritativeSettlementEvidence
+  | ImmutableCompactAuditTombstone;
 
 export interface AuthoritativeCustodyRoot {
   readonly publishedGeneration: number;
@@ -475,53 +548,183 @@ export interface AuthoritativeCustodyRoot {
   readonly gateState: CustodyGateState;
   readonly pendingSettlementObligations: ImmutableMap<number, PendingSettlementObligation>;
   readonly publicationResults: ImmutableMap<number, PublicationResult>;
-  readonly generationAuditHistory: ImmutableMap<number, AuthoritativeSettlementEvidence | ImmutableCompactAuditTombstone>;
+  readonly generationAuditHistory: ImmutableMap<number, GenerationAuditRecord>;
   readonly activeSettlementPins: ImmutableMap<string, ImmutableSettlementPin>;
   readonly activeRetryLeases: ImmutableMap<string, ImmutableRetryLease>;
 }
+
+export interface ReleaseRetryLeaseParams {
+  readonly leaseId: string;
+  readonly consumerId: string;
+  readonly clientRequestId: string;
+  readonly callerToken: CustodyOwnershipToken;
+  readonly transactionId: string;
+  readonly operationIdentity: string;
+  readonly barrierIdentity: string;
+}
 ```
 
-#### Independent Consumer Retry Lease Model (B1):
+#### Independent Consumer Retry Lease Model & Release Authorization (B1):
 
-To resolve the shared-pin premature release vulnerability:
-1. **Independent Consumer Leases:** Each concurrent retry consumer receives an independent `ImmutableRetryLease` identified by `leaseId`.
-2. **Idempotent Retransmission Recovery:** When a consumer retransmits a retry request with matching `(generation, consumerId, clientRequestId)`, the coordinator recovers the existing `leaseId` without allocating a duplicate lease or leaking references. Conflicting identity fields fail closed with `RETRY_LEASE_COLLISION_MUTATED_IDENTITY`.
-3. **Isolation of Consumer Release:** When Consumer 1 calls `releaseRetryLease(leaseId_A)`, only `leaseId_A` is removed. Consumer 2's `leaseId_B` remains active in `activeRetryLeases`.
-4. **Eviction Protection Rule:** Generation $g$ is eviction-eligible if and only if:
-   $$\forall p \in \mathbf{activeSettlementPins},\; p.\text{generation} \ne g \;\;\land\;\; \forall l \in \mathbf{activeRetryLeases},\; l.\text{generation} \ne g$$
-5. **Watchdog Immunity:** Watchdog timeouts log telemetry but **CANNOT** release retry leases or settlement pins.
-6. **Linearization:** Lease acquisition and release are atomic candidate-root replacements executed synchronously before returning to the caller.
+To resolve the shared-pin premature release vulnerability and establish retransmission idempotency:
+1. **Mandatory Stable Request Identity:** `RetryRequestContext` (`consumerId`, `clientRequestId`) is mandatory on all retry paths. Both fields must be non-empty strings of at most 256 characters. Using newly generated timestamps or random values at runtime is strictly prohibited. Missing context throws `INVALID_RETRY_REQUEST_CONTEXT`. Malformed context throws `MALFORMED_RETRY_REQUEST_CONTEXT`. Oversized context throws `RETRY_REQUEST_CONTEXT_OVERSIZED`.
+2. **Idempotent Retransmission Recovery:** When a consumer retransmits a retry request with matching `(generation, consumerId, clientRequestId)`, the coordinator recovers the existing `leaseId` without allocating a duplicate lease or leaking references. Conflicting identity fields fail closed with `IDEMPOTENT_RETRY_IDENTITY_CONFLICT`.
+3. **Independent Consumer Release Authority:** `releaseRetryLease(params: ReleaseRetryLeaseParams)` binds and verifies all seven dimensions: `leaseId`, `consumerId`, `clientRequestId`, `callerToken`, `transactionId`, `operationIdentity`, and `barrierIdentity`. Consumer 1 cannot release Consumer 2's lease (`UNAUTHORIZED_CROSS_CONSUMER_LEASE_RELEASE`).
+4. **Complete Lease Lifecycle:**
+   - *Lost Acquisition Response:* Consumer retransmits with same `(consumerId, clientRequestId)`; existing lease returned idempotently.
+   - *Repeated Acquisition with Identical Identity:* Returns existing `ImmutableRetryLease`.
+   - *Repeated Acquisition with Conflicting Identity:* Throws `IDEMPOTENT_RETRY_IDENTITY_CONFLICT`.
+   - *Consumer Termination / Timeout:* Monotonic expiration at `expiresAtMonotonicMs` ensures crashed consumers do not leak memory forever.
+   - *Duplicate Release:* Authorized consumer releasing an already released lease receives `{ status: 'ALREADY_RELEASED' }` idempotently.
+   - *Unauthorized Cross-Consumer Release:* Fails closed with `UNAUTHORIZED_CROSS_CONSUMER_LEASE_RELEASE`.
+   - *Coordinator Attempt Advancement:* Existing historical leases remain bound to the generation and original publication token.
+   - *Settlement Completion While Leases Active:* Barrier resolution does not evict generation $g$ from `publicationResults` while active retry leases exist.
+   - *Retry Lease Release While Settlement Pin Active:* Generation remains protected until all leases and pins are released.
+5. **Eviction Protection Rule:** Generation $g$ is eviction-eligible if and only if:
+   $$\forall p \in \mathbf{activeSettlementPins},\; p.\text{generation} \ne g \;\;\land\;\; \forall l \in \mathbf{activeRetryLeases},\; l.\text{generation} \ne g \;\;\land\;\; g \notin \mathbf{pendingSettlementObligations}$$
+6. **Watchdog Immunity:** Watchdog timeouts log telemetry but **CANNOT** release retry leases or settlement pins.
 
-#### Genuinely Bounded Tombstone Lifecycle & Contiguity (B2):
+#### Option A Audit-History Model & Bounded Tombstone Retirement (B2):
 
-To enforce bounded memory while guaranteeing auditability:
-1. **Capacity Budget:** `MAX_AUDIT_TOMBSTONES = 5000` is an authoritative ceiling.
-2. **Dual Exact Contiguity Invariants:**
+To guarantee unconditional key contiguity and bounded memory:
+1. **Option A Adoption:** `generationAuditHistory` holds lifecycle-discriminated records:
+   - On first publication: `ImmutablePendingAuditRecord` (`PENDING_PUBLICATION`) is inserted for $g$.
+   - On barrier settlement: `AuthoritativeSettlementEvidence` (`TERMINAL_SETTLEMENT`) replaces the pending record.
+   - On result eviction: `ImmutableCompactAuditTombstone` (`COMPACT_TOMBSTONE`) replaces the evidence.
+   - On tombstone retirement: the oldest entry is deleted from `generationAuditHistory`.
+2. **Dual Unconditional Key Contiguity Invariants:**
    - **Publication Results:**
      $$\mathbf{publicationResults.keys()} \equiv \{\mathbf{custodyGenerationFloor} + 1,\;\; \dots,\;\; \mathbf{publishedGeneration}\}$$
    - **Generation Audit History:**
      $$\mathbf{generationAuditHistory.keys()} \equiv \{\mathbf{auditTombstoneFloor} + 1,\;\; \dots,\;\; \mathbf{publishedGeneration}\}$$
    subject to empty-cache states ($\mathbf{floor} === \mathbf{publishedGeneration} \iff \mathbf{size} === 0$).
-3. **FIFO Tombstone Retirement:**
-   When $\mathbf{tombstoneCount} = \mathbf{custodyGenerationFloor} - \mathbf{auditTombstoneFloor} \ge 5000$, oldest tombstone $g_{\text{tomb}} = \mathbf{auditTombstoneFloor} + 1$ is retired if and only if no active retry lease or settlement pin protects it. If protected, retirement applies fail-closed backpressure (`TOMBSTONE_CAPACITY_EXHAUSTED`).
-4. **Lookup Horizons:**
-   - $\mathbf{custodyGenerationFloor} < g \le \mathbf{publishedGeneration}$: Retained detailed result.
-   - $\mathbf{auditTombstoneFloor} < g \le \mathbf{custodyGenerationFloor}$: Promised tombstone horizon. Tombstone must exist; missing tombstone throws `STATE_INCONSISTENT_TOMBSTONE_MISSING_IN_HORIZON`.
-   - $g \le \mathbf{auditTombstoneFloor}$: Legitimate historical expiry beyond tombstone horizon. Returns `CUSTODY_RECEIPT_EXPIRED` with `horizonExpired: true`.
+3. **Complete Tombstone Retirement Protection:**
+   The oldest tombstone $g_{\text{tomb\_oldest}} = \mathbf{auditTombstoneFloor} + 1$ can be retired if and only if:
+   - It is of kind `COMPACT_TOMBSTONE`.
+   - No active retry lease references $g_{\text{tomb\_oldest}}$: `!activeRetryLeases.some(l => l.generation === g && l.expiresAtMonotonicMs > now)`.
+   - No active settlement pin references $g_{\text{tomb\_oldest}}$: `!activeSettlementPins.some(p => p.generation === g)`.
+   - No pending settlement obligation references $g_{\text{tomb\_oldest}}$: `!pendingSettlementObligations.has(g)`.
+   If protected, throws `TOMBSTONE_CAPACITY_EXHAUSTED`.
+4. **Strict Capacity Enforcement (`MAX_AUDIT_TOMBSTONES = 5000`):**
+   - Pre-existing tombstone counts $> 5000$ fail closed with `TOMBSTONE_CAPACITY_CORRUPTED`.
+   - Normal operation retires exactly the single oldest eligible tombstone per eviction, advancing `auditTombstoneFloor` atomically.
+5. **Safe Integer Floor Invariants:**
+   $$0 \le \mathbf{auditTombstoneFloor} \le \mathbf{custodyGenerationFloor} \le \mathbf{publishedGeneration}$$
+   All floors and generations must be non-negative safe integers.
 
 #### Complete Retained-Record Identity Consistency (C1):
 
-For every entry $g \in \mathbf{publicationResults}$, the coordinator unconditionally validates:
-$$\mathbf{result.releaseReceipt.releasedCustodyGeneration} === g === \mathbf{result.obligation.generation}$$
-$$\mathbf{isEquivalentOwnerToken}(\mathbf{result.releaseReceipt.identity},\; \mathbf{result.obligation.ownerToken}) \equiv \mathbf{true}$$
-$$\mathbf{result.obligation.transactionId} === \mathbf{result.releaseReceipt.identity.transactionId}$$
-$$\mathbf{result.obligation.operationIdentity} === \mathbf{result.releaseReceipt.identity.operationIdentity}$$
-$$\mathbf{result.obligation.drainerOwnershipGeneration} === \mathbf{result.releaseReceipt.identity.drainerOwnershipGeneration}$$
-If pending, `obligation` matches `pendingSettlementObligations.get(g)`. If settled, `generationAuditHistory.get(g)` matches across all identity dimensions. Any discrepancy fails closed with `STATE_INCONSISTENT_RETAINED_RECORD_CORRUPTED`.
+For every entry in `publicationResults` and `generationAuditHistory`, all fields (generation, original owner token, transaction ID, operation ID, barrier ID, drainer ownership generation) are strictly verified. Historical records remain permanently bound to their original owner token across coordinator attempt advancements.
 
-#### Complete Corrected Pseudocode:
+#### Settlement Evidence Factory Authorization & Replay Protection (C2):
+
+- **Sole Authorized Issuer:** `SettlementEvidenceFactory` within `@syncplay/protocol` using private Symbol `SETTLEMENT_EVIDENCE_BRAND` and internal `AUTHORIZED_EVIDENCE_REGISTRY`.
+- **Verified Facts:** Promise settled callback executed (watchdog timeout CANNOT manufacture evidence), terminal outcome classified (`CONFIRMED_COMMITTED` or `ABORTED_FENCED`), archive disposition verified, custody reconciliation verified, drainer relinquished custody.
+- **Single-Use Replay Protection:** Evidence consumption is tracked in `CONSUMED_EVIDENCE_REGISTRY`. Replay across generations or obligations throws `SETTLEMENT_EVIDENCE_REPLAY_DETECTED`.
+
+#### Cross-Resource Identifier Semantics:
+- `releaseRetryLease(pinId)` -> throws `LEASE_TYPE_MISMATCH`.
+- `releaseSettlementPin(leaseId)` -> throws `PIN_TYPE_MISMATCH`.
+- Unknown or never-issued ID -> throws `RESOURCE_NOT_FOUND`.
+- Duplicate release by authorized caller -> returns `{ status: 'ALREADY_RELEASED' }` idempotently.
+
+---
+
+#### Complete Corrected Architectural Pseudocode:
 
 ```typescript
+const DRAINER_RELEASE_BRAND = Symbol('@syncplay/DrainerCustodyReleaseReceipt');
+const SETTLEMENT_EVIDENCE_BRAND = Symbol('@syncplay/SettlementEvidence');
+const AUTHORIZED_EVIDENCE_REGISTRY = new WeakSet<AuthoritativeSettlementEvidence>();
+const CONSUMED_EVIDENCE_REGISTRY = new Set<string>();
+
+export function validateRetryRequestContext(ctx: unknown): asserts ctx is RetryRequestContext {
+  if (!ctx || typeof ctx !== 'object') {
+    throw new Error('INVALID_RETRY_REQUEST_CONTEXT: retryContext is mandatory on retry');
+  }
+  const { consumerId, clientRequestId } = ctx as Partial<RetryRequestContext>;
+  if (typeof consumerId !== 'string' || typeof clientRequestId !== 'string') {
+    throw new Error('MALFORMED_RETRY_REQUEST_CONTEXT: consumerId and clientRequestId must be strings');
+  }
+  if (consumerId.trim() === '' || clientRequestId.trim() === '') {
+    throw new Error('MALFORMED_RETRY_REQUEST_CONTEXT: consumerId and clientRequestId cannot be empty');
+  }
+  if (consumerId.length > 256 || clientRequestId.length > 256) {
+    throw new Error('RETRY_REQUEST_CONTEXT_OVERSIZED: consumerId and clientRequestId must be <= 256 chars');
+  }
+}
+
+export class SettlementEvidenceFactory {
+  public static createEvidence(params: {
+    generation: number;
+    expectedOwner: CustodyOwnershipToken;
+    transactionId: string;
+    operationIdentity: string;
+    barrierIdentity: string;
+    drainerOwnershipGeneration: number;
+    terminalOutcome: 'CONFIRMED_COMMITTED' | 'ABORTED_FENCED';
+    promiseSettled: boolean;
+    isWatchdogTimeout: boolean;
+    archiveDispositionConfirmed: boolean;
+    custodyReconciledConfirmed: boolean;
+    drainerReleasedConfirmed: boolean;
+    releaseReceipt: DrainerCustodyReleaseReceipt;
+    reconciliationReceipt: CustodyReconciliationReceipt;
+    archiveReceipt: ArchiveDispositionReceipt;
+    executionReceipt: ExecutionSettlementReceipt;
+  }): AuthoritativeSettlementEvidence {
+    if (params.isWatchdogTimeout || !params.promiseSettled) {
+      throw new Error('CANNOT_ISSUE_SETTLEMENT_EVIDENCE_ON_TIMEOUT_OR_UNSETTLED_PROMISE');
+    }
+    if (!params.archiveDispositionConfirmed || !params.custodyReconciledConfirmed || !params.drainerReleasedConfirmed) {
+      throw new Error('CANNOT_ISSUE_SETTLEMENT_EVIDENCE_UNVERIFIED_COORDINATOR_FACTS');
+    }
+    if (params.terminalOutcome !== 'CONFIRMED_COMMITTED' && params.terminalOutcome !== 'ABORTED_FENCED') {
+      throw new Error('INVALID_TERMINAL_OUTCOME_CLASSIFICATION');
+    }
+
+    const evidence: AuthoritativeSettlementEvidence = Object.freeze({
+      kind: 'TERMINAL_SETTLEMENT',
+      [SETTLEMENT_EVIDENCE_BRAND]: true,
+      generation: params.generation,
+      expectedOwner: cloneAndFreezeOwnerToken(params.expectedOwner),
+      transactionId: params.transactionId,
+      operationIdentity: params.operationIdentity,
+      barrierIdentity: params.barrierIdentity,
+      drainerOwnershipGeneration: params.drainerOwnershipGeneration,
+      terminalOutcome: params.terminalOutcome,
+      settledAtTimestamp: Date.now(),
+      monotonicSettledMs: performance.now(),
+      releaseReceipt: params.releaseReceipt,
+      reconciliationReceipt: params.reconciliationReceipt,
+      archiveReceipt: params.archiveReceipt,
+      executionReceipt: params.executionReceipt,
+      evidenceDigest: computeEvidenceDigest(params),
+    });
+
+    AUTHORIZED_EVIDENCE_REGISTRY.add(evidence);
+    return evidence;
+  }
+
+  public static assertAuthoritativeEvidenceProvenance(evidence: unknown): asserts evidence is AuthoritativeSettlementEvidence {
+    if (!evidence || typeof evidence !== 'object') {
+      throw new Error('INVALID_SETTLEMENT_EVIDENCE_PROVENANCE: evidence must be an object');
+    }
+    const ev = evidence as AuthoritativeSettlementEvidence;
+    if (!ev[SETTLEMENT_EVIDENCE_BRAND] || !AUTHORIZED_EVIDENCE_REGISTRY.has(ev)) {
+      throw new Error('INVALID_SETTLEMENT_EVIDENCE_PROVENANCE: unauthorized issuer or mock evidence rejected');
+    }
+  }
+
+  public static consumeEvidence(evidence: AuthoritativeSettlementEvidence, pinId: string): void {
+    const replayKey = `${evidence.generation}:${evidence.barrierIdentity}:${pinId}`;
+    if (CONSUMED_EVIDENCE_REGISTRY.has(replayKey)) {
+      throw new Error(`SETTLEMENT_EVIDENCE_REPLAY_DETECTED: evidence for key ${replayKey} has already been consumed`);
+    }
+    CONSUMED_EVIDENCE_REGISTRY.add(replayKey);
+  }
+}
+
 public assertRetentionMapContiguity(
   resultsMap: Map<number, PublicationResult> | ImmutableMap<number, PublicationResult>,
   floor: number,
@@ -576,23 +779,85 @@ public assertRetentionMapContiguity(
 }
 
 public assertAuditHistoryContiguity(
-  auditMap: Map<number, any> | ImmutableMap<number, any>,
+  auditMap: Map<number, GenerationAuditRecord> | ImmutableMap<number, GenerationAuditRecord>,
   auditFloor: number,
   publishedGeneration: number,
   custodyFloor: number,
+  publicationResults?: Map<number, PublicationResult> | ImmutableMap<number, PublicationResult>,
 ): void {
+  // Validate non-negative safe integers and monotonic ordering
+  if (!Number.isSafeInteger(auditFloor) || auditFloor < 0) {
+    throw new Error('STATE_INCONSISTENT_INVALID_AUDIT_FLOOR');
+  }
+  if (!Number.isSafeInteger(custodyFloor) || custodyFloor < 0) {
+    throw new Error('STATE_INCONSISTENT_INVALID_CUSTODY_FLOOR');
+  }
+  if (!Number.isSafeInteger(publishedGeneration) || publishedGeneration < 0) {
+    throw new Error('STATE_INCONSISTENT_INVALID_PUBLISHED_GENERATION');
+  }
+  if (auditFloor > custodyFloor || custodyFloor > publishedGeneration) {
+    throw new Error('STATE_INCONSISTENT_FLOOR_ORDER_VIOLATION');
+  }
+
   if (auditFloor === publishedGeneration) {
     if (auditMap.size !== 0) throw new Error('STATE_INCONSISTENT_EMPTY_AUDIT_NON_EMPTY_MAP');
     return;
   }
+
   const expectedCount = publishedGeneration - auditFloor;
-  if (auditMap.size !== expectedCount) throw new Error('STATE_INCONSISTENT_AUDIT_MAP_NON_CONTIGUOUS');
+  if (auditMap.size !== expectedCount) {
+    throw new Error(`STATE_INCONSISTENT_AUDIT_MAP_NON_CONTIGUOUS: expected ${expectedCount}, got ${auditMap.size}`);
+  }
 
   for (let g = auditFloor + 1; g <= publishedGeneration; g++) {
-    if (!auditMap.has(g)) throw new Error(`STATE_INCONSISTENT_AUDIT_KEY_GAP: missing generation ${g}`);
-    const record = auditMap.get(g);
-    if (g <= custodyFloor && !record.evidenceDigest) {
-      throw new Error(`STATE_INCONSISTENT_TOMBSTONE_SCHEMA_VIOLATION: key ${g}`);
+    if (!auditMap.has(g)) {
+      throw new Error(`STATE_INCONSISTENT_AUDIT_KEY_GAP: missing generation ${g}`);
+    }
+    const record = auditMap.get(g)!;
+
+    // Complete Audit Record Identity Consistency (C1)
+    if (record.generation !== g) {
+      throw new Error(`AUDIT_RECORD_GENERATION_MISMATCH: key ${g} !== record.generation ${record.generation}`);
+    }
+
+    if (g <= custodyFloor) {
+      // Must be a compact tombstone in the tombstone horizon
+      if (record.kind !== 'COMPACT_TOMBSTONE') {
+        throw new Error(`STATE_INCONSISTENT_TOMBSTONE_SCHEMA_VIOLATION: key ${g} in tombstone horizon must be COMPACT_TOMBSTONE, got ${record.kind}`);
+      }
+      if (!record.evidenceDigest || !(record.evidenceDigest instanceof Uint8Array) || record.evidenceDigest.length !== 32) {
+        throw new Error(`STATE_INCONSISTENT_TOMBSTONE_DIGEST_CORRUPTED: key ${g}`);
+      }
+    } else {
+      // Above custodyFloor: must be PENDING_PUBLICATION or TERMINAL_SETTLEMENT
+      if (record.kind !== 'PENDING_PUBLICATION' && record.kind !== 'TERMINAL_SETTLEMENT') {
+        throw new Error(`STATE_INCONSISTENT_AUDIT_SCHEMA_VIOLATION: key ${g} must be PENDING_PUBLICATION or TERMINAL_SETTLEMENT, got ${record.kind}`);
+      }
+      if (record.kind === 'TERMINAL_SETTLEMENT') {
+        if (record.terminalOutcome !== 'CONFIRMED_COMMITTED' && record.terminalOutcome !== 'ABORTED_FENCED') {
+          throw new Error(`STATE_INCONSISTENT_TERMINAL_OUTCOME_CORRUPTED: key ${g}`);
+        }
+      }
+    }
+
+    // Cross-check against publicationResults if provided
+    if (publicationResults && publicationResults.has(g)) {
+      const pub = publicationResults.get(g)!;
+      if (
+        !isEquivalentOwnerToken(record.expectedOwner, pub.obligation.ownerToken) ||
+        record.transactionId !== pub.obligation.transactionId ||
+        record.operationIdentity !== pub.obligation.operationIdentity ||
+        record.barrierIdentity !== pub.obligation.barrierIdentity ||
+        record.drainerOwnershipGeneration !== pub.obligation.drainerOwnershipGeneration
+      ) {
+        throw new Error(`STATE_INCONSISTENT_AUDIT_RESULT_IDENTITY_MISMATCH: key ${g}`);
+      }
+    }
+  }
+
+  for (const k of auditMap.keys()) {
+    if (!Number.isSafeInteger(k) || k <= auditFloor || k > publishedGeneration) {
+      throw new Error(`STATE_INCONSISTENT_AUDIT_GENERATION_OUT_OF_BOUNDS: key ${k}`);
     }
   }
 }
@@ -601,7 +866,7 @@ public publishReleaseAndObligation(
   preparedEvidence: PreparedEvidenceContext,
   expectedOwner: CustodyOwnershipToken,
   barrierIdentity: string,
-  retryContext?: { consumerId: string; clientRequestId: string },
+  retryContext?: RetryRequestContext,
 ): PublicationResponse {
   const currentRoot = this.#custodyRoot;
 
@@ -613,8 +878,11 @@ public publishReleaseAndObligation(
   const safeTxId = String(safeOwner.transactionId);
   const safeOpId = String(safeOwner.operationIdentity);
 
-  // 3. PRIOR PUBLICATION EVALUATION:
+  // 3. PRIOR PUBLICATION EVALUATION (RETRY PATH):
   if (g <= currentRoot.publishedGeneration) {
+    // Mandatory stable request context on retry (B1.1)
+    validateRetryRequestContext(retryContext);
+
     // Case 3A: Published with Settlement Pending
     if (currentRoot.pendingSettlementObligations.has(g)) {
       const existingObligation = currentRoot.pendingSettlementObligations.get(g)!;
@@ -624,7 +892,7 @@ public publishReleaseAndObligation(
 
       if (currentRoot.generationAuditHistory.has(g)) {
         const audit = currentRoot.generationAuditHistory.get(g)!;
-        if (audit.terminalOutcome === 'CONFIRMED_COMMITTED' || audit.terminalOutcome === 'ABORTED_FENCED') {
+        if (audit.kind === 'TERMINAL_SETTLEMENT' || audit.kind === 'COMPACT_TOMBSTONE') {
           throw new Error('STATE_INCONSISTENT_PENDING_OBLIGATION_CONTRADICTS_AUDIT');
         }
       }
@@ -649,11 +917,9 @@ public publishReleaseAndObligation(
         throw new Error('CUSTODY_PUBLICATION_TOKEN_MISMATCH');
       }
 
-      // ATOMIC RETRY LEASE ACQUISITION (B1):
-      const consumerId = retryContext?.consumerId ?? `consumer-${safeOpId}`;
-      const clientReqId = retryContext?.clientRequestId ?? `req-${performance.now()}`;
+      // ATOMIC RETRY LEASE ACQUISITION WITH STABLE CONTEXT (B1):
       const { candidateLeases, leaseId } = this._getOrAllocateRetryLease(
-        currentRoot, g, consumerId, clientReqId, safeOwner, safeTxId, safeBarrierId
+        currentRoot, g, retryContext.consumerId, retryContext.clientRequestId, safeOwner, safeTxId, safeOpId, safeBarrierId
       );
 
       if (candidateLeases !== currentRoot.activeRetryLeases) {
@@ -670,20 +936,20 @@ public publishReleaseAndObligation(
     if (currentRoot.publicationResults.has(g)) {
       const cachedResult = currentRoot.publicationResults.get(g)!;
 
-      const auditEvidence = currentRoot.generationAuditHistory.get(g);
-      if (!auditEvidence) throw new Error('STATE_INCONSISTENT_SETTLED_RESULT_MISSING_AUDIT');
+      const auditRecord = currentRoot.generationAuditHistory.get(g);
+      if (!auditRecord) throw new Error('STATE_INCONSISTENT_SETTLED_RESULT_MISSING_AUDIT');
 
       if (
-        !isEquivalentOwnerToken(auditEvidence.expectedOwner, cachedResult.releaseReceipt.identity) ||
-        auditEvidence.generation !== g ||
-        auditEvidence.transactionId !== cachedResult.releaseReceipt.identity.transactionId ||
-        auditEvidence.operationIdentity !== cachedResult.releaseReceipt.identity.operationIdentity ||
-        auditEvidence.barrierIdentity !== cachedResult.obligation.barrierIdentity
+        !isEquivalentOwnerToken(auditRecord.expectedOwner, cachedResult.releaseReceipt.identity) ||
+        auditRecord.generation !== g ||
+        auditRecord.transactionId !== cachedResult.releaseReceipt.identity.transactionId ||
+        auditRecord.operationIdentity !== cachedResult.releaseReceipt.identity.operationIdentity ||
+        auditRecord.barrierIdentity !== cachedResult.obligation.barrierIdentity
       ) {
         throw new Error('STATE_INCONSISTENT_AUDIT_RESULT_IDENTITY_MISMATCH');
       }
 
-      if (auditEvidence.terminalOutcome !== 'CONFIRMED_COMMITTED' && auditEvidence.terminalOutcome !== 'ABORTED_FENCED') {
+      if (auditRecord.kind !== 'TERMINAL_SETTLEMENT' && auditRecord.kind !== 'COMPACT_TOMBSTONE') {
         throw new Error('STATE_INCONSISTENT_TERMINAL_OUTCOME_CONFLICT');
       }
 
@@ -696,11 +962,9 @@ public publishReleaseAndObligation(
         throw new Error('CUSTODY_PUBLICATION_TOKEN_MISMATCH');
       }
 
-      // ATOMIC RETRY LEASE ACQUISITION (B1):
-      const consumerId = retryContext?.consumerId ?? `consumer-${safeOpId}`;
-      const clientReqId = retryContext?.clientRequestId ?? `req-${performance.now()}`;
+      // ATOMIC RETRY LEASE ACQUISITION WITH STABLE CONTEXT (B1):
       const { candidateLeases, leaseId } = this._getOrAllocateRetryLease(
-        currentRoot, g, consumerId, clientReqId, safeOwner, safeTxId, safeBarrierId
+        currentRoot, g, retryContext.consumerId, retryContext.clientRequestId, safeOwner, safeTxId, safeOpId, safeBarrierId
       );
 
       if (candidateLeases !== currentRoot.activeRetryLeases) {
@@ -716,8 +980,8 @@ public publishReleaseAndObligation(
     // Case 3C: Published but Outside Retention Horizon (Evicted / Bounded Tombstone Horizon)
     if (g <= currentRoot.custodyGenerationFloor) {
       if (g > currentRoot.auditTombstoneFloor) {
-        const tombstone = currentRoot.generationAuditHistory.get(g) as ImmutableCompactAuditTombstone | undefined;
-        if (!tombstone) {
+        const tombstone = currentRoot.generationAuditHistory.get(g);
+        if (!tombstone || tombstone.kind !== 'COMPACT_TOMBSTONE') {
           throw new Error('STATE_INCONSISTENT_TOMBSTONE_MISSING_IN_HORIZON');
         }
         if (
@@ -756,7 +1020,7 @@ public publishReleaseAndObligation(
 
   // Unconditional Pre-Contiguity Assertions
   this.assertRetentionMapContiguity(currentRoot.publicationResults, currentRoot.custodyGenerationFloor, currentRoot.publishedGeneration);
-  this.assertAuditHistoryContiguity(currentRoot.generationAuditHistory, currentRoot.auditTombstoneFloor, currentRoot.publishedGeneration, currentRoot.custodyGenerationFloor);
+  this.assertAuditHistoryContiguity(currentRoot.generationAuditHistory, currentRoot.auditTombstoneFloor, currentRoot.publishedGeneration, currentRoot.custodyGenerationFloor, currentRoot.publicationResults);
 
   const safeEvidence = cloneAndFreezeEvidence(preparedEvidence, safeOwner);
   const monotonicNow = performance.now();
@@ -795,6 +1059,19 @@ public publishReleaseAndObligation(
     obligation,
   });
 
+  // Option A: Immutable Pending Audit Record published atomically on first publication
+  const pendingAuditRecord: ImmutablePendingAuditRecord = Object.freeze({
+    kind: 'PENDING_PUBLICATION',
+    generation: g,
+    expectedOwner: safeOwner,
+    transactionId: safeTxId,
+    operationIdentity: safeOpId,
+    barrierIdentity: safeBarrierId,
+    drainerOwnershipGeneration: safeOwner.drainerOwnershipGeneration,
+    publishedAtTimestamp: Date.now(),
+    monotonicPublishedMs: monotonicNow,
+  });
+
   // Allocate Settlement Pin for First Publication
   const settlementPinId = `pin:${this._coordinatorInstanceId}:${g}:${safeBarrierId}:${++this._pinSequenceCounter}`;
   const settlementPin: ImmutableSettlementPin = Object.freeze({
@@ -805,7 +1082,7 @@ public publishReleaseAndObligation(
     transactionId: safeTxId,
     operationIdentity: safeOpId,
     acquiredAtTimestamp: Date.now(),
-    monotonicAcquiredMs: performance.now(),
+    monotonicAcquiredMs: monotonicNow,
   });
 
   // Strict FIFO Contiguity Verification, Eviction & Atomic Tombstone Publication
@@ -834,19 +1111,25 @@ public publishReleaseAndObligation(
       if (pin.generation === g_oldest) throw new Error('CUSTODY_PUBLICATION_BACKPRESSURE_EXHAUSTED');
     }
     for (const lease of currentRoot.activeRetryLeases.values()) {
-      if (lease.generation === g_oldest) throw new Error('CUSTODY_PUBLICATION_BACKPRESSURE_EXHAUSTED');
+      if (lease.generation === g_oldest && lease.expiresAtMonotonicMs > monotonicNow) {
+        throw new Error('CUSTODY_PUBLICATION_BACKPRESSURE_EXHAUSTED');
+      }
     }
 
     // Atomic Tombstone Staging
-    const existingAudit = candidateAuditHistory.get(g_oldest) as AuthoritativeSettlementEvidence;
-    if (!existingAudit) throw new Error('STATE_INCONSISTENT_SETTLED_RESULT_MISSING_AUDIT');
+    const existingAudit = candidateAuditHistory.get(g_oldest);
+    if (!existingAudit || existingAudit.kind !== 'TERMINAL_SETTLEMENT') {
+      throw new Error('STATE_INCONSISTENT_SETTLED_RESULT_MISSING_AUDIT');
+    }
 
     const tombstone: ImmutableCompactAuditTombstone = Object.freeze({
+      kind: 'COMPACT_TOMBSTONE',
       generation: g_oldest,
       expectedOwner: existingAudit.expectedOwner,
       transactionId: existingAudit.transactionId,
       operationIdentity: existingAudit.operationIdentity,
       barrierIdentity: existingAudit.barrierIdentity,
+      drainerOwnershipGeneration: existingAudit.drainerOwnershipGeneration,
       terminalOutcome: existingAudit.terminalOutcome,
       settledAtTimestamp: existingAudit.settledAtTimestamp,
       monotonicSettledMs: existingAudit.monotonicSettledMs,
@@ -857,24 +1140,47 @@ public publishReleaseAndObligation(
     candidateAuditHistory.set(g_oldest, tombstone);
     candidateFloor = g_oldest;
 
-    // Genuinely Bounded Tombstone Retirement (B2):
+    // Strict Capacity Enforcement (MAX_AUDIT_TOMBSTONES = 5000) & Complete Protection (B2):
     const tombstoneCount = candidateFloor - candidateAuditFloor;
-    if (tombstoneCount >= 5000) {
+    if (tombstoneCount > 5000) {
+      throw new Error('TOMBSTONE_CAPACITY_CORRUPTED: pre-existing tombstone count exceeds 5000');
+    }
+    if (tombstoneCount === 5000) {
       const g_tomb_oldest = candidateAuditFloor + 1;
-      // Ensure oldest tombstone is not protected by an active lease
-      for (const lease of currentRoot.activeRetryLeases.values()) {
-        if (lease.generation === g_tomb_oldest) throw new Error('TOMBSTONE_CAPACITY_EXHAUSTED');
+      const tombEntry = candidateAuditHistory.get(g_tomb_oldest);
+      if (!tombEntry || tombEntry.kind !== 'COMPACT_TOMBSTONE') {
+        throw new Error('STATE_INCONSISTENT_TOMBSTONE_RETIREMENT_TYPE_VIOLATION');
       }
+
+      // Check active retry leases
+      for (const lease of currentRoot.activeRetryLeases.values()) {
+        if (lease.generation === g_tomb_oldest && lease.expiresAtMonotonicMs > monotonicNow) {
+          throw new Error('TOMBSTONE_CAPACITY_EXHAUSTED: oldest tombstone protected by active retry lease');
+        }
+      }
+      // Check active settlement pins
+      for (const pin of currentRoot.activeSettlementPins.values()) {
+        if (pin.generation === g_tomb_oldest) {
+          throw new Error('TOMBSTONE_CAPACITY_EXHAUSTED: oldest tombstone protected by active settlement pin');
+        }
+      }
+      // Check pending settlement obligations
+      if (currentRoot.pendingSettlementObligations.has(g_tomb_oldest)) {
+        throw new Error('TOMBSTONE_CAPACITY_EXHAUSTED: oldest tombstone protected by pending settlement obligation');
+      }
+
       candidateAuditHistory.delete(g_tomb_oldest);
       candidateAuditFloor = g_tomb_oldest;
     }
   }
 
+  // Insert publication result and pending audit record
   candidateResultsMap.set(g, publicationResult);
+  candidateAuditHistory.set(g, pendingAuditRecord); // Option A: unconditional contiguity!
 
   // Post-insertion unconditional contiguity assertions
   this.assertRetentionMapContiguity(candidateResultsMap, candidateFloor, g);
-  this.assertAuditHistoryContiguity(candidateAuditHistory, candidateAuditFloor, g, candidateFloor);
+  this.assertAuditHistoryContiguity(candidateAuditHistory, candidateAuditFloor, g, candidateFloor, candidateResultsMap);
 
   const candidateObligations = new ImmutableMap([
     ...currentRoot.pendingSettlementObligations.entries(),
@@ -912,6 +1218,7 @@ private _getOrAllocateRetryLease(
   clientRequestId: string,
   ownerToken: CustodyOwnershipToken,
   transactionId: string,
+  operationIdentity: string,
   barrierIdentity: string,
 ): { candidateLeases: ImmutableMap<string, ImmutableRetryLease>; leaseId: string } {
   // Idempotent recovery for same consumer and request ID
@@ -924,11 +1231,12 @@ private _getOrAllocateRetryLease(
       if (
         isEquivalentOwnerToken(existingLease.ownerToken, ownerToken) &&
         existingLease.transactionId === transactionId &&
+        existingLease.operationIdentity === operationIdentity &&
         existingLease.barrierIdentity === barrierIdentity
       ) {
         return { candidateLeases: root.activeRetryLeases, leaseId: existingLease.leaseId };
       }
-      throw new Error('RETRY_LEASE_COLLISION_MUTATED_IDENTITY');
+      throw new Error('IDEMPOTENT_RETRY_IDENTITY_CONFLICT');
     }
   }
 
@@ -939,6 +1247,7 @@ private _getOrAllocateRetryLease(
     throw new Error('RETRY_LEASE_ID_COLLISION');
   }
 
+  const monotonicNow = performance.now();
   const lease: ImmutableRetryLease = Object.freeze({
     leaseId,
     generation,
@@ -946,9 +1255,11 @@ private _getOrAllocateRetryLease(
     clientRequestId,
     ownerToken,
     transactionId,
+    operationIdentity,
     barrierIdentity,
     acquiredAtTimestamp: Date.now(),
-    monotonicAcquiredMs: performance.now(),
+    monotonicAcquiredMs: monotonicNow,
+    expiresAtMonotonicMs: monotonicNow + 30000, // 30-second bounded lease duration
   });
 
   const candidateLeases = new ImmutableMap([
@@ -959,13 +1270,42 @@ private _getOrAllocateRetryLease(
   return { candidateLeases, leaseId };
 }
 
-public releaseRetryLease(leaseId: string, callerToken: CustodyOwnershipToken): void {
+public releaseRetryLease(params: ReleaseRetryLeaseParams): { leaseId: string; status: 'RELEASED' | 'ALREADY_RELEASED' } {
+  const { leaseId, consumerId, clientRequestId, callerToken, transactionId, operationIdentity, barrierIdentity } = params;
+
+  // Cross-Resource Type Checking
+  if (leaseId.startsWith('pin:')) {
+    throw new Error('LEASE_TYPE_MISMATCH: identifier is a settlement pin, not a retry lease');
+  }
+  if (!leaseId.startsWith('lease:')) {
+    throw new Error('RESOURCE_NOT_FOUND: unknown lease identifier format');
+  }
+
   const currentRoot = this.#custodyRoot;
   const lease = currentRoot.activeRetryLeases.get(leaseId);
-  if (!lease) return; // Idempotent
+  if (!lease) {
+    // Idempotent return for already-released lease
+    return { leaseId, status: 'ALREADY_RELEASED' };
+  }
 
+  // Independent Consumer Authorization Check (B1.2)
+  if (lease.consumerId !== consumerId) {
+    throw new Error(`UNAUTHORIZED_CROSS_CONSUMER_LEASE_RELEASE: caller consumer ${consumerId} does not own lease ${leaseId} owned by ${lease.consumerId}`);
+  }
+  if (lease.clientRequestId !== clientRequestId) {
+    throw new Error(`LEASE_CLIENT_REQUEST_MISMATCH: clientRequestId ${clientRequestId} does not match lease ${lease.clientRequestId}`);
+  }
   if (!isEquivalentOwnerToken(lease.ownerToken, callerToken)) {
-    throw new Error('STALE_ATTEMPT_LEASE_RELEASE_REJECTED');
+    throw new Error('UNAUTHORIZED_LEASE_RELEASE_TOKEN_MISMATCH: caller token does not match lease owner token');
+  }
+  if (lease.transactionId !== transactionId) {
+    throw new Error(`LEASE_TRANSACTION_ID_MISMATCH: transactionId ${transactionId} does not match lease`);
+  }
+  if (lease.operationIdentity !== operationIdentity) {
+    throw new Error(`LEASE_OPERATION_IDENTITY_MISMATCH: operationIdentity ${operationIdentity} does not match lease`);
+  }
+  if (lease.barrierIdentity !== barrierIdentity) {
+    throw new Error(`LEASE_BARRIER_IDENTITY_MISMATCH: barrierIdentity ${barrierIdentity} does not match lease`);
   }
 
   const candidateLeasesMap = new Map(currentRoot.activeRetryLeases.entries());
@@ -975,14 +1315,27 @@ public releaseRetryLease(leaseId: string, callerToken: CustodyOwnershipToken): v
     ...currentRoot,
     activeRetryLeases: new ImmutableMap(candidateLeasesMap.entries()),
   });
+
+  return { leaseId, status: 'RELEASED' };
 }
 
-public releaseSettlementPin(pinId: string, settlementEvidence: AuthoritativeSettlementEvidence): void {
+public releaseSettlementPin(pinId: string, settlementEvidence: AuthoritativeSettlementEvidence): { pinId: string; status: 'RELEASED' | 'ALREADY_RELEASED' } {
+  // Cross-Resource Type Checking
+  if (pinId.startsWith('lease:')) {
+    throw new Error('PIN_TYPE_MISMATCH: identifier is a retry lease, not a settlement pin');
+  }
+  if (!pinId.startsWith('pin:')) {
+    throw new Error('RESOURCE_NOT_FOUND: unknown pin identifier format');
+  }
+
   const currentRoot = this.#custodyRoot;
   const pin = currentRoot.activeSettlementPins.get(pinId);
-  if (!pin) return; // Idempotent
+  if (!pin) {
+    return { pinId, status: 'ALREADY_RELEASED' };
+  }
 
-  assertAuthoritativeSettlementEvidence(settlementEvidence);
+  // Settlement Evidence Factory Provenance and Capability Validation (C2)
+  SettlementEvidenceFactory.assertAuthoritativeEvidenceProvenance(settlementEvidence);
 
   if (
     !isEquivalentOwnerToken(pin.ownerToken, settlementEvidence.expectedOwner) ||
@@ -995,6 +1348,9 @@ public releaseSettlementPin(pinId: string, settlementEvidence: AuthoritativeSett
     throw new Error('SETTLEMENT_EVIDENCE_IDENTITY_MISMATCH');
   }
 
+  // Replay Protection: Mark evidence consumed in internal registry
+  SettlementEvidenceFactory.consumeEvidence(settlementEvidence, pinId);
+
   const candidatePinsMap = new Map(currentRoot.activeSettlementPins.entries());
   candidatePinsMap.delete(pinId);
 
@@ -1002,6 +1358,8 @@ public releaseSettlementPin(pinId: string, settlementEvidence: AuthoritativeSett
     ...currentRoot,
     activeSettlementPins: new ImmutableMap(candidatePinsMap.entries()),
   });
+
+  return { pinId, status: 'RELEASED' };
 }
 ```
 
@@ -1027,7 +1385,7 @@ Under single-realm JavaScript execution:
 | **Phase 5: Pre-Allocation**| Object instantiation fail| Synchronous throw | Root unchanged; in-flight retained |
 | **Phase 6: Eviction Check**| Oldest entry pinned/leased| Backpressure throw | Root unchanged; capacity preserved |
 | **Phase 7: Tombstone Staging**| Missing audit record | Fail-closed throw | Root unchanged; no eviction |
-| **Phase 8: Tombstone Retir.**| Tombstone pinned by lease| Backpressure throw | Root unchanged; capacity preserved |
+| **Phase 8: Tombstone Retir.**| Tombstone pinned by lease/pin/obligation | Backpressure throw | Root unchanged; capacity preserved |
 | **Phase 9: Post-Contiguity**| Key gap in candidate map | Fail-closed throw | Candidate root discarded |
 | **Phase 10: Atomic Swap** | Pointer replacement | Infallible | Single linearization point |
 | **Phase 11: Return Ref** | Return cached pointer | Infallible | Zero post-publication allocation |
@@ -1039,8 +1397,8 @@ Under single-realm JavaScript execution:
 Protocol A linearizes commitment of the operation and settles execution:
 1. `commitRetirementBatch` synchronously stages and commits the transaction in the archive.
 2. Custody gate transitions to `CUSTODY_RELEASED_BARRIER_PENDING`.
-3. Pre-allocated `DrainerCustodyReleaseReceipt` and `PendingSettlementObligation` are published atomically.
-4. Barrier resolves with `AuthoritativeSettlementEvidence` containing `CONFIRMED_COMMITTED`.
+3. Pre-allocated `DrainerCustodyReleaseReceipt`, `PendingSettlementObligation`, and `ImmutablePendingAuditRecord` are published atomically into the root.
+4. Barrier resolves with `AuthoritativeSettlementEvidence` containing `CONFIRMED_COMMITTED`, updating `generationAuditHistory`.
 5. `releaseSettlementPin` is authorized using the verified `AuthoritativeSettlementEvidence`.
 
 ---
@@ -1052,8 +1410,8 @@ Protocol B handles cancelled or uncommitted operations:
 2. Atomically fence transaction ID in archive.
 3. Transition custody gate to `RECONCILING_CUSTODY`.
 4. If destination is healthy, transfer operation; otherwise restore to source buffer.
-5. Publish release and pending obligation.
-6. Resolve barrier with `ABORTED_FENCED` evidence.
+5. Publish release, pending obligation, and pending audit record.
+6. Resolve barrier with `ABORTED_FENCED` evidence, updating `generationAuditHistory`.
 7. `releaseSettlementPin` is authorized using the verified `AuthoritativeSettlementEvidence`.
 
 ---
@@ -1088,13 +1446,13 @@ Protocol B handles cancelled or uncommitted operations:
 - **Case C (Post-Commit Rejection):** Commit succeeded; Promise rejected; irrevocable commit honored; barrier resolved committed; settlement pin released with commit evidence.
 - **Case D (Network Split / Timeout):** Watchdog fires; attempt 1 invalidated; barrier held; settlement pin remains held; attempt 2 waits at Step 4; resolves cleanly when I/O completes.
 - **Case E (Split-Brain Leader):** Fencing token mismatch; stale leader rejected; active leader reconciles.
-- **Case F (Tombstone Capacity Saturation):** Oldest tombstone pinned by lease; backpressure applied; zero generation floor gaps.
+- **Case F (Tombstone Capacity Saturation):** Oldest tombstone pinned by lease or pin; backpressure applied; zero generation floor gaps.
 - **Case G (Duplicate Retry After Eviction):** Floor advanced past generation; returns `CUSTODY_RECEIPT_EXPIRED` with compact audit tombstone verification; zero republication.
 - **Case H (Delayed Settled Retry After Attempt Change):** Settled retry arrives with Attempt 1 token while Attempt 2 is active or attempt is null; identity matched against cached receipt and audit record; acquires independent retry lease; returns cached receipt immediately without error.
 
 ---
 
-## 15. Exhaustive Failure and Retry Matrix (24 Deterministic Cases)
+## 15. Exhaustive Failure and Retry Matrix (28 Deterministic Cases)
 
 | Case | Scenario | Gate State | Custody Owner | Barrier State | Correct Action | Forbidden Action |
 |---|---|---|---|---|---|---|
@@ -1122,6 +1480,10 @@ Protocol B handles cancelled or uncommitted operations:
 | **22** | Pre-eviction result map has key gaps | `PUBLISHING` | Drainer | PENDING | Throw non-contiguous | Silently choose min key |
 | **23** | Destination transfer succeeds | `TRANSFERRED` | Destination | PENDING | Settle barrier Protocol B | Restore to source buffer |
 | **24** | Catastrophic proof corruption | `BLOCKED` | Audit Admin | DEGRADED | Latch `RECONCILIATION_BLOCKED` | Optimistic barrier resolution |
+| **25** | Retry request without stable context | `ANY` | Any | ANY | Throw `INVALID_RETRY_REQUEST_CONTEXT` | Generate random/timestamp ID |
+| **26** | Consumer 1 releases Consumer 2's lease | `ANY` | Any | ANY | Throw `UNAUTHORIZED_CROSS_CONSUMER_LEASE_RELEASE` | Delete Consumer 2's lease |
+| **27** | Settlement pin passed to lease release | `ANY` | Any | ANY | Throw `LEASE_TYPE_MISMATCH` | Delete pin as lease |
+| **28** | Retry lease passed to pin release | `ANY` | Any | ANY | Throw `PIN_TYPE_MISMATCH` | Delete lease as pin |
 
 ---
 
@@ -1131,29 +1493,30 @@ Protocol B handles cancelled or uncommitted operations:
    $$\mathbf{BARRIER\_RESOLVED}(g) \implies \mathbf{EXECUTION\_SETTLED}(g) \land \mathbf{CUSTODY\_RECONCILED}(g) \land \mathbf{DRAINER\_RELEASED}(g) \land \mathbf{EVIDENCE\_MATCHED}(g)$$
 2. **Capability-Gated Settlement-Pin Release Invariant:**
    $$\mathbf{RELEASE\_SETTLEMENT\_PIN}(pinId) \implies \mathbf{AssertAuthoritativeSettlementEvidence}(evidence) \land (\mathbf{pin.identity} \equiv \mathbf{evidence.identity})$$
-3. **Independent Retry Lease Ownership Invariant:**
-   Each concurrent retry consumer must acquire an independent `ImmutableRetryLease`; early release by one consumer cannot remove protection required by another.
-4. **Complete Retained-Record Identity Consistency Invariant:**
-   Every retained entry in `publicationResults` must match 1-to-1 across generation, 5-field token, transaction ID, operation ID, and drainer ownership generation.
-5. **Exact Dual-Map Contiguity Invariant:**
-   Both `publicationResults` and `generationAuditHistory` must satisfy exact integer key sequence contiguity from their respective floors to `publishedGeneration`.
-6. **Bounded Tombstone Retirement Invariant:**
-   Tombstone count cannot exceed 5,000; FIFO retirement must advance `auditTombstoneFloor` atomically with tombstone deletion; pinned tombstones apply fail-closed backpressure.
-7. **Attempt-Fenced First Publication Invariant:**
-   $$\mathbf{FIRST\_PUBLICATION}(g) \implies (\mathbf{callerAttempt} === \mathbf{\_currentAttemptId}) \land (\mathbf{inFlightRecord.token} === \mathbf{callerToken}) \land (g === \mathbf{publishedGeneration} + 1)$$
-8. **Settled Retry Attempt Independence Invariant:**
-   A settled retry validates exact 1-to-1 token identity against cached evidence and authoritative audit history, completely independent of `_currentAttemptId`.
-9. **Bidirectional Audit Consistency Invariant:**
-   Any structural discrepancy across `pendingSettlementObligations`, `publicationResults`, and `generationAuditHistory` fails closed.
-10. **Watchdog Pin and Lease Immunity Invariant:**
-   Watchdog timeouts CANNOT release retention pins or retry leases whose underlying operations remain unresolved.
-11. **Empty-Cache Floor Invariant:**
+3. **Mandatory Stable Retry Request Identity Invariant:**
+   All retry requests must supply non-empty, string-typed `(consumerId, clientRequestId)` bounded to $\le 256$ characters. The coordinator cannot substitute timestamps or nonces.
+4. **Independent Consumer Release Authority Invariant:**
+   A retry lease is releaseable only by the owning consumer matching all seven identity dimensions (`leaseId`, `consumerId`, `clientRequestId`, `callerToken`, `transactionId`, `operationIdentity`, `barrierIdentity`). Cross-consumer release fails closed.
+5. **Option A Audit-History Invariant:**
+   `generationAuditHistory` maintains lifecycle-discriminated records (`PENDING_PUBLICATION`, `TERMINAL_SETTLEMENT`, `COMPACT_TOMBSTONE`) such that $\mathbf{generationAuditHistory.keys()} \equiv \{\mathbf{auditTombstoneFloor} + 1, \dots, \mathbf{publishedGeneration}\}$ holds unconditionally.
+6. **Complete Tombstone Retirement Protection Invariant:**
+   Oldest tombstone cannot be retired while any active retry lease, settlement pin, or pending obligation references it.
+7. **Strict Capacity Ceiling Invariant:**
+   `MAX_AUDIT_TOMBSTONES = 5000` is an authoritative ceiling; pre-existing violations fail closed; retirement operates strictly FIFO.
+8. **Monotonic Safe-Integer Floor Invariant:**
    $$0 \le \mathbf{auditTombstoneFloor} \le \mathbf{custodyGenerationFloor} \le \mathbf{publishedGeneration}$$
-   An evicted generation ($g \le \mathbf{custodyGenerationFloor}$) can never re-enter first publication.
-12. **Strict Tombstone Capacity Ceiling:** `#fencedTransactions.size` **CANNOT** exceed 1,000 under any condition.
-13. **Single In-Flight Drain Invariant:** A second drain **CANNOT** dequeue an operation while `this.#custodyRoot.inFlightRecord !== null` ($N_{\text{in-flight}} \le 1$).
-14. **Irreversibility Precedence:** Post-commit execution failure **CANNOT** reverse an irrevocable commit or trigger Protocol B restoration.
-15. **Inseparable Release/Obligation Invariant:** A released custody state can **never** become observable without its corresponding settlement obligation already present in `this.#custodyRoot.pendingSettlementObligations`.
+9. **Complete Retained-Record Identity Consistency Invariant:**
+   Every retained entry in `publicationResults` and `generationAuditHistory` must match 1-to-1 across generation, 5-field token, transaction ID, operation ID, and drainer ownership generation.
+10. **Settled Retry Attempt Independence Invariant:**
+   A settled retry validates exact 1-to-1 token identity against cached evidence and authoritative audit history, completely independent of `_currentAttemptId`.
+11. **Evidence Factory Provenance & Replay Invariant:**
+   Level 3 settlement evidence is issued exclusively by `SettlementEvidenceFactory` within `@syncplay/protocol` and is single-use per barrier and obligation.
+12. **Cross-Resource Identifier Distinction Invariant:**
+   `releaseRetryLease` rejects settlement pins with `LEASE_TYPE_MISMATCH`. `releaseSettlementPin` rejects retry leases with `PIN_TYPE_MISMATCH`.
+13. **Watchdog Pin and Lease Immunity Invariant:**
+   Watchdog timeouts CANNOT release retention pins or retry leases whose underlying operations remain unresolved.
+14. **Single In-Flight Drain Invariant:** A second drain **CANNOT** dequeue an operation while `this.#custodyRoot.inFlightRecord !== null` ($N_{\text{in-flight}} \le 1$).
+15. **Irreversibility Precedence:** Post-commit execution failure **CANNOT** reverse an irrevocable commit or trigger Protocol B restoration.
 16. **Runtime Immutability Invariant:** Published collections and evidence references **CANNOT** be mutated through `Map.prototype` or mutable array/buffer aliases.
 
 ### Strict Ordering of Finalization:
@@ -1167,7 +1530,7 @@ The proposal excises all references to `forceEmergencyReset(capability)`:
 - Ordinary recovery APIs cannot bypass `CUSTODY_RECONCILIATION_BLOCKED`.
 - No automated root replacement is permitted while custody remains unresolved.
 - Emergency data abandonment, if ever required, needs a separate architectural decision defining operator authorization, auditability, late-settling Promise behavior, and data-loss semantics.
-- That separate decision is outside the scope of R18-R19 and is **not authorized** by this proposal.
+- That separate decision is outside the scope of R18-R20 and is **not authorized** by this proposal.
 
 ---
 
@@ -1184,36 +1547,204 @@ The proposal excises all references to `forceEmergencyReset(capability)`:
 
 The following thirty deterministic future test specifications are formally codified for Sub-Milestone M5.1:
 
-- **Test R18-R19-T01 (Two Concurrent Consumers Acquire Distinct Leases):** Consumer 1 and Consumer 2 query settled $g=1$; assert both acquire distinct `leaseId_A` and `leaseId_B`; assert `activeRetryLeases.size === 2`.
-- **Test R18-R19-T02 (Early Release by One Consumer Preserves Other Consumer Protection):** Consumer 1 releases `leaseId_A`; assert `leaseId_B` remains active in root; attempt publication of $g=1001$; assert eviction of $g=1$ blocked by backpressure.
-- **Test R18-R19-T03 (Lost-Response Retransmission Recovers Original Lease Idempotently):** Consumer 1 resends identical retry with matching `clientRequestId`; assert returns existing `leaseId_A`; assert `activeRetryLeases.size` does not increase.
-- **Test R18-R19-T04 (Duplicate Lease Release Is Idempotent No-Op):** Consumer 1 calls `releaseRetryLease(leaseId_A)` twice; assert second call returns void without error or root mutation.
-- **Test R18-R19-T05 (Consumer Failure Cleans Up Only Failing Consumer Lease):** Simulate Consumer 1 connection abort; abort cleanup releases `leaseId_A`; assert Consumer 2's `leaseId_B` remains intact.
-- **Test R18-R19-T06 (Final Lease Release Enables Generation Eviction):** Consumer 2 releases `leaseId_B`; assert $g=1$ has 0 leases and 0 pins; assert subsequent publication of $g=1001$ evicts $g=1$ cleanly.
-- **Test R18-R19-T07 (Exact Tombstone Range Key Contiguity Enforced):** Populate tombstones; artificially delete middle tombstone key; attempt publication; assert throws `STATE_INCONSISTENT_AUDIT_KEY_GAP`.
-- **Test R18-R19-T08 (Atomic Result Eviction and Tombstone Creation Linearize in Same Root):** At capacity, publish $g=1001$; assert $g=1$ deleted from `publicationResults` AND `ImmutableCompactAuditTombstone` for $g=1$ added to `generationAuditHistory` in single atomic root replacement.
-- **Test R18-R19-T09 (FIFO Tombstone Retirement at 5,000 Capacity):** Populate 5,000 tombstones; evict next result; assert oldest tombstone $g_{\text{tomb}}$ deleted and `auditTombstoneFloor` advanced to $g_{\text{tomb}}$.
-- **Test R18-R19-T10 (Pinned Oldest Tombstone Blocks Retirement via Backpressure):** Acquire retry lease on $g=1$ (now in tombstone range); reach 5,000 tombstones; assert next eviction throws `TOMBSTONE_CAPACITY_EXHAUSTED`.
-- **Test R18-R19-T11 (Lookup Within Tombstone Horizon Validates Compact Tombstone):** Query $g=1$ where $\mathbf{auditTombstoneFloor} < 1 \le \mathbf{custodyGenerationFloor}$; assert returns `CUSTODY_RECEIPT_EXPIRED` with tombstone confirmation.
-- **Test R18-R19-T12 (Missing Tombstone Inside Horizon Fails Closed as State Corruption):** Delete tombstone for $g=1$ within horizon; query $g=1$; assert throws `STATE_INCONSISTENT_TOMBSTONE_MISSING_IN_HORIZON`.
-- **Test R18-R19-T13 (Lookup Below Tombstone Floor Returns Historical Expiry):** Query $g \le \mathbf{auditTombstoneFloor}$; assert returns `CUSTODY_RECEIPT_EXPIRED` with `horizonExpired: true`.
-- **Test R18-R19-T14 (Complete Retained-Record Identity Consistency Validated):** Mutate `operationIdentity` in `obligation` of retained result; assert `assertRetentionMapContiguity` throws `STATE_INCONSISTENT_RETAINED_RECORD_CORRUPTED`.
-- **Test R18-R19-T15 (Drainer Ownership Generation Discrepancy Fails Closed):** Inject mismatched `drainerOwnershipGeneration` in release receipt; assert throws `STATE_INCONSISTENT_RETAINED_RECORD_CORRUPTED`.
-- **Test R18-R19-T16 (Settled Audit Record Identity Mismatch Fails Closed):** Inject audit record with differing `transactionId`; call retry; assert throws `STATE_INCONSISTENT_AUDIT_RESULT_IDENTITY_MISMATCH`.
-- **Test R18-R19-T17 (Attempt-Independent Settled Retry Bound to Original Token):** Advance coordinator attempt to 2; present retry for $g=1$ presenting Attempt 1 token; assert succeeds cleanly with independent lease.
-- **Test R18-R19-T18 (Settled Retry Presenting Current Attempt Token Rejected When Original Token Differs):** Present retry for $g=1$ with Attempt 2 token; assert throws `CUSTODY_PUBLICATION_TOKEN_MISMATCH`.
-- **Test R18-R19-T19 (Settlement Evidence Factory Authorization Required):** Pass caller-constructed mock evidence to `releaseSettlementPin`; assert throws `INVALID_SETTLEMENT_EVIDENCE_PROVENANCE`.
-- **Test R18-R19-T20 (Evidence Pre-Validation of Five Coordinator Facts):** Attempt evidence creation before archive confirms commit; assert factory refuses issuance.
-- **Test R18-R19-T21 (Watchdog Timeout Cannot Manufacture Settlement Evidence):** Fire 5,000 ms watchdog; assert status latches `DEGRADED`; assert factory rejects evidence issuance; assert settlement pin remains held.
-- **Test R18-R19-T22 (Post-Commit Promise Rejection Settles Committed with Warning):** Promise rejects after commit confirmed; assert factory issues `CONFIRMED_COMMITTED` evidence with execution warning; assert settlement pin released cleanly.
-- **Test R18-R19-T23 (Ambiguous Pre-Commit Promise Rejection Latches Blocked):** Promise rejects but archive status inconclusive; assert coordinator latches `CUSTODY_RECONCILIATION_BLOCKED`; assert no evidence issued.
-- **Test R18-R19-T24 (Settlement Evidence Replay Rejected):** Attempt to release pin for $g=2$ using evidence for $g=1$; assert throws `SETTLEMENT_EVIDENCE_IDENTITY_MISMATCH`.
-- **Test R18-R19-T25 (Release Retry Lease with Settlement Pin ID Rejected):** Call `releaseRetryLease` with settlement pin ID; assert throws `LEASE_TYPE_MISMATCH`.
-- **Test R18-R19-T26 (Release Settlement Pin with Retry Lease ID Rejected):** Call `releaseSettlementPin` with retry lease ID; assert throws `PIN_TYPE_MISMATCH`.
-- **Test R18-R19-T27 (Concurrent Retry Acquisition Racing with FIFO Eviction):** Synchronously serialize candidate root replacement; assert either lease acquired before eviction or eviction advances floor before lease.
-- **Test R18-R19-T28 (Map Pre-Existing Cap Violation Fails Closed Without Bulk Eviction):** Inject map with 1,005 entries; call publication; assert throws `CUSTODY_PUBLICATION_BACKPRESSURE_EXHAUSTED`.
-- **Test R18-R19-T29 (Prototype Freeze on Published Collections Prevents Map Mutation):** Invoking `.set()` or `.delete()` on `ImmutableMap` throws `UNSUPPORTED_MUTATION_ON_IMMUTABLE_COLLECTION`.
-- **Test R18-R19-T30 (Universal M5.0 Invariant Regression Suite):** Full regression across all Phase 7.5 single-owner, single-drainer, and archive arbitration invariants.
+### Test R18-R20-T01: Retry Acquisition Without Stable Request Context
+- **Initial Authoritative Root:** Settled result at $g=1$; `activeRetryLeases.size === 0`.
+- **Operation Sequence:** Call `publishReleaseAndObligation` presenting retry token for $g=1$ with `retryContext === undefined`.
+- **Expected Final Root:** Unchanged; zero leases allocated.
+- **Expected Result / Error:** Throws `INVALID_RETRY_REQUEST_CONTEXT`.
+
+### Test R18-R20-T02: Retry Acquisition With Malformed or Empty Request Context
+- **Initial Authoritative Root:** Settled result at $g=1$; `activeRetryLeases.size === 0`.
+- **Operation Sequence:** Call `publishReleaseAndObligation` presenting retry token for $g=1$ with `retryContext = { consumerId: "   ", clientRequestId: "" }`.
+- **Expected Final Root:** Unchanged; zero leases allocated.
+- **Expected Result / Error:** Throws `MALFORMED_RETRY_REQUEST_CONTEXT`.
+
+### Test R18-R20-T03: Retry Acquisition With Oversized Request Context
+- **Initial Authoritative Root:** Settled result at $g=1$; `activeRetryLeases.size === 0`.
+- **Operation Sequence:** Call `publishReleaseAndObligation` with `consumerId` of length 257 characters.
+- **Expected Final Root:** Unchanged; zero leases allocated.
+- **Expected Result / Error:** Throws `RETRY_REQUEST_CONTEXT_OVERSIZED`.
+
+### Test R18-R20-T04: Lost-Response Retransmission Recovers Original Lease Idempotently
+- **Initial Authoritative Root:** Settled result at $g=1$; `activeRetryLeases.size === 0`.
+- **Operation Sequence:**
+  1. Consumer 1 acquires lease for $g=1$ with `clientRequestId = "req-101"`; receives `leaseId_A`.
+  2. Consumer 1 retransmits identical request with matching `(consumerId, clientRequestId)`.
+- **Expected Final Root:** `activeRetryLeases.size === 1`, containing `leaseId_A`.
+- **Expected Result / Error:** Second call returns existing `leaseId_A` idempotently.
+
+### Test R18-R20-T05: Repeated Retry Acquisition With Conflicting Operation Identity
+- **Initial Authoritative Root:** Settled result at $g=1$; lease active for `(consumer1, req-101)`.
+- **Operation Sequence:** Consumer 1 submits request with `clientRequestId = "req-101"` but altered `operationIdentity`.
+- **Expected Final Root:** Unchanged.
+- **Expected Result / Error:** Throws `IDEMPOTENT_RETRY_IDENTITY_CONFLICT`.
+
+### Test R18-R20-T06: Two Distinct Consumers Acquire Independent Leases Under Same Recovery Owner Token
+- **Initial Authoritative Root:** Settled result at $g=1$; `activeRetryLeases.size === 0`.
+- **Operation Sequence:**
+  1. Consumer 1 requests lease for $g=1$ with `consumerId = "c1"`.
+  2. Consumer 2 requests lease for $g=1$ with `consumerId = "c2"`.
+- **Expected Final Root:** `activeRetryLeases.size === 2`, containing `leaseId_1` and `leaseId_2`.
+- **Expected Result / Error:** Both acquire distinct leases successfully.
+
+### Test R18-R20-T07: Consumer 1 Attempting to Release Consumer 2's Lease Fails Closed
+- **Initial Authoritative Root:** Active leases for Consumer 1 (`leaseId_1`) and Consumer 2 (`leaseId_2`).
+- **Operation Sequence:** Consumer 1 invokes `releaseRetryLease` passing `leaseId_2` with `consumerId = "c1"`.
+- **Expected Final Root:** Unchanged; both leases remain active.
+- **Expected Result / Error:** Throws `UNAUTHORIZED_CROSS_CONSUMER_LEASE_RELEASE`.
+
+### Test R18-R20-T08: Duplicate Lease Release by Authorized Consumer Is Idempotent
+- **Initial Authoritative Root:** Active lease `leaseId_1` for Consumer 1.
+- **Operation Sequence:**
+  1. Consumer 1 calls `releaseRetryLease` with all matching parameters; returns `{ status: 'RELEASED' }`.
+  2. Consumer 1 calls `releaseRetryLease` again with identical parameters.
+- **Expected Final Root:** `activeRetryLeases.has(leaseId_1) === false`.
+- **Expected Result / Error:** Second call returns `{ status: 'ALREADY_RELEASED' }` without error.
+
+### Test R18-R20-T09: First Publication With Option A Lifecycle Model
+- **Initial Authoritative Root:** `publishedGeneration = 0`, `auditTombstoneFloor = 0`, `custodyGenerationFloor = 0`.
+- **Operation Sequence:** Call `publishReleaseAndObligation` for $g=1$.
+- **Expected Final Root:**
+  - `publishedGeneration === 1`.
+  - `publicationResults.has(1) === true`.
+  - `pendingSettlementObligations.has(1) === true`.
+  - `generationAuditHistory.get(1).kind === 'PENDING_PUBLICATION'`.
+- **Expected Result / Error:** Success; contiguity invariant holds unconditionally.
+
+### Test R18-R20-T10: Pending-to-Terminal Audit History Transition
+- **Initial Authoritative Root:** Generation $g=1$ published; audit record is `PENDING_PUBLICATION`.
+- **Operation Sequence:** Barrier for $g=1$ settles with `AuthoritativeSettlementEvidence` (`CONFIRMED_COMMITTED`).
+- **Expected Final Root:** `generationAuditHistory.get(1).kind === 'TERMINAL_SETTLEMENT'`.
+- **Expected Result / Error:** Success; record upgraded in place.
+
+### Test R18-R20-T11: Eviction and Compact Tombstone Conversion
+- **Initial Authoritative Root:** Result at $g=1$ settled (`TERMINAL_SETTLEMENT`); 1,000 results retained.
+- **Operation Sequence:** Publish $g=1001$; triggers FIFO eviction of $g=1$.
+- **Expected Final Root:**
+  - `publicationResults.has(1) === false`.
+  - `custodyGenerationFloor === 1`.
+  - `generationAuditHistory.get(1).kind === 'COMPACT_TOMBSTONE'`.
+  - `generationAuditHistory.get(1).evidenceDigest` is 32-byte SHA-256.
+- **Expected Result / Error:** Success.
+
+### Test R18-R20-T12: Tombstone Retirement Blocked by Active Settlement Pin
+- **Initial Authoritative Root:** 5,000 tombstones retained; oldest tombstone $g=1$ has an active settlement pin.
+- **Operation Sequence:** Next result eviction attempts to retire tombstone $g=1$.
+- **Expected Final Root:** Unchanged; zero tombstones deleted; zero results evicted.
+- **Expected Result / Error:** Throws `TOMBSTONE_CAPACITY_EXHAUSTED`.
+
+### Test R18-R20-T13: Tombstone Retirement Blocked by Active Retry Lease
+- **Initial Authoritative Root:** 5,000 tombstones retained; oldest tombstone $g=1$ has an active retry lease.
+- **Operation Sequence:** Next result eviction attempts to retire tombstone $g=1$.
+- **Expected Final Root:** Unchanged; zero tombstones deleted; zero results evicted.
+- **Expected Result / Error:** Throws `TOMBSTONE_CAPACITY_EXHAUSTED`.
+
+### Test R18-R20-T14: Tombstone Retirement Blocked by Pending Settlement Obligation
+- **Initial Authoritative Root:** 5,000 tombstones retained; oldest tombstone $g=1$ references pending obligation.
+- **Operation Sequence:** Next result eviction attempts to retire tombstone $g=1$.
+- **Expected Final Root:** Unchanged.
+- **Expected Result / Error:** Throws `TOMBSTONE_CAPACITY_EXHAUSTED`.
+
+### Test R18-R20-T15: Normal FIFO Tombstone Retirement at 5,000 Capacity
+- **Initial Authoritative Root:** 5,000 tombstones retained ($[1 \dots 5000]$); zero pins/leases on $g=1$.
+- **Operation Sequence:** Publish new generation causing eviction and tombstone retirement.
+- **Expected Final Root:**
+  - Tombstone $g=1$ deleted from `generationAuditHistory`.
+  - `auditTombstoneFloor === 1`.
+  - Total tombstones remaining: 5,000 ($[2 \dots 5001]$).
+- **Expected Result / Error:** Success; contiguity preserved over $[2 \dots publishedGeneration]$.
+
+### Test R18-R20-T16: Pre-Existing Tombstone Count Above Cap Fails Closed
+- **Initial Authoritative Root:** Artificially injected root with 5,005 tombstones.
+- **Operation Sequence:** Call `publishReleaseAndObligation`.
+- **Expected Final Root:** Unchanged; zero bulk deletions performed.
+- **Expected Result / Error:** Throws `TOMBSTONE_CAPACITY_CORRUPTED`.
+
+### Test R18-R20-T17: Missing Tombstone Inside Promised Horizon Fails Closed
+- **Initial Authoritative Root:** `auditTombstoneFloor = 10`, `custodyGenerationFloor = 20`; tombstone $g=15$ deleted.
+- **Operation Sequence:** Call `assertAuditHistoryContiguity`.
+- **Expected Final Root:** Unchanged.
+- **Expected Result / Error:** Throws `STATE_INCONSISTENT_AUDIT_KEY_GAP`.
+
+### Test R18-R20-T18: Expiry Below Tombstone Floor Returns Historical Expiry
+- **Initial Authoritative Root:** `auditTombstoneFloor = 50`.
+- **Operation Sequence:** Query generation $g=30$.
+- **Expected Final Root:** Unchanged.
+- **Expected Result / Error:** Returns `CUSTODY_RECEIPT_EXPIRED` with `horizonExpired: true`.
+
+### Test R18-R20-T19: Floor Order Invariant Violation Fails Closed
+- **Initial Authoritative Root:** Artificially set `auditTombstoneFloor = 50`, `custodyGenerationFloor = 40`.
+- **Operation Sequence:** Call `assertAuditHistoryContiguity`.
+- **Expected Final Root:** Unchanged.
+- **Expected Result / Error:** Throws `STATE_INCONSISTENT_FLOOR_ORDER_VIOLATION`.
+
+### Test R18-R20-T20: Audit Record With Mismatched Generation Fails Closed
+- **Initial Authoritative Root:** Audit history key is 5, but record payload has `generation: 4`.
+- **Operation Sequence:** Call `assertAuditHistoryContiguity`.
+- **Expected Final Root:** Unchanged.
+- **Expected Result / Error:** Throws `AUDIT_RECORD_GENERATION_MISMATCH`.
+
+### Test R18-R20-T21: Audit Record With Mismatched Owner Token Fails Closed
+- **Initial Authoritative Root:** Audit record at $g=1$ has altered `membershipEpoch`.
+- **Operation Sequence:** Call `assertAuditHistoryContiguity` with publicationResults.
+- **Expected Final Root:** Unchanged.
+- **Expected Result / Error:** Throws `STATE_INCONSISTENT_AUDIT_RESULT_IDENTITY_MISMATCH`.
+
+### Test R18-R20-T22: Audit Record With Mismatched Drainer Ownership Generation Fails Closed
+- **Initial Authoritative Root:** Audit record at $g=1$ has altered `drainerOwnershipGeneration`.
+- **Operation Sequence:** Call `assertAuditHistoryContiguity` with publicationResults.
+- **Expected Final Root:** Unchanged.
+- **Expected Result / Error:** Throws `STATE_INCONSISTENT_AUDIT_RESULT_IDENTITY_MISMATCH`.
+
+### Test R18-R20-T23: Cross-Generation Settlement Evidence Replay Rejected
+- **Initial Authoritative Root:** Active pin for $g=2$; evidence constructed for $g=1$.
+- **Operation Sequence:** Call `releaseSettlementPin("pin:...:g2:...", evidence_g1)`.
+- **Expected Final Root:** Unchanged; pin remains active.
+- **Expected Result / Error:** Throws `SETTLEMENT_EVIDENCE_IDENTITY_MISMATCH`.
+
+### Test R18-R20-T24: Cross-Obligation Settlement Evidence Replay Rejected
+- **Initial Authoritative Root:** Evidence for $g=1$ already consumed on `pin_1`.
+- **Operation Sequence:** Attempt to reuse identical evidence on `pin_2`.
+- **Expected Final Root:** Unchanged.
+- **Expected Result / Error:** Throws `SETTLEMENT_EVIDENCE_REPLAY_DETECTED`.
+
+### Test R18-R20-T25: Caller-Constructed Mock Evidence Rejected by Provenance Check
+- **Initial Authoritative Root:** Active pin for $g=1$.
+- **Operation Sequence:** Caller constructs object matching `AuthoritativeSettlementEvidence` schema without factory.
+- **Expected Final Root:** Unchanged; pin remains active.
+- **Expected Result / Error:** Throws `INVALID_SETTLEMENT_EVIDENCE_PROVENANCE`.
+
+### Test R18-R20-T26: Watchdog Timeout Cannot Release Settlement Protection
+- **Initial Authoritative Root:** Barrier pending for $g=1$; watchdog fires after 5,000 ms.
+- **Operation Sequence:** Watchdog handler attempts to call `releaseSettlementPin` with watchdog receipt.
+- **Expected Final Root:** Pin remains active; gate state latches `DEGRADED`.
+- **Expected Result / Error:** Throws `INVALID_SETTLEMENT_EVIDENCE_PROVENANCE`.
+
+### Test R18-R20-T27: Retry Lease ID Passed to Settlement Pin Release Fails Closed
+- **Initial Authoritative Root:** Active lease `lease:1:1:c1:1`.
+- **Operation Sequence:** Call `releaseSettlementPin("lease:1:1:c1:1", evidence)`.
+- **Expected Final Root:** Unchanged.
+- **Expected Result / Error:** Throws `PIN_TYPE_MISMATCH`.
+
+### Test R18-R20-T28: Settlement Pin ID Passed to Retry Lease Release Fails Closed
+- **Initial Authoritative Root:** Active pin `pin:1:1:b1:1`.
+- **Operation Sequence:** Call `releaseRetryLease({ leaseId: "pin:1:1:b1:1", ... })`.
+- **Expected Final Root:** Unchanged.
+- **Expected Result / Error:** Throws `LEASE_TYPE_MISMATCH`.
+
+### Test R18-R20-T29: Unknown Identifier Passed to Release APIs
+- **Initial Authoritative Root:** Clean root.
+- **Operation Sequence:**
+  1. Call `releaseRetryLease` with `leaseId = "lease:unknown"`.
+  2. Call `releaseSettlementPin` with `pinId = "pin:unknown"`.
+- **Expected Final Root:** Unchanged.
+- **Expected Result / Error:** Both return `{ status: 'ALREADY_RELEASED' }` idempotently.
+
+### Test R18-R20-T30: Universal M5.0 Invariant Regression Suite
+- **Initial Authoritative Root:** Initialized system ($g=0$).
+- **Operation Sequence:** Execute sequential publication, concurrent retries, barrier settlements, FIFO result evictions, tombstone retirements, and attempt handovers across 10,000 operations.
+- **Expected Final Root:** All contiguity, identity, floor, and single-owner invariants verified.
+- **Expected Result / Error:** All assertions pass.
 
 ---
 
@@ -1221,31 +1752,32 @@ The following thirty deterministic future test specifications are formally codif
 
 ```
 ================================================================================
-ENGINEERING AUTHORITY APPROVAL QUESTIONS (MILESTONE M5.0-R18-R19):
+ENGINEERING AUTHORITY APPROVAL QUESTIONS (MILESTONE M5.0-R18-R20):
 ================================================================================
-1. [INDEPENDENT RETRY LEASE OWNERSHIP]: Does the Engineering Authority approve
-   replacing shared retry pins with independent consumer retry leases (ImmutableRetryLease),
-   ensuring early release by one consumer cannot remove eviction protection required
-   by another concurrent consumer?
+1. [MANDATORY STABLE RETRY REQUEST IDENTITY]: Does the Engineering Authority approve
+   making RetryRequestContext (consumerId, clientRequestId) strictly mandatory for
+   retry acquisitions, eliminating runtime timestamp fallbacks and guaranteeing
+   idempotency on lost-response retransmissions?
 
-2. [GENUINELY BOUNDED TOMBSTONE LIFECYCLE]: Does the Engineering Authority approve
-   capping generationAuditHistory tombstones at 5,000 entries with strict FIFO retirement,
-   enforcing dual key contiguity invariants across results and tombstones, and failing
-   closed on missing tombstones within the promised horizon?
+2. [INDEPENDENT CONSUMER RELEASE AUTHORITY]: Does the Engineering Authority approve
+   binding leaseId, consumerId, clientRequestId, callerToken, txId, opId, and
+   barrierId into releaseRetryLease(), strictly preventing unauthorized cross-consumer
+   lease releases?
 
-3. [COMPLETE RETAINED-RECORD IDENTITY CONSISTENCY]: Does the Engineering Authority approve
-   enforcing 6-dimensional identity consistency (generation, 5-field token, tx, op,
-   barrier, drainer generation) across all retained records, permanently binding
-   original publication tokens to historical generations?
+3. [OPTION A AUDIT-HISTORY MODEL & CONTINUOUS CONTIGUITY]: Does the Engineering
+   Authority approve Option A, publishing ImmutablePendingAuditRecord on first
+   publication to guarantee generationAuditHistory key contiguity unconditionally
+   across all lifecycle stages?
 
-4. [AUDITABLE SETTLEMENT EVIDENCE PROVENANCE]: Does the Engineering Authority approve
-   authorizing Level 3 evidence exclusively through SettlementEvidenceFactory,
-   pre-validating all five coordinator facts prior to settlement pin release, with
-   strict single-use replay protection?
+4. [COMPLETE TOMBSTONE RETIREMENT PROTECTION]: Does the Engineering Authority approve
+   protecting tombstones from retirement whenever active retry leases, active
+   settlement pins, or pending settlement obligations reference them, enforcing
+   MAX_AUDIT_TOMBSTONES = 5000 with fail-closed backpressure?
 
-5. [CLOSURE OF ALL ARCHITECTURAL BLOCKERS]: Does the Engineering Authority agree
-   that B1 (lease lifetime), B2 (bounded tombstones), C1 (identity consistency),
-   and C2 (evidence provenance) are fully closed without introducing new gaps?
+5. [EVIDENCE FACTORY AUTHORIZATION & CROSS-RESOURCE ENFORCEMENT]: Does the
+   Engineering Authority approve authorizing Level 3 evidence exclusively via
+   internal SettlementEvidenceFactory, rejecting watchdog receipts, and enforcing
+   strict LEASE_TYPE_MISMATCH and PIN_TYPE_MISMATCH cross-resource error semantics?
 ================================================================================
 ```
 
@@ -1255,13 +1787,13 @@ ENGINEERING AUTHORITY APPROVAL QUESTIONS (MILESTONE M5.0-R18-R19):
 
 ```
 ================================================================================
-M5.0-R18-R19 ARCHITECTURAL DECISION PROPOSAL VERDICT:
+M5.0-R18-R20 ARCHITECTURAL DECISION PROPOSAL VERDICT:
 DECISION PROPOSAL COMPLETE — READY FOR INDEPENDENT ENGINEERING AUTHORITY REVIEW
 ================================================================================
 ```
 
-This R18-R19 proposal completes the formal recovery arbitration architecture. It resolves concurrent consumer retry lease lifetimes, bounds tombstone retention with exact contiguity and FIFO retirement, enforces 6-dimensional identity consistency across all retained records, establishes auditable settlement evidence provenance, and codifies thirty deterministic future test specifications.
+This R18-R20 proposal completes the formal recovery arbitration architecture. It resolves retry lease idempotency and independent consumer release authority, formalizes the Option A audit-history lifecycle with continuous key contiguity, establishes complete tombstone retirement protection and safe integer floor invariants, enforces auditable settlement evidence provenance with single-use replay protection, specifies distinct cross-resource identifier semantics, and codifies thirty deterministic future test specifications.
 
 ### Mandatory Implementation Authorization Statement
 
-> "M5.0-R18-R19 is an architectural documentation correction only. No production implementation has been started. M5.1, including M5.1a, remains strictly unauthorized pending explicit Engineering Authority approval."
+> "M5.0-R18-R20 is an architectural documentation correction only. No production implementation has been started. M5.1, including M5.1a, remains strictly unauthorized pending explicit Engineering Authority approval."
