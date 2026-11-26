@@ -1,38 +1,69 @@
-# Phase 7.5 M5.0-R18-R23 — Restart-Safe Resource Allocation, Strict Overflow Fencing & Universal Final Acceptance Readiness
+# Phase 7.5 M5.0-R18-R24 — Durable Boot Fencing, Encapsulated Immutable Custody, Byte-Digest Equality & Strict Replay Invariant Verification
 **Concurrent Recovery Arbitration & Authoritative Settlement Architecture Decision**
 
 **Status:** PROPOSED ARCHITECTURAL AMENDMENT TO FROZEN M5.0 SPECIFICATIONS (DECISION DOCUMENT ONLY)
 **Author:** Principal TypeScript Distributed-Systems Architect and Independent Recovery-Systems Auditor
-**Baseline Commit:** `49d55afde34d3433e0b58f58562dbedbc6ce23e3` (M5.0-R18-R22)
-**Direct Parent Commit:** `49d55afde34d3433e0b58f58562dbedbc6ce23e3`
-**Authorization Scope:** M5.0-R18-R23 is strictly a documentation-only architectural proposal. No production source code, tests, configuration, package manifests, or frozen M5.0 specifications may be modified. Implementation of Milestone M5.1, including M5.1a, remains **STRICTLY BLOCKED AND UNAUTHORIZED**.
+**Baseline Commit:** `3b9651695ba33bdb104a2744e07a16771cb6cd72` (M5.0-R18-R23)
+**Direct Parent Commit:** `3b9651695ba33bdb104a2744e07a16771cb6cd72`
+**Authorization Scope:** M5.0-R18-R24 is strictly a documentation-only architectural proposal. No production source code, tests, configuration, package manifests, or frozen M5.0 specifications may be modified. Implementation of Milestone M5.1, including M5.1a, remains **STRICTLY BLOCKED AND UNAUTHORIZED**.
 
 ---
 
-## 1. Problem Statement & R18-R23 Objectives
+## 1. Problem Statement & R18-R24 Objectives
 
-In Phase 7.5 Sub-Milestone M5.0-R18-R22, we established full seven-dimensional identity validation on retired retry leases and universal evidence provenance checks on retired settlement pins. However, the subsequent architectural audit identified two critical edge-case implementation-contract gaps:
+In Phase 7.5 Sub-Milestone M5.0-R18-R23, we established the fundamental principles of restart-safe resource identification and pre-existing capacity overflow fencing. However, the subsequent independent architectural review identified six critical implementation-contract and operational correctness gaps in the concrete pseudocode and specifications:
 
-1. **Pin-ID Monotonicity Vulnerability Across Process Restarts (Blocker B1):**
-   - In R18-R22, pin IDs relied on an in-memory sequence counter (`_pinSequenceCounter`). Because the custody root is volatile in-memory state, if a process restarts, the counter reinitializes to `0`. A pin allocated in the new process could reuse an identifier that was issued, retired, and evicted in a previous process instance. A delayed release request could then match a completely different resource in the new session.
-   - *Correction:* Establish a restart-safe, non-reusable identifier allocation contract. Each coordinator instance incorporates a globally unique, non-reusable boot epoch: `coordinatorBootId: string` (a cryptographically secure, non-reusable UUIDv4 allocated at process startup and recorded in node bootstrap metadata). All pin IDs and lease IDs bind this boot epoch: `pin:${coordinatorBootId}:${generation}:${barrierIdentity}:${seq}`. The pair `(coordinatorBootId, seq)` is globally unique across time, space, and process restarts. A restarted process uses a new `coordinatorBootId`, guaranteeing that no identifier from a previous process lifetime can EVER be reissued. Interrupted allocations consume the monotonic counter without publishing the ID, preventing collisions. Delayed release requests presenting an identifier from a prior boot epoch fail closed as `RESOURCE_NOT_FOUND`.
-2. **Failure to Fail Closed on Pre-Existing Retirement Overflow (Blocker B2):**
-   - In R18-R22, the retirement logic used `if (candidateRetiredPins.size >= 5000) delete oldest; insert new;`. If pre-existing state contained more than 5,000 entries (e.g. 5,001 due to corrupted injection), deleting 1 and inserting 1 left the collection at 5,001 entries, failing to enforce the strict 5,000-entry ceiling. The same defect existed in `retiredRetryLeases` and `consumedSettlementEvidence`.
-   - *Correction:* Enforce strict pre-existing overflow detection across all three collections:
-     - `if (currentRoot.retiredSettlementPins.size > 5000) throw new Error('RETIRED_PINS_CAPACITY_CORRUPTED');`
-     - `if (currentRoot.retiredRetryLeases.size > 5000) throw new Error('RETIRED_LEASES_CAPACITY_CORRUPTED');`
-     - `if (currentRoot.consumedSettlementEvidence.size > 5000) throw new Error('CONSUMED_EVIDENCE_CAPACITY_CORRUPTED');`
-     Pre-existing violations fail closed immediately without performing unsafe partial deletions. At exactly 5,000 entries, the coordinator validates that the selected candidate is the exact oldest eligible entry, deletes it and its replay key in lockstep, and inserts the new record, strictly preserving the 5,000-entry bound.
+1. **Durable Boot Epoch Fencing & Concurrent Coordinator Protection (Reviewer Issue 1):**
+   - *Previous Defect:* R18-R23 proposed `coordinatorBootId` using UUIDv4 logged in metadata. UUIDv4 is collision-resistant but only probabilistically unique, and metadata logging alone does not guarantee that two concurrently active (or split-brain) coordinators cannot allocate conflicting namespaces or collide with prior process generations.
+   - *Architectural Correction in R24:* Formally define the coordinator boot epoch as a compound, durable fencing token:
+     `coordinatorBootEpoch: { clusterTerm: number; bootGeneration: number; bootInstanceId: string }`
+     Canonical formatted string representation:
+     `coordinatorBootId = `${clusterTerm}.${bootGeneration}.${bootInstanceId}``
+     - `bootGeneration`: A strictly monotonic, consensus-allocated durable sequence counter incremented on every node startup via distributed consensus or monotonic WAL epoch prior to accepting traffic.
+     - `clusterTerm`: The active Raft/consensus term under which this coordinator instance was granted recovery leadership. Fences out split-brain or partitioned coordinators immediately via lease checks.
+     - `bootInstanceId`: A cryptographically secure collision-resistant UUIDv4 identifying this specific process memory instance.
+     - *Guarantee:* Monotonic non-reusability across restarts is mathematically guaranteed by consensus-allocated `bootGeneration`, split-brain leader safety is enforced by `clusterTerm`, and instance collision resistance is guaranteed by `bootInstanceId`. An identifier from a prior process lifetime can NEVER be reissued in subsequent lifetimes.
 
-### Core Architectural Guarantees Established in R18-R23:
+2. **Full Lifecycle Parity for Retry Leases (Reviewer Issue 2):**
+   - *Previous Defect:* R18-R23 specified boot-epoch templates for retry leases but omitted explicit allocation and release pseudocode demonstrating symmetrical pre-existing overflow checks and exact-capacity retirement.
+   - *Architectural Correction in R24:* Fully codify and display both `_getOrAllocateRetryLease()` and `releaseRetryLease()` pseudocode, establishing exact parity with settlement pins:
+     - Lease template: `lease:${this._coordinatorBootId}:${generation}:${consumerId}:${seq}`
+     - Symmetrical pre-existing overflow check: `if (currentRoot.retiredRetryLeases.size > 5000) throw new Error('RETIRED_LEASES_CAPACITY_CORRUPTED');`
+     - Exact-capacity retirement at 5,000 entries with eligible tombstone eviction and full 7-dimensional identity verification.
 
-- **Restart-Safe Non-Reusable Pin & Lease Allocation (B1):** Binds `coordinatorBootId` into all allocated pins and retry leases, guaranteeing that evicted identifiers can never be re-issued across process restarts.
-- **Strict Pre-Existing Overflow Fencing (B2):** Pre-existing collection sizes $> 5000$ fail closed immediately with dedicated corruption errors across `retiredRetryLeases`, `retiredSettlementPins`, and `consumedSettlementEvidence`.
-- **Lockstep Atomic Replay Pruning:** At exactly 5,000 entries, retired pins and consumed evidence keys are pruned in lockstep within a single atomic candidate-root replacement.
-- **Exhaustive Deterministic Test Suite (40 Test Cases):** Codifies forty deterministic future test specifications in Section 19 covering cross-restart isolation, interrupted allocation, pre-existing overflow rejection, and exact-capacity lockstep eviction.
+3. **Genuinely Encapsulated Immutable Custody Root Collections (Reviewer Issue 3 & 4):**
+   - *Previous Defect:* R18-R23 pseudocode utilized `Object.freeze(nextActive)` on native JavaScript `Map` and `Set` instances. In JavaScript, `Object.freeze()` on a `Map` or `Set` does NOT prevent mutations via `.set()`, `.delete()`, or `.clear()`, violating the immutable custody-root invariant.
+   - *Architectural Correction in R24:* Eliminate all naive `Object.freeze(new Map())` patterns. Re-establish canonical, deeply encapsulated `ImmutableMap<K, V>` and `ImmutableSet<T>` class wrappers where internal state is completely private, mutating operations throw or return brand-new immutable instances, and native mutating methods are completely inaccessible.
+
+4. **Byte-for-Byte Digest Comparison & Complete Structured Owner-Token Identity (Reviewer Issue 3 & 4):**
+   - *Previous Defect:* R18-R23 pseudocode performed reference comparison `retiredPin.evidenceDigest !== settlementEvidence.evidenceDigest`. For byte containers (`Uint8Array`), reference equality fails even for identical digest contents. Additionally, owner token identity had been simplified to plain string comparisons in illustrative summaries.
+   - *Architectural Correction in R24:*
+     - Restore constant-time, byte-for-byte digest comparison: `areEqualByteArrays(a: Uint8Array, b: Uint8Array): boolean` with mandatory defensive byte copying (`cloneByteArray(src)`) on ingress and egress.
+     - Restore complete structured owner token identity: `CustodyOwnershipToken` (`recoveryAttemptId`, `custodyGeneration`, `drainerOwnershipGeneration`, `transactionId`, `operationIdentity`, `barrierIdentity`, `leaseTerm`, `ownerSignature: Uint8Array`) compared via `isEquivalentOwnerToken()`.
+
+5. **Deterministic Oldest Eligible Tombstone Eviction with Backpressure (Reviewer Issue 2A):**
+   - *Previous Defect:* R18-R23 assumed the oldest entry in `candidateRetired` was unconditionally eligible for eviction. If the oldest entry was protected by an active retry lease, active settlement pin, or pending settlement obligation, silent eviction would violate active retention guarantees.
+   - *Architectural Correction in R24:* Codify explicit eligibility search methods:
+     `_findOldestEligibleRetiredPin(currentRoot, candidateRetired)` and `_findOldestEligibleRetiredLease(currentRoot, candidateRetired)`.
+     If collection size is exactly 5,000 and all 5,000 entries are currently protected, the coordinator fails closed with `RETENTION_CAPACITY_EXHAUSTED_BACKPRESSURE` (or `RETIRED_LEASES_CAPACITY_EXHAUSTED_BACKPRESSURE`), strictly refusing to evict protected entries.
+
+6. **Strict Replay-Key Lockstep & Post-Publication Invariant Verification (Reviewer Issue 2B, 5, 6):**
+   - *Previous Defect:* R18-R23 called `candidateConsumed.delete(oldestReplayKey)` without checking whether the key existed or corresponded to the evicted record. If missing, `delete` returned false, allowing the subsequent insertion to push `candidateConsumed.size` to 5,001 entries, silently violating the bound.
+   - *Architectural Correction in R24:*
+     - Before deleting from `candidateConsumed`, the coordinator validates that `candidateConsumed.has(oldestReplayKey)` is strictly true; if false, it throws `REPLAY_KEY_DESYNCHRONIZATION_CORRUPTED`.
+     - Implement a mandatory pre-swap validation method: `_validatePostPublicationInvariants(candidateRoot)` that unconditionally verifies collection sizes $\le 5000$, verifies that every retired pin has its exact replay key in `consumedSettlementEvidence`, and confirms that collection sizes remain in exact lockstep (`retiredSettlementPins.size === consumedSettlementEvidence.size`).
+
+### Core Architectural Guarantees Established in R18-R24:
+
+- **Compound Durable Boot Epoch Fencing:** Binds consensus term, monotonic WAL generation, and instance UUID into all allocated pins and retry leases, guaranteeing zero cross-restart or split-brain collisions.
+- **Symmetrical Retry Lease Lifecycle:** Explicit allocation, strict pre-existing overflow fencing, eligible tombstone eviction, and full 7-dimensional validation for retry leases.
+- **Genuine Collection Encapsulation:** Enforces deep immutability via `ImmutableMap` and `ImmutableSet` across all custody root structures.
+- **Constant-Time Byte-Digest & Structured Owner Identity:** Enforces bitwise byte comparison for evidence digests and full 8-field verification for owner tokens.
+- **Eligible Tombstone Eviction with Backpressure:** Guarantees that protected resources are never evicted, failing closed with backpressure when retention capacity is saturated.
+- **Post-Publication Cross-Collection Integrity:** Enforces exact lockstep eviction and post-publication invariant checks, making collection overflows mathematically impossible.
+- **Exhaustive Deterministic Test Suite (44 Test Cases):** Codifies forty-four deterministic future test specifications in Section 19 covering boot fencing, encapsulated immutable collections, byte digest equality, and post-publication invariant validation.
 
 ---
-
 ## 2. Separation of the Three Independent Conditions
 
 A correct recovery arbitration architecture must strictly distinguish three independent system conditions:
@@ -179,7 +210,7 @@ The system enforces strict monotonic ordering of generations:
   $$0 \le \mathbf{auditTombstoneFloor} \le \mathbf{custodyGenerationFloor} \le \mathbf{publishedGeneration}$$
   All floors and generations must be non-negative safe integers (`Number.isSafeInteger(x) && x >= 0`).
 
-### 8.2 Safe Tombstone Eviction & Generation Ordering Invariants
+### 8.2 Safe Tombstone Eviction & Compound Boot Epoch Fencing
 
 To bound memory while preventing stale execution:
 
@@ -187,42 +218,50 @@ To bound memory while preventing stale execution:
 - If eviction occurs, the generation floor advances monotonically:
   $$\mathbf{fencingGenerationFloor} = \max(\mathbf{fencingGenerationFloor},\; g_{\text{evicted}})$$
 
+#### Compound Durable Coordinator Boot Epoch:
+To guarantee that resource identifiers are mathematically non-reusable across process restarts and split-brain coordinator transitions:
+- Every coordinator instance is bound to a compound durable fencing token:
+  $$\mathbf{coordinatorBootEpoch} = \langle \mathbf{clusterTerm},\; \mathbf{bootGeneration},\; \mathbf{bootInstanceId} \rangle$$
+  formatted canonically as:
+  $$\mathbf{coordinatorBootId} = \text{"}\mathbf{clusterTerm}.\mathbf{bootGeneration}.\mathbf{bootInstanceId}\text{"}$$
+- **Cluster Term ($\mathbf{clusterTerm}$):** Monotonically increasing consensus term (e.g. Raft term) under which recovery leadership was granted. Fences out stale or partitioned coordinators immediately upon leadership transfer.
+- **Boot Generation ($\mathbf{bootGeneration}$):** Monotonically increasing sequence number persisted and fsynced to Write-Ahead Log (WAL) or consensus state before coordinator traffic admission. Guarantees mathematical non-reusability across process restarts on the same or migrating node.
+- **Boot Instance ID ($\mathbf{bootInstanceId}$):** Cryptographically secure, collision-resistant UUIDv4 uniquely identifying the in-memory process execution lifetime.
+- Every allocated settlement pin and retry lease binds $\mathbf{coordinatorBootId}$ as a prefix. Because $\mathbf{bootGeneration}$ never decreases and $\mathbf{clusterTerm}$ fences split-brain leaders, an evicted identifier from an earlier session can never be re-issued in subsequent sessions.
+
 ### 8.3 Empty-Cache and Generation-Floor Semantics
 
 A robust distributed recovery engine must define exact invariants when `publicationResults` is empty:
 
 1. **Initial State (Never Published):**
    - At system initialization: `publishedGeneration = 0`, `custodyGenerationFloor = 0`, `auditTombstoneFloor = 0`, `publicationResults.size = 0`, `pendingSettlementObligations.size = 0`, `generationAuditHistory.size = 0`, `activeSettlementPins.size = 0`, `activeRetryLeases.size = 0`, `retiredRetryLeases.size = 0`, `retiredSettlementPins.size = 0`, `consumedSettlementEvidence.size = 0`.
-   - Any query for $g \le 0$ fails with `INVALID_GENERATION_DOMAIN`.
-   - The first valid first-publication generation is $g = 1$ ($1 = 0 + 1$).
-2. **Empty Cache After Historical Eviction (Fully Evicted):**
-   - Suppose generations $1 \dots N$ were published and subsequently all $N$ detailed results were evicted via safe FIFO eviction.
-   - The state is: `publishedGeneration = N`, `custodyGenerationFloor = N`, `publicationResults.size = 0`, `pendingSettlementObligations.size = 0`.
-   - The system distinguishes this state from the initial uninitialized state by inspecting `publishedGeneration`:
-     - If `publishedGeneration === 0`: Cache is empty because no generation has ever been published.
-     - If `publishedGeneration > 0`: Cache is empty because all published generations $1 \dots N$ have been evicted.
-3. **Monotonic Floor Immunity Against Republication:**
-   - Any retry presented for $g \le \mathbf{custodyGenerationFloor}$ (where $\mathbf{custodyGenerationFloor} = N$) immediately matches the floor check:
-     $$g \le \mathbf{custodyGenerationFloor} \implies \text{Evaluated against tombstone horizon}$$
-   - **Mathematical Proof of First-Publication Immunity:**
-     First publication requires $g === \mathbf{publishedGeneration} + 1 = N + 1$.
-     Since $g \le \mathbf{custodyGenerationFloor}$ and $\mathbf{custodyGenerationFloor} \le \mathbf{publishedGeneration}$, we have $g \le N < N + 1$.
-     Therefore, an evicted generation $g \le \mathbf{custodyGenerationFloor}$ can **never** satisfy the first-publication sequence requirement $g === \mathbf{publishedGeneration} + 1$, guaranteeing it can never re-enter first publication, reacquire custody, or fabricate duplicate obligations.
-4. **Seamless Sequential Publication Resumption:**
-   - When the cache is completely empty after historical eviction (`custodyGenerationFloor = N`, `publishedGeneration = N`), the next valid first-publication is $g = N + 1$.
-   - The first-publication precondition $g === \text{currentRoot.publishedGeneration} + 1$ evaluates to $N + 1 === N + 1 \implies \mathbf{true}$.
-   - Candidate root construction sets `candidatePublishedGeneration = N + 1`, leaves `candidateGenerationFloor = N` (floor does not advance on insertion), and inserts the new result at key $N + 1$.
-   - The resulting cache contains exactly 1 entry covering $[N+1, N+1]$. Sequential publication proceeds without disruption.
+   - The first valid publication generation is strictly $g = 1$.
+   - Any query or retry for generation $g \le 0$ throws `INVALID_GENERATION_DOMAIN`.
+2. **Post-Eviction Empty State (Cache Completely Trimmed):**
+   - If all retained results in `publicationResults` are evicted to `COMPACT_TOMBSTONE` records in `generationAuditHistory`:
+     `publishedGeneration = N`, `custodyGenerationFloor = N`, `publicationResults.size = 0`.
+   - The contiguity predicate holds vacuously for the empty set: $\text{keys}(publicationResults) \equiv \emptyset \equiv \{N + 1, \dots, N\}$.
+   - In this state:
+     - The next valid first-publication generation is strictly $g = N + 1$.
+     - Any retry for generation $g \le N$:
+       - If $g > \text{auditTombstoneFloor}$, it locates the tombstone in `generationAuditHistory` and throws `CUSTODY_RECEIPT_EXPIRED` (with validated token equality).
+       - If $g \le \text{auditTombstoneFloor}$, the tombstone has been pruned; the coordinator throws `CUSTODY_RECEIPT_EXPIRED`.
+     - In neither case can an empty cache be misinterpreted as a system-reset or permit publication of an arbitrary out-of-order generation.
 
-### 8.4 Protection of Active Reservations, No-Active-Reservations Rule & Strict Backpressure Recovery
+### 8.4 Protection of Active Reservations, Eligible Tombstone Search & Strict Backpressure Recovery
 
-- If `MAX_TOMBSTONES = 1000` is reached in archive or `MAX_AUDIT_TOMBSTONES = 5000` in custody, eviction selects the lowest generation $g$.
-- If $g$ belongs to an active retry lease, active settlement pin, or pending settlement obligation, eviction is blocked.
-- **Strict FIFO Preservation:** Eviction **cannot** skip active reservations. Skipping would create generation gaps in the tombstone map and violate monotonic floor invariants.
-- Instead, the coordinator applies **strict backpressure**: new requests are rejected with `TOMBSTONE_CAPACITY_EXHAUSTED` until active operations complete and release their pins or leases.
+A tombstone or retired resource cannot be evicted while active reservations or dependent consumers rely upon it:
 
----
-
+1. **Active Settlement Pin Protection:**
+   - A retired pin or tombstone for generation $g$ cannot be evicted if an active settlement pin exists in `activeSettlementPins` for generation $g$.
+2. **Active Retry Lease Protection:**
+   - A retired pin or tombstone for generation $g$ cannot be evicted if an active retry lease exists in `activeRetryLeases` for generation $g$ with `expiresAtMonotonicMs > performance.now()`.
+3. **Pending Settlement Obligation Protection:**
+   - A retired pin or tombstone for generation $g$ cannot be evicted if `pendingSettlementObligations.has(g)` is true.
+4. **Deterministic Eligible Tombstone Search & Fail-Closed Backpressure:**
+   - When collection capacity reaches 5,000 entries, the coordinator searches deterministically for the oldest *eligible* entry that satisfies all three protection rules.
+   - If all 5,000 entries are currently protected by active pins, active leases, or pending obligations, the coordinator strictly refuses to perform silent or unsafe eviction.
+   - Instead, the operation aborts and fails closed with `RETENTION_CAPACITY_EXHAUSTED_BACKPRESSURE` (or `RETIRED_LEASES_CAPACITY_EXHAUSTED_BACKPRESSURE` / `CUSTODY_PUBLICATION_BACKPRESSURE_EXHAUSTED`), signaling callers to retry after active consumers have released their protection.
 ## 9. Process Failure Model & Monotonic Clock Semantics
 
 ### Decoupled Clock Semantics:
@@ -379,26 +418,171 @@ Each barrier resolves at most once. A barrier cannot be reused for a different g
 
 ### 12.9 Runtime Immutability of Published Collections
 
-`Object.freeze()` on a native `Map` or `Set` does not prevent calls to `.set()`, `.delete()`, or `.clear()`. Therefore, all published collections are encapsulated in `ImmutableMap` and `ImmutableSet` wrappers whose mutation methods throw `UNSUPPORTED_MUTATION_ON_IMMUTABLE_COLLECTION`.
+In ECMAScript environments, applying `Object.freeze()` to native `Map` or `Set` instances freezes only the object prototype and property descriptors; it does **not** intercept internal slots, meaning `.set()`, `.delete()`, and `.clear()` continue to mutate the collection contents in place.
 
-#### Defensive Handling of Byte Arrays:
-All byte arrays, buffers, and payload digests (`Uint8Array`) are defensively copied via `.slice()` before receipt construction and frozen to prevent external mutations from corrupting published state.
+To enforce absolute custody-root immutability, all published collections are encapsulated in genuinely immutable wrapper classes (`ImmutableMap<K, V>` and `ImmutableSet<T>`). These wrappers encapsulate the internal map/set in private backing storage, omit mutating methods, provide read-only iteration interfaces, and return new immutable instances upon copy-on-write operations (`.set()`, `.delete()`, `.add()`).
+
+```typescript
+export class ImmutableMap<K, V> implements Iterable<[K, V]> {
+  private readonly _inner: ReadonlyMap<K, V>;
+
+  public constructor(entries?: Iterable<readonly [K, V]> | ReadonlyMap<K, V>) {
+    this._inner = entries instanceof Map ? new Map(entries) : new Map(entries ?? []);
+    Object.freeze(this);
+  }
+
+  public get size(): number {
+    return this._inner.size;
+  }
+
+  public get(key: K): V | undefined {
+    return this._inner.get(key);
+  }
+
+  public has(key: K): boolean {
+    return this._inner.has(key);
+  }
+
+  public entries(): IterableIterator<[K, V]> {
+    return this._inner.entries();
+  }
+
+  public keys(): IterableIterator<K> {
+    return this._inner.keys();
+  }
+
+  public values(): IterableIterator<V> {
+    return this._inner.values();
+  }
+
+  public [Symbol.iterator](): IterableIterator<[K, V]> {
+    return this._inner[Symbol.iterator]();
+  }
+
+  public set(key: K, value: V): ImmutableMap<K, V> {
+    const next = new Map(this._inner);
+    next.set(key, value);
+    return new ImmutableMap(next);
+  }
+
+  public delete(key: K): ImmutableMap<K, V> {
+    const next = new Map(this._inner);
+    next.delete(key);
+    return new ImmutableMap(next);
+  }
+}
+
+export class ImmutableSet<T> implements Iterable<T> {
+  private readonly _inner: ReadonlySet<T>;
+
+  public constructor(values?: Iterable<T> | ReadonlySet<T>) {
+    this._inner = values instanceof Set ? new Set(values) : new Set(values ?? []);
+    Object.freeze(this);
+  }
+
+  public get size(): number {
+    return this._inner.size;
+  }
+
+  public has(value: T): boolean {
+    return this._inner.has(value);
+  }
+
+  public values(): IterableIterator<T> {
+    return this._inner.values();
+  }
+
+  public [Symbol.iterator](): IterableIterator<T> {
+    return this._inner[Symbol.iterator]();
+  }
+
+  public add(value: T): ImmutableSet<T> {
+    const next = new Set(this._inner);
+    next.add(value);
+    return new ImmutableSet(next);
+  }
+
+  public delete(value: T): ImmutableSet<T> {
+    const next = new Set(this._inner);
+    next.delete(value);
+    return new ImmutableSet(next);
+  }
+}
+```
+
+#### Defensive Handling of Byte Arrays & Bitwise Digest Comparison:
+All byte arrays, buffers, and cryptographic payload digests (`Uint8Array`) are defensively cloned via `new Uint8Array(src)` on ingress before storage and on egress before return.
+
+Equality comparisons across byte containers **never** use reference equality (`===` or `!==`), which fail for independently allocated arrays with identical bytes. Instead, equality is evaluated strictly via constant-time bitwise comparison:
+
+```typescript
+export function areEqualByteArrays(a: Uint8Array, b: Uint8Array): boolean {
+  if (a.length !== b.length) return false;
+  let mismatch = 0;
+  for (let i = 0; i < a.length; i++) {
+    mismatch |= a[i] ^ b[i];
+  }
+  return mismatch === 0;
+}
+
+export function cloneByteArray(src: Uint8Array): Uint8Array {
+  const dest = new Uint8Array(src.length);
+  dest.set(src);
+  return dest;
+}
+```
+
+#### Structured Owner Token Identity Preservation:
+Owner token equality is strictly preserved across all eight structural dimensions, including attempt ID, generation, transaction, operation, barrier, lease term, and digital signature:
+
+```typescript
+export function isEquivalentOwnerToken(a: CustodyOwnershipToken | null, b: CustodyOwnershipToken | null): boolean {
+  if (a === b) return true;
+  if (!a || !b) return false;
+  return (
+    a.recoveryAttemptId === b.recoveryAttemptId &&
+    a.custodyGeneration === b.custodyGeneration &&
+    a.drainerOwnershipGeneration === b.drainerOwnershipGeneration &&
+    a.transactionId === b.transactionId &&
+    a.operationIdentity === b.operationIdentity &&
+    a.barrierIdentity === b.barrierIdentity &&
+    a.leaseTerm === b.leaseTerm &&
+    areEqualByteArrays(a.ownerSignature, b.ownerSignature)
+  );
+}
+```
 
 ### 12.10 Ingress and Egress Nested Evidence Alias Closure
 
 All objects entering `AuthoritativeCustodyRoot` are deeply cloned and frozen on ingress. All objects returned from publication methods are immutable cached references, preventing reference sharing and memory corruption.
-
 ### 12.11 Permitted Generation Domain & Sequence Exhaustion Boundary
 
 - Permitted generations: integers $g \in [1, \text{Number.MAX\_SAFE\_INTEGER}]$.
 - Out-of-domain values ($g \le 0$, non-integers, NaN, $\infty$) are rejected upfront with `INVALID_GENERATION_DOMAIN`.
 - Sequence exhaustion ($g = \text{Number.MAX\_SAFE\_INTEGER}$) triggers fail-closed `GENERATION_SEQUENCE_EXHAUSTED`.
 
-### 12.12 The Complete Lifecycle Publication, Restart-Safe Resource Allocation, Strict Overflow Fencing & Universal Final Acceptance Readiness
+### 12.12 The Complete Lifecycle Publication, Durable Boot Fencing, Encapsulated Immutable Custody & Strict Replay Invariant Verification
 
 #### The Complete Custody Root State Structure:
 
 ```typescript
+export interface CoordinatorBootEpoch {
+  readonly clusterTerm: number;       // Monotonic consensus term under which leadership was granted
+  readonly bootGeneration: number;    // Durable monotonically incrementing boot sequence (WAL/consensus)
+  readonly bootInstanceId: string;    // Collision-resistant cryptographically secure UUIDv4
+}
+
+export interface CustodyOwnershipToken {
+  readonly recoveryAttemptId: string;
+  readonly custodyGeneration: number;
+  readonly drainerOwnershipGeneration: number;
+  readonly transactionId: string;
+  readonly operationIdentity: string;
+  readonly barrierIdentity: string;
+  readonly leaseTerm: number;
+  readonly ownerSignature: Uint8Array;
+}
+
 export interface InFlightCustodyRecord {
   readonly token: CustodyOwnershipToken;
   readonly dequeuedAtTimestamp: number;
@@ -440,7 +624,7 @@ export interface PublicationResponse {
   readonly retryLeaseId: string | null; // Non-null on retries; null on first publication
 }
 
-// Blockers B1 & C1: Bound 7-dimensional active and retired records with restart-safe boot ID
+// B1 & C1: Bound 7-dimensional active and retired records with compound durable boot epoch
 export interface ImmutableSettlementPin {
   readonly pinId: string; // pin:${coordinatorBootId}:${generation}:${barrierIdentity}:${seq}
   readonly generation: number;
@@ -448,9 +632,10 @@ export interface ImmutableSettlementPin {
   readonly ownerToken: CustodyOwnershipToken;
   readonly transactionId: string;
   readonly operationIdentity: string;
-  readonly drainerOwnershipGeneration: number; // Block C1: Bound & checked!
+  readonly drainerOwnershipGeneration: number;
   readonly acquiredAtTimestamp: number;
   readonly monotonicAcquiredMs: number;
+  readonly allocatedBootEpoch: CoordinatorBootEpoch;
 }
 
 export interface ImmutableRetiredPinRecord {
@@ -464,6 +649,7 @@ export interface ImmutableRetiredPinRecord {
   readonly releasedAtTimestamp: number;
   readonly monotonicReleasedMs: number;
   readonly evidenceDigest: Uint8Array;
+  readonly allocatedBootEpoch: CoordinatorBootEpoch;
 }
 
 export interface RetryRequestContext {
@@ -483,6 +669,7 @@ export interface ImmutableRetryLease {
   readonly acquiredAtTimestamp: number;
   readonly monotonicAcquiredMs: number;
   readonly expiresAtMonotonicMs: number;
+  readonly allocatedBootEpoch: CoordinatorBootEpoch;
 }
 
 export interface ImmutableRetiredLeaseRecord {
@@ -496,6 +683,7 @@ export interface ImmutableRetiredLeaseRecord {
   readonly barrierIdentity: string;
   readonly releasedAtTimestamp: number;
   readonly monotonicReleasedMs: number;
+  readonly allocatedBootEpoch: CoordinatorBootEpoch;
 }
 
 // Option A: Lifecycle-Discriminated Audit Records
@@ -560,9 +748,9 @@ export interface AuthoritativeCustodyRoot {
   readonly generationAuditHistory: ImmutableMap<number, GenerationAuditRecord>;
   readonly activeSettlementPins: ImmutableMap<string, ImmutableSettlementPin>;
   readonly activeRetryLeases: ImmutableMap<string, ImmutableRetryLease>;
-  readonly retiredRetryLeases: ImmutableMap<string, ImmutableRetiredLeaseRecord>;     // B1: Authoritative retired leases
-  readonly retiredSettlementPins: ImmutableMap<string, ImmutableRetiredPinRecord>;   // B1: Authoritative retired pins
-  readonly consumedSettlementEvidence: ImmutableSet<string>;                         // C2: Bounded in-root replay protection
+  readonly retiredRetryLeases: ImmutableMap<string, ImmutableRetiredLeaseRecord>;
+  readonly retiredSettlementPins: ImmutableMap<string, ImmutableRetiredPinRecord>;
+  readonly consumedSettlementEvidence: ImmutableSet<string>;
 }
 
 export interface ReleaseRetryLeaseParams {
@@ -576,51 +764,49 @@ export interface ReleaseRetryLeaseParams {
 }
 ```
 
-#### Restart-Safe Non-Reusable Pin & Lease Allocation Contract (Blocker B1):
+#### Durable Coordinator Boot Epoch Fencing Contract:
 
-To prevent identifier collisions across process restarts without relying on mutable in-memory counters:
-1. **Durable Non-Reusable Coordinator Boot Epoch (`coordinatorBootId`):**
-   - At coordinator bootstrap, a cryptographically secure, non-reusable identifier `coordinatorBootId` (e.g. UUIDv4 or monotonic consensus boot epoch) is generated and durably logged in archive initialization metadata.
-   - All pin identifiers follow the canonical template:
-     `pin:${this._coordinatorBootId}:${generation}:${barrierIdentity}:${seq}`
-   - All retry lease identifiers follow the canonical template:
-     `lease:${this._coordinatorBootId}:${generation}:${consumerId}:${seq}`
-2. **Mathematical Collision-Free Guarantee:**
-   - Within a process instance, `seq` is strictly monotonic (`++this._pinSequenceCounter`).
-   - Across process restarts, `coordinatorBootId_new !== coordinatorBootId_old`.
-   - Therefore, the composite pair $(coordinatorBootId, seq)$ forms a globally unique tuple across time, space, and process restarts.
-   - An identifier issued, retired, and evicted in a previous process instance can **never** be reissued in a subsequent process instance, even if the sequence counter reinitializes to `0`.
+To prevent resource identifier collisions across process restarts and split-brain coordinator transitions:
+1. **Compound Durable Boot Epoch (`coordinatorBootEpoch`):**
+   - At coordinator startup, the node establishes a compound boot epoch:
+     `this._coordinatorBootEpoch = { clusterTerm, bootGeneration, bootInstanceId }`
+   - Formatted canonical string:
+     `this._coordinatorBootId = `${clusterTerm}.${bootGeneration}.${bootInstanceId}``
+   - `clusterTerm`: Monotonic consensus term under which recovery leadership was granted; stale coordinators lose lease validity and cannot execute arbitration.
+   - `bootGeneration`: Monotonically incrementing sequence number persisted and fsynced to Write-Ahead Log (WAL) or consensus state before coordinator traffic admission; mathematically prevents sequence counter reuse across node restarts.
+   - `bootInstanceId`: Cryptographically secure, collision-resistant UUIDv4 uniquely identifying this specific process memory execution.
+2. **Canonical Non-Reusable Identifier Templates:**
+   - Settlement Pin: `pin:${this._coordinatorBootId}:${generation}:${barrierIdentity}:${seq}`
+   - Retry Lease: `lease:${this._coordinatorBootId}:${generation}:${consumerId}:${seq}`
 3. **Allocation Interruption Semantics:**
    - Pin and lease allocations execute synchronously during candidate root construction.
-   - If candidate construction or invariant validation throws an exception prior to the atomic pointer replacement `this.#custodyRoot = candidateRoot`, the reserved sequence counter `seq` is consumed/discarded, and the ID is never published to the active collections.
-   - A discarded sequence counter is never reused, guaranteeing zero collisions.
+   - If candidate construction or invariant validation throws an exception prior to the atomic pointer replacement `this.#custodyRoot = candidateRoot`, the reserved sequence counter `seq` is consumed/discarded, and the ID is never published to active collections, guaranteeing zero identifier collisions.
 4. **Cross-Restart Delayed Release Rejection:**
-   - A delayed release request presenting an identifier from an earlier process lifetime (`coordinatorBootId_old`) will look up that identifier in the active and retired maps of the new process lifetime (`coordinatorBootId_new`).
-   - Because the restarted instance never issued that identifier, it is absent from both maps.
-   - The coordinator fails closed with `RESOURCE_NOT_FOUND`. It can never erroneously collide with a newly allocated resource in the new session.
+   - Any delayed release request presenting an identifier from an earlier process lifetime (`bootGeneration_old`) fails closed as `RESOURCE_NOT_FOUND` because the new instance (`bootGeneration_new`) has never allocated or retired that identifier.
 
-#### Strict Pre-Existing Overflow Fencing & Lockstep Retirement (Blocker B2):
+#### Symmetrical Pre-Existing Overflow Fencing & Backpressure:
 
-To enforce strict bounded memory and fail closed under corrupted pre-existing states:
 1. **Pre-Existing Capacity Fencing:**
-   - Before any retired record insertion, the coordinator validates that pre-existing collection sizes do not exceed the authoritative cap:
+   - Before any retired record insertion, the coordinator validates that pre-existing collection sizes do not exceed the authoritative 5,000-entry cap:
      ```typescript
      if (currentRoot.retiredSettlementPins.size > 5000) {
-       throw new Error('RETIRED_PINS_CAPACITY_CORRUPTED: pre-existing retired pins count exceeds 5000');
+       throw new Error('RETIRED_PINS_CAPACITY_CORRUPTED: pre-existing count exceeds 5000');
      }
      if (currentRoot.retiredRetryLeases.size > 5000) {
-       throw new Error('RETIRED_LEASES_CAPACITY_CORRUPTED: pre-existing retired leases count exceeds 5000');
+       throw new Error('RETIRED_LEASES_CAPACITY_CORRUPTED: pre-existing count exceeds 5000');
      }
      if (currentRoot.consumedSettlementEvidence.size > 5000) {
-       throw new Error('CONSUMED_EVIDENCE_CAPACITY_CORRUPTED: pre-existing consumed evidence count exceeds 5000');
+       throw new Error('CONSUMED_EVIDENCE_CAPACITY_CORRUPTED: pre-existing count exceeds 5000');
      }
      ```
    - If pre-existing corruption exists ($> 5000$), the system fails closed immediately. It **does not** perform silent single-entry trimming.
-2. **Lockstep FIFO Trimming at Exactly 5,000 Capacity:**
-   - In steady state, when `candidateRetiredPins.size === 5000`, the coordinator selects the oldest eligible entry by insertion order / monotonic release timestamp.
-   - The oldest retired pin is removed from `candidateRetiredPins`, and its corresponding replay key `${generation}:${barrierIdentity}:${oldestPinId}` is removed from `candidateConsumed` in the **exact same candidate mutation**.
-   - The new retired pin and replay key are inserted, maintaining the collection at exactly 5,000 entries.
-   - Equivalent capacity semantics are enforced for `retiredRetryLeases`.
+2. **Deterministic Oldest Eligible Tombstone Search & Backpressure:**
+   - At exactly 5,000 entries (`candidateRetired.size === 5000`), the coordinator searches for the oldest *eligible* entry that is not protected by active retry leases, active settlement pins, or pending settlement obligations.
+   - If all 5,000 entries are currently protected, the operation aborts and fails closed with `RETENTION_CAPACITY_EXHAUSTED_BACKPRESSURE` (or `RETIRED_LEASES_CAPACITY_EXHAUSTED_BACKPRESSURE`), strictly refusing to evict protected entries.
+3. **Lockstep Atomic Replay Retention & Post-Publication Invariant Verification:**
+   - For retired pins, the coordinator validates that the replay key `${oldestRecord.generation}:${oldestRecord.barrierIdentity}:${oldestPinId}` strictly exists in `candidateConsumed`; if missing, it throws `REPLAY_KEY_DESYNCHRONIZATION_CORRUPTED`.
+   - The oldest pin and its replay key are deleted in lockstep, and the new pin and new replay key are inserted.
+   - Before publication, `_validatePostPublicationInvariants()` verifies that all three collections are $\le 5000$, confirms that every retired pin has its exact replay key, and verifies size lockstep (`retiredSettlementPins.size === consumedSettlementEvidence.size`).
 
 ---
 
@@ -633,10 +819,32 @@ const AUTHORIZED_EVIDENCE_REGISTRY = new WeakSet<AuthoritativeSettlementEvidence
 
 export function areEqualByteArrays(a: Uint8Array, b: Uint8Array): boolean {
   if (a.length !== b.length) return false;
+  let mismatch = 0;
   for (let i = 0; i < a.length; i++) {
-    if (a[i] !== b[i]) return false;
+    mismatch |= a[i] ^ b[i];
   }
-  return true;
+  return mismatch === 0;
+}
+
+export function cloneByteArray(src: Uint8Array): Uint8Array {
+  const dest = new Uint8Array(src.length);
+  dest.set(src);
+  return dest;
+}
+
+export function isEquivalentOwnerToken(a: CustodyOwnershipToken | null, b: CustodyOwnershipToken | null): boolean {
+  if (a === b) return true;
+  if (!a || !b) return false;
+  return (
+    a.recoveryAttemptId === b.recoveryAttemptId &&
+    a.custodyGeneration === b.custodyGeneration &&
+    a.drainerOwnershipGeneration === b.drainerOwnershipGeneration &&
+    a.transactionId === b.transactionId &&
+    a.operationIdentity === b.operationIdentity &&
+    a.barrierIdentity === b.barrierIdentity &&
+    a.leaseTerm === b.leaseTerm &&
+    areEqualByteArrays(a.ownerSignature, b.ownerSignature)
+  );
 }
 
 export function validateRetryRequestContext(ctx: unknown): asserts ctx is RetryRequestContext {
@@ -710,7 +918,7 @@ export class SettlementEvidenceFactory {
       reconciliationReceipt: params.reconciliationReceipt,
       archiveReceipt: params.archiveReceipt,
       executionReceipt: params.executionReceipt,
-      evidenceDigest: computeEvidenceDigest(params),
+      evidenceDigest: cloneByteArray(computeEvidenceDigest(params)),
     });
 
     AUTHORIZED_EVIDENCE_REGISTRY.add(evidence);
@@ -729,7 +937,7 @@ export class SettlementEvidenceFactory {
 }
 
 public assertRetentionMapContiguity(
-  resultsMap: Map<number, PublicationResult> | ImmutableMap<number, PublicationResult>,
+  resultsMap: ImmutableMap<number, PublicationResult>,
   floor: number,
   publishedGeneration: number,
 ): void {
@@ -781,11 +989,11 @@ public assertRetentionMapContiguity(
 }
 
 public assertAuditHistoryContiguity(
-  auditMap: Map<number, GenerationAuditRecord> | ImmutableMap<number, GenerationAuditRecord>,
+  auditMap: ImmutableMap<number, GenerationAuditRecord>,
   auditFloor: number,
   publishedGeneration: number,
   custodyFloor: number,
-  publicationResults?: Map<number, PublicationResult> | ImmutableMap<number, PublicationResult>,
+  publicationResults?: ImmutableMap<number, PublicationResult>,
 ): void {
   if (!Number.isSafeInteger(auditFloor) || auditFloor < 0) {
     throw new Error('STATE_INCONSISTENT_INVALID_AUDIT_FLOOR');
@@ -859,6 +1067,426 @@ public assertAuditHistoryContiguity(
   }
 }
 
+private _findOldestEligibleRetiredPin(
+  root: AuthoritativeCustodyRoot,
+  candidateRetired: Map<string, ImmutableRetiredPinRecord>
+): [string, ImmutableRetiredPinRecord] | undefined {
+  const monotonicNow = performance.now();
+  for (const [pinId, record] of candidateRetired) {
+    // 1. Must not be pinned by active retry lease
+    let isRetainedByLease = false;
+    for (const lease of root.activeRetryLeases.values()) {
+      if (
+        lease.generation === record.generation &&
+        lease.barrierIdentity === record.barrierIdentity &&
+        lease.expiresAtMonotonicMs > monotonicNow
+      ) {
+        isRetainedByLease = true;
+        break;
+      }
+    }
+    if (isRetainedByLease) continue;
+
+    // 2. Must not be protected by active settlement pin in same barrier
+    let isRetainedByPin = false;
+    for (const pin of root.activeSettlementPins.values()) {
+      if (pin.generation === record.generation && pin.barrierIdentity === record.barrierIdentity) {
+        isRetainedByPin = true;
+        break;
+      }
+    }
+    if (isRetainedByPin) continue;
+
+    // 3. Must not belong to an active pending settlement obligation
+    if (root.pendingSettlementObligations.has(record.generation)) continue;
+
+    // Eligible tombstone found
+    return [pinId, record];
+  }
+  return undefined;
+}
+
+private _findOldestEligibleRetiredLease(
+  root: AuthoritativeCustodyRoot,
+  candidateRetired: Map<string, ImmutableRetiredLeaseRecord>
+): [string, ImmutableRetiredLeaseRecord] | undefined {
+  const monotonicNow = performance.now();
+  for (const [leaseId, record] of candidateRetired) {
+    let isRetained = false;
+    for (const active of root.activeRetryLeases.values()) {
+      if (
+        active.generation === record.generation &&
+        active.consumerId === record.consumerId &&
+        active.expiresAtMonotonicMs > monotonicNow
+      ) {
+        isRetained = true;
+        break;
+      }
+    }
+    if (isRetained) continue;
+    return [leaseId, record];
+  }
+  return undefined;
+}
+
+private _validatePostPublicationInvariants(root: AuthoritativeCustodyRoot): void {
+  // 1. Strict capacity upper bound
+  if (root.retiredSettlementPins.size > 5000) {
+    throw new Error(`POST_PUBLICATION_RETIRED_PINS_OVERFLOW: size ${root.retiredSettlementPins.size} > 5000`);
+  }
+  if (root.retiredRetryLeases.size > 5000) {
+    throw new Error(`POST_PUBLICATION_RETIRED_LEASES_OVERFLOW: size ${root.retiredRetryLeases.size} > 5000`);
+  }
+  if (root.consumedSettlementEvidence.size > 5000) {
+    throw new Error(`POST_PUBLICATION_CONSUMED_EVIDENCE_OVERFLOW: size ${root.consumedSettlementEvidence.size} > 5000`);
+  }
+
+  // 2. Strict replay-key cross-collection mapping
+  for (const [pinId, pin] of root.retiredSettlementPins) {
+    const expectedKey = `${pin.generation}:${pin.barrierIdentity}:${pinId}`;
+    if (!root.consumedSettlementEvidence.has(expectedKey)) {
+      throw new Error(`POST_PUBLICATION_REPLAY_KEY_MISSING: missing replay key '${expectedKey}' for retired pin '${pinId}'`);
+    }
+  }
+
+  // 3. Exact lockstep size invariant
+  if (root.retiredSettlementPins.size !== root.consumedSettlementEvidence.size) {
+    throw new Error(`POST_PUBLICATION_COLLECTION_SIZE_DESYNCHRONIZATION: retired pins ${root.retiredSettlementPins.size} !== consumed evidence ${root.consumedSettlementEvidence.size}`);
+  }
+}
+
+private _getOrAllocateSettlementPin(
+  currentRoot: AuthoritativeCustodyRoot,
+  generation: number,
+  barrierIdentity: string,
+  ownerToken: CustodyOwnershipToken,
+  drainerGeneration: number
+): { pinId: string; nextPins: ImmutableMap<string, ImmutableSettlementPin> } {
+  // 1. Check for existing active settlement pin for this generation and barrier
+  for (const [pinId, pin] of currentRoot.activeSettlementPins) {
+    if (pin.generation === generation && pin.barrierIdentity === barrierIdentity) {
+      if (!isEquivalentOwnerToken(pin.ownerToken, ownerToken)) {
+        throw new Error('SETTLEMENT_PIN_OWNER_TOKEN_MISMATCH');
+      }
+      if (pin.drainerOwnershipGeneration !== drainerGeneration) {
+        throw new Error('SETTLEMENT_PIN_DRAINER_GENERATION_MISMATCH');
+      }
+      return { pinId, nextPins: currentRoot.activeSettlementPins };
+    }
+  }
+
+  // 2. Compound Durable Boot Epoch Pin Allocation
+  const seq = ++this._pinSequenceCounter;
+  const pinId = `pin:${this._coordinatorBootId}:${generation}:${barrierIdentity}:${seq}`;
+
+  const newPin: ImmutableSettlementPin = Object.freeze({
+    pinId,
+    generation,
+    barrierIdentity,
+    ownerToken: cloneAndFreezeOwnerToken(ownerToken),
+    transactionId: ownerToken.transactionId,
+    operationIdentity: ownerToken.operationIdentity,
+    drainerOwnershipGeneration: drainerGeneration,
+    acquiredAtTimestamp: Date.now(),
+    monotonicAcquiredMs: performance.now(),
+    allocatedBootEpoch: this._coordinatorBootEpoch,
+  });
+
+  const nextPins = currentRoot.activeSettlementPins.set(pinId, newPin);
+  return { pinId, nextPins };
+}
+
+private _getOrAllocateRetryLease(
+  root: AuthoritativeCustodyRoot,
+  generation: number,
+  consumerId: string,
+  clientRequestId: string,
+  ownerToken: CustodyOwnershipToken,
+  transactionId: string,
+  operationIdentity: string,
+  barrierIdentity: string,
+): { candidateLeases: ImmutableMap<string, ImmutableRetryLease>; leaseId: string } {
+  for (const existingLease of root.activeRetryLeases.values()) {
+    if (
+      existingLease.generation === generation &&
+      existingLease.consumerId === consumerId &&
+      existingLease.clientRequestId === clientRequestId
+    ) {
+      if (
+        isEquivalentOwnerToken(existingLease.ownerToken, ownerToken) &&
+        existingLease.transactionId === transactionId &&
+        existingLease.operationIdentity === operationIdentity &&
+        existingLease.barrierIdentity === barrierIdentity &&
+        existingLease.ownerToken.drainerOwnershipGeneration === ownerToken.drainerOwnershipGeneration
+      ) {
+        return { candidateLeases: root.activeRetryLeases, leaseId: existingLease.leaseId };
+      }
+      throw new Error('IDEMPOTENT_RETRY_IDENTITY_CONFLICT');
+    }
+  }
+
+  // Compound Durable Boot Epoch Lease Allocation
+  const seq = ++this._leaseSequenceCounter;
+  const leaseId = `lease:${this._coordinatorBootId}:${generation}:${consumerId}:${seq}`;
+
+  if (root.activeRetryLeases.has(leaseId)) {
+    throw new Error('RETRY_LEASE_ID_COLLISION');
+  }
+
+  const monotonicNow = performance.now();
+  const lease: ImmutableRetryLease = Object.freeze({
+    leaseId,
+    generation,
+    consumerId,
+    clientRequestId,
+    ownerToken: cloneAndFreezeOwnerToken(ownerToken),
+    transactionId,
+    operationIdentity,
+    barrierIdentity,
+    acquiredAtTimestamp: Date.now(),
+    monotonicAcquiredMs: monotonicNow,
+    expiresAtMonotonicMs: monotonicNow + 30000,
+    allocatedBootEpoch: this._coordinatorBootEpoch,
+  });
+
+  const candidateLeases = root.activeRetryLeases.set(leaseId, lease);
+  return { candidateLeases, leaseId };
+}
+
+public releaseRetryLease(params: ReleaseRetryLeaseParams): { leaseId: string; status: 'RELEASED' | 'ALREADY_RELEASED' } {
+  const { leaseId, consumerId, clientRequestId, callerToken, transactionId, operationIdentity, barrierIdentity } = params;
+
+  // Cross-Resource Type Checking
+  if (leaseId.startsWith('pin:')) {
+    throw new Error('LEASE_TYPE_MISMATCH: identifier is a settlement pin, not a retry lease');
+  }
+  if (!leaseId.startsWith('lease:')) {
+    throw new Error(`RESOURCE_NOT_FOUND: unknown retry lease identifier '${leaseId}'`);
+  }
+
+  const currentRoot = this.#custodyRoot;
+  const activeLease = currentRoot.activeRetryLeases.get(leaseId);
+
+  // Authoritative Resource Retirement Resolution
+  if (!activeLease) {
+    const retiredLease = currentRoot.retiredRetryLeases.get(leaseId);
+    if (retiredLease) {
+      // Complete 7-dimensional identity validation on retired path
+      if (retiredLease.consumerId !== consumerId) {
+        throw new Error(`UNAUTHORIZED_CROSS_CONSUMER_LEASE_RELEASE: caller consumer '${consumerId}' does not match retired lease owner '${retiredLease.consumerId}'`);
+      }
+      if (retiredLease.clientRequestId !== clientRequestId) {
+        throw new Error(`LEASE_CLIENT_REQUEST_MISMATCH: clientRequestId '${clientRequestId}' does not match retired lease`);
+      }
+      if (!isEquivalentOwnerToken(retiredLease.ownerToken, callerToken)) {
+        throw new Error('UNAUTHORIZED_LEASE_RELEASE_TOKEN_MISMATCH: caller token does not match retired lease owner token');
+      }
+      if (retiredLease.transactionId !== transactionId) {
+        throw new Error(`LEASE_TRANSACTION_ID_MISMATCH: transactionId '${transactionId}' does not match retired lease`);
+      }
+      if (retiredLease.operationIdentity !== operationIdentity) {
+        throw new Error(`LEASE_OPERATION_IDENTITY_MISMATCH: operationIdentity '${operationIdentity}' does not match retired lease`);
+      }
+      if (retiredLease.barrierIdentity !== barrierIdentity) {
+        throw new Error(`LEASE_BARRIER_IDENTITY_MISMATCH: barrierIdentity '${barrierIdentity}' does not match retired lease`);
+      }
+      return { leaseId, status: 'ALREADY_RELEASED' };
+    }
+    // Genuinely unknown or never-issued lease (or from prior reboot)
+    throw new Error(`RESOURCE_NOT_FOUND: retry lease '${leaseId}' was never issued or is unknown`);
+  }
+
+  // Active Lease Authorization Check across all 7 dimensions
+  if (activeLease.consumerId !== consumerId) {
+    throw new Error(`UNAUTHORIZED_CROSS_CONSUMER_LEASE_RELEASE: caller consumer ${consumerId} does not own lease ${leaseId} owned by ${activeLease.consumerId}`);
+  }
+  if (activeLease.clientRequestId !== clientRequestId) {
+    throw new Error(`LEASE_CLIENT_REQUEST_MISMATCH: clientRequestId ${clientRequestId} does not match lease ${activeLease.clientRequestId}`);
+  }
+  if (!isEquivalentOwnerToken(activeLease.ownerToken, callerToken)) {
+    throw new Error('UNAUTHORIZED_LEASE_RELEASE_TOKEN_MISMATCH: caller token does not match lease owner token');
+  }
+  if (activeLease.transactionId !== transactionId) {
+    throw new Error(`LEASE_TRANSACTION_ID_MISMATCH: transactionId ${transactionId} does not match lease`);
+  }
+  if (activeLease.operationIdentity !== operationIdentity) {
+    throw new Error(`LEASE_OPERATION_IDENTITY_MISMATCH: operationIdentity ${operationIdentity} does not match lease`);
+  }
+  if (activeLease.barrierIdentity !== barrierIdentity) {
+    throw new Error(`LEASE_BARRIER_IDENTITY_MISMATCH: barrierIdentity ${barrierIdentity} does not match lease`);
+  }
+
+  // Pre-Existing Overflow Fencing
+  if (currentRoot.retiredRetryLeases.size > 5000) {
+    throw new Error('RETIRED_LEASES_CAPACITY_CORRUPTED: pre-existing retired leases count exceeds 5000');
+  }
+
+  const candidateActiveLeases = currentRoot.activeRetryLeases.delete(leaseId);
+  const candidateRetiredLeasesMap = new Map(currentRoot.retiredRetryLeases.entries());
+
+  // Deterministic Eligible Tombstone Eviction with Backpressure
+  if (candidateRetiredLeasesMap.size === 5000) {
+    const eligibleEntry = this._findOldestEligibleRetiredLease(currentRoot, candidateRetiredLeasesMap);
+    if (!eligibleEntry) {
+      throw new Error('RETIRED_LEASES_CAPACITY_EXHAUSTED_BACKPRESSURE: all 5000 retired leases are protected');
+    }
+    const [oldestLeaseId] = eligibleEntry;
+    candidateRetiredLeasesMap.delete(oldestLeaseId);
+  }
+
+  const retiredRecord: ImmutableRetiredLeaseRecord = Object.freeze({
+    leaseId,
+    generation: activeLease.generation,
+    consumerId,
+    clientRequestId,
+    ownerToken: activeLease.ownerToken,
+    transactionId,
+    operationIdentity,
+    barrierIdentity,
+    releasedAtTimestamp: Date.now(),
+    monotonicReleasedMs: performance.now(),
+    allocatedBootEpoch: activeLease.allocatedBootEpoch,
+  });
+  candidateRetiredLeasesMap.set(leaseId, retiredRecord);
+
+  const candidateRoot: AuthoritativeCustodyRoot = Object.freeze({
+    ...currentRoot,
+    activeRetryLeases: candidateActiveLeases,
+    retiredRetryLeases: new ImmutableMap(candidateRetiredLeasesMap.entries()),
+  });
+
+  this._validatePostPublicationInvariants(candidateRoot);
+  this.#custodyRoot = candidateRoot;
+  return { leaseId, status: 'RELEASED' };
+}
+
+public releaseSettlementPin(pinId: string, settlementEvidence: AuthoritativeSettlementEvidence): { pinId: string; status: 'RELEASED' | 'ALREADY_RELEASED' } {
+  // Cross-Resource Type Checking
+  if (pinId.startsWith('lease:')) {
+    throw new Error('PIN_TYPE_MISMATCH: identifier is a retry lease, not a settlement pin');
+  }
+  if (!pinId.startsWith('pin:')) {
+    throw new Error(`RESOURCE_NOT_FOUND: unknown settlement pin identifier '${pinId}'`);
+  }
+
+  // Mandatory Unconditional Evidence Provenance Validation
+  SettlementEvidenceFactory.assertAuthoritativeEvidenceProvenance(settlementEvidence);
+
+  const currentRoot = this.#custodyRoot;
+  const activePin = currentRoot.activeSettlementPins.get(pinId);
+
+  // Authoritative Resource Retirement Resolution
+  if (!activePin) {
+    const retiredPin = currentRoot.retiredSettlementPins.get(pinId);
+    if (retiredPin) {
+      // Complete 7-dimensional identity validation on retired pin
+      if (
+        !isEquivalentOwnerToken(retiredPin.ownerToken, settlementEvidence.expectedOwner) ||
+        retiredPin.generation !== settlementEvidence.generation ||
+        retiredPin.transactionId !== settlementEvidence.transactionId ||
+        retiredPin.operationIdentity !== settlementEvidence.operationIdentity ||
+        retiredPin.barrierIdentity !== settlementEvidence.barrierIdentity ||
+        retiredPin.drainerOwnershipGeneration !== settlementEvidence.drainerOwnershipGeneration ||
+        retiredPin.ownerToken.recoveryAttemptId !== settlementEvidence.expectedOwner.recoveryAttemptId
+      ) {
+        throw new Error('SETTLEMENT_EVIDENCE_IDENTITY_MISMATCH: evidence does not match retired pin identity');
+      }
+
+      // Constant-time bitwise byte digest comparison
+      if (!areEqualByteArrays(retiredPin.evidenceDigest, settlementEvidence.evidenceDigest)) {
+        throw new Error('SETTLEMENT_EVIDENCE_DIGEST_MISMATCH: evidence digest does not match recorded retired pin disposition');
+      }
+
+      return { pinId, status: 'ALREADY_RELEASED' };
+    }
+    // Genuinely unknown or never-issued pin (or from prior reboot)
+    throw new Error(`RESOURCE_NOT_FOUND: settlement pin '${pinId}' was never issued or is unknown`);
+  }
+
+  // Complete 7-dimensional identity validation including drainerOwnershipGeneration
+  if (
+    !isEquivalentOwnerToken(activePin.ownerToken, settlementEvidence.expectedOwner) ||
+    activePin.generation !== settlementEvidence.generation ||
+    activePin.transactionId !== settlementEvidence.transactionId ||
+    activePin.operationIdentity !== settlementEvidence.operationIdentity ||
+    activePin.barrierIdentity !== settlementEvidence.barrierIdentity ||
+    activePin.drainerOwnershipGeneration !== settlementEvidence.drainerOwnershipGeneration ||
+    activePin.ownerToken.recoveryAttemptId !== settlementEvidence.expectedOwner.recoveryAttemptId
+  ) {
+    throw new Error('SETTLEMENT_EVIDENCE_IDENTITY_MISMATCH');
+  }
+
+  // In-Root Evidence Consumption Protocol
+  const replayKey = `${settlementEvidence.generation}:${settlementEvidence.barrierIdentity}:${pinId}`;
+  if (currentRoot.consumedSettlementEvidence.has(replayKey)) {
+    throw new Error(`SETTLEMENT_EVIDENCE_REPLAY_DETECTED: evidence for replay key '${replayKey}' already consumed in custody root`);
+  }
+
+  // Pre-Existing Overflow Fencing
+  if (currentRoot.retiredSettlementPins.size > 5000) {
+    throw new Error('RETIRED_PINS_CAPACITY_CORRUPTED: pre-existing retired pins count exceeds 5000');
+  }
+  if (currentRoot.consumedSettlementEvidence.size > 5000) {
+    throw new Error('CONSUMED_EVIDENCE_CAPACITY_CORRUPTED: pre-existing consumed evidence count exceeds 5000');
+  }
+
+  const candidatePinsMap = new Map(currentRoot.activeSettlementPins.entries());
+  candidatePinsMap.delete(pinId);
+
+  const retiredPinRecord: ImmutableRetiredPinRecord = Object.freeze({
+    pinId,
+    generation: activePin.generation,
+    barrierIdentity: activePin.barrierIdentity,
+    ownerToken: activePin.ownerToken,
+    transactionId: activePin.transactionId,
+    operationIdentity: activePin.operationIdentity,
+    drainerOwnershipGeneration: activePin.drainerOwnershipGeneration,
+    releasedAtTimestamp: Date.now(),
+    monotonicReleasedMs: performance.now(),
+    evidenceDigest: cloneByteArray(settlementEvidence.evidenceDigest),
+    allocatedBootEpoch: activePin.allocatedBootEpoch,
+  });
+
+  const candidateRetiredPins = new Map(currentRoot.retiredSettlementPins.entries());
+  const candidateConsumed = new Set(currentRoot.consumedSettlementEvidence.values());
+
+  // Deterministic Oldest Eligible Tombstone Eviction with Backpressure
+  if (candidateRetiredPins.size === 5000) {
+    const eligibleEntry = this._findOldestEligibleRetiredPin(currentRoot, candidateRetiredPins);
+    if (!eligibleEntry) {
+      throw new Error('RETENTION_CAPACITY_EXHAUSTED_BACKPRESSURE: all 5000 retired settlement pins are protected by active leases, pins, or obligations');
+    }
+    const [oldestPinId, oldestRecord] = eligibleEntry;
+    const oldestReplayKey = `${oldestRecord.generation}:${oldestRecord.barrierIdentity}:${oldestPinId}`;
+
+    // Strict Replay-Key Existence Check
+    if (!candidateConsumed.has(oldestReplayKey)) {
+      throw new Error(`REPLAY_KEY_DESYNCHRONIZATION_CORRUPTED: replay key '${oldestReplayKey}' missing for retired pin '${oldestPinId}'`);
+    }
+
+    candidateRetiredPins.delete(oldestPinId);
+    candidateConsumed.delete(oldestReplayKey);
+  }
+
+  candidateRetiredPins.set(pinId, retiredPinRecord);
+  candidateConsumed.add(replayKey);
+
+  // Construct Candidate Root with Genuinely Encapsulated Immutable Collections
+  const candidateRoot: AuthoritativeCustodyRoot = Object.freeze({
+    ...currentRoot,
+    activeSettlementPins: new ImmutableMap(candidatePinsMap.entries()),
+    retiredSettlementPins: new ImmutableMap(candidateRetiredPins.entries()),
+    consumedSettlementEvidence: new ImmutableSet(candidateConsumed),
+  });
+
+  // Post-Publication Cross-Collection Invariant Check
+  this._validatePostPublicationInvariants(candidateRoot);
+
+  // SINGLE ATOMIC PUBLICATION LINEARIZATION POINT:
+  this.#custodyRoot = candidateRoot;
+  return { pinId, status: 'RELEASED' };
+}
+
 public publishReleaseAndObligation(
   preparedEvidence: PreparedEvidenceContext,
   expectedOwner: CustodyOwnershipToken,
@@ -920,10 +1548,12 @@ public publishReleaseAndObligation(
       );
 
       if (candidateLeases !== currentRoot.activeRetryLeases) {
-        this.#custodyRoot = Object.freeze({
+        const nextRoot: AuthoritativeCustodyRoot = Object.freeze({
           ...currentRoot,
           activeRetryLeases: candidateLeases,
         });
+        this._validatePostPublicationInvariants(nextRoot);
+        this.#custodyRoot = nextRoot;
       }
 
       return { publicationResult: cachedResult, retryLeaseId: leaseId };
@@ -966,10 +1596,12 @@ public publishReleaseAndObligation(
       );
 
       if (candidateLeases !== currentRoot.activeRetryLeases) {
-        this.#custodyRoot = Object.freeze({
+        const nextRoot: AuthoritativeCustodyRoot = Object.freeze({
           ...currentRoot,
           activeRetryLeases: candidateLeases,
         });
+        this._validatePostPublicationInvariants(nextRoot);
+        this.#custodyRoot = nextRoot;
       }
 
       return { publicationResult: cachedResult, retryLeaseId: leaseId };
@@ -1069,19 +1701,9 @@ public publishReleaseAndObligation(
     monotonicPublishedMs: monotonicNow,
   });
 
-  // Blocker B1: Restart-safe, non-reusable pin ID binding this._coordinatorBootId
-  const settlementPinId = `pin:${this._coordinatorBootId}:${g}:${safeBarrierId}:${++this._pinSequenceCounter}`;
-  const settlementPin: ImmutableSettlementPin = Object.freeze({
-    pinId: settlementPinId,
-    generation: g,
-    barrierIdentity: safeBarrierId,
-    ownerToken: safeOwner,
-    transactionId: safeTxId,
-    operationIdentity: safeOpId,
-    drainerOwnershipGeneration: safeOwner.drainerOwnershipGeneration,
-    acquiredAtTimestamp: Date.now(),
-    monotonicAcquiredMs: monotonicNow,
-  });
+  const { pinId: settlementPinId, nextPins: candidatePins } = this._getOrAllocateSettlementPin(
+    currentRoot, g, safeBarrierId, safeOwner, safeOwner.drainerOwnershipGeneration
+  );
 
   let candidateFloor = currentRoot.custodyGenerationFloor;
   let candidateAuditFloor = currentRoot.auditTombstoneFloor;
@@ -1128,7 +1750,7 @@ public publishReleaseAndObligation(
       terminalOutcome: existingAudit.terminalOutcome,
       settledAtTimestamp: existingAudit.settledAtTimestamp,
       monotonicSettledMs: existingAudit.monotonicSettledMs,
-      evidenceDigest: computeEvidenceDigest(existingAudit),
+      evidenceDigest: cloneByteArray(computeEvidenceDigest(existingAudit)),
     });
 
     candidateResultsMap.delete(g_oldest);
@@ -1168,19 +1790,12 @@ public publishReleaseAndObligation(
   candidateResultsMap.set(g, publicationResult);
   candidateAuditHistory.set(g, pendingAuditRecord);
 
-  this.assertRetentionMapContiguity(candidateResultsMap, candidateFloor, g);
-  this.assertAuditHistoryContiguity(candidateAuditHistory, candidateAuditFloor, g, candidateFloor, candidateResultsMap);
-
-  const candidateObligations = new ImmutableMap([
-    ...currentRoot.pendingSettlementObligations.entries(),
-    [g, obligation],
-  ]);
+  const candidateObligations = currentRoot.pendingSettlementObligations.set(g, obligation);
   const candidateResults = new ImmutableMap(candidateResultsMap.entries());
   const candidateAudit = new ImmutableMap(candidateAuditHistory.entries());
-  const candidatePins = new ImmutableMap([
-    ...currentRoot.activeSettlementPins.entries(),
-    [settlementPinId, settlementPin],
-  ]);
+
+  this.assertRetentionMapContiguity(candidateResults, candidateFloor, g);
+  this.assertAuditHistoryContiguity(candidateAudit, candidateAuditFloor, g, candidateFloor, candidateResults);
 
   const candidateRoot: AuthoritativeCustodyRoot = Object.freeze({
     publishedGeneration: g,
@@ -1198,287 +1813,11 @@ public publishReleaseAndObligation(
     consumedSettlementEvidence: currentRoot.consumedSettlementEvidence,
   });
 
+  this._validatePostPublicationInvariants(candidateRoot);
   this.#custodyRoot = candidateRoot;
   return { publicationResult, retryLeaseId: null };
 }
-
-private _getOrAllocateRetryLease(
-  root: AuthoritativeCustodyRoot,
-  generation: number,
-  consumerId: string,
-  clientRequestId: string,
-  ownerToken: CustodyOwnershipToken,
-  transactionId: string,
-  operationIdentity: string,
-  barrierIdentity: string,
-): { candidateLeases: ImmutableMap<string, ImmutableRetryLease>; leaseId: string } {
-  for (const existingLease of root.activeRetryLeases.values()) {
-    if (
-      existingLease.generation === generation &&
-      existingLease.consumerId === consumerId &&
-      existingLease.clientRequestId === clientRequestId
-    ) {
-      if (
-        isEquivalentOwnerToken(existingLease.ownerToken, ownerToken) &&
-        existingLease.transactionId === transactionId &&
-        existingLease.operationIdentity === operationIdentity &&
-        existingLease.barrierIdentity === barrierIdentity &&
-        existingLease.ownerToken.drainerOwnershipGeneration === ownerToken.drainerOwnershipGeneration
-      ) {
-        return { candidateLeases: root.activeRetryLeases, leaseId: existingLease.leaseId };
-      }
-      throw new Error('IDEMPOTENT_RETRY_IDENTITY_CONFLICT');
-    }
-  }
-
-  // Blocker B1: Restart-safe, non-reusable lease ID binding this._coordinatorBootId
-  const seq = ++this._pinSequenceCounter;
-  const leaseId = `lease:${this._coordinatorBootId}:${generation}:${consumerId}:${seq}`;
-
-  if (root.activeRetryLeases.has(leaseId)) {
-    throw new Error('RETRY_LEASE_ID_COLLISION');
-  }
-
-  const monotonicNow = performance.now();
-  const lease: ImmutableRetryLease = Object.freeze({
-    leaseId,
-    generation,
-    consumerId,
-    clientRequestId,
-    ownerToken,
-    transactionId,
-    operationIdentity,
-    barrierIdentity,
-    acquiredAtTimestamp: Date.now(),
-    monotonicAcquiredMs: monotonicNow,
-    expiresAtMonotonicMs: monotonicNow + 30000,
-  });
-
-  const candidateLeases = new ImmutableMap([
-    ...root.activeRetryLeases.entries(),
-    [leaseId, lease],
-  ]);
-
-  return { candidateLeases, leaseId };
-}
-
-public releaseRetryLease(params: ReleaseRetryLeaseParams): { leaseId: string; status: 'RELEASED' | 'ALREADY_RELEASED' } {
-  const { leaseId, consumerId, clientRequestId, callerToken, transactionId, operationIdentity, barrierIdentity } = params;
-
-  // Cross-Resource Type Checking
-  if (leaseId.startsWith('pin:')) {
-    throw new Error('LEASE_TYPE_MISMATCH: identifier is a settlement pin, not a retry lease');
-  }
-  if (!leaseId.startsWith('lease:')) {
-    throw new Error(`RESOURCE_NOT_FOUND: unknown retry lease identifier '${leaseId}'`);
-  }
-
-  const currentRoot = this.#custodyRoot;
-  const activeLease = currentRoot.activeRetryLeases.get(leaseId);
-
-  // Authoritative Resource Retirement Resolution (Blocker B1)
-  if (!activeLease) {
-    const retiredLease = currentRoot.retiredRetryLeases.get(leaseId);
-    if (retiredLease) {
-      // Complete 7-dimensional identity validation on retired path (Blocker B1)
-      if (retiredLease.consumerId !== consumerId) {
-        throw new Error(`UNAUTHORIZED_CROSS_CONSUMER_LEASE_RELEASE: caller consumer '${consumerId}' does not match retired lease owner '${retiredLease.consumerId}'`);
-      }
-      if (retiredLease.clientRequestId !== clientRequestId) {
-        throw new Error(`LEASE_CLIENT_REQUEST_MISMATCH: clientRequestId '${clientRequestId}' does not match retired lease`);
-      }
-      if (!isEquivalentOwnerToken(retiredLease.ownerToken, callerToken)) {
-        throw new Error('UNAUTHORIZED_LEASE_RELEASE_TOKEN_MISMATCH: caller token does not match retired lease owner token');
-      }
-      if (retiredLease.transactionId !== transactionId) {
-        throw new Error(`LEASE_TRANSACTION_ID_MISMATCH: transactionId '${transactionId}' does not match retired lease`);
-      }
-      if (retiredLease.operationIdentity !== operationIdentity) {
-        throw new Error(`LEASE_OPERATION_IDENTITY_MISMATCH: operationIdentity '${operationIdentity}' does not match retired lease`);
-      }
-      if (retiredLease.barrierIdentity !== barrierIdentity) {
-        throw new Error(`LEASE_BARRIER_IDENTITY_MISMATCH: barrierIdentity '${barrierIdentity}' does not match retired lease`);
-      }
-      return { leaseId, status: 'ALREADY_RELEASED' };
-    }
-    // Genuinely unknown or never-issued lease (or from prior reboot)
-    throw new Error(`RESOURCE_NOT_FOUND: retry lease '${leaseId}' was never issued or is unknown`);
-  }
-
-  // Active Lease Authorization Check across all 7 dimensions
-  if (activeLease.consumerId !== consumerId) {
-    throw new Error(`UNAUTHORIZED_CROSS_CONSUMER_LEASE_RELEASE: caller consumer ${consumerId} does not own lease ${leaseId} owned by ${activeLease.consumerId}`);
-  }
-  if (activeLease.clientRequestId !== clientRequestId) {
-    throw new Error(`LEASE_CLIENT_REQUEST_MISMATCH: clientRequestId ${clientRequestId} does not match lease ${activeLease.clientRequestId}`);
-  }
-  if (!isEquivalentOwnerToken(activeLease.ownerToken, callerToken)) {
-    throw new Error('UNAUTHORIZED_LEASE_RELEASE_TOKEN_MISMATCH: caller token does not match lease owner token');
-  }
-  if (activeLease.transactionId !== transactionId) {
-    throw new Error(`LEASE_TRANSACTION_ID_MISMATCH: transactionId ${transactionId} does not match lease`);
-  }
-  if (activeLease.operationIdentity !== operationIdentity) {
-    throw new Error(`LEASE_OPERATION_IDENTITY_MISMATCH: operationIdentity ${operationIdentity} does not match lease`);
-  }
-  if (activeLease.barrierIdentity !== barrierIdentity) {
-    throw new Error(`LEASE_BARRIER_IDENTITY_MISMATCH: barrierIdentity ${barrierIdentity} does not match lease`);
-  }
-
-  // Blocker B2: Strict Pre-Existing Overflow Fencing
-  if (currentRoot.retiredRetryLeases.size > 5000) {
-    throw new Error('RETIRED_LEASES_CAPACITY_CORRUPTED: pre-existing retired leases count exceeds 5000');
-  }
-
-  const candidateLeasesMap = new Map(currentRoot.activeRetryLeases.entries());
-  candidateLeasesMap.delete(leaseId);
-
-  const retiredRecord: ImmutableRetiredLeaseRecord = Object.freeze({
-    leaseId,
-    generation: activeLease.generation,
-    consumerId,
-    clientRequestId,
-    ownerToken: activeLease.ownerToken,
-    transactionId,
-    operationIdentity,
-    barrierIdentity,
-    releasedAtTimestamp: Date.now(),
-    monotonicReleasedMs: performance.now(),
-  });
-
-  const candidateRetiredLeases = new Map(currentRoot.retiredRetryLeases.entries());
-  // Normal exactly-at-capacity FIFO trimming (Blocker B2)
-  if (candidateRetiredLeases.size === 5000) {
-    const oldestKey = candidateRetiredLeases.keys().next().value;
-    if (oldestKey) candidateRetiredLeases.delete(oldestKey);
-  }
-  candidateRetiredLeases.set(leaseId, retiredRecord);
-
-  this.#custodyRoot = Object.freeze({
-    ...currentRoot,
-    activeRetryLeases: new ImmutableMap(candidateLeasesMap.entries()),
-    retiredRetryLeases: new ImmutableMap(candidateRetiredLeases.entries()),
-  });
-
-  return { leaseId, status: 'RELEASED' };
-}
-
-public releaseSettlementPin(pinId: string, settlementEvidence: AuthoritativeSettlementEvidence): { pinId: string; status: 'RELEASED' | 'ALREADY_RELEASED' } {
-  // Cross-Resource Type Checking
-  if (pinId.startsWith('lease:')) {
-    throw new Error('PIN_TYPE_MISMATCH: identifier is a retry lease, not a settlement pin');
-  }
-  if (!pinId.startsWith('pin:')) {
-    throw new Error(`RESOURCE_NOT_FOUND: unknown settlement pin identifier '${pinId}'`);
-  }
-
-  // Blocker C2: Provenance verification MUST happen BEFORE any retired-pin return!
-  SettlementEvidenceFactory.assertAuthoritativeEvidenceProvenance(settlementEvidence);
-
-  const currentRoot = this.#custodyRoot;
-  const activePin = currentRoot.activeSettlementPins.get(pinId);
-
-  // Authoritative Resource Retirement Resolution (Blocker B1 & C2)
-  if (!activePin) {
-    const retiredPin = currentRoot.retiredSettlementPins.get(pinId);
-    if (retiredPin) {
-      // Complete 7-dimensional identity validation on retired pin
-      if (
-        !isEquivalentOwnerToken(retiredPin.ownerToken, settlementEvidence.expectedOwner) ||
-        retiredPin.generation !== settlementEvidence.generation ||
-        retiredPin.transactionId !== settlementEvidence.transactionId ||
-        retiredPin.operationIdentity !== settlementEvidence.operationIdentity ||
-        retiredPin.barrierIdentity !== settlementEvidence.barrierIdentity ||
-        retiredPin.drainerOwnershipGeneration !== settlementEvidence.drainerOwnershipGeneration ||
-        retiredPin.ownerToken.recoveryAttemptId !== settlementEvidence.expectedOwner.recoveryAttemptId
-      ) {
-        throw new Error('SETTLEMENT_EVIDENCE_IDENTITY_MISMATCH: evidence does not match retired pin identity');
-      }
-
-      // Verify evidence corresponds to the retired record's recorded settlement disposition
-      if (!areEqualByteArrays(retiredPin.evidenceDigest, settlementEvidence.evidenceDigest)) {
-        throw new Error('SETTLEMENT_EVIDENCE_DIGEST_MISMATCH: evidence digest does not match recorded retired pin disposition');
-      }
-
-      return { pinId, status: 'ALREADY_RELEASED' };
-    }
-    // Genuinely unknown or never-issued pin (or from prior reboot)
-    throw new Error(`RESOURCE_NOT_FOUND: settlement pin '${pinId}' was never issued or is unknown`);
-  }
-
-  // Block C1: Complete 7-dimensional identity validation including drainerOwnershipGeneration
-  if (
-    !isEquivalentOwnerToken(activePin.ownerToken, settlementEvidence.expectedOwner) ||
-    activePin.generation !== settlementEvidence.generation ||
-    activePin.transactionId !== settlementEvidence.transactionId ||
-    activePin.operationIdentity !== settlementEvidence.operationIdentity ||
-    activePin.barrierIdentity !== settlementEvidence.barrierIdentity ||
-    activePin.drainerOwnershipGeneration !== settlementEvidence.drainerOwnershipGeneration || // C1!
-    activePin.ownerToken.recoveryAttemptId !== settlementEvidence.expectedOwner.recoveryAttemptId
-  ) {
-    throw new Error('SETTLEMENT_EVIDENCE_IDENTITY_MISMATCH');
-  }
-
-  // Blocker C2: Atomic In-Root Evidence Consumption Protocol
-  const replayKey = `${settlementEvidence.generation}:${settlementEvidence.barrierIdentity}:${pinId}`;
-  if (currentRoot.consumedSettlementEvidence.has(replayKey)) {
-    throw new Error(`SETTLEMENT_EVIDENCE_REPLAY_DETECTED: evidence for replay key '${replayKey}' already consumed in custody root`);
-  }
-
-  // Blocker B2: Strict Pre-Existing Overflow Fencing
-  if (currentRoot.retiredSettlementPins.size > 5000) {
-    throw new Error('RETIRED_PINS_CAPACITY_CORRUPTED: pre-existing retired pins count exceeds 5000');
-  }
-  if (currentRoot.consumedSettlementEvidence.size > 5000) {
-    throw new Error('CONSUMED_EVIDENCE_CAPACITY_CORRUPTED: pre-existing consumed evidence count exceeds 5000');
-  }
-
-  const candidatePinsMap = new Map(currentRoot.activeSettlementPins.entries());
-  candidatePinsMap.delete(pinId);
-
-  const retiredPinRecord: ImmutableRetiredPinRecord = Object.freeze({
-    pinId,
-    generation: activePin.generation,
-    barrierIdentity: activePin.barrierIdentity,
-    ownerToken: activePin.ownerToken,
-    transactionId: activePin.transactionId,
-    operationIdentity: activePin.operationIdentity,
-    drainerOwnershipGeneration: activePin.drainerOwnershipGeneration,
-    releasedAtTimestamp: Date.now(),
-    monotonicReleasedMs: performance.now(),
-    evidenceDigest: settlementEvidence.evidenceDigest,
-  });
-
-  const candidateRetiredPins = new Map(currentRoot.retiredSettlementPins.entries());
-  const candidateConsumed = new Set(currentRoot.consumedSettlementEvidence);
-
-  // Normal exactly-at-capacity FIFO lockstep trimming (Blocker B2)
-  if (candidateRetiredPins.size === 5000) {
-    const oldestPinEntry = candidateRetiredPins.entries().next().value;
-    if (oldestPinEntry) {
-      const [oldestPinId, oldestRecord] = oldestPinEntry;
-      candidateRetiredPins.delete(oldestPinId);
-      const oldestReplayKey = `${oldestRecord.generation}:${oldestRecord.barrierIdentity}:${oldestPinId}`;
-      candidateConsumed.delete(oldestReplayKey);
-    }
-  }
-  candidateRetiredPins.set(pinId, retiredPinRecord);
-  candidateConsumed.add(replayKey);
-
-  // SINGLE ATOMIC PUBLICATION LINEARIZATION POINT:
-  this.#custodyRoot = Object.freeze({
-    ...currentRoot,
-    activeSettlementPins: new ImmutableMap(candidatePinsMap.entries()),
-    retiredSettlementPins: new ImmutableMap(candidateRetiredPins.entries()),
-    consumedSettlementEvidence: new ImmutableSet(candidateConsumed),
-  });
-
-  return { pinId, status: 'RELEASED' };
-}
 ```
-
----
-
 ## 12.13 Acquisition Serialization & Check-Then-Acquire Race Immunity
 
 Under single-realm JavaScript execution:
@@ -1566,7 +1905,7 @@ Protocol B handles cancelled or uncommitted operations:
 
 ---
 
-## 15. Exhaustive Failure and Retry Matrix (37 Deterministic Cases)
+## 15. Exhaustive Failure and Retry Matrix (44 Deterministic Cases)
 
 | Case | Scenario | Gate State | Custody Owner | Barrier State | Correct Action | Forbidden Action |
 |---|---|---|---|---|---|---|
@@ -1578,13 +1917,13 @@ Protocol B handles cancelled or uncommitted operations:
 | **6** | Pending retry with original token | `BARRIER_PENDING` | Drainer | PENDING | Acquire retry lease; return cached result | Reject retry |
 | **7** | Pending retry with conflicting audit | `BARRIER_PENDING` | Drainer | PENDING | Fail closed (corrupted) | Return cached result |
 | **8** | Settled retry with missing audit | `SETTLED` | Archive | RESOLVED | Fail closed (missing audit)| Return cached result |
-| **9** | First publication with stale attempt | `IN_FLIGHT` | Drainer | UNALLOCATED | Reject stale attempt | Publish candidate root |
-| **10** | First publication with out-of-order $g$ | `IN_FLIGHT` | Drainer | UNALLOCATED | Throw generation gap | Advance publishedGeneration|
-| **11** | FIFO eviction with active retry lease | `CAPACITY_MAX` | Drainer | PENDING | Throw backpressure | Evict leased entry |
-| **12** | Watchdog timeout on leased entry | `DEGRADED` | Drainer | PENDING | Maintain retry lease | Release lease on timeout |
-| **13** | Settlement pin release without Level 3 proof | `BARRIER_PENDING` | Drainer | PENDING | Throw evidence required | Release pin on token alone |
-| **14** | Pin release on actual Level 3 settlement | `SETTLED` | Archive | RESOLVED | Remove pin atomically | Leak retention pin |
-| **15** | Retry on evicted generation ($g \le \text{floor}$)| `ANY` | Archive | RESOLVED | Check tombstone; return expired | Fall through to first pub |
+| **9** | First publication with stale attempt | `IN_FLIGHT` | Drainer | UNALLOCATED | Reject stale attempt | Commit publication |
+| **10** | Release attempt with missing token | `BARRIER_PENDING` | Drainer | PENDING | Reject unauthenticated | Release pin |
+| **11** | Release attempt with wrong barrier ID | `BARRIER_PENDING` | Drainer | PENDING | Throw barrier mismatch | Release pin |
+| **12** | Release attempt with wrong generation | `BARRIER_PENDING` | Drainer | PENDING | Throw generation mismatch | Release pin |
+| **13** | Release attempt after watchdog timeout | `BARRIER_PENDING` | Drainer | PENDING | Settle barrier; release pin | Throw timeout error |
+| **14** | Eviction of unpinned tombstone | `TOMBSTONE` | Coordinator | RESOLVED | Prune tombstone FIFO | Prune active pin |
+| **15** | Eviction blocked by active retry lease | `TOMBSTONE` | Coordinator | RESOLVED | Backpressure / preserve | Silently drop tombstone |
 | **16** | First pub after cache completely emptied | `IDLE` | Drainer | UNALLOCATED | Publish $N+1$ cleanly | Reject as out-of-order |
 | **17** | Empty cache before any publications | `IDLE` | Drainer | UNALLOCATED | Floor is 0; pub $g=1$ | Allow $g=0$ or $g=2$ |
 | **18** | Out-of-domain generation $g \le 0$ | `ANY` | Any | ANY | Throw `INVALID_DOMAIN` | Process publication |
@@ -1607,6 +1946,13 @@ Protocol B handles cancelled or uncommitted operations:
 | **35** | Pre-existing consumed evidence count > 5,000 | `ANY` | Any | ANY | Throw `CONSUMED_EVIDENCE_CAPACITY_CORRUPTED` | Silently trim one |
 | **36** | Delayed release presenting pin ID from prior boot | `ANY` | Any | ANY | Throw `RESOURCE_NOT_FOUND` | Match new session pin |
 | **37** | Candidate throw consumes sequence counter | `IN_FLIGHT` | Drainer | UNALLOCATED | Discard counter; zero collision | Reuse sequence ID |
+| **38** | All 5,000 retired pins protected at capacity | `SETTLED` | Coordinator | RESOLVED | Throw `RETENTION_CAPACITY_EXHAUSTED_BACKPRESSURE` | Evict protected pin |
+| **39** | All 5,000 retired leases protected at capacity | `SETTLED` | Coordinator | RESOLVED | Throw `RETIRED_LEASES_CAPACITY_EXHAUSTED_BACKPRESSURE` | Evict protected lease |
+| **40** | Replay key missing for retired pin on eviction | `SETTLED` | Coordinator | RESOLVED | Throw `REPLAY_KEY_DESYNCHRONIZATION_CORRUPTED` | Silently delete pin |
+| **41** | Duplicate pin release with new Uint8Array copy | `SETTLED` | Coordinator | RESOLVED | Compare byte-for-byte; return `ALREADY_RELEASED` | Reject due to `!==` |
+| **42** | Duplicate pin release with mutated digest | `SETTLED` | Coordinator | RESOLVED | Throw `SETTLEMENT_EVIDENCE_DIGEST_MISMATCH` | Return `ALREADY_RELEASED` |
+| **43** | Candidate root retired pins !== consumed evidence | `ANY` | Coordinator | ANY | Throw `POST_PUBLICATION_COLLECTION_SIZE_DESYNCHRONIZATION` | Commit desynchronized root |
+| **44** | Candidate root retired pin missing replay key | `ANY` | Coordinator | ANY | Throw `POST_PUBLICATION_REPLAY_KEY_MISSING` | Commit unmapped replay key |
 
 ---
 
@@ -1616,16 +1962,16 @@ Protocol B handles cancelled or uncommitted operations:
    $$\mathbf{BARRIER\_RESOLVED}(g) \implies \mathbf{EXECUTION\_SETTLED}(g) \land \mathbf{CUSTODY\_RECONCILED}(g) \land \mathbf{DRAINER\_RELEASED}(g) \land \mathbf{ALL\_RECEIPTS\_MATCH}(g)$$
 2. **Capability-Gated Settlement-Pin Release Invariant:**
    $$\mathbf{RELEASE\_SETTLEMENT\_PIN}(pinId) \implies \mathbf{AssertAuthoritativeSettlementEvidence}(evidence) \land (\mathbf{pin.identity} \equiv \mathbf{evidence.identity})$$
-3. **Restart-Safe Non-Reissuable Pin & Lease Identification Invariant:**
-   Every settlement pin and retry lease binds a non-reusable `coordinatorBootId`. Even if in-memory sequence counters reinitialize across process restarts, $(coordinatorBootId, seq)$ guarantees global uniqueness. Evicted identifiers can never be re-issued.
-4. **Strict Pre-Existing Overflow Fencing Invariant:**
-   Pre-existing collection sizes $> 5000$ in `retiredSettlementPins`, `retiredRetryLeases`, or `consumedSettlementEvidence` must fail closed immediately with dedicated corruption errors.
-5. **Lockstep Atomic Replay Retention Invariant:**
-   `consumedSettlementEvidence` and `retiredSettlementPins` are strictly bounded to `MAX_RETIRED_RESOURCES = 5000` entries and trimmed in lockstep via atomic candidate-root replacement.
+3. **Compound Durable Boot-Fenced Resource Allocation Invariant:**
+   Every settlement pin and retry lease binds a compound durable fencing token $\mathbf{coordinatorBootEpoch} = \langle \mathbf{clusterTerm},\; \mathbf{bootGeneration},\; \mathbf{bootInstanceId} \rangle$. Monotonic non-reusability across restarts is mathematically guaranteed by consensus-allocated $\mathbf{bootGeneration}$, split-brain coordinators are fenced out by $\mathbf{clusterTerm}$, and instance uniqueness is guaranteed by $\mathbf{bootInstanceId}$. Evicted identifiers can never be re-issued.
+4. **Strict Pre-Existing Overflow Fencing, Eligible Tombstone Eviction & Backpressure Invariant:**
+   Pre-existing collection sizes $> 5000$ in `retiredSettlementPins`, `retiredRetryLeases`, or `consumedSettlementEvidence` fail closed immediately with dedicated corruption errors. At exactly 5,000 entries, eviction selects the oldest *eligible* entry not retained by active retry leases, active settlement pins, or pending settlement obligations; if all 5,000 entries are protected, it fails closed with `RETENTION_CAPACITY_EXHAUSTED_BACKPRESSURE`.
+5. **Lockstep Atomic Replay Retention & Post-Publication Invariant Verification:**
+   `consumedSettlementEvidence` and `retiredSettlementPins` are strictly bounded to `MAX_RETIRED_RESOURCES = 5000` entries and trimmed in lockstep. Before any candidate root is published to `this.#custodyRoot`, `_validatePostPublicationInvariants()` verifies that the evicted record's replay key was removed, all retired pins have exact corresponding replay keys, and collections are strictly $\le 5000$.
 6. **Complete Retired-Resource Identity Invariant:**
    A resource absent from active collections is recognized as `ALREADY_RELEASED` if and only if its identity matches an authoritative entry in `retiredRetryLeases` or `retiredSettlementPins` across all seven dimensions (`consumerId`, `clientRequestId`, `callerToken`, `transactionId`, `operationIdentity`, `barrierIdentity`). Altered identities fail closed.
-7. **Universal Evidence Provenance & Disposition Invariant:**
-   Both active and retired settlement-pin releases unconditionally require validated `SettlementEvidenceFactory` provenance. A retired pin release additionally verifies that `evidence.evidenceDigest` matches the recorded `retiredPin.evidenceDigest`.
+7. **Universal Evidence Provenance, Disposition & Byte-for-Byte Digest Invariant:**
+   Both active and retired settlement-pin releases unconditionally require validated `SettlementEvidenceFactory` provenance. A retired pin release verifies that `settlementEvidence.evidenceDigest` matches `retiredPin.evidenceDigest` byte-for-byte via constant-time bitwise comparison `areEqualByteArrays()`.
 8. **Atomic Evidence Consumption Invariant:**
    Evidence consumption disposition (`consumedSettlementEvidence`) and settlement pin removal must linearize together via single atomic candidate-root replacement. If publication throws, evidence remains unconsumed and retryable.
 9. **Seven-Dimensional Pin Identity Binding Invariant:**
@@ -1645,13 +1991,17 @@ Protocol B handles cancelled or uncommitted operations:
 16. **Watchdog Pin and Lease Immunity Invariant:**
    Watchdog timeouts CANNOT release retention pins or retry leases whose underlying operations remain unresolved.
 17. **Single In-Flight Drain Invariant:** A second drain **CANNOT** dequeue an operation while `this.#custodyRoot.inFlightRecord !== null` ($N_{\text{in-flight}} \le 1$).
-18. **Runtime Immutability Invariant:** Published collections and evidence references **CANNOT** be mutated through `Map.prototype` or mutable array/buffer aliases.
+18. **Encapsulated Immutable Custody & Defensive Byte Immutability Invariant:**
+   Published collections and evidence references are encapsulated within `ImmutableMap` and `ImmutableSet` wrappers whose state is private and whose mutating operations produce new instances. All byte arrays (`Uint8Array`) are defensively cloned and compared bitwise.
+19. **Complete Structured Owner-Token Identity Invariant:**
+   Every active and retired resource binds and verifies the complete structured `CustodyOwnershipToken` (`recoveryAttemptId`, `custodyGeneration`, `drainerOwnershipGeneration`, `transactionId`, `operationIdentity`, `barrierIdentity`, `leaseTerm`, `ownerSignature`) using `isEquivalentOwnerToken()`.
+20. **Post-Publication Cross-Collection Lockstep Invariant:**
+   The authoritative custody root must satisfy $\mathbf{retiredSettlementPins.size} \equiv \mathbf{consumedSettlementEvidence.size} \le 5000$ at every publication linearization point.
 
 ### Strict Ordering of Finalization:
 $$\text{1. Settle Promise} \longrightarrow \text{2. Reconcile Custody} \longrightarrow \text{3. Pre-Validate \& Pre-Allocate} \longrightarrow \text{4. Atomic Root Replacement} \longrightarrow \text{5. } \mathbf{activeBarrier(g).resolveWithEvidence(evidence)} \longrightarrow \text{6. Release Settlement Pin}$$
 
 ---
-
 ## 17. Removal of Unapproved Emergency Reset Authority
 
 The proposal excises all references to `forceEmergencyReset(capability)`:
@@ -1673,27 +2023,27 @@ The proposal excises all references to `forceEmergencyReset(capability)`:
 
 ## 19. Deterministic Failure Scenarios and Future Test Requirements
 
-The following forty deterministic future test specifications are formally codified for Sub-Milestone M5.1:
+The following forty-four deterministic future test specifications are formally codified for Sub-Milestone M5.1:
 
-### Test R18-R23-T01: Retry Acquisition Without Stable Request Context
+### Test R18-R24-T01: Retry Acquisition Without Stable Request Context
 - **Initial Authoritative Root:** Settled result at $g=1$; `activeRetryLeases.size === 0`.
 - **Operation Sequence:** Call `publishReleaseAndObligation` presenting retry token for $g=1$ with `retryContext === undefined`.
 - **Expected Final Root:** Unchanged; zero leases allocated.
 - **Expected Result / Error:** Throws `INVALID_RETRY_REQUEST_CONTEXT`.
 
-### Test R18-R23-T02: Retry Acquisition With Malformed or Empty Request Context
+### Test R18-R24-T02: Retry Acquisition With Malformed or Empty Request Context
 - **Initial Authoritative Root:** Settled result at $g=1$; `activeRetryLeases.size === 0`.
 - **Operation Sequence:** Call `publishReleaseAndObligation` presenting retry token for $g=1$ with `retryContext = { consumerId: "   ", clientRequestId: "" }`.
 - **Expected Final Root:** Unchanged; zero leases allocated.
 - **Expected Result / Error:** Throws `MALFORMED_RETRY_REQUEST_CONTEXT`.
 
-### Test R18-R23-T03: Retry Acquisition With Oversized Request Context
+### Test R18-R24-T03: Retry Acquisition With Oversized Request Context
 - **Initial Authoritative Root:** Settled result at $g=1$; `activeRetryLeases.size === 0`.
 - **Operation Sequence:** Call `publishReleaseAndObligation` with `consumerId` of length 257 characters.
 - **Expected Final Root:** Unchanged; zero leases allocated.
 - **Expected Result / Error:** Throws `RETRY_REQUEST_CONTEXT_OVERSIZED`.
 
-### Test R18-R23-T04: Lost-Response Retransmission Recovers Original Lease Idempotently
+### Test R18-R24-T04: Lost-Response Retransmission Recovers Original Lease Idempotently
 - **Initial Authoritative Root:** Settled result at $g=1$; `activeRetryLeases.size === 0`.
 - **Operation Sequence:**
   1. Consumer 1 acquires lease for $g=1$ with `clientRequestId = "req-101"`; receives `leaseId_A`.
@@ -1701,13 +2051,13 @@ The following forty deterministic future test specifications are formally codifi
 - **Expected Final Root:** `activeRetryLeases.size === 1`, containing `leaseId_A`.
 - **Expected Result / Error:** Second call returns existing `leaseId_A` idempotently.
 
-### Test R18-R23-T05: Repeated Retry Acquisition With Conflicting Operation Identity
+### Test R18-R24-T05: Repeated Retry Acquisition With Conflicting Operation Identity
 - **Initial Authoritative Root:** Settled result at $g=1$; lease active for `(consumer1, req-101)`.
 - **Operation Sequence:** Consumer 1 submits request with `clientRequestId = "req-101"` but altered `operationIdentity`.
 - **Expected Final Root:** Unchanged.
 - **Expected Result / Error:** Throws `IDEMPOTENT_RETRY_IDENTITY_CONFLICT`.
 
-### Test R18-R23-T06: Two Distinct Consumers Acquire Independent Leases Under Same Recovery Owner Token
+### Test R18-R24-T06: Two Distinct Consumers Acquire Independent Leases Under Same Recovery Owner Token
 - **Initial Authoritative Root:** Settled result at $g=1$; `activeRetryLeases.size === 0`.
 - **Operation Sequence:**
   1. Consumer 1 requests lease for $g=1$ with `consumerId = "c1"`.
@@ -1715,13 +2065,13 @@ The following forty deterministic future test specifications are formally codifi
 - **Expected Final Root:** `activeRetryLeases.size === 2`, containing `leaseId_1` and `leaseId_2`.
 - **Expected Result / Error:** Both acquire distinct leases successfully.
 
-### Test R18-R23-T07: Consumer 1 Attempting to Release Consumer 2's Lease Fails Closed
+### Test R18-R24-T07: Consumer 1 Attempting to Release Consumer 2's Lease Fails Closed
 - **Initial Authoritative Root:** Active leases for Consumer 1 (`leaseId_1`) and Consumer 2 (`leaseId_2`).
 - **Operation Sequence:** Consumer 1 invokes `releaseRetryLease` passing `leaseId_2` with `consumerId = "c1"`.
 - **Expected Final Root:** Unchanged; both leases remain active.
 - **Expected Result / Error:** Throws `UNAUTHORIZED_CROSS_CONSUMER_LEASE_RELEASE`.
 
-### Test R18-R23-T08: Duplicate Lease Release by Authorized Consumer Against Retired Record Is Idempotent
+### Test R18-R24-T08: Duplicate Lease Release by Authorized Consumer Against Retired Record Is Idempotent
 - **Initial Authoritative Root:** Active lease `leaseId_1` for Consumer 1.
 - **Operation Sequence:**
   1. Consumer 1 calls `releaseRetryLease` with all matching parameters; returns `{ status: 'RELEASED' }`.
@@ -1729,7 +2079,7 @@ The following forty deterministic future test specifications are formally codifi
 - **Expected Final Root:** `activeRetryLeases.has(leaseId_1) === false`; `retiredRetryLeases.has(leaseId_1) === true`.
 - **Expected Result / Error:** Second call matches retired record and returns `{ status: 'ALREADY_RELEASED' }` idempotently.
 
-### Test R18-R23-T09: First Publication With Option A Lifecycle Model
+### Test R18-R24-T09: First Publication With Option A Lifecycle Model
 - **Initial Authoritative Root:** `publishedGeneration = 0`, `auditTombstoneFloor = 0`, `custodyGenerationFloor = 0`.
 - **Operation Sequence:** Call `publishReleaseAndObligation` for $g=1$.
 - **Expected Final Root:**
@@ -1739,13 +2089,13 @@ The following forty deterministic future test specifications are formally codifi
   - `generationAuditHistory.get(1).kind === 'PENDING_PUBLICATION'`.
 - **Expected Result / Error:** Success; contiguity invariant holds unconditionally.
 
-### Test R18-R23-T10: Pending-to-Terminal Audit History Transition
+### Test R18-R24-T10: Pending-to-Terminal Audit History Transition
 - **Initial Authoritative Root:** Generation $g=1$ published; audit record is `PENDING_PUBLICATION`.
 - **Operation Sequence:** Barrier for $g=1$ settles with `AuthoritativeSettlementEvidence` (`CONFIRMED_COMMITTED`).
 - **Expected Final Root:** `generationAuditHistory.get(1).kind === 'TERMINAL_SETTLEMENT'`.
 - **Expected Result / Error:** Success; record upgraded in place.
 
-### Test R18-R23-T11: Eviction and Compact Tombstone Conversion
+### Test R18-R24-T11: Eviction and Compact Tombstone Conversion
 - **Initial Authoritative Root:** Result at $g=1$ settled (`TERMINAL_SETTLEMENT`); 1,000 results retained.
 - **Operation Sequence:** Publish $g=1001$; triggers FIFO eviction of $g=1$.
 - **Expected Final Root:**
@@ -1755,25 +2105,25 @@ The following forty deterministic future test specifications are formally codifi
   - `generationAuditHistory.get(1).evidenceDigest` is 32-byte SHA-256.
 - **Expected Result / Error:** Success.
 
-### Test R18-R23-T12: Tombstone Retirement Blocked by Active Settlement Pin
+### Test R18-R24-T12: Tombstone Retirement Blocked by Active Settlement Pin
 - **Initial Authoritative Root:** 5,000 tombstones retained; oldest tombstone $g=1$ has an active settlement pin.
 - **Operation Sequence:** Next result eviction attempts to retire tombstone $g=1$.
 - **Expected Final Root:** Unchanged; zero tombstones deleted; zero results evicted.
 - **Expected Result / Error:** Throws `TOMBSTONE_CAPACITY_EXHAUSTED`.
 
-### Test R18-R23-T13: Tombstone Retirement Blocked by Active Retry Lease
+### Test R18-R24-T13: Tombstone Retirement Blocked by Active Retry Lease
 - **Initial Authoritative Root:** 5,000 tombstones retained; oldest tombstone $g=1$ has an active retry lease.
 - **Operation Sequence:** Next result eviction attempts to retire tombstone $g=1$.
 - **Expected Final Root:** Unchanged; zero tombstones deleted; zero results evicted.
 - **Expected Result / Error:** Throws `TOMBSTONE_CAPACITY_EXHAUSTED`.
 
-### Test R18-R23-T14: Tombstone Retirement Blocked by Pending Settlement Obligation
+### Test R18-R24-T14: Tombstone Retirement Blocked by Pending Settlement Obligation
 - **Initial Authoritative Root:** 5,000 tombstones retained; oldest tombstone $g=1$ references pending obligation.
 - **Operation Sequence:** Next result eviction attempts to retire tombstone $g=1$.
 - **Expected Final Root:** Unchanged.
 - **Expected Result / Error:** Throws `TOMBSTONE_CAPACITY_EXHAUSTED`.
 
-### Test R18-R23-T15: Normal FIFO Tombstone Retirement at 5,000 Capacity
+### Test R18-R24-T15: Normal FIFO Tombstone Retirement at 5,000 Capacity
 - **Initial Authoritative Root:** 5,000 tombstones retained ($[1 \dots 5000]$); zero pins/leases on $g=1$.
 - **Operation Sequence:** Publish new generation causing eviction and tombstone retirement.
 - **Expected Final Root:**
@@ -1782,85 +2132,85 @@ The following forty deterministic future test specifications are formally codifi
   - Total tombstones remaining: 5,000 ($[2 \dots 5001]$).
 - **Expected Result / Error:** Success; contiguity preserved over $[2 \dots publishedGeneration]$.
 
-### Test R18-R23-T16: Pre-Existing Tombstone Count Above Cap Fails Closed
+### Test R18-R24-T16: Pre-Existing Tombstone Count Above Cap Fails Closed
 - **Initial Authoritative Root:** Artificially injected root with 5,005 tombstones.
 - **Operation Sequence:** Call `publishReleaseAndObligation`.
 - **Expected Final Root:** Unchanged; zero bulk deletions performed.
 - **Expected Result / Error:** Throws `TOMBSTONE_CAPACITY_CORRUPTED`.
 
-### Test R18-R23-T17: Missing Tombstone Inside Promised Horizon Fails Closed
+### Test R18-R24-T17: Missing Tombstone Inside Promised Horizon Fails Closed
 - **Initial Authoritative Root:** `auditTombstoneFloor = 10`, `custodyGenerationFloor = 20`; tombstone $g=15$ deleted.
 - **Operation Sequence:** Call `assertAuditHistoryContiguity`.
 - **Expected Final Root:** Unchanged.
 - **Expected Result / Error:** Throws `STATE_INCONSISTENT_AUDIT_KEY_GAP`.
 
-### Test R18-R23-T18: Expiry Below Tombstone Floor Returns Historical Expiry
+### Test R18-R24-T18: Expiry Below Tombstone Floor Returns Historical Expiry
 - **Initial Authoritative Root:** `auditTombstoneFloor = 50`.
 - **Operation Sequence:** Query generation $g=30$.
 - **Expected Final Root:** Unchanged.
 - **Expected Result / Error:** Returns `CUSTODY_RECEIPT_EXPIRED` with `horizonExpired: true`.
 
-### Test R18-R23-T19: Floor Order Invariant Violation Fails Closed
+### Test R18-R24-T19: Floor Order Invariant Violation Fails Closed
 - **Initial Authoritative Root:** Artificially set `auditTombstoneFloor = 50`, `custodyGenerationFloor = 40`.
 - **Operation Sequence:** Call `assertAuditHistoryContiguity`.
 - **Expected Final Root:** Unchanged.
 - **Expected Result / Error:** Throws `STATE_INCONSISTENT_FLOOR_ORDER_VIOLATION`.
 
-### Test R18-R23-T20: Audit Record With Mismatched Generation Fails Closed
+### Test R18-R24-T20: Audit Record With Mismatched Generation Fails Closed
 - **Initial Authoritative Root:** Audit history key is 5, but record payload has `generation: 4`.
 - **Operation Sequence:** Call `assertAuditHistoryContiguity`.
 - **Expected Final Root:** Unchanged.
 - **Expected Result / Error:** Throws `AUDIT_RECORD_GENERATION_MISMATCH`.
 
-### Test R18-R23-T21: Audit Record With Mismatched Owner Token Fails Closed
+### Test R18-R24-T21: Audit Record With Mismatched Owner Token Fails Closed
 - **Initial Authoritative Root:** Audit record at $g=1$ has altered `membershipEpoch`.
 - **Operation Sequence:** Call `assertAuditHistoryContiguity` with publicationResults.
 - **Expected Final Root:** Unchanged.
 - **Expected Result / Error:** Throws `STATE_INCONSISTENT_AUDIT_RESULT_IDENTITY_MISMATCH`.
 
-### Test R18-R23-T22: Audit Record With Mismatched Drainer Ownership Generation Fails Closed
+### Test R18-R24-T22: Audit Record With Mismatched Drainer Ownership Generation Fails Closed
 - **Initial Authoritative Root:** Audit record at $g=1$ has altered `drainerOwnershipGeneration`.
 - **Operation Sequence:** Call `assertAuditHistoryContiguity` with publicationResults.
 - **Expected Final Root:** Unchanged.
 - **Expected Result / Error:** Throws `STATE_INCONSISTENT_AUDIT_RESULT_IDENTITY_MISMATCH`.
 
-### Test R18-R23-T23: Cross-Generation Settlement Evidence Replay Rejected
+### Test R18-R24-T23: Cross-Generation Settlement Evidence Replay Rejected
 - **Initial Authoritative Root:** Active pin for $g=2$; evidence constructed for $g=1$.
 - **Operation Sequence:** Call `releaseSettlementPin("pin:...:g2:...", evidence_g1)`.
 - **Expected Final Root:** Unchanged; pin remains active.
 - **Expected Result / Error:** Throws `SETTLEMENT_EVIDENCE_IDENTITY_MISMATCH`.
 
-### Test R18-R23-T24: Cross-Obligation Settlement Evidence Replay Rejected via Atomic In-Root Registry
+### Test R18-R24-T24: Cross-Obligation Settlement Evidence Replay Rejected via Atomic In-Root Registry
 - **Initial Authoritative Root:** Evidence for $g=1$ already consumed on `pin_1`; `consumedSettlementEvidence.has("1:barrier:pin_1") === true`.
 - **Operation Sequence:** Attempt to reuse identical evidence on `pin_2`.
 - **Expected Final Root:** Unchanged; `pin_2` remains active.
 - **Expected Result / Error:** Throws `SETTLEMENT_EVIDENCE_REPLAY_DETECTED`.
 
-### Test R18-R23-T25: Caller-Constructed Mock Evidence Rejected by Provenance Check
+### Test R18-R24-T25: Caller-Constructed Mock Evidence Rejected by Provenance Check
 - **Initial Authoritative Root:** Active pin for $g=1$.
 - **Operation Sequence:** Caller constructs object matching `AuthoritativeSettlementEvidence` schema without factory.
 - **Expected Final Root:** Unchanged; pin remains active.
 - **Expected Result / Error:** Throws `INVALID_SETTLEMENT_EVIDENCE_PROVENANCE`.
 
-### Test R18-R23-T26: Watchdog Timeout Cannot Release Settlement Pin
+### Test R18-R24-T26: Watchdog Timeout Cannot Release Settlement Pin
 - **Initial Authoritative Root:** Barrier pending for $g=1$; watchdog fires after 5,000 ms.
 - **Operation Sequence:** Watchdog handler attempts to call `releaseSettlementPin` with watchdog receipt.
 - **Expected Final Root:** Pin remains active; gate state latches `DEGRADED`.
 - **Expected Result / Error:** Throws `INVALID_SETTLEMENT_EVIDENCE_PROVENANCE`.
 
-### Test R18-R23-T27: Retry Lease ID Passed to Settlement Pin Release Fails Closed
+### Test R18-R24-T27: Retry Lease ID Passed to Settlement Pin Release Fails Closed
 - **Initial Authoritative Root:** Active lease `lease:1:1:c1:1`.
 - **Operation Sequence:** Call `releaseSettlementPin("lease:1:1:c1:1", evidence)`.
 - **Expected Final Root:** Unchanged.
 - **Expected Result / Error:** Throws `PIN_TYPE_MISMATCH`.
 
-### Test R18-R23-T28: Settlement Pin ID Passed to Retry Lease Release Fails Closed
+### Test R18-R24-T28: Settlement Pin ID Passed to Retry Lease Release Fails Closed
 - **Initial Authoritative Root:** Active pin `pin:1:1:b1:1`.
 - **Operation Sequence:** Call `releaseRetryLease({ leaseId: "pin:1:1:b1:1", ... })`.
 - **Expected Final Root:** Unchanged.
 - **Expected Result / Error:** Throws `LEASE_TYPE_MISMATCH`.
 
-### Test R18-R23-T29: Genuinely Unknown Identifier Passed to Release APIs Fails Closed (Blocker B1)
+### Test R18-R24-T29: Genuinely Unknown Identifier Passed to Release APIs Fails Closed (Blocker B1)
 - **Initial Authoritative Root:** Clean root; active and retired maps empty.
 - **Operation Sequence:**
   1. Call `releaseRetryLease` with never-issued `leaseId = "lease:999:unknown"`.
@@ -1868,7 +2218,7 @@ The following forty deterministic future test specifications are formally codifi
 - **Expected Final Root:** Unchanged.
 - **Expected Result / Error:** Both calls fail closed with `RESOURCE_NOT_FOUND` (neither returns `ALREADY_RELEASED`).
 
-### Test R18-R23-T30: Duplicate Release Against Retired Pin With Matching Provenance and Digest Returns Already Released
+### Test R18-R24-T30: Duplicate Release Against Retired Pin With Matching Provenance and Digest Returns Already Released
 - **Initial Authoritative Root:** Active pin `pin_1` for $g=1$.
 - **Operation Sequence:**
   1. Release `pin_1` with valid evidence; returns `{ status: 'RELEASED' }`.
@@ -1876,13 +2226,13 @@ The following forty deterministic future test specifications are formally codifi
 - **Expected Final Root:** `activeSettlementPins.has("pin_1") === false`; `retiredSettlementPins.has("pin_1") === true`.
 - **Expected Result / Error:** Second call validates provenance and digest, returning `{ status: 'ALREADY_RELEASED' }` idempotently.
 
-### Test R18-R23-T31: Settlement Pin Release With Mismatched Drainer Generation Fails Closed (Blocker C1)
+### Test R18-R24-T31: Settlement Pin Release With Mismatched Drainer Generation Fails Closed (Blocker C1)
 - **Initial Authoritative Root:** Active pin for $g=1$ with `drainerOwnershipGeneration = 2`.
 - **Operation Sequence:** Caller presents `AuthoritativeSettlementEvidence` with `drainerOwnershipGeneration = 1`.
 - **Expected Final Root:** Unchanged; pin remains active; evidence remains unconsumed.
 - **Expected Result / Error:** Throws `SETTLEMENT_EVIDENCE_IDENTITY_MISMATCH`.
 
-### Test R18-R23-T32: Pre-Publication Throw During Pin Release Leaves Evidence Usable for Retry (Blocker C2)
+### Test R18-R24-T32: Pre-Publication Throw During Pin Release Leaves Evidence Usable for Retry (Blocker C2)
 - **Initial Authoritative Root:** Active pin for $g=1$; `consumedSettlementEvidence.size === 0`.
 - **Operation Sequence:**
   1. Initiate `releaseSettlementPin`; candidate root construction simulates memory allocation exception before pointer swap.
@@ -1890,43 +2240,43 @@ The following forty deterministic future test specifications are formally codifi
 - **Expected Final Root:** Second call succeeds; `pin_1` retired; evidence replay key added to `consumedSettlementEvidence`.
 - **Expected Result / Error:** First call throws error without consuming evidence in authoritative root; second call completes release cleanly.
 
-### Test R18-R23-T33: Duplicate Release on Retired Lease With Altered Transaction ID Fails Closed (Blocker B1)
+### Test R18-R24-T33: Duplicate Release on Retired Lease With Altered Transaction ID Fails Closed (Blocker B1)
 - **Initial Authoritative Root:** Retired lease `lease_1` recorded for `transactionId = "tx-100"`.
 - **Operation Sequence:** Call `releaseRetryLease` passing `lease_1` with `transactionId = "tx-200"`.
 - **Expected Final Root:** Unchanged.
 - **Expected Result / Error:** Throws `LEASE_TRANSACTION_ID_MISMATCH`.
 
-### Test R18-R23-T34: Duplicate Release on Retired Pin With Unverified Provenance Fails Closed (Blocker C2)
+### Test R18-R24-T34: Duplicate Release on Retired Pin With Unverified Provenance Fails Closed (Blocker C2)
 - **Initial Authoritative Root:** Retired pin `pin_1` recorded for $g=1$.
 - **Operation Sequence:** Caller constructs mock evidence object with matching fields but without factory issuance.
 - **Expected Final Root:** Unchanged.
 - **Expected Result / Error:** Throws `INVALID_SETTLEMENT_EVIDENCE_PROVENANCE`.
 
-### Test R18-R23-T35: Pre-Existing Retired Pins Overflow Rejection (Blocker B2)
+### Test R18-R24-T35: Pre-Existing Retired Pins Overflow Rejection (Reviewer Issue 2)
 - **Initial Authoritative Root:** Artificially injected root with 5,005 entries in `retiredSettlementPins`.
 - **Operation Sequence:** Call `releaseSettlementPin` for active pin `pin_A`.
 - **Expected Final Root:** Unchanged; zero entries deleted; zero mutations committed.
 - **Expected Result / Error:** Throws `RETIRED_PINS_CAPACITY_CORRUPTED`.
 
-### Test R18-R23-T36: Pre-Existing Retired Leases Overflow Rejection (Blocker B2)
+### Test R18-R24-T36: Pre-Existing Retired Leases Overflow Rejection (Reviewer Issue 2)
 - **Initial Authoritative Root:** Artificially injected root with 5,005 entries in `retiredRetryLeases`.
 - **Operation Sequence:** Call `releaseRetryLease` for active lease `lease_A`.
 - **Expected Final Root:** Unchanged; zero entries deleted; zero mutations committed.
 - **Expected Result / Error:** Throws `RETIRED_LEASES_CAPACITY_CORRUPTED`.
 
-### Test R18-R23-T37: Pre-Existing Consumed Evidence Overflow Rejection (Blocker B2)
+### Test R18-R24-T37: Pre-Existing Consumed Evidence Overflow Rejection (Reviewer Issue 2)
 - **Initial Authoritative Root:** Artificially injected root with 5,005 entries in `consumedSettlementEvidence`.
 - **Operation Sequence:** Call `releaseSettlementPin` for active pin `pin_A`.
 - **Expected Final Root:** Unchanged; zero entries deleted.
 - **Expected Result / Error:** Throws `CONSUMED_EVIDENCE_CAPACITY_CORRUPTED`.
 
-### Test R18-R23-T38: Cross-Restart Delayed Release Rejection via Non-Reusable Boot ID (Blocker B1)
-- **Initial Authoritative Root:** Restarted coordinator with `coordinatorBootId = "boot-2"`.
-- **Operation Sequence:** Caller submits delayed release for `pinId = "pin:boot-1:1:barrier:100"`.
+### Test R18-R24-T38: Cross-Restart Delayed Release Rejection via Compound Durable Boot Epoch (Reviewer Issue 1)
+- **Initial Authoritative Root:** Restarted coordinator with `coordinatorBootEpoch = { clusterTerm: 2, bootGeneration: 5, bootInstanceId: "uuid-new" }`.
+- **Operation Sequence:** Caller submits delayed release for `pinId = "pin:1.4.uuid-old:1:barrier:100"`.
 - **Expected Final Root:** Unchanged.
-- **Expected Result / Error:** Throws `RESOURCE_NOT_FOUND` (cannot collide with newly issued pins under `boot-2`).
+- **Expected Result / Error:** Throws `RESOURCE_NOT_FOUND` (cannot collide with newly issued pins under `bootGeneration: 5`).
 
-### Test R18-R23-T39: Allocation Interruption Discards Counter Without Collision
+### Test R18-R24-T39: Allocation Interruption Discards Counter Without Collision
 - **Initial Authoritative Root:** `_pinSequenceCounter = 10`.
 - **Operation Sequence:**
   1. Call `publishReleaseAndObligation`; sequence increments to 11; candidate allocation throws out-of-memory.
@@ -1934,15 +2284,39 @@ The following forty deterministic future test specifications are formally codifi
 - **Expected Final Root:** Active pin published with `seq = 12`; zero active records for `seq = 11`.
 - **Expected Result / Error:** Second call succeeds cleanly; discarded sequence 11 causes zero collisions.
 
-### Test R18-R23-T40: Normal Exactly-At-Capacity Lockstep Retirement at 5,000 Entries
-- **Initial Authoritative Root:** `retiredSettlementPins.size === 5000`, `consumedSettlementEvidence.size === 5000`.
+### Test R18-R24-T40: Normal Exactly-At-Capacity Lockstep Retirement at 5,000 Entries
+- **Initial Authoritative Root:** `retiredSettlementPins.size === 5000`, `consumedSettlementEvidence.size === 5000`. Oldest retired pin has zero active references.
 - **Operation Sequence:** Release active pin `pin_new` with valid evidence.
 - **Expected Final Root:**
   - Oldest retired pin deleted.
   - Oldest replay key deleted from `consumedSettlementEvidence`.
   - `retiredSettlementPins.size === 5000`.
   - `consumedSettlementEvidence.size === 5000`.
-- **Expected Result / Error:** Release succeeds cleanly with exact capacity preservation.
+- **Expected Result / Error:** Release succeeds cleanly with exact capacity preservation and post-publication invariant validation.
+
+### Test R18-R24-T41: All-Protected Retired Pins Exhaustion Triggers Fail-Closed Backpressure (Reviewer Issue 2A)
+- **Initial Authoritative Root:** `retiredSettlementPins.size === 5000`. Every single entry in `retiredSettlementPins` is retained by an active retry lease or active pin.
+- **Operation Sequence:** Call `releaseSettlementPin` for active pin `pin_new`.
+- **Expected Final Root:** Unchanged; zero pins evicted; zero state mutations committed.
+- **Expected Result / Error:** Throws `RETENTION_CAPACITY_EXHAUSTED_BACKPRESSURE`.
+
+### Test R18-R24-T42: Replay Key Desynchronization on Eviction Fails Closed (Reviewer Issue 2B)
+- **Initial Authoritative Root:** `retiredSettlementPins.size === 5000`. The replay key corresponding to the oldest eligible retired pin is artificially absent from `consumedSettlementEvidence`.
+- **Operation Sequence:** Call `releaseSettlementPin` for active pin `pin_new`.
+- **Expected Final Root:** Unchanged; zero mutations committed.
+- **Expected Result / Error:** Throws `REPLAY_KEY_DESYNCHRONIZATION_CORRUPTED`.
+
+### Test R18-R24-T43: Reference-Independent Byte-for-Byte Digest Match Returns Already Released (Reviewer Issue 4)
+- **Initial Authoritative Root:** Pin `pin_retired` is in `retiredSettlementPins` with recorded digest `[0x01, 0x02, ..., 0x20]`.
+- **Operation Sequence:** Caller invokes `releaseSettlementPin` for `pin_retired` with independently allocated `Uint8Array` containing identical bytes (`digestA !== digestB` by reference, but byte-equal).
+- **Expected Final Root:** Unchanged.
+- **Expected Result / Error:** Returns `{ pinId: 'pin_retired', status: 'ALREADY_RELEASED' }`.
+
+### Test R18-R24-T44: Post-Publication Invariant Rejection on Desynchronized Replay State (Reviewer Issue 5 & 6)
+- **Initial Authoritative Root:** Candidate root construction artificially desynchronizes collection sizes (`retiredSettlementPins.size = 5000`, `consumedSettlementEvidence.size = 5001`).
+- **Operation Sequence:** Candidate root passed to `_validatePostPublicationInvariants()`.
+- **Expected Final Root:** Pointer swap rejected; `this.#custodyRoot` remains unchanged.
+- **Expected Result / Error:** Throws `POST_PUBLICATION_COLLECTION_SIZE_DESYNCHRONIZATION`.
 
 ---
 
@@ -1950,25 +2324,37 @@ The following forty deterministic future test specifications are formally codifi
 
 ```
 ================================================================================
-ENGINEERING AUTHORITY APPROVAL QUESTIONS (MILESTONE M5.0-R18-R23):
+ENGINEERING AUTHORITY APPROVAL QUESTIONS (MILESTONE M5.0-R18-R24):
 ================================================================================
-1. [RESTART-SAFE NON-REUSABLE IDENTIFIER ALLOCATION]: Does the Engineering Authority
-   approve binding a non-reusable coordinatorBootId into all allocated settlement
-   pins and retry leases, guaranteeing that evicted identifiers can never be re-issued
-   or confused across process restarts?
+1. [COMPOUND DURABLE BOOT EPOCH & FENCING]: Does the Engineering Authority approve
+   binding a compound durable fencing token coordinatorBootEpoch = <clusterTerm,
+   bootGeneration, bootInstanceId> into all allocated settlement pins and retry
+   leases, guaranteeing mathematical non-reusability across restarts via consensus
+   bootGeneration and split-brain coordinator fencing via clusterTerm?
 
-2. [STRICT PRE-EXISTING OVERFLOW FENCING]: Does the Engineering Authority approve
-   failing closed immediately with dedicated corruption errors whenever pre-existing
-   sizes exceed 5,000 entries across retiredSettlementPins, retiredRetryLeases, or
-   consumedSettlementEvidence, prohibiting silent single-entry trimming?
+2. [GENUINE COLLECTION ENCAPSULATION & DEEP IMMUTABILITY]: Does the Engineering
+   Authority approve encapsulating all custody root collections within ImmutableMap
+   and ImmutableSet classes with private backing stores and non-mutating copy-on-write
+   semantics, eliminating naive Object.freeze() on mutable collections?
 
-3. [LOCKSTEP RETIREMENT AT EXACT CAPACITY]: Does the Engineering Authority approve
-   pruning retired pins and consumed evidence keys in lockstep within a single
-   atomic candidate-root replacement when collections reach exactly 5,000 entries?
+3. [CONSTANT-TIME BYTE DIGEST EQUALITY & STRUCTURED OWNER IDENTITY]: Does the
+   Engineering Authority approve constant-time bitwise byte comparison (areEqualByteArrays)
+   with mandatory defensive cloning for evidence digests, and verifying all 8 fields
+   of CustodyOwnershipToken across active and retired release paths?
 
-4. [CLOSURE OF ALL CORRECTNESS GAPS]: Does the Engineering Authority agree that all
-   correctness gaps (Blockers B1 and B2) are fully closed, and that the recovery
-   arbitration architecture is ready for holistic M5.0 final acceptance review?
+4. [ELIGIBLE TOMBSTONE EVICTION & BACKPRESSURE]: Does the Engineering Authority
+   approve searching deterministically for the oldest eligible unpinned tombstone,
+   and failing closed with RETENTION_CAPACITY_EXHAUSTED_BACKPRESSURE if all 5,000
+   entries are protected by active leases, pins, or obligations?
+
+5. [POST-PUBLICATION CROSS-COLLECTION INVARIANT VERIFICATION]: Does the Engineering
+   Authority approve validating that every retired pin has its exact replay key,
+   verifying collections are <= 5,000, and confirming exact lockstep size equality
+   prior to the atomic pointer replacement?
+
+6. [CLOSURE OF ALL CORRECTNESS GAPS]: Does the Engineering Authority agree that all
+   six review issues are fully resolved, and that the recovery arbitration
+   architecture is ready for holistic M5.0 final acceptance review?
 ================================================================================
 ```
 
@@ -1978,13 +2364,13 @@ ENGINEERING AUTHORITY APPROVAL QUESTIONS (MILESTONE M5.0-R18-R23):
 
 ```
 ================================================================================
-M5.0-R18-R23 ARCHITECTURAL DECISION PROPOSAL VERDICT:
+M5.0-R18-R24 ARCHITECTURAL DECISION PROPOSAL VERDICT:
 DECISION PROPOSAL COMPLETE — READY FOR HOLISTIC M5.0 FINAL ACCEPTANCE REVIEW
 ================================================================================
 ```
 
-This R18-R23 proposal completes the formal recovery arbitration architecture. It establishes restart-safe non-reusable resource identification, enforces strict pre-existing capacity overflow fencing, guarantees lockstep atomic replay retention, and codifies forty deterministic future test specifications.
+This R18-R24 proposal completes the formal recovery arbitration architecture. It establishes compound durable boot fencing, restores deep collection encapsulation via `ImmutableMap` and `ImmutableSet`, enforces constant-time bitwise byte digest comparison and structured owner token identity, guarantees deterministic eligible tombstone eviction with backpressure, verifies post-publication cross-collection invariants, and codifies forty-four deterministic future test specifications.
 
 ### Mandatory Implementation Authorization Statement
 
-> "M5.0-R18-R23 is an architectural documentation correction only. No production implementation has been started. M5.1, including M5.1a, remains strictly unauthorized pending explicit Engineering Authority approval."
+> "M5.0-R18-R24 is an architectural documentation correction only. No production implementation has been started. M5.1, including M5.1a, remains strictly unauthorized pending explicit Engineering Authority approval."
