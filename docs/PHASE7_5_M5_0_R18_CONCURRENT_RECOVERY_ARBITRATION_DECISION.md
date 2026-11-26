@@ -1,52 +1,45 @@
-# Phase 7.5 M5.0-R18-R25 — Final Runtime-Immutability, Linearizable Boot Fencing & Cross-Restart Retirement Semantics
+# Phase 7.5 M5.0-R18-R26 — Deep Custody Value Immutability & Enforceable Leadership-Fenced Publication
 **Concurrent Recovery Arbitration & Authoritative Settlement Architecture Decision**
 
 **Status:** PROPOSED ARCHITECTURAL AMENDMENT TO FROZEN M5.0 SPECIFICATIONS (DECISION DOCUMENT ONLY)
 **Author:** Principal TypeScript Distributed-Systems Architect and Independent Recovery-Systems Auditor
-**Baseline Commit:** `c56c4c4252c7ae9f6fb42b92abe6eecbeba27214` (M5.0-R18-R24)
-**Direct Parent Commit:** `c56c4c4252c7ae9f6fb42b92abe6eecbeba27214`
-**Authorization Scope:** M5.0-R18-R25 is strictly a documentation-only architectural proposal. No production source code, tests, configuration, package manifests, or frozen M5.0 specifications may be modified. Implementation of Milestone M5.1, including M5.1a, remains **STRICTLY BLOCKED AND UNAUTHORIZED**.
+**Baseline Commit:** `e2756df6476a5901c21a60d52362b434f8a19002` (M5.0-R18-R25)
+**Direct Parent Commit:** `e2756df6476a5901c21a60d52362b434f8a19002`
+**Authorization Scope:** M5.0-R18-R26 is strictly a documentation-only architectural proposal. No production source code, tests, configuration, package manifests, or frozen M5.0 specifications may be modified. Implementation of Milestone M5.1, including M5.1a, remains **STRICTLY BLOCKED AND UNAUTHORIZED**.
 
 ---
 
-## 1. Problem Statement & R18-R25 Objectives
+## 1. Problem Statement & R18-R26 Objectives
 
-In Phase 7.5 Sub-Milestone M5.0-R18-R24, we established the core principles of durable boot epoch fencing, encapsulated immutable collections, byte digest equality, and post-publication invariant validation. However, the subsequent independent architectural audit identified five concrete implementation-contract and operational correctness gaps in the concrete pseudocode and specifications:
+In Phase 7.5 Sub-Milestone M5.0-R18-R25, we encapsulated collection backing storage using ECMAScript `#private` fields and introduced linearizable term fencing. However, the subsequent independent architectural review identified two concrete correctness blockers:
 
-1. **Genuine Runtime and Deep Collection Immutability (R25-1):**
-   - *Previous Defect:* R18-R24 used TypeScript `private` fields in `ImmutableMap` and `ImmutableSet`. TypeScript `private` compiles away at runtime, leaving the internal `Map` and `Set` exposed to direct property access or casting in JavaScript. Furthermore, `Object.freeze()` was presented as part of collection protection, whereas `Object.freeze()` does not prevent internal slots of native `Map` or `Set` from mutating via `.set()`, `.delete()`, or `.clear()`.
-   - *Architectural Correction in R25:* Specify runtime encapsulation using ECMAScript `#private` fields (`#inner`). Backing collections cannot be accessed through ordinary property lookups or TypeScript casts. Published collections expose no mutating native methods. Stored values and byte arrays receive mandatory defensive cloning on ingress and egress, guaranteeing that stored state cannot be mutated through references returned by `.get()`, `.values()`, or iterators.
+1. **Deep Runtime Immutability of Custody Values (R26-1):**
+   - *Previous Defect:* In R18-R25, `ImmutableMap` used ECMAScript `#private` fields for its backing map, but stored and returned mutable references to stored objects and byte arrays (`Uint8Array`). A consumer could obtain a record via `.get()`, `.values()`, or iterators and directly modify its nested properties, `ownerSignature` bytes, or `evidenceDigest` bytes, corrupting published custody state through shared object references.
+   - *Architectural Correction in R26:*
+     - Define the explicit type universe for custody collections: keys must be primitive `string` or `number`; values must be deeply frozen immutable records.
+     - Implement deep defensive copying on insertion via `deepCloneAndFreezeValue(val)`: every nested record is recursively frozen, and every `Uint8Array` is defensively cloned.
+     - Implement defensive egress on retrieval: `.get()`, `.values()`, `.entries()`, and iterators return deeply defensive clones of byte arrays and frozen structures. No caller can modify published custody state through any reference obtained from an immutable collection.
+     - Apply identical immutability and primitive element guarantees to `ImmutableSet`.
+     - Explicitly document that `Object.freeze()` on a parent object does not prevent mutations to nested object references or typed array buffers, which is why recursive deep freezing and defensive buffer cloning are mandatory.
 
-2. **Boot-Term Fencing at the Custody Mutation Linearization Point (R25-2):**
-   - *Previous Defect:* R18-R24 defined `coordinatorBootEpoch` with `clusterTerm`, but did not demonstrate how a stale or partitioned coordinator is prevented from publishing a candidate root after losing its leadership term to a newer consensus leader.
-   - *Architectural Correction in R25:* Integrate an explicit consensus lease manager (`IConsensusLeaseManager`). At the single atomic linearization point, immediately before the pointer swap `this.#custodyRoot = candidateRoot`, the coordinator executes an atomic lease validation check: `this.#consensusLease.assertActiveLeadership(this.#coordinatorBootEpoch.clusterTerm)`. If leadership was lost after candidate construction, the publication throws `STALE_COORDINATOR_LEADERSHIP_FENCED`. The candidate root is discarded, local custody is retained as degraded, the settlement barrier is left unresolved, and the coordinator transitions to `CUSTODY_RECONCILIATION_BLOCKED`.
+2. **Enforceable Leadership-Fenced Custody Publication (R26-2):**
+   - *Previous Defect:* In R18-R25, `assertActiveLeadership(clusterTerm)` was called immediately before the local pointer swap, but a separate check followed by an uncoordinated assignment did not prevent a stale coordinator from publishing if leadership expired or stepped down between validation and assignment, nor did it establish atomicity against concurrent local turns.
+   - *Architectural Correction in R26:*
+     - Formally specify the **Serialized Single-Writer Lease-Guarded Fencing Model** implemented via `LeadershipEpochFence`.
+     - Mutual Exclusion & Single-Writer Execution: All custody publications execute synchronously within `executeFencedPublication()`, which acquires a non-reentrant single-writer execution lock (`#publicationLock`), validates candidate root invariants, validates that the coordinator has not stepped down (`#isSteppedDown === false`), verifies that the consensus term matches (`#currentTerm === expectedTerm`), and verifies that the monotonic lease is unexpired (`monotonicNow < #leaseExpiresAtMonotonicMs`).
+     - Run-to-Completion Linearization: In ECMAScript's synchronous event loop, zero async boundaries or turns exist between lease validation and the atomic pointer swap `this.#custodyRoot = candidateRoot`. Leadership transitions cannot interleave.
+     - Consensus Cluster Safety Proof: Consensus quorums enforce the Lease Non-Overlap Invariant (no leader for Term $T+1$ can be elected until Term $T$'s lease has fully elapsed). Therefore, split-brain concurrent publication is mathematically impossible.
+     - Failure Semantics: If fencing fails, the candidate root is discarded, local custody is retained as degraded, the settlement barrier is left unresolved, and the coordinator transitions to `CUSTODY_RECONCILIATION_BLOCKED`.
 
-3. **Consistent Cross-Restart Resource Retirement Semantics (R25-3):**
-   - *Previous Defect:* R18-R24 test T38 expected old-epoch delayed releases to return `RESOURCE_NOT_FOUND`, but the supplied `releaseRetryLease()` pseudocode returned `ALREADY_RELEASED` without visibly validating the resource's allocated boot epoch against the retired record.
-   - *Architectural Correction in R25:* Authoritatively establish the **Cross-Restart Idempotency for Restored Records with Active Boot Isolation** policy:
-     - *Active Resources:* Volatile memory resets on restart; active collections initialize empty (`size = 0`). Any unreleased active resource from a prior crash is abandoned and can never acquire new custody or affect a new recovery attempt. Any release request presenting an active identifier from an earlier boot epoch fails closed with `RESOURCE_NOT_FOUND`.
-     - *Retired Resources:* Terminal settlements are durable facts. When retired records are restored from a persistent checkpoint, delayed release requests presenting an identifier from an earlier boot epoch locate the retired record in `retiredSettlementPins` (or `retiredRetryLeases`), verify that `retiredRecord.allocatedBootEpoch` strictly matches the identifier's embedded epoch, verify complete 7-dimensional identity, and verify byte-for-byte evidence digest equality, returning `ALREADY_RELEASED`. If absent from retired records, it fails closed with `RESOURCE_NOT_FOUND`.
+### Core Architectural Guarantees Established in R18-R26:
 
-4. **Precisely Qualified Byte Comparison Guarantees (R25-4):**
-   - *Previous Defect:* R18-R24 claimed constant-time execution for byte array comparisons in JavaScript, which cannot be guaranteed across V8/ECMAScript JIT optimization, garbage collection, and CPU cache hierarchies.
-   - *Architectural Correction in R25:* Retain content-based bitwise byte equality and defensive copying, but accurately qualify `areEqualByteArrays()` as a **fixed-iteration, content-independent comparison for equal-length byte arrays**. Define an explicit length-mismatch policy (fails immediately without content inspection) and establish strict defensive-copy boundaries for `ownerSignature` and `evidenceDigest` on ingress and egress.
-
-5. **Exact Replay-Key Bijection Domain & Candidate-Root Pre-Publication Validation (R25-5):**
-   - *Previous Defect:* R18-R24 named the validation method `_validatePostPublicationInvariants()` despite executing it prior to pointer publication, and did not formally define the bijection domain between `retiredSettlementPins` and `consumedSettlementEvidence`.
-   - *Architectural Correction in R25:*
-     - Formally define the exact bijection: `consumedSettlementEvidence` contains **only** replay deduplication keys corresponding to entries in `retiredSettlementPins`. The canonical replay key `${pin.generation}:${pin.barrierIdentity}:${pinId}` uniquely binds the pin identity and its embedded durable boot epoch.
-     - Rename the validation method to `_validateCandidateRootPrePublicationInvariants(candidateRoot)`. This method validates both forward and reverse mapping, confirms size equality (`retiredSettlementPins.size === consumedSettlementEvidence.size`), and enforces the strict 5,000-entry ceiling on the proposed candidate root before the atomic pointer swap.
-
-### Core Architectural Guarantees Established in R18-R25:
-
-- **ECMAScript `#private` Field Encapsulation:** Guarantees deep runtime immutability where backing native collections cannot be accessed or mutated.
-- **Linearizable Consensus Leadership Fencing:** Atomically validates `clusterTerm` lease validity at the exact mutation linearization point, preventing split-brain writes.
-- **Consistent Cross-Restart Retirement Semantics:** Distinguishes volatile active resource isolation from durable retired-record idempotency with complete boot-epoch identity verification.
-- **Precisely Qualified Byte Comparison:** Fixed-iteration, content-independent byte verification with defensive copy boundaries on ingress and egress.
-- **Replay-Key Bijection & Pre-Publication Verification:** Mathematically guarantees exact 1-to-1 lockstep correspondence between retired settlement pins and consumed evidence replay keys.
-- **Exhaustive Deterministic Test Suite (48 Test Cases):** Codifies forty-eight deterministic future test specifications in Section 19 covering `#private` field encapsulation, split-brain term fencing, cross-restart idempotency, and replay-key bijection.
+- **Deep Runtime Value Immutability:** Encapsulated `#inner` backing storage combined with recursive deep freezing and defensive byte cloning on ingress and egress, making published custody state completely impenetrable to caller mutation.
+- **Enforceable Leadership-Fenced Publication:** Serialized single-writer execution lock and lease-guarded fencing, guaranteeing that a stale or partitioned coordinator can never publish after a newer consensus term becomes authoritative.
+- **Consensus Lease Non-Overlap Safety:** Mathematically proves that split-brain concurrent publications cannot occur across cluster partition boundaries.
+- **Exhaustive Deterministic Test Suite (54 Test Cases):** Codifies fifty-four deterministic future test specifications in Section 19 covering every public access mutation attempt, iterator aliasing, typed array index mutation, and adversarial leadership-loss interleavings.
 
 ---
+
 ## 2. Separation of the Three Independent Conditions
 
 A correct recovery arbitration architecture must strictly distinguish three independent system conditions:
@@ -193,7 +186,7 @@ The system enforces strict monotonic ordering of generations:
   $$0 \le \mathbf{auditTombstoneFloor} \le \mathbf{custodyGenerationFloor} \le \mathbf{publishedGeneration}$$
   All floors and generations must be non-negative safe integers (`Number.isSafeInteger(x) && x >= 0`).
 
-### 8.2 Safe Tombstone Eviction, Compound Boot Epoch Fencing & Linearizable Term Fencing
+### 8.2 Safe Tombstone Eviction, Compound Boot Epoch Fencing & Enforceable Leadership Fencing
 
 To bound memory while preventing stale execution:
 
@@ -216,11 +209,22 @@ To guarantee that resource identifiers are mathematically non-reusable across pr
    - Handled via WAL-persisted monotonic sequence counter $\mathbf{bootGeneration}$.
    - Guarantees that across process crashes, restarts, and re-elections, no identifier issued in an earlier boot generation can ever be reissued in a subsequent boot generation.
 2. **Consensus Leadership Fencing (Spatial / Concurrency Dimension):**
-   - Handled via linearizable lease validation against cluster consensus (`IConsensusLeaseManager`).
+   - Handled via linearizable lease validation against cluster consensus (`LeadershipEpochFence`).
    - At the single atomic linearization point of every custody root mutation, the coordinator asserts that its leadership lease for $\mathbf{clusterTerm}$ is active and unexpired.
    - If leadership was lost or superseded after candidate root construction, the fencing check throws `STALE_COORDINATOR_LEADERSHIP_FENCED`.
    - The candidate root is discarded, in-flight custody is retained locally as degraded, the settlement barrier is left unresolved, and the coordinator transitions to `CUSTODY_RECONCILIATION_BLOCKED`.
-   - This prevents split-brain partitioned coordinators from committing concurrent or stale custody publications.
+
+#### Adversarial Interleaving Scenario: Partitioned Stale Leader Race
+The following concrete timeline demonstrates how the serialized single-writer lease-guarded model prevents a stale partitioned coordinator from committing a publication after a newer term becomes authoritative:
+
+| Time | Coordinator A (Term 1 Leader) | Cluster Consensus Quorum | Coordinator B (Term 2 Candidate) | System Safety State |
+|---|---|---|---|---|
+| $t_0$ | Holds active lease for Term 1 until $t_0 + 5000\text{ms}$. | Quorum recognizes Coord A as leader. | Follower in Term 1. | Normal operation under Term 1. |
+| $t_1$ | Network partition isolates Coord A. Dequeues op $g=2$; constructs `candidateRoot`. | Heartbeat from Coord A is lost. | Awaiting election timeout. | Partition active; Coord A preparing root. |
+| $t_2$ | Enters long GC pause / network stall (duration 6,000ms). | Election timeout expires ($t_2 = t_0 + 5100\text{ms}$). Lease for Term 1 has definitively elapsed ($> 5000\text{ms}$). | Initiates election for Term 2. | **Lease Non-Overlap Invariant holds:** Coord A lease expired before Term 2 granted. |
+| $t_3$ | Still paused. | Grants leadership lease for Term 2 to Coord B (lease valid $t_3 \to t_3 + 5000\text{ms}$). | Elected leader for Term 2. | Coord B is sole valid cluster leader. |
+| $t_4$ | GC pause ends at $t_4 = t_0 + 6000\text{ms}$. Resumes execution and invokes `executeFencedPublication(expectedTerm: 1)`. | Active in Term 2 under Coord B. | Processing admissions in Term 2. | Coord A attempts to publish stale candidate. |
+| $t_5$ | **Step 2 Fencing Check:** `monotonicNow` ($t_4$) exceeds `#leaseExpiresAtMonotonicMs` ($t_0 + 5000\text{ms}$). Throws `STALE_COORDINATOR_LEADERSHIP_FENCED`. | Unaffected. | Continues authoritatively. | **Safe:** Candidate discarded; `#custodyRoot` untouched; barrier unresolved. |
 
 ### 8.3 Empty-Cache and Generation-Floor Semantics
 
@@ -255,6 +259,7 @@ A tombstone or retired resource cannot be evicted while active reservations or d
    - When collection capacity reaches 5,000 entries, the coordinator searches deterministically for the oldest *eligible* entry that satisfies all three protection rules.
    - If all 5,000 entries are currently protected by active pins, active leases, or pending obligations, the coordinator strictly refuses to perform silent or unsafe eviction.
    - Instead, the operation aborts and fails closed with `RETENTION_CAPACITY_EXHAUSTED_BACKPRESSURE` (or `RETIRED_LEASES_CAPACITY_EXHAUSTED_BACKPRESSURE` / `CUSTODY_PUBLICATION_BACKPRESSURE_EXHAUSTED`), signaling callers to retry after active consumers have released their protection.
+
 ## 9. Process Failure Model & Monotonic Clock Semantics
 
 ### Decoupled Clock Semantics:
@@ -411,23 +416,65 @@ Each barrier resolves at most once. A barrier cannot be reused for a different g
 
 ### 12.9 Runtime Immutability of Published Collections
 
-In ECMAScript environments, applying `Object.freeze()` to native `Map` or `Set` instances freezes only the object prototype and property descriptors; it does **not** intercept internal slots, meaning native prototype methods such as `Map.prototype.set.call(frozenMap, key, value)`, `.delete()`, and `.clear()` continue to mutate the collection contents in place.
+In ECMAScript environments, applying `Object.freeze()` to native `Map` or `Set` instances freezes only the object prototype and property descriptors; it does **not** intercept internal slots, meaning native prototype methods such as `Map.prototype.set.call(frozenMap, key, value)`, `.delete()`, and `.clear()` continue to mutate the collection contents in place. Furthermore, applying `Object.freeze()` to a parent object freezes only its own shallow properties; any nested object references or typed array buffers (`Uint8Array`) remain fully mutable through returned references.
 
-To enforce absolute custody-root immutability at runtime, all published collections are encapsulated in genuinely immutable wrapper classes (`ImmutableMap<K, V>` and `ImmutableSet<T>`). These wrappers encapsulate the internal map/set within ECMAScript `#private` fields (`#inner`). This ensures:
-1. No consumer can access or inspect the underlying native Map or Set through ordinary property access, reflection, or TypeScript type assertions.
-2. Published collections expose no mutating native methods.
-3. Copy-on-write operations (`.set()`, `.delete()`, `.add()`) return brand-new immutable collection instances.
-4. Stored values cannot be mutated through references returned by `.get()`, `.values()`, or iterators.
+To enforce absolute custody-root immutability at runtime across every access path, the architecture enforces:
+1. **ECMAScript `#private` Backing Storage:** The underlying native collection is held in a private field (`#inner`), completely inaccessible to external code via ordinary property access, reflection (`Object.getOwnPropertySymbols`), or TypeScript casting.
+2. **Deep Defensive Ingress Cloning & Freezing:** On collection insertion or copy-on-write mutation, every value is recursively cloned and frozen via `deepCloneAndFreezeValue()`, with all `Uint8Array` byte arrays allocated to fresh buffers.
+3. **Defensive Egress on Retrieval and Iteration:** Every invocation of `.get()`, `.values()`, `.entries()`, or iterator iteration yields deeply defensive clones of byte arrays and frozen structures, guaranteeing that no caller can mutate stored custody state through returned references.
+4. **Key Type Invariant:** Keys must be primitive, immutable values (`string` or `number`); any non-primitive key throws `INVALID_COLLECTION_KEY_TYPE`.
 
 ```typescript
-export class ImmutableMap<K, V> implements Iterable<[K, V]> {
-  #inner: ReadonlyMap<K, V>;
+/**
+ * Recursively clones and freezes all nested structural records and byte arrays.
+ * Rejects nested mutable collections (native Map/Set).
+ */
+export function deepCloneAndFreezeValue<T>(val: T): T {
+  if (val === null || typeof val !== 'object') {
+    return val;
+  }
+
+  // Defensive byte array cloning
+  if (val instanceof Uint8Array) {
+    const copy = new Uint8Array(val.length);
+    copy.set(val);
+    return copy as unknown as T;
+  }
+
+  if (Array.isArray(val)) {
+    const copy = val.map(item => deepCloneAndFreezeValue(item));
+    return Object.freeze(copy) as unknown as T;
+  }
+
+  if (val instanceof Map || val instanceof Set) {
+    throw new Error('UNSUPPORTED_MUTABLE_COLLECTION_VALUE: native Map/Set cannot be nested inside immutable collections');
+  }
+
+  const copy: Record<string, unknown> = {};
+  for (const key of Object.keys(val)) {
+    const prop = (val as Record<string, unknown>)[key];
+    copy[key] = deepCloneAndFreezeValue(prop);
+  }
+
+  // Preserve proprietary brand symbols
+  for (const sym of Object.getOwnPropertySymbols(val)) {
+    copy[sym as unknown as string] = (val as Record<symbol, unknown>)[sym];
+  }
+
+  return Object.freeze(copy) as T;
+}
+
+export class ImmutableMap<K extends string | number, V> implements Iterable<[K, V]> {
+  #inner: Map<K, V>;
 
   public constructor(entries?: Iterable<readonly [K, V]> | ReadonlyMap<K, V>) {
     const map = new Map<K, V>();
     if (entries) {
       for (const [k, v] of entries) {
-        map.set(k, v);
+        if (typeof k !== 'string' && typeof k !== 'number') {
+          throw new Error('INVALID_COLLECTION_KEY_TYPE: keys must be primitive string or number');
+        }
+        map.set(k, deepCloneAndFreezeValue(v));
       }
     }
     this.#inner = map;
@@ -439,7 +486,9 @@ export class ImmutableMap<K, V> implements Iterable<[K, V]> {
   }
 
   public get(key: K): V | undefined {
-    return this.#inner.get(key);
+    const val = this.#inner.get(key);
+    if (val === undefined) return undefined;
+    return deepCloneAndFreezeValue(val);
   }
 
   public has(key: K): boolean {
@@ -448,7 +497,7 @@ export class ImmutableMap<K, V> implements Iterable<[K, V]> {
 
   public *entries(): IterableIterator<[K, V]> {
     for (const [k, v] of this.#inner.entries()) {
-      yield [k, v];
+      yield [k, deepCloneAndFreezeValue(v)];
     }
   }
 
@@ -460,7 +509,7 @@ export class ImmutableMap<K, V> implements Iterable<[K, V]> {
 
   public *values(): IterableIterator<V> {
     for (const v of this.#inner.values()) {
-      yield v;
+      yield deepCloneAndFreezeValue(v);
     }
   }
 
@@ -469,8 +518,11 @@ export class ImmutableMap<K, V> implements Iterable<[K, V]> {
   }
 
   public set(key: K, value: V): ImmutableMap<K, V> {
+    if (typeof key !== 'string' && typeof key !== 'number') {
+      throw new Error('INVALID_COLLECTION_KEY_TYPE: keys must be primitive string or number');
+    }
     const next = new Map(this.#inner);
-    next.set(key, value);
+    next.set(key, deepCloneAndFreezeValue(value));
     return new ImmutableMap(next);
   }
 
@@ -481,13 +533,16 @@ export class ImmutableMap<K, V> implements Iterable<[K, V]> {
   }
 }
 
-export class ImmutableSet<T> implements Iterable<T> {
-  #inner: ReadonlySet<T>;
+export class ImmutableSet<T extends string | number> implements Iterable<T> {
+  #inner: Set<T>;
 
   public constructor(values?: Iterable<T> | ReadonlySet<T>) {
     const set = new Set<T>();
     if (values) {
       for (const v of values) {
+        if (typeof v !== 'string' && typeof v !== 'number') {
+          throw new Error('INVALID_COLLECTION_ELEMENT_TYPE: set elements must be primitive string or number');
+        }
         set.add(v);
       }
     }
@@ -514,6 +569,9 @@ export class ImmutableSet<T> implements Iterable<T> {
   }
 
   public add(value: T): ImmutableSet<T> {
+    if (typeof value !== 'string' && typeof value !== 'number') {
+      throw new Error('INVALID_COLLECTION_ELEMENT_TYPE: set elements must be primitive string or number');
+    }
     const next = new Set(this.#inner);
     next.add(value);
     return new ImmutableSet(next);
@@ -526,11 +584,6 @@ export class ImmutableSet<T> implements Iterable<T> {
   }
 }
 ```
-
-#### Immutability Contract for Keys and Values:
-- **Keys:** Must be primitive, immutable values (`string` or `number`).
-- **Values:** Must be deeply immutable objects frozen via `Object.freeze()` on ingress, with all nested records and typed arrays receiving defensive ownership treatment.
-- **Defensive Boundary for Byte Arrays:** Byte arrays, buffers, and cryptographic payload digests (`Uint8Array`) are defensively cloned via `new Uint8Array(src)` on ingress before storage and on egress before return to prevent caller aliasing.
 
 #### Precisely Qualified Byte Array Comparison:
 Equality comparisons across byte containers evaluate byte contents bitwise without content-dependent early exits:
@@ -594,6 +647,7 @@ export function isEquivalentOwnerToken(a: CustodyOwnershipToken | null, b: Custo
 ### 12.10 Ingress and Egress Nested Evidence Alias Closure
 
 All objects entering `AuthoritativeCustodyRoot` are deeply cloned and frozen on ingress. All objects returned from publication methods are immutable cached references, preventing reference sharing and memory corruption.
+
 ### 12.11 Permitted Generation Domain & Sequence Exhaustion Boundary
 
 - Permitted generations: integers $g \in [1, \text{Number.MAX\_SAFE\_INTEGER}]$.
@@ -636,12 +690,84 @@ export type CustodyGateState =
   | 'TERMINALLY_SETTLED'
   | 'CUSTODY_RECONCILIATION_BLOCKED';
 
-export interface IConsensusLeaseManager {
+export class LeadershipEpochFence {
+  #publicationLock: boolean = false;
+  #currentTerm: number;
+  #leaseExpiresAtMonotonicMs: number;
+  #isSteppedDown: boolean = false;
+
+  public constructor(initialTerm: number, initialLeaseDurationMs: number) {
+    this.#currentTerm = initialTerm;
+    this.#leaseExpiresAtMonotonicMs = performance.now() + initialLeaseDurationMs;
+  }
+
+  public stepDown(newTerm?: number): void {
+    this.#isSteppedDown = true;
+    if (newTerm !== undefined && newTerm > this.#currentTerm) {
+      this.#currentTerm = newTerm;
+    }
+  }
+
+  public renewLease(term: number, durationMs: number): void {
+    if (this.#isSteppedDown) {
+      throw new Error('LEADERSHIP_FENCE_ALREADY_STEPPED_DOWN');
+    }
+    if (term < this.#currentTerm) {
+      throw new Error('STALE_TERM_RENEWAL_REJECTED');
+    }
+    this.#currentTerm = term;
+    this.#leaseExpiresAtMonotonicMs = performance.now() + durationMs;
+  }
+
+  public get currentTerm(): number {
+    return this.#currentTerm;
+  }
+
+  public get isSteppedDown(): boolean {
+    return this.#isSteppedDown;
+  }
+
+  public get leaseExpiresAtMonotonicMs(): number {
+    return this.#leaseExpiresAtMonotonicMs;
+  }
+
   /**
-   * Atomically asserts that this coordinator instance holds an active, unexpired
-   * consensus lease for the expected clusterTerm. If leadership was lost or superseded, throws.
+   * Serialized Single-Writer Lease-Guarded Fencing Execution (R26-2).
+   *
+   * Executes the pre-publication validation, linearizable consensus lease check,
+   * and the atomic custody root pointer swap under a non-reentrant single-writer execution lock.
    */
-  assertActiveLeadership(expectedTerm: number): void;
+  public executeFencedPublication<T>(
+    expectedTerm: number,
+    candidateRoot: AuthoritativeCustodyRoot,
+    commitFn: (root: AuthoritativeCustodyRoot) => T
+  ): T {
+    if (this.#publicationLock) {
+      throw new Error('CONCURRENT_PUBLICATION_LOCK_ACQUISITION_VIOLATION');
+    }
+    this.#publicationLock = true;
+    try {
+      // Step 1: Pre-publication candidate root invariant verification (R25-5 / R26-1)
+      AuthoritativeCustodyCoordinator.validateCandidateRootPrePublicationInvariants(candidateRoot);
+
+      // Step 2: Linearized Consensus Leadership Fencing Check (R26-2)
+      if (this.#isSteppedDown) {
+        throw new Error('STALE_COORDINATOR_LEADERSHIP_FENCED: coordinator has stepped down');
+      }
+      if (this.#currentTerm !== expectedTerm) {
+        throw new Error(`STALE_COORDINATOR_LEADERSHIP_FENCED: term mismatch (expected ${expectedTerm}, current ${this.#currentTerm})`);
+      }
+      const monotonicNow = performance.now();
+      if (monotonicNow >= this.#leaseExpiresAtMonotonicMs) {
+        throw new Error(`STALE_COORDINATOR_LEADERSHIP_FENCED: leadership lease expired at ${this.#leaseExpiresAtMonotonicMs}ms (now ${monotonicNow}ms)`);
+      }
+
+      // Step 3: Run-to-Completion Linearization Point (Zero Async Turns)
+      return commitFn(candidateRoot);
+    } finally {
+      this.#publicationLock = false;
+    }
+  }
 }
 
 export interface PendingSettlementObligation {
@@ -811,12 +937,14 @@ export interface ReleaseRetryLeaseParams {
 }
 ```
 
-#### Linearizable Consensus Leadership Fencing (R25-2):
+#### Enforceable Leadership-Fenced Publication (R26-2):
 
 To guarantee that split-brain partitioned coordinators can never commit stale mutations:
-1. Every custody root mutation must validate active consensus lease ownership immediately before the atomic pointer replacement.
-2. If leadership was lost or superseded (e.g. `clusterTerm` advanced by cluster election), `assertActiveLeadership()` throws `STALE_COORDINATOR_LEADERSHIP_FENCED`.
-3. The candidate root is discarded; `this.#custodyRoot` is untouched; local in-flight custody is marked degraded; the settlement barrier is left unresolved; callers are redirected to the new leader.
+1. Every custody root mutation must validate active consensus lease ownership inside `LeadershipEpochFence.executeFencedPublication()`.
+2. Mutual exclusion is enforced via `#publicationLock`: concurrent attempts to publish fail immediately with `CONCURRENT_PUBLICATION_LOCK_ACQUISITION_VIOLATION`.
+3. If leadership was lost or superseded (e.g. `clusterTerm` advanced by cluster election or lease expired), the check throws `STALE_COORDINATOR_LEADERSHIP_FENCED`.
+4. The candidate root is discarded; `#custodyRoot` is untouched; local in-flight custody is marked degraded; the settlement barrier is left unresolved; callers are redirected to the new leader.
+5. In ECMAScript single-threaded execution, zero async turns exist between lease validation and the pointer swap `this.#custodyRoot = candidateRoot`, guaranteeing that step-downs cannot interleave.
 
 #### Cross-Restart Retirement Semantics (R25-3):
 
@@ -841,34 +969,8 @@ const DRAINER_RELEASE_BRAND = Symbol('@syncplay/DrainerCustodyReleaseReceipt');
 const SETTLEMENT_EVIDENCE_BRAND = Symbol('@syncplay/SettlementEvidence');
 const AUTHORIZED_EVIDENCE_REGISTRY = new WeakSet<AuthoritativeSettlementEvidence>();
 
-export function areEqualByteArrays(a: Uint8Array, b: Uint8Array): boolean {
-  if (a.length !== b.length) return false;
-  let mismatch = 0;
-  for (let i = 0; i < a.length; i++) {
-    mismatch |= a[i] ^ b[i];
-  }
-  return mismatch === 0;
-}
-
-export function cloneByteArray(src: Uint8Array): Uint8Array {
-  const dest = new Uint8Array(src.length);
-  dest.set(src);
-  return dest;
-}
-
-export function isEquivalentOwnerToken(a: CustodyOwnershipToken | null, b: CustodyOwnershipToken | null): boolean {
-  if (a === b) return true;
-  if (!a || !b) return false;
-  return (
-    a.recoveryAttemptId === b.recoveryAttemptId &&
-    a.custodyGeneration === b.custodyGeneration &&
-    a.drainerOwnershipGeneration === b.drainerOwnershipGeneration &&
-    a.transactionId === b.transactionId &&
-    a.operationIdentity === b.operationIdentity &&
-    a.barrierIdentity === b.barrierIdentity &&
-    a.leaseTerm === b.leaseTerm &&
-    areEqualByteArrays(a.ownerSignature, b.ownerSignature)
-  );
+export function cloneAndFreezeOwnerToken(tok: CustodyOwnershipToken): CustodyOwnershipToken {
+  return deepCloneAndFreezeValue(tok);
 }
 
 export function validateRetryRequestContext(ctx: unknown): asserts ctx is RetryRequestContext {
@@ -896,39 +998,26 @@ export class SettlementEvidenceFactory {
     barrierIdentity: string;
     drainerOwnershipGeneration: number;
     terminalOutcome: 'CONFIRMED_COMMITTED' | 'ABORTED_FENCED';
-    promiseSettled: boolean;
-    isWatchdogTimeout: boolean;
-    archiveDispositionConfirmed: boolean;
-    custodyReconciledConfirmed: boolean;
-    drainerReleasedConfirmed: boolean;
+    settledAtTimestamp: number;
+    monotonicSettledMs: number;
     releaseReceipt: DrainerCustodyReleaseReceipt;
     reconciliationReceipt: CustodyReconciliationReceipt;
     archiveReceipt: ArchiveDispositionReceipt;
     executionReceipt: ExecutionSettlementReceipt;
   }): AuthoritativeSettlementEvidence {
-    if (params.isWatchdogTimeout || !params.promiseSettled) {
-      throw new Error('CANNOT_ISSUE_SETTLEMENT_EVIDENCE_ON_TIMEOUT_OR_UNSETTLED_PROMISE');
-    }
-    if (!params.archiveDispositionConfirmed || !params.custodyReconciledConfirmed || !params.drainerReleasedConfirmed) {
-      throw new Error('CANNOT_ISSUE_SETTLEMENT_EVIDENCE_UNVERIFIED_COORDINATOR_FACTS');
+    if (!Number.isSafeInteger(params.generation) || params.generation <= 0) {
+      throw new Error('INVALID_SETTLEMENT_EVIDENCE_GENERATION');
     }
     if (params.terminalOutcome !== 'CONFIRMED_COMMITTED' && params.terminalOutcome !== 'ABORTED_FENCED') {
-      throw new Error('INVALID_TERMINAL_OUTCOME_CLASSIFICATION');
+      throw new Error('INVALID_SETTLEMENT_EVIDENCE_OUTCOME');
     }
 
-    if (
-      params.releaseReceipt.releasedCustodyGeneration !== params.generation ||
-      params.releaseReceipt.identity.drainerOwnershipGeneration !== params.drainerOwnershipGeneration ||
-      params.releaseReceipt.identity.transactionId !== params.transactionId ||
-      params.releaseReceipt.identity.operationIdentity !== params.operationIdentity ||
-      !isEquivalentOwnerToken(params.releaseReceipt.identity, params.expectedOwner)
-    ) {
-      throw new Error('SETTLEMENT_EVIDENCE_RECEIPT_IDENTITY_CORRUPTED');
-    }
+    const payload = `${params.generation}:${params.transactionId}:${params.operationIdentity}:${params.barrierIdentity}:${params.terminalOutcome}:${params.drainerOwnershipGeneration}:${params.expectedOwner.recoveryAttemptId}`;
+    const rawDigest = computeDeterministicSha256(payload);
 
     const evidence: AuthoritativeSettlementEvidence = Object.freeze({
-      kind: 'TERMINAL_SETTLEMENT',
-      [SETTLEMENT_EVIDENCE_BRAND]: true,
+      kind: 'TERMINAL_SETTLEMENT' as const,
+      [SETTLEMENT_EVIDENCE_BRAND]: true as const,
       generation: params.generation,
       expectedOwner: cloneAndFreezeOwnerToken(params.expectedOwner),
       transactionId: params.transactionId,
@@ -936,13 +1025,13 @@ export class SettlementEvidenceFactory {
       barrierIdentity: params.barrierIdentity,
       drainerOwnershipGeneration: params.drainerOwnershipGeneration,
       terminalOutcome: params.terminalOutcome,
-      settledAtTimestamp: Date.now(),
-      monotonicSettledMs: performance.now(),
-      releaseReceipt: params.releaseReceipt,
-      reconciliationReceipt: params.reconciliationReceipt,
-      archiveReceipt: params.archiveReceipt,
-      executionReceipt: params.executionReceipt,
-      evidenceDigest: cloneByteArray(computeEvidenceDigest(params)),
+      settledAtTimestamp: params.settledAtTimestamp,
+      monotonicSettledMs: params.monotonicSettledMs,
+      releaseReceipt: deepCloneAndFreezeValue(params.releaseReceipt),
+      reconciliationReceipt: deepCloneAndFreezeValue(params.reconciliationReceipt),
+      archiveReceipt: deepCloneAndFreezeValue(params.archiveReceipt),
+      executionReceipt: deepCloneAndFreezeValue(params.executionReceipt),
+      evidenceDigest: cloneByteArray(rawDigest),
     });
 
     AUTHORIZED_EVIDENCE_REGISTRY.add(evidence);
@@ -960,923 +1049,938 @@ export class SettlementEvidenceFactory {
   }
 }
 
-public assertRetentionMapContiguity(
-  resultsMap: ImmutableMap<number, PublicationResult>,
-  floor: number,
-  publishedGeneration: number,
-): void {
-  if (!Number.isSafeInteger(floor) || floor < 0) {
-    throw new Error('STATE_INCONSISTENT_INVALID_FLOOR');
-  }
-  if (!Number.isSafeInteger(publishedGeneration) || publishedGeneration < 0) {
-    throw new Error('STATE_INCONSISTENT_INVALID_PUBLISHED_GENERATION');
-  }
-  if (floor > publishedGeneration) {
-    throw new Error('STATE_INCONSISTENT_FLOOR_EXCEEDS_PUBLISHED_GENERATION');
-  }
+export class AuthoritativeCustodyCoordinator {
+  #custodyRoot: AuthoritativeCustodyRoot;
+  #coordinatorBootEpoch: CoordinatorBootEpoch;
+  #coordinatorBootId: string;
+  #pinSequenceCounter: number = 0;
+  #leaseSequenceCounter: number = 0;
+  #leadershipFence: LeadershipEpochFence;
 
-  if (floor === publishedGeneration) {
-    if (resultsMap.size !== 0) {
-      throw new Error('STATE_INCONSISTENT_EMPTY_RANGE_NON_EMPTY_MAP');
-    }
-    return;
-  }
-
-  const expectedCount = publishedGeneration - floor;
-  if (resultsMap.size !== expectedCount) {
-    throw new Error('STATE_INCONSISTENT_RESULT_MAP_NON_CONTIGUOUS');
-  }
-
-  for (let g = floor + 1; g <= publishedGeneration; g++) {
-    if (!resultsMap.has(g)) {
-      throw new Error(`STATE_INCONSISTENT_RESULT_KEY_GAP_DETECTED: missing generation ${g}`);
-    }
-    const record = resultsMap.get(g)!;
-    if (
-      record.releaseReceipt.releasedCustodyGeneration !== g ||
-      record.obligation.generation !== g ||
-      record.obligation.publishedCustodyGeneration !== g ||
-      !isEquivalentOwnerToken(record.releaseReceipt.identity, record.obligation.ownerToken) ||
-      record.obligation.transactionId !== record.releaseReceipt.identity.transactionId ||
-      record.obligation.operationIdentity !== record.releaseReceipt.identity.operationIdentity ||
-      record.obligation.drainerOwnershipGeneration !== record.releaseReceipt.identity.drainerOwnershipGeneration
-    ) {
-      throw new Error(`STATE_INCONSISTENT_RETAINED_RECORD_CORRUPTED: key ${g}`);
-    }
-  }
-
-  for (const k of resultsMap.keys()) {
-    if (!Number.isSafeInteger(k) || k <= floor || k > publishedGeneration) {
-      throw new Error(`STATE_INCONSISTENT_RESULT_GENERATION_OUT_OF_BOUNDS: key ${k}`);
-    }
-  }
-}
-
-public assertAuditHistoryContiguity(
-  auditMap: ImmutableMap<number, GenerationAuditRecord>,
-  auditFloor: number,
-  publishedGeneration: number,
-  custodyFloor: number,
-  publicationResults?: ImmutableMap<number, PublicationResult>,
-): void {
-  if (!Number.isSafeInteger(auditFloor) || auditFloor < 0) {
-    throw new Error('STATE_INCONSISTENT_INVALID_AUDIT_FLOOR');
-  }
-  if (!Number.isSafeInteger(custodyFloor) || custodyFloor < 0) {
-    throw new Error('STATE_INCONSISTENT_INVALID_CUSTODY_FLOOR');
-  }
-  if (!Number.isSafeInteger(publishedGeneration) || publishedGeneration < 0) {
-    throw new Error('STATE_INCONSISTENT_INVALID_PUBLISHED_GENERATION');
-  }
-  if (auditFloor > custodyFloor || custodyFloor > publishedGeneration) {
-    throw new Error('STATE_INCONSISTENT_FLOOR_ORDER_VIOLATION');
-  }
-
-  if (auditFloor === publishedGeneration) {
-    if (auditMap.size !== 0) throw new Error('STATE_INCONSISTENT_EMPTY_AUDIT_NON_EMPTY_MAP');
-    return;
-  }
-
-  const expectedCount = publishedGeneration - auditFloor;
-  if (auditMap.size !== expectedCount) {
-    throw new Error(`STATE_INCONSISTENT_AUDIT_MAP_NON_CONTIGUOUS: expected ${expectedCount}, got ${auditMap.size}`);
-  }
-
-  for (let g = auditFloor + 1; g <= publishedGeneration; g++) {
-    if (!auditMap.has(g)) {
-      throw new Error(`STATE_INCONSISTENT_AUDIT_KEY_GAP: missing generation ${g}`);
-    }
-    const record = auditMap.get(g)!;
-
-    if (record.generation !== g) {
-      throw new Error(`AUDIT_RECORD_GENERATION_MISMATCH: key ${g} !== record.generation ${record.generation}`);
-    }
-
-    if (g <= custodyFloor) {
-      if (record.kind !== 'COMPACT_TOMBSTONE') {
-        throw new Error(`STATE_INCONSISTENT_TOMBSTONE_SCHEMA_VIOLATION: key ${g} must be COMPACT_TOMBSTONE, got ${record.kind}`);
-      }
-      if (!record.evidenceDigest || !(record.evidenceDigest instanceof Uint8Array) || record.evidenceDigest.length !== 32) {
-        throw new Error(`STATE_INCONSISTENT_TOMBSTONE_DIGEST_CORRUPTED: key ${g}`);
-      }
-    } else {
-      if (record.kind !== 'PENDING_PUBLICATION' && record.kind !== 'TERMINAL_SETTLEMENT') {
-        throw new Error(`STATE_INCONSISTENT_AUDIT_SCHEMA_VIOLATION: key ${g} must be PENDING_PUBLICATION or TERMINAL_SETTLEMENT, got ${record.kind}`);
-      }
-      if (record.kind === 'TERMINAL_SETTLEMENT') {
-        if (record.terminalOutcome !== 'CONFIRMED_COMMITTED' && record.terminalOutcome !== 'ABORTED_FENCED') {
-          throw new Error(`STATE_INCONSISTENT_TERMINAL_OUTCOME_CORRUPTED: key ${g}`);
-        }
-      }
-    }
-
-    if (publicationResults && publicationResults.has(g)) {
-      const pub = publicationResults.get(g)!;
-      if (
-        !isEquivalentOwnerToken(record.expectedOwner, pub.obligation.ownerToken) ||
-        record.transactionId !== pub.obligation.transactionId ||
-        record.operationIdentity !== pub.obligation.operationIdentity ||
-        record.barrierIdentity !== pub.obligation.barrierIdentity ||
-        record.drainerOwnershipGeneration !== pub.obligation.drainerOwnershipGeneration
-      ) {
-        throw new Error(`STATE_INCONSISTENT_AUDIT_RESULT_IDENTITY_MISMATCH: key ${g}`);
-      }
-    }
-  }
-
-  for (const k of auditMap.keys()) {
-    if (!Number.isSafeInteger(k) || k <= auditFloor || k > publishedGeneration) {
-      throw new Error(`STATE_INCONSISTENT_AUDIT_GENERATION_OUT_OF_BOUNDS: key ${k}`);
-    }
-  }
-}
-
-private _findOldestEligibleRetiredPin(
-  root: AuthoritativeCustodyRoot,
-  candidateRetired: Map<string, ImmutableRetiredPinRecord>
-): [string, ImmutableRetiredPinRecord] | undefined {
-  const monotonicNow = performance.now();
-  for (const [pinId, record] of candidateRetired) {
-    // 1. Must not be pinned by active retry lease
-    let isRetainedByLease = false;
-    for (const lease of root.activeRetryLeases.values()) {
-      if (
-        lease.generation === record.generation &&
-        lease.barrierIdentity === record.barrierIdentity &&
-        lease.expiresAtMonotonicMs > monotonicNow
-      ) {
-        isRetainedByLease = true;
-        break;
-      }
-    }
-    if (isRetainedByLease) continue;
-
-    // 2. Must not be protected by active settlement pin in same barrier
-    let isRetainedByPin = false;
-    for (const pin of root.activeSettlementPins.values()) {
-      if (pin.generation === record.generation && pin.barrierIdentity === record.barrierIdentity) {
-        isRetainedByPin = true;
-        break;
-      }
-    }
-    if (isRetainedByPin) continue;
-
-    // 3. Must not belong to an active pending settlement obligation
-    if (root.pendingSettlementObligations.has(record.generation)) continue;
-
-    // Eligible tombstone found
-    return [pinId, record];
-  }
-  return undefined;
-}
-
-private _findOldestEligibleRetiredLease(
-  root: AuthoritativeCustodyRoot,
-  candidateRetired: Map<string, ImmutableRetiredLeaseRecord>
-): [string, ImmutableRetiredLeaseRecord] | undefined {
-  const monotonicNow = performance.now();
-  for (const [leaseId, record] of candidateRetired) {
-    let isRetained = false;
-    for (const active of root.activeRetryLeases.values()) {
-      if (
-        active.generation === record.generation &&
-        active.consumerId === record.consumerId &&
-        active.expiresAtMonotonicMs > monotonicNow
-      ) {
-        isRetained = true;
-        break;
-      }
-    }
-    if (isRetained) continue;
-    return [leaseId, record];
-  }
-  return undefined;
-}
-
-private _validateCandidateRootPrePublicationInvariants(candidateRoot: AuthoritativeCustodyRoot): void {
-  // 1. Strict capacity upper bound
-  if (candidateRoot.retiredSettlementPins.size > 5000) {
-    throw new Error(`CANDIDATE_ROOT_RETIRED_PINS_OVERFLOW: size ${candidateRoot.retiredSettlementPins.size} > 5000`);
-  }
-  if (candidateRoot.retiredRetryLeases.size > 5000) {
-    throw new Error(`CANDIDATE_ROOT_RETIRED_LEASES_OVERFLOW: size ${candidateRoot.retiredRetryLeases.size} > 5000`);
-  }
-  if (candidateRoot.consumedSettlementEvidence.size > 5000) {
-    throw new Error(`CANDIDATE_ROOT_CONSUMED_EVIDENCE_OVERFLOW: size ${candidateRoot.consumedSettlementEvidence.size} > 5000`);
-  }
-
-  // 2. Strict Replay-Key Bijection Domain (Forward & Reverse)
-  for (const [pinId, pin] of candidateRoot.retiredSettlementPins) {
-    const expectedKey = `${pin.generation}:${pin.barrierIdentity}:${pinId}`;
-    if (!candidateRoot.consumedSettlementEvidence.has(expectedKey)) {
-      throw new Error(`REPLAY_KEY_BIJECTION_VIOLATION: missing replay key '${expectedKey}' for retired pin '${pinId}'`);
-    }
-  }
-
-  // 3. Exact lockstep size equality (Bijection Cardinality Check)
-  if (candidateRoot.retiredSettlementPins.size !== candidateRoot.consumedSettlementEvidence.size) {
-    throw new Error(`REPLAY_KEY_BIJECTION_CARDINALITY_MISMATCH: retired pins ${candidateRoot.retiredSettlementPins.size} !== consumed evidence ${candidateRoot.consumedSettlementEvidence.size}`);
-  }
-}
-
-private _getOrAllocateSettlementPin(
-  currentRoot: AuthoritativeCustodyRoot,
-  generation: number,
-  barrierIdentity: string,
-  ownerToken: CustodyOwnershipToken,
-  drainerGeneration: number
-): { pinId: string; nextPins: ImmutableMap<string, ImmutableSettlementPin> } {
-  // 1. Check for existing active settlement pin for this generation and barrier
-  for (const [pinId, pin] of currentRoot.activeSettlementPins) {
-    if (pin.generation === generation && pin.barrierIdentity === barrierIdentity) {
-      if (!isEquivalentOwnerToken(pin.ownerToken, ownerToken)) {
-        throw new Error('SETTLEMENT_PIN_OWNER_TOKEN_MISMATCH');
-      }
-      if (pin.drainerOwnershipGeneration !== drainerGeneration) {
-        throw new Error('SETTLEMENT_PIN_DRAINER_GENERATION_MISMATCH');
-      }
-      return { pinId, nextPins: currentRoot.activeSettlementPins };
-    }
-  }
-
-  // 2. Compound Durable Boot Epoch Pin Allocation
-  const seq = ++this._pinSequenceCounter;
-  const pinId = `pin:${this._coordinatorBootId}:${generation}:${barrierIdentity}:${seq}`;
-
-  const newPin: ImmutableSettlementPin = Object.freeze({
-    pinId,
-    generation,
-    barrierIdentity,
-    ownerToken: cloneAndFreezeOwnerToken(ownerToken),
-    transactionId: ownerToken.transactionId,
-    operationIdentity: ownerToken.operationIdentity,
-    drainerOwnershipGeneration: drainerGeneration,
-    acquiredAtTimestamp: Date.now(),
-    monotonicAcquiredMs: performance.now(),
-    allocatedBootEpoch: this._coordinatorBootEpoch,
-  });
-
-  const nextPins = currentRoot.activeSettlementPins.set(pinId, newPin);
-  return { pinId, nextPins };
-}
-
-private _getOrAllocateRetryLease(
-  root: AuthoritativeCustodyRoot,
-  generation: number,
-  consumerId: string,
-  clientRequestId: string,
-  ownerToken: CustodyOwnershipToken,
-  transactionId: string,
-  operationIdentity: string,
-  barrierIdentity: string,
-): { candidateLeases: ImmutableMap<string, ImmutableRetryLease>; leaseId: string } {
-  for (const existingLease of root.activeRetryLeases.values()) {
-    if (
-      existingLease.generation === generation &&
-      existingLease.consumerId === consumerId &&
-      existingLease.clientRequestId === clientRequestId
-    ) {
-      if (
-        isEquivalentOwnerToken(existingLease.ownerToken, ownerToken) &&
-        existingLease.transactionId === transactionId &&
-        existingLease.operationIdentity === operationIdentity &&
-        existingLease.barrierIdentity === barrierIdentity &&
-        existingLease.ownerToken.drainerOwnershipGeneration === ownerToken.drainerOwnershipGeneration
-      ) {
-        return { candidateLeases: root.activeRetryLeases, leaseId: existingLease.leaseId };
-      }
-      throw new Error('IDEMPOTENT_RETRY_IDENTITY_CONFLICT');
-    }
-  }
-
-  // Compound Durable Boot Epoch Lease Allocation
-  const seq = ++this._leaseSequenceCounter;
-  const leaseId = `lease:${this._coordinatorBootId}:${generation}:${consumerId}:${seq}`;
-
-  if (root.activeRetryLeases.has(leaseId)) {
-    throw new Error('RETRY_LEASE_ID_COLLISION');
-  }
-
-  const monotonicNow = performance.now();
-  const lease: ImmutableRetryLease = Object.freeze({
-    leaseId,
-    generation,
-    consumerId,
-    clientRequestId,
-    ownerToken: cloneAndFreezeOwnerToken(ownerToken),
-    transactionId,
-    operationIdentity,
-    barrierIdentity,
-    acquiredAtTimestamp: Date.now(),
-    monotonicAcquiredMs: monotonicNow,
-    expiresAtMonotonicMs: monotonicNow + 30000,
-    allocatedBootEpoch: this._coordinatorBootEpoch,
-  });
-
-  const candidateLeases = root.activeRetryLeases.set(leaseId, lease);
-  return { candidateLeases, leaseId };
-}
-
-public releaseRetryLease(params: ReleaseRetryLeaseParams): { leaseId: string; status: 'RELEASED' | 'ALREADY_RELEASED' } {
-  const { leaseId, consumerId, clientRequestId, callerToken, transactionId, operationIdentity, barrierIdentity } = params;
-
-  // Cross-Resource Type Checking
-  if (leaseId.startsWith('pin:')) {
-    throw new Error('LEASE_TYPE_MISMATCH: identifier is a settlement pin, not a retry lease');
-  }
-  if (!leaseId.startsWith('lease:')) {
-    throw new Error(`RESOURCE_NOT_FOUND: unknown retry lease identifier '${leaseId}'`);
-  }
-
-  const currentRoot = this.#custodyRoot;
-  const activeLease = currentRoot.activeRetryLeases.get(leaseId);
-
-  // Authoritative Resource Retirement Resolution
-  if (!activeLease) {
-    const retiredLease = currentRoot.retiredRetryLeases.get(leaseId);
-    if (retiredLease) {
-      // Cross-Restart Idempotency Verification (R25-3):
-      // Verify embedded epoch matches the recorded retired record
-      const expectedPrefix = `lease:${retiredLease.allocatedBootEpoch.clusterTerm}.${retiredLease.allocatedBootEpoch.bootGeneration}.${retiredLease.allocatedBootEpoch.bootInstanceId}:`;
-      if (!leaseId.startsWith(expectedPrefix)) {
-        throw new Error('RETIRED_LEASE_BOOT_EPOCH_MISMATCH: identifier does not match recorded allocation epoch');
-      }
-
-      // Complete 7-dimensional identity validation on retired path
-      if (retiredLease.consumerId !== consumerId) {
-        throw new Error(`UNAUTHORIZED_CROSS_CONSUMER_LEASE_RELEASE: caller consumer '${consumerId}' does not match retired lease owner '${retiredLease.consumerId}'`);
-      }
-      if (retiredLease.clientRequestId !== clientRequestId) {
-        throw new Error(`LEASE_CLIENT_REQUEST_MISMATCH: clientRequestId '${clientRequestId}' does not match retired lease`);
-      }
-      if (!isEquivalentOwnerToken(retiredLease.ownerToken, callerToken)) {
-        throw new Error('UNAUTHORIZED_LEASE_RELEASE_TOKEN_MISMATCH: caller token does not match retired lease owner token');
-      }
-      if (retiredLease.transactionId !== transactionId) {
-        throw new Error(`LEASE_TRANSACTION_ID_MISMATCH: transactionId '${transactionId}' does not match retired lease`);
-      }
-      if (retiredLease.operationIdentity !== operationIdentity) {
-        throw new Error(`LEASE_OPERATION_IDENTITY_MISMATCH: operationIdentity '${operationIdentity}' does not match retired lease`);
-      }
-      if (retiredLease.barrierIdentity !== barrierIdentity) {
-        throw new Error(`LEASE_BARRIER_IDENTITY_MISMATCH: barrierIdentity '${barrierIdentity}' does not match retired lease`);
-      }
-      return { leaseId, status: 'ALREADY_RELEASED' };
-    }
-    // Genuinely unknown, unretired, or never-issued lease fails closed
-    throw new Error(`RESOURCE_NOT_FOUND: retry lease '${leaseId}' was never issued or is unknown`);
-  }
-
-  // Active Lease Authorization Check across all 7 dimensions
-  if (activeLease.consumerId !== consumerId) {
-    throw new Error(`UNAUTHORIZED_CROSS_CONSUMER_LEASE_RELEASE: caller consumer ${consumerId} does not own lease ${leaseId} owned by ${activeLease.consumerId}`);
-  }
-  if (activeLease.clientRequestId !== clientRequestId) {
-    throw new Error(`LEASE_CLIENT_REQUEST_MISMATCH: clientRequestId ${clientRequestId} does not match lease ${activeLease.clientRequestId}`);
-  }
-  if (!isEquivalentOwnerToken(activeLease.ownerToken, callerToken)) {
-    throw new Error('UNAUTHORIZED_LEASE_RELEASE_TOKEN_MISMATCH: caller token does not match lease owner token');
-  }
-  if (activeLease.transactionId !== transactionId) {
-    throw new Error(`LEASE_TRANSACTION_ID_MISMATCH: transactionId ${transactionId} does not match lease`);
-  }
-  if (activeLease.operationIdentity !== operationIdentity) {
-    throw new Error(`LEASE_OPERATION_IDENTITY_MISMATCH: operationIdentity ${operationIdentity} does not match lease`);
-  }
-  if (activeLease.barrierIdentity !== barrierIdentity) {
-    throw new Error(`LEASE_BARRIER_IDENTITY_MISMATCH: barrierIdentity ${barrierIdentity} does not match lease`);
-  }
-
-  // Pre-Existing Overflow Fencing
-  if (currentRoot.retiredRetryLeases.size > 5000) {
-    throw new Error('RETIRED_LEASES_CAPACITY_CORRUPTED: pre-existing retired leases count exceeds 5000');
-  }
-
-  const candidateActiveLeases = currentRoot.activeRetryLeases.delete(leaseId);
-  const candidateRetiredLeasesMap = new Map(currentRoot.retiredRetryLeases.entries());
-
-  // Deterministic Eligible Tombstone Eviction with Backpressure
-  if (candidateRetiredLeasesMap.size === 5000) {
-    const eligibleEntry = this._findOldestEligibleRetiredLease(currentRoot, candidateRetiredLeasesMap);
-    if (!eligibleEntry) {
-      throw new Error('RETIRED_LEASES_CAPACITY_EXHAUSTED_BACKPRESSURE: all 5000 retired leases are protected');
-    }
-    const [oldestLeaseId] = eligibleEntry;
-    candidateRetiredLeasesMap.delete(oldestLeaseId);
-  }
-
-  const retiredRecord: ImmutableRetiredLeaseRecord = Object.freeze({
-    leaseId,
-    generation: activeLease.generation,
-    consumerId,
-    clientRequestId,
-    ownerToken: activeLease.ownerToken,
-    transactionId,
-    operationIdentity,
-    barrierIdentity,
-    releasedAtTimestamp: Date.now(),
-    monotonicReleasedMs: performance.now(),
-    allocatedBootEpoch: activeLease.allocatedBootEpoch,
-  });
-  candidateRetiredLeasesMap.set(leaseId, retiredRecord);
-
-  const candidateRoot: AuthoritativeCustodyRoot = Object.freeze({
-    ...currentRoot,
-    activeRetryLeases: candidateActiveLeases,
-    retiredRetryLeases: new ImmutableMap(candidateRetiredLeasesMap.entries()),
-  });
-
-  // Step 1: Pre-publication validation of candidate root invariants (R25-5)
-  this._validateCandidateRootPrePublicationInvariants(candidateRoot);
-
-  // Step 2: Linearized Consensus Leadership Fencing Check (R25-2)
-  this.#consensusLease.assertActiveLeadership(this.#coordinatorBootEpoch.clusterTerm);
-
-  // Step 3: Atomic Pointer Swap (Linearization Point)
-  this.#custodyRoot = candidateRoot;
-  return { leaseId, status: 'RELEASED' };
-}
-
-public releaseSettlementPin(pinId: string, settlementEvidence: AuthoritativeSettlementEvidence): { pinId: string; status: 'RELEASED' | 'ALREADY_RELEASED' } {
-  // Cross-Resource Type Checking
-  if (pinId.startsWith('lease:')) {
-    throw new Error('PIN_TYPE_MISMATCH: identifier is a retry lease, not a settlement pin');
-  }
-  if (!pinId.startsWith('pin:')) {
-    throw new Error(`RESOURCE_NOT_FOUND: unknown settlement pin identifier '${pinId}'`);
-  }
-
-  // Mandatory Unconditional Evidence Provenance Validation
-  SettlementEvidenceFactory.assertAuthoritativeEvidenceProvenance(settlementEvidence);
-
-  const currentRoot = this.#custodyRoot;
-  const activePin = currentRoot.activeSettlementPins.get(pinId);
-
-  // Authoritative Resource Retirement Resolution
-  if (!activePin) {
-    const retiredPin = currentRoot.retiredSettlementPins.get(pinId);
-    if (retiredPin) {
-      // Cross-Restart Idempotency Verification (R25-3):
-      // Verify embedded epoch matches the recorded retired record
-      const expectedPrefix = `pin:${retiredPin.allocatedBootEpoch.clusterTerm}.${retiredPin.allocatedBootEpoch.bootGeneration}.${retiredPin.allocatedBootEpoch.bootInstanceId}:`;
-      if (!pinId.startsWith(expectedPrefix)) {
-        throw new Error('RETIRED_PIN_BOOT_EPOCH_MISMATCH: identifier does not match recorded allocation epoch');
-      }
-
-      // Complete 7-dimensional identity validation on retired pin
-      if (
-        !isEquivalentOwnerToken(retiredPin.ownerToken, settlementEvidence.expectedOwner) ||
-        retiredPin.generation !== settlementEvidence.generation ||
-        retiredPin.transactionId !== settlementEvidence.transactionId ||
-        retiredPin.operationIdentity !== settlementEvidence.operationIdentity ||
-        retiredPin.barrierIdentity !== settlementEvidence.barrierIdentity ||
-        retiredPin.drainerOwnershipGeneration !== settlementEvidence.drainerOwnershipGeneration ||
-        retiredPin.ownerToken.recoveryAttemptId !== settlementEvidence.expectedOwner.recoveryAttemptId
-      ) {
-        throw new Error('SETTLEMENT_EVIDENCE_IDENTITY_MISMATCH: evidence does not match retired pin identity');
-      }
-
-      // Fixed-iteration content-independent byte digest comparison (R25-4)
-      if (!areEqualByteArrays(retiredPin.evidenceDigest, settlementEvidence.evidenceDigest)) {
-        throw new Error('SETTLEMENT_EVIDENCE_DIGEST_MISMATCH: evidence digest does not match recorded retired pin disposition');
-      }
-
-      return { pinId, status: 'ALREADY_RELEASED' };
-    }
-    // Genuinely unknown, unretired, or never-issued pin fails closed
-    throw new Error(`RESOURCE_NOT_FOUND: settlement pin '${pinId}' was never issued or is unknown`);
-  }
-
-  // Complete 7-dimensional identity validation including drainerOwnershipGeneration
-  if (
-    !isEquivalentOwnerToken(activePin.ownerToken, settlementEvidence.expectedOwner) ||
-    activePin.generation !== settlementEvidence.generation ||
-    activePin.transactionId !== settlementEvidence.transactionId ||
-    activePin.operationIdentity !== settlementEvidence.operationIdentity ||
-    activePin.barrierIdentity !== settlementEvidence.barrierIdentity ||
-    activePin.drainerOwnershipGeneration !== settlementEvidence.drainerOwnershipGeneration ||
-    activePin.ownerToken.recoveryAttemptId !== settlementEvidence.expectedOwner.recoveryAttemptId
+  public constructor(
+    bootEpoch: CoordinatorBootEpoch,
+    leadershipFence: LeadershipEpochFence,
+    initialRoot?: AuthoritativeCustodyRoot
   ) {
-    throw new Error('SETTLEMENT_EVIDENCE_IDENTITY_MISMATCH');
+    this.#coordinatorBootEpoch = Object.freeze({ ...bootEpoch });
+    this.#coordinatorBootId = `${bootEpoch.clusterTerm}.${bootEpoch.bootGeneration}.${bootEpoch.bootInstanceId}`;
+    this.#leadershipFence = leadershipFence;
+    this.#custodyRoot = initialRoot ?? createInitialCustodyRoot();
   }
 
-  // In-Root Evidence Consumption Protocol
-  const replayKey = `${settlementEvidence.generation}:${settlementEvidence.barrierIdentity}:${pinId}`;
-  if (currentRoot.consumedSettlementEvidence.has(replayKey)) {
-    throw new Error(`SETTLEMENT_EVIDENCE_REPLAY_DETECTED: evidence for replay key '${replayKey}' already consumed in custody root`);
+  public get custodyRoot(): AuthoritativeCustodyRoot {
+    return this.#custodyRoot;
   }
 
-  // Pre-Existing Overflow Fencing
-  if (currentRoot.retiredSettlementPins.size > 5000) {
-    throw new Error('RETIRED_PINS_CAPACITY_CORRUPTED: pre-existing retired pins count exceeds 5000');
-  }
-  if (currentRoot.consumedSettlementEvidence.size > 5000) {
-    throw new Error('CONSUMED_EVIDENCE_CAPACITY_CORRUPTED: pre-existing consumed evidence count exceeds 5000');
-  }
-
-  const candidatePinsMap = new Map(currentRoot.activeSettlementPins.entries());
-  candidatePinsMap.delete(pinId);
-
-  const retiredPinRecord: ImmutableRetiredPinRecord = Object.freeze({
-    pinId,
-    generation: activePin.generation,
-    barrierIdentity: activePin.barrierIdentity,
-    ownerToken: activePin.ownerToken,
-    transactionId: activePin.transactionId,
-    operationIdentity: activePin.operationIdentity,
-    drainerOwnershipGeneration: activePin.drainerOwnershipGeneration,
-    releasedAtTimestamp: Date.now(),
-    monotonicReleasedMs: performance.now(),
-    evidenceDigest: cloneByteArray(settlementEvidence.evidenceDigest),
-    allocatedBootEpoch: activePin.allocatedBootEpoch,
-  });
-
-  const candidateRetiredPins = new Map(currentRoot.retiredSettlementPins.entries());
-  const candidateConsumed = new Set(currentRoot.consumedSettlementEvidence.values());
-
-  // Deterministic Oldest Eligible Tombstone Eviction with Backpressure
-  if (candidateRetiredPins.size === 5000) {
-    const eligibleEntry = this._findOldestEligibleRetiredPin(currentRoot, candidateRetiredPins);
-    if (!eligibleEntry) {
-      throw new Error('RETENTION_CAPACITY_EXHAUSTED_BACKPRESSURE: all 5000 retired settlement pins are protected by active leases, pins, or obligations');
-    }
-    const [oldestPinId, oldestRecord] = eligibleEntry;
-    const oldestReplayKey = `${oldestRecord.generation}:${oldestRecord.barrierIdentity}:${oldestPinId}`;
-
-    // Strict Replay-Key Existence Check
-    if (!candidateConsumed.has(oldestReplayKey)) {
-      throw new Error(`REPLAY_KEY_DESYNCHRONIZATION_CORRUPTED: replay key '${oldestReplayKey}' missing for retired pin '${oldestPinId}'`);
-    }
-
-    candidateRetiredPins.delete(oldestPinId);
-    candidateConsumed.delete(oldestReplayKey);
-  }
-
-  candidateRetiredPins.set(pinId, retiredPinRecord);
-  candidateConsumed.add(replayKey);
-
-  // Construct Candidate Root with Genuinely Encapsulated Immutable Collections
-  const candidateRoot: AuthoritativeCustodyRoot = Object.freeze({
-    ...currentRoot,
-    activeSettlementPins: new ImmutableMap(candidatePinsMap.entries()),
-    retiredSettlementPins: new ImmutableMap(candidateRetiredPins.entries()),
-    consumedSettlementEvidence: new ImmutableSet(candidateConsumed),
-  });
-
-  // Step 1: Pre-Publication Candidate Root Invariant Verification (R25-5)
-  this._validateCandidateRootPrePublicationInvariants(candidateRoot);
-
-  // Step 2: Linearized Consensus Leadership Fencing Check (R25-2)
-  this.#consensusLease.assertActiveLeadership(this.#coordinatorBootEpoch.clusterTerm);
-
-  // Step 3: Atomic Pointer Swap (Linearization Point)
-  this.#custodyRoot = candidateRoot;
-  return { pinId, status: 'RELEASED' };
-}
-
-public publishReleaseAndObligation(
-  preparedEvidence: PreparedEvidenceContext,
-  expectedOwner: CustodyOwnershipToken,
-  barrierIdentity: string,
-  retryContext?: RetryRequestContext,
-): PublicationResponse {
-  const currentRoot = this.#custodyRoot;
-
-  const g = expectedOwner.custodyGeneration;
-  assertValidGenerationDomain(g);
-
-  const safeOwner = cloneAndFreezeOwnerToken(expectedOwner);
-  const safeBarrierId = String(barrierIdentity);
-  const safeTxId = String(safeOwner.transactionId);
-  const safeOpId = String(safeOwner.operationIdentity);
-
-  // 3. PRIOR PUBLICATION EVALUATION (RETRY PATH):
-  if (g <= currentRoot.publishedGeneration) {
-    validateRetryRequestContext(retryContext);
-
-    // Case 3A: Published with Settlement Pending
-    if (currentRoot.pendingSettlementObligations.has(g)) {
-      const existingObligation = currentRoot.pendingSettlementObligations.get(g)!;
-
-      const cachedResult = currentRoot.publicationResults.get(g);
-      if (!cachedResult) throw new Error('STATE_INCONSISTENT_ORPHANED_PENDING_OBLIGATION');
-
-      if (currentRoot.generationAuditHistory.has(g)) {
-        const audit = currentRoot.generationAuditHistory.get(g)!;
-        if (audit.kind === 'TERMINAL_SETTLEMENT' || audit.kind === 'COMPACT_TOMBSTONE') {
-          throw new Error('STATE_INCONSISTENT_PENDING_OBLIGATION_CONTRADICTS_AUDIT');
-        }
-      }
-
-      if (
-        !isEquivalentOwnerToken(existingObligation.ownerToken, cachedResult.releaseReceipt.identity) ||
-        existingObligation.transactionId !== cachedResult.releaseReceipt.identity.transactionId ||
-        existingObligation.operationIdentity !== cachedResult.releaseReceipt.identity.operationIdentity ||
-        existingObligation.barrierIdentity !== cachedResult.obligation.barrierIdentity ||
-        existingObligation.generation !== g ||
-        existingObligation.drainerOwnershipGeneration !== cachedResult.releaseReceipt.identity.drainerOwnershipGeneration ||
-        cachedResult.releaseReceipt.releasedCustodyGeneration !== g
-      ) {
-        throw new Error('STATE_INCONSISTENT_AUDIT_RESULT_IDENTITY_MISMATCH');
-      }
-
-      if (
-        !isEquivalentOwnerToken(existingObligation.ownerToken, safeOwner) ||
-        existingObligation.transactionId !== safeTxId ||
-        existingObligation.operationIdentity !== safeOpId ||
-        existingObligation.barrierIdentity !== safeBarrierId ||
-        existingObligation.drainerOwnershipGeneration !== safeOwner.drainerOwnershipGeneration
-      ) {
-        throw new Error('CUSTODY_PUBLICATION_TOKEN_MISMATCH');
-      }
-
-      const { candidateLeases, leaseId } = this._getOrAllocateRetryLease(
-        currentRoot, g, retryContext.consumerId, retryContext.clientRequestId, safeOwner, safeTxId, safeOpId, safeBarrierId
+  public static validateCandidateRootPrePublicationInvariants(candidateRoot: AuthoritativeCustodyRoot): void {
+    // 1. Bijection between retiredSettlementPins and consumedSettlementEvidence (R25-5)
+    if (candidateRoot.retiredSettlementPins.size !== candidateRoot.consumedSettlementEvidence.size) {
+      throw new Error(
+        `STATE_INCONSISTENT_REPLAY_EVIDENCE_CARDINALITY_MISMATCH: retired pins (${candidateRoot.retiredSettlementPins.size}) != consumed evidence (${candidateRoot.consumedSettlementEvidence.size})`
       );
-
-      if (candidateLeases !== currentRoot.activeRetryLeases) {
-        const nextRoot: AuthoritativeCustodyRoot = Object.freeze({
-          ...currentRoot,
-          activeRetryLeases: candidateLeases,
-        });
-        this._validateCandidateRootPrePublicationInvariants(nextRoot);
-        this.#consensusLease.assertActiveLeadership(this.#coordinatorBootEpoch.clusterTerm);
-        this.#custodyRoot = nextRoot;
-      }
-
-      return { publicationResult: cachedResult, retryLeaseId: leaseId };
     }
 
-    // Case 3B: Published and Fully Settled
-    if (currentRoot.publicationResults.has(g)) {
-      const cachedResult = currentRoot.publicationResults.get(g)!;
-
-      const auditRecord = currentRoot.generationAuditHistory.get(g);
-      if (!auditRecord) throw new Error('STATE_INCONSISTENT_SETTLED_RESULT_MISSING_AUDIT');
-
-      if (
-        !isEquivalentOwnerToken(auditRecord.expectedOwner, cachedResult.releaseReceipt.identity) ||
-        auditRecord.generation !== g ||
-        auditRecord.transactionId !== cachedResult.releaseReceipt.identity.transactionId ||
-        auditRecord.operationIdentity !== cachedResult.releaseReceipt.identity.operationIdentity ||
-        auditRecord.barrierIdentity !== cachedResult.obligation.barrierIdentity ||
-        auditRecord.drainerOwnershipGeneration !== cachedResult.releaseReceipt.identity.drainerOwnershipGeneration
-      ) {
-        throw new Error('STATE_INCONSISTENT_AUDIT_RESULT_IDENTITY_MISMATCH');
+    for (const [pinId, pin] of candidateRoot.retiredSettlementPins) {
+      const expectedKey = `${pin.generation}:${pin.barrierIdentity}:${pinId}`;
+      if (!candidateRoot.consumedSettlementEvidence.has(expectedKey)) {
+        throw new Error(`STATE_INCONSISTENT_REPLAY_KEY_BIJECTION_VIOLATION: missing key '${expectedKey}'`);
       }
-
-      if (auditRecord.kind !== 'TERMINAL_SETTLEMENT' && auditRecord.kind !== 'COMPACT_TOMBSTONE') {
-        throw new Error('STATE_INCONSISTENT_TERMINAL_OUTCOME_CONFLICT');
-      }
-
-      if (
-        !isEquivalentOwnerToken(cachedResult.releaseReceipt.identity, safeOwner) ||
-        cachedResult.releaseReceipt.identity.transactionId !== safeTxId ||
-        cachedResult.releaseReceipt.identity.operationIdentity !== safeOpId ||
-        cachedResult.obligation.barrierIdentity !== safeBarrierId ||
-        cachedResult.releaseReceipt.identity.drainerOwnershipGeneration !== safeOwner.drainerOwnershipGeneration
-      ) {
-        throw new Error('CUSTODY_PUBLICATION_TOKEN_MISMATCH');
-      }
-
-      const { candidateLeases, leaseId } = this._getOrAllocateRetryLease(
-        currentRoot, g, retryContext.consumerId, retryContext.clientRequestId, safeOwner, safeTxId, safeOpId, safeBarrierId
-      );
-
-      if (candidateLeases !== currentRoot.activeRetryLeases) {
-        const nextRoot: AuthoritativeCustodyRoot = Object.freeze({
-          ...currentRoot,
-          activeRetryLeases: candidateLeases,
-        });
-        this._validateCandidateRootPrePublicationInvariants(nextRoot);
-        this.#consensusLease.assertActiveLeadership(this.#coordinatorBootEpoch.clusterTerm);
-        this.#custodyRoot = nextRoot;
-      }
-
-      return { publicationResult: cachedResult, retryLeaseId: leaseId };
     }
 
-    // Case 3C: Published but Outside Retention Horizon (Evicted / Tombstone Horizon)
-    if (g <= currentRoot.custodyGenerationFloor) {
-      if (g > currentRoot.auditTombstoneFloor) {
-        const tombstone = currentRoot.generationAuditHistory.get(g);
-        if (!tombstone || tombstone.kind !== 'COMPACT_TOMBSTONE') {
-          throw new Error('STATE_INCONSISTENT_TOMBSTONE_MISSING_IN_HORIZON');
-        }
-        if (
-          !isEquivalentOwnerToken(tombstone.expectedOwner, safeOwner) ||
-          tombstone.transactionId !== safeTxId ||
-          tombstone.operationIdentity !== safeOpId ||
-          tombstone.barrierIdentity !== safeBarrierId ||
-          tombstone.drainerOwnershipGeneration !== safeOwner.drainerOwnershipGeneration
-        ) {
-          throw new Error('CUSTODY_PUBLICATION_TOKEN_MISMATCH');
-        }
+    // 2. Maximum Capacity Fencing
+    if (candidateRoot.retiredSettlementPins.size > 5000) {
+      throw new Error('RETIRED_PINS_CAPACITY_CORRUPTED: exceeds 5000 entries');
+    }
+    if (candidateRoot.retiredRetryLeases.size > 5000) {
+      throw new Error('RETIRED_LEASES_CAPACITY_CORRUPTED: exceeds 5000 entries');
+    }
+
+    // 3. Safe Integer & Monotonic Non-Negative Floors
+    if (!Number.isSafeInteger(candidateRoot.publishedGeneration) || candidateRoot.publishedGeneration < 0) {
+      throw new Error('STATE_INCONSISTENT_INVALID_PUBLISHED_GENERATION');
+    }
+    if (!Number.isSafeInteger(candidateRoot.custodyGenerationFloor) || candidateRoot.custodyGenerationFloor < 0) {
+      throw new Error('STATE_INCONSISTENT_INVALID_FLOOR');
+    }
+    if (!Number.isSafeInteger(candidateRoot.auditTombstoneFloor) || candidateRoot.auditTombstoneFloor < 0) {
+      throw new Error('STATE_INCONSISTENT_INVALID_AUDIT_FLOOR');
+    }
+    if (candidateRoot.auditTombstoneFloor > candidateRoot.custodyGenerationFloor) {
+      throw new Error('STATE_INCONSISTENT_AUDIT_FLOOR_EXCEEDS_CUSTODY_FLOOR');
+    }
+    if (candidateRoot.custodyGenerationFloor > candidateRoot.publishedGeneration) {
+      throw new Error('STATE_INCONSISTENT_FLOOR_EXCEEDS_PUBLISHED_GENERATION');
+    }
+  }
+
+  public static assertRetentionMapContiguity(
+    resultsMap: ImmutableMap<number, PublicationResult>,
+    floor: number,
+    publishedGeneration: number,
+  ): void {
+    if (!Number.isSafeInteger(floor) || floor < 0) {
+      throw new Error('STATE_INCONSISTENT_INVALID_FLOOR');
+    }
+    if (!Number.isSafeInteger(publishedGeneration) || publishedGeneration < 0) {
+      throw new Error('STATE_INCONSISTENT_INVALID_PUBLISHED_GENERATION');
+    }
+    if (floor > publishedGeneration) {
+      throw new Error('STATE_INCONSISTENT_FLOOR_EXCEEDS_PUBLISHED_GENERATION');
+    }
+
+    if (floor === publishedGeneration) {
+      if (resultsMap.size !== 0) {
+        throw new Error('STATE_INCONSISTENT_EMPTY_RANGE_NON_EMPTY_MAP');
       }
-      throw new Error('CUSTODY_RECEIPT_EXPIRED');
+      return;
     }
 
-    throw new Error('STATE_INCONSISTENT_RESULT_MAP_NON_CONTIGUOUS');
-  }
-
-  // ===========================================================================
-  // FIRST PUBLICATION PATH (g === currentRoot.publishedGeneration + 1)
-  // ===========================================================================
-  if (g !== currentRoot.publishedGeneration + 1) {
-    throw new Error('GENERATION_OUT_OF_SEQUENCE_GAP_DETECTED');
-  }
-
-  if (!isEquivalentOwnerToken(currentRoot.inFlightRecord?.token ?? null, safeOwner)) {
-    throw new Error('STALE_CUSTODY_RELEASE_REJECTED');
-  }
-
-  if (safeOwner.recoveryAttemptId !== this._currentAttemptId) {
-    throw new Error('STALE_ATTEMPT_CUSTODY_RELEASE_REJECTED');
-  }
-
-  if (currentRoot.generationAuditHistory.has(g)) {
-    throw new Error('STATE_INCONSISTENT_FUTURE_GENERATION_AUDITED');
-  }
-
-  this.assertRetentionMapContiguity(currentRoot.publicationResults, currentRoot.custodyGenerationFloor, currentRoot.publishedGeneration);
-  this.assertAuditHistoryContiguity(currentRoot.generationAuditHistory, currentRoot.auditTombstoneFloor, currentRoot.publishedGeneration, currentRoot.custodyGenerationFloor, currentRoot.publicationResults);
-
-  const safeEvidence = cloneAndFreezeEvidence(preparedEvidence, safeOwner);
-  const monotonicNow = performance.now();
-  const previousInFlightMs = currentRoot.inFlightRecord
-    ? monotonicNow - currentRoot.inFlightRecord.monotonicDequeuedMs
-    : null;
-
-  const releaseReceipt: DrainerCustodyReleaseReceipt = Object.freeze({
-    [DRAINER_RELEASE_BRAND]: true,
-    identity: safeOwner,
-    releasedCustodyGeneration: safeOwner.custodyGeneration,
-    previousInFlightDurationMs: previousInFlightMs,
-    releasedAtTimestamp: Date.now(),
-    monotonicReleasedMs: monotonicNow,
-  });
-
-  const obligation: PendingSettlementObligation = Object.freeze({
-    obligationId: `obl-${safeOwner.custodyGeneration}-${Date.now()}`,
-    generation: safeOwner.custodyGeneration,
-    barrierIdentity: safeBarrierId,
-    ownerToken: safeOwner,
-    transactionId: safeTxId,
-    operationIdentity: safeOpId,
-    drainerOwnershipGeneration: safeOwner.drainerOwnershipGeneration,
-    publishedCustodyGeneration: g,
-    preAllocatedReleaseReceipt: releaseReceipt,
-    preparedReconciliationReceipt: safeEvidence.custodyReconciliation,
-    preparedArchiveReceipt: safeEvidence.archiveDisposition,
-    preparedExecutionReceipt: safeEvidence.executionSettlement,
-    publishedAtTimestamp: Date.now(),
-    monotonicPublishedMs: monotonicNow,
-  });
-
-  const publicationResult: PublicationResult = Object.freeze({
-    releaseReceipt,
-    obligation,
-  });
-
-  const pendingAuditRecord: ImmutablePendingAuditRecord = Object.freeze({
-    kind: 'PENDING_PUBLICATION',
-    generation: g,
-    expectedOwner: safeOwner,
-    transactionId: safeTxId,
-    operationIdentity: safeOpId,
-    barrierIdentity: safeBarrierId,
-    drainerOwnershipGeneration: safeOwner.drainerOwnershipGeneration,
-    publishedAtTimestamp: Date.now(),
-    monotonicPublishedMs: monotonicNow,
-  });
-
-  const { pinId: settlementPinId, nextPins: candidatePins } = this._getOrAllocateSettlementPin(
-    currentRoot, g, safeBarrierId, safeOwner, safeOwner.drainerOwnershipGeneration
-  );
-
-  let candidateFloor = currentRoot.custodyGenerationFloor;
-  let candidateAuditFloor = currentRoot.auditTombstoneFloor;
-  const candidateResultsMap = new Map(currentRoot.publicationResults.entries());
-  const candidateAuditHistory = new Map(currentRoot.generationAuditHistory.entries());
-
-  if (candidateResultsMap.size >= 1000) {
-    if (candidateResultsMap.size > 1000) {
-      throw new Error('CUSTODY_PUBLICATION_BACKPRESSURE_EXHAUSTED');
-    }
-
-    const g_oldest = candidateFloor + 1;
-
-    if (!candidateResultsMap.has(g_oldest)) {
+    const expectedCount = publishedGeneration - floor;
+    if (resultsMap.size !== expectedCount) {
       throw new Error('STATE_INCONSISTENT_RESULT_MAP_NON_CONTIGUOUS');
     }
 
-    if (currentRoot.pendingSettlementObligations.has(g_oldest)) {
-      throw new Error('CUSTODY_PUBLICATION_BACKPRESSURE_EXHAUSTED');
-    }
-
-    for (const pin of currentRoot.activeSettlementPins.values()) {
-      if (pin.generation === g_oldest) throw new Error('CUSTODY_PUBLICATION_BACKPRESSURE_EXHAUSTED');
-    }
-    for (const lease of currentRoot.activeRetryLeases.values()) {
-      if (lease.generation === g_oldest && lease.expiresAtMonotonicMs > monotonicNow) {
-        throw new Error('CUSTODY_PUBLICATION_BACKPRESSURE_EXHAUSTED');
+    for (let g = floor + 1; g <= publishedGeneration; g++) {
+      if (!resultsMap.has(g)) {
+        throw new Error(`STATE_INCONSISTENT_RESULT_KEY_GAP_DETECTED: missing generation ${g}`);
+      }
+      const record = resultsMap.get(g)!;
+      if (
+        record.releaseReceipt.releasedCustodyGeneration !== g ||
+        record.obligation.generation !== g ||
+        record.obligation.publishedCustodyGeneration !== g ||
+        !isEquivalentOwnerToken(record.releaseReceipt.identity, record.obligation.ownerToken) ||
+        record.obligation.transactionId !== record.releaseReceipt.identity.transactionId ||
+        record.obligation.operationIdentity !== record.releaseReceipt.identity.operationIdentity ||
+        record.obligation.drainerOwnershipGeneration !== record.releaseReceipt.identity.drainerOwnershipGeneration
+      ) {
+        throw new Error(`STATE_INCONSISTENT_RETAINED_RECORD_CORRUPTED: key ${g}`);
       }
     }
 
-    const existingAudit = candidateAuditHistory.get(g_oldest);
-    if (!existingAudit || existingAudit.kind !== 'TERMINAL_SETTLEMENT') {
-      throw new Error('STATE_INCONSISTENT_SETTLED_RESULT_MISSING_AUDIT');
-    }
-
-    const tombstone: ImmutableCompactAuditTombstone = Object.freeze({
-      kind: 'COMPACT_TOMBSTONE',
-      generation: g_oldest,
-      expectedOwner: existingAudit.expectedOwner,
-      transactionId: existingAudit.transactionId,
-      operationIdentity: existingAudit.operationIdentity,
-      barrierIdentity: existingAudit.barrierIdentity,
-      drainerOwnershipGeneration: existingAudit.drainerOwnershipGeneration,
-      terminalOutcome: existingAudit.terminalOutcome,
-      settledAtTimestamp: existingAudit.settledAtTimestamp,
-      monotonicSettledMs: existingAudit.monotonicSettledMs,
-      evidenceDigest: cloneByteArray(computeEvidenceDigest(existingAudit)),
-    });
-
-    candidateResultsMap.delete(g_oldest);
-    candidateAuditHistory.set(g_oldest, tombstone);
-    candidateFloor = g_oldest;
-
-    const tombstoneCount = candidateFloor - candidateAuditFloor;
-    if (tombstoneCount > 5000) {
-      throw new Error('TOMBSTONE_CAPACITY_CORRUPTED: pre-existing tombstone count exceeds 5000');
-    }
-    if (tombstoneCount === 5000) {
-      const g_tomb_oldest = candidateAuditFloor + 1;
-      const tombEntry = candidateAuditHistory.get(g_tomb_oldest);
-      if (!tombEntry || tombEntry.kind !== 'COMPACT_TOMBSTONE') {
-        throw new Error('STATE_INCONSISTENT_TOMBSTONE_RETIREMENT_TYPE_VIOLATION');
+    for (const k of resultsMap.keys()) {
+      if (!Number.isSafeInteger(k) || k <= floor || k > publishedGeneration) {
+        throw new Error(`STATE_INCONSISTENT_RESULT_GENERATION_OUT_OF_BOUNDS: key ${k}`);
       }
-
-      for (const lease of currentRoot.activeRetryLeases.values()) {
-        if (lease.generation === g_tomb_oldest && lease.expiresAtMonotonicMs > monotonicNow) {
-          throw new Error('TOMBSTONE_CAPACITY_EXHAUSTED: oldest tombstone protected by active retry lease');
-        }
-      }
-      for (const pin of currentRoot.activeSettlementPins.values()) {
-        if (pin.generation === g_tomb_oldest) {
-          throw new Error('TOMBSTONE_CAPACITY_EXHAUSTED: oldest tombstone protected by active settlement pin');
-        }
-      }
-      if (currentRoot.pendingSettlementObligations.has(g_tomb_oldest)) {
-        throw new Error('TOMBSTONE_CAPACITY_EXHAUSTED: oldest tombstone protected by pending settlement obligation');
-      }
-
-      candidateAuditHistory.delete(g_tomb_oldest);
-      candidateAuditFloor = g_tomb_oldest;
     }
   }
 
-  candidateResultsMap.set(g, publicationResult);
-  candidateAuditHistory.set(g, pendingAuditRecord);
+  public static assertAuditHistoryContiguity(
+    auditMap: ImmutableMap<number, GenerationAuditRecord>,
+    auditFloor: number,
+    publishedGeneration: number,
+    custodyFloor: number,
+    publicationResults?: ImmutableMap<number, PublicationResult>,
+  ): void {
+    if (!Number.isSafeInteger(auditFloor) || auditFloor < 0) {
+      throw new Error('STATE_INCONSISTENT_INVALID_AUDIT_FLOOR');
+    }
+    if (!Number.isSafeInteger(publishedGeneration) || publishedGeneration < 0) {
+      throw new Error('STATE_INCONSISTENT_INVALID_PUBLISHED_GENERATION');
+    }
+    if (auditFloor > publishedGeneration) {
+      throw new Error('STATE_INCONSISTENT_AUDIT_FLOOR_EXCEEDS_PUBLISHED_GENERATION');
+    }
 
-  const candidateObligations = currentRoot.pendingSettlementObligations.set(g, obligation);
-  const candidateResults = new ImmutableMap(candidateResultsMap.entries());
-  const candidateAudit = new ImmutableMap(candidateAuditHistory.entries());
+    if (auditFloor === publishedGeneration) {
+      if (auditMap.size !== 0) {
+        throw new Error('STATE_INCONSISTENT_EMPTY_AUDIT_RANGE_NON_EMPTY_MAP');
+      }
+      return;
+    }
 
-  this.assertRetentionMapContiguity(candidateResults, candidateFloor, g);
-  this.assertAuditHistoryContiguity(candidateAudit, candidateAuditFloor, g, candidateFloor, candidateResults);
+    const expectedCount = publishedGeneration - auditFloor;
+    if (auditMap.size !== expectedCount) {
+      throw new Error('STATE_INCONSISTENT_AUDIT_MAP_NON_CONTIGUOUS');
+    }
 
-  const candidateRoot: AuthoritativeCustodyRoot = Object.freeze({
-    publishedGeneration: g,
-    custodyGenerationFloor: candidateFloor,
-    auditTombstoneFloor: candidateAuditFloor,
-    inFlightRecord: null,
-    gateState: 'CUSTODY_RELEASED_BARRIER_PENDING',
-    pendingSettlementObligations: candidateObligations,
-    publicationResults: candidateResults,
-    generationAuditHistory: candidateAudit,
-    activeSettlementPins: candidatePins,
-    activeRetryLeases: currentRoot.activeRetryLeases,
-    retiredRetryLeases: currentRoot.retiredRetryLeases,
-    retiredSettlementPins: currentRoot.retiredSettlementPins,
-    consumedSettlementEvidence: currentRoot.consumedSettlementEvidence,
-  });
+    for (let g = auditFloor + 1; g <= publishedGeneration; g++) {
+      if (!auditMap.has(g)) {
+        throw new Error(`STATE_INCONSISTENT_AUDIT_KEY_GAP_DETECTED: missing generation ${g}`);
+      }
+      const record = auditMap.get(g)!;
+      if (record.generation !== g) {
+        throw new Error(`STATE_INCONSISTENT_AUDIT_RECORD_CORRUPTED: generation field mismatch at key ${g}`);
+      }
 
-  // Step 1: Pre-Publication Candidate Root Invariant Verification (R25-5)
-  this._validateCandidateRootPrePublicationInvariants(candidateRoot);
+      if (g <= custodyFloor && record.kind !== 'COMPACT_TOMBSTONE') {
+        throw new Error(`STATE_INCONSISTENT_EVICTED_RESULT_WITHOUT_TOMBSTONE: key ${g}`);
+      }
 
-  // Step 2: Linearized Consensus Leadership Fencing Check (R25-2)
-  this.#consensusLease.assertActiveLeadership(this.#coordinatorBootEpoch.clusterTerm);
+      if (publicationResults && publicationResults.has(g)) {
+        const pub = publicationResults.get(g)!;
+        if (
+          !isEquivalentOwnerToken(record.expectedOwner, pub.obligation.ownerToken) ||
+          record.transactionId !== pub.obligation.transactionId ||
+          record.operationIdentity !== pub.obligation.operationIdentity ||
+          record.barrierIdentity !== pub.obligation.barrierIdentity ||
+          record.drainerOwnershipGeneration !== pub.obligation.drainerOwnershipGeneration
+        ) {
+          throw new Error(`STATE_INCONSISTENT_AUDIT_RESULT_IDENTITY_MISMATCH: key ${g}`);
+        }
+      }
+    }
 
-  // Step 3: Atomic Pointer Swap (Linearization Point)
-  this.#custodyRoot = candidateRoot;
-  return { publicationResult, retryLeaseId: null };
+    for (const k of auditMap.keys()) {
+      if (!Number.isSafeInteger(k) || k <= auditFloor || k > publishedGeneration) {
+        throw new Error(`STATE_INCONSISTENT_AUDIT_GENERATION_OUT_OF_BOUNDS: key ${k}`);
+      }
+    }
+  }
+
+  private _findOldestEligibleRetiredPin(
+    root: AuthoritativeCustodyRoot,
+    candidateRetired: Map<string, ImmutableRetiredPinRecord>
+  ): [string, ImmutableRetiredPinRecord] | undefined {
+    const monotonicNow = performance.now();
+    for (const [pinId, record] of candidateRetired) {
+      // 1. Must not be pinned by active retry lease
+      let pinnedByLease = false;
+      for (const lease of root.activeRetryLeases.values()) {
+        if (lease.generation === record.generation && lease.expiresAtMonotonicMs > monotonicNow) {
+          pinnedByLease = true;
+          break;
+        }
+      }
+      if (pinnedByLease) continue;
+
+      // 2. Must not be pinned by active settlement pin
+      let pinnedByPin = false;
+      for (const pin of root.activeSettlementPins.values()) {
+        if (pin.generation === record.generation) {
+          pinnedByPin = true;
+          break;
+        }
+      }
+      if (pinnedByPin) continue;
+
+      // 3. Must not be pinned by pending settlement obligation
+      if (root.pendingSettlementObligations.has(record.generation)) {
+        continue;
+      }
+
+      return [pinId, record];
+    }
+    return undefined;
+  }
+
+  private _findOldestEligibleRetiredLease(
+    root: AuthoritativeCustodyRoot,
+    candidateRetired: Map<string, ImmutableRetiredLeaseRecord>
+  ): [string, ImmutableRetiredLeaseRecord] | undefined {
+    const monotonicNow = performance.now();
+    for (const [leaseId, record] of candidateRetired) {
+      let pinnedByLease = false;
+      for (const lease of root.activeRetryLeases.values()) {
+        if (lease.generation === record.generation && lease.expiresAtMonotonicMs > monotonicNow) {
+          pinnedByLease = true;
+          break;
+        }
+      }
+      if (pinnedByLease) continue;
+
+      let pinnedByPin = false;
+      for (const pin of root.activeSettlementPins.values()) {
+        if (pin.generation === record.generation) {
+          pinnedByPin = true;
+          break;
+        }
+      }
+      if (pinnedByPin) continue;
+
+      if (root.pendingSettlementObligations.has(record.generation)) {
+        continue;
+      }
+
+      return [leaseId, record];
+    }
+    return undefined;
+  }
+
+  private _getOrAllocateSettlementPin(
+    currentRoot: AuthoritativeCustodyRoot,
+    generation: number,
+    barrierIdentity: string,
+    ownerToken: CustodyOwnershipToken,
+    drainerGeneration: number
+  ): { pinId: string; nextPins: ImmutableMap<string, ImmutableSettlementPin> } {
+    for (const [pinId, pin] of currentRoot.activeSettlementPins) {
+      if (pin.generation === generation && pin.barrierIdentity === barrierIdentity) {
+        if (!isEquivalentOwnerToken(pin.ownerToken, ownerToken)) {
+          throw new Error('SETTLEMENT_PIN_OWNER_TOKEN_MISMATCH');
+        }
+        if (pin.drainerOwnershipGeneration !== drainerGeneration) {
+          throw new Error('SETTLEMENT_PIN_DRAINER_GENERATION_MISMATCH');
+        }
+        return { pinId, nextPins: currentRoot.activeSettlementPins };
+      }
+    }
+
+    const seq = ++this.#pinSequenceCounter;
+    const pinId = `pin:${this.#coordinatorBootId}:${generation}:${barrierIdentity}:${seq}`;
+
+    const newPin: ImmutableSettlementPin = Object.freeze({
+      pinId,
+      generation,
+      barrierIdentity,
+      ownerToken: cloneAndFreezeOwnerToken(ownerToken),
+      transactionId: ownerToken.transactionId,
+      operationIdentity: ownerToken.operationIdentity,
+      drainerOwnershipGeneration: drainerGeneration,
+      acquiredAtTimestamp: Date.now(),
+      monotonicAcquiredMs: performance.now(),
+      allocatedBootEpoch: this.#coordinatorBootEpoch,
+    });
+
+    const nextPins = currentRoot.activeSettlementPins.set(pinId, newPin);
+    return { pinId, nextPins };
+  }
+
+  private _getOrAllocateRetryLease(
+    root: AuthoritativeCustodyRoot,
+    generation: number,
+    consumerId: string,
+    clientRequestId: string,
+    ownerToken: CustodyOwnershipToken,
+    transactionId: string,
+    operationIdentity: string,
+    barrierIdentity: string,
+  ): { candidateLeases: ImmutableMap<string, ImmutableRetryLease>; leaseId: string } {
+    for (const existingLease of root.activeRetryLeases.values()) {
+      if (
+        existingLease.generation === generation &&
+        existingLease.consumerId === consumerId &&
+        existingLease.clientRequestId === clientRequestId
+      ) {
+        if (
+          isEquivalentOwnerToken(existingLease.ownerToken, ownerToken) &&
+          existingLease.transactionId === transactionId &&
+          existingLease.operationIdentity === operationIdentity &&
+          existingLease.barrierIdentity === barrierIdentity &&
+          existingLease.ownerToken.drainerOwnershipGeneration === ownerToken.drainerOwnershipGeneration
+        ) {
+          return { candidateLeases: root.activeRetryLeases, leaseId: existingLease.leaseId };
+        }
+        throw new Error('IDEMPOTENT_RETRY_IDENTITY_CONFLICT');
+      }
+    }
+
+    const seq = ++this.#leaseSequenceCounter;
+    const leaseId = `lease:${this.#coordinatorBootId}:${generation}:${consumerId}:${seq}`;
+
+    if (root.activeRetryLeases.has(leaseId)) {
+      throw new Error('RETRY_LEASE_ID_COLLISION');
+    }
+
+    const monotonicNow = performance.now();
+    const newLease: ImmutableRetryLease = Object.freeze({
+      leaseId,
+      generation,
+      consumerId,
+      clientRequestId,
+      ownerToken: cloneAndFreezeOwnerToken(ownerToken),
+      transactionId,
+      operationIdentity,
+      barrierIdentity,
+      acquiredAtTimestamp: Date.now(),
+      monotonicAcquiredMs: monotonicNow,
+      expiresAtMonotonicMs: monotonicNow + 30000,
+      allocatedBootEpoch: this.#coordinatorBootEpoch,
+    });
+
+    const candidateLeases = root.activeRetryLeases.set(leaseId, newLease);
+    return { candidateLeases, leaseId };
+  }
+
+  public releaseRetryLease(params: ReleaseRetryLeaseParams): { leaseId: string; status: 'RELEASED' | 'ALREADY_RELEASED' } {
+    const { leaseId, consumerId, clientRequestId, callerToken, transactionId, operationIdentity, barrierIdentity } = params;
+
+    if (leaseId.startsWith('pin:')) {
+      throw new Error('LEASE_TYPE_MISMATCH: identifier is a settlement pin, not a retry lease');
+    }
+    if (!leaseId.startsWith('lease:')) {
+      throw new Error(`RESOURCE_NOT_FOUND: unknown retry lease identifier '${leaseId}'`);
+    }
+
+    const currentRoot = this.#custodyRoot;
+    const activeLease = currentRoot.activeRetryLeases.get(leaseId);
+
+    if (!activeLease) {
+      const retiredLease = currentRoot.retiredRetryLeases.get(leaseId);
+      if (retiredLease) {
+        const expectedPrefix = `lease:${retiredLease.allocatedBootEpoch.clusterTerm}.${retiredLease.allocatedBootEpoch.bootGeneration}.${retiredLease.allocatedBootEpoch.bootInstanceId}:`;
+        if (!leaseId.startsWith(expectedPrefix)) {
+          throw new Error('RETIRED_LEASE_BOOT_EPOCH_MISMATCH: identifier does not match recorded allocation epoch');
+        }
+
+        if (retiredLease.consumerId !== consumerId) {
+          throw new Error(`UNAUTHORIZED_CROSS_CONSUMER_LEASE_RELEASE: caller consumer '${consumerId}' does not match retired lease owner '${retiredLease.consumerId}'`);
+        }
+        if (retiredLease.clientRequestId !== clientRequestId) {
+          throw new Error(`LEASE_CLIENT_REQUEST_MISMATCH: clientRequestId '${clientRequestId}' does not match retired lease`);
+        }
+        if (!isEquivalentOwnerToken(retiredLease.ownerToken, callerToken)) {
+          throw new Error('UNAUTHORIZED_LEASE_RELEASE_TOKEN_MISMATCH: caller token does not match retired lease owner token');
+        }
+        if (retiredLease.transactionId !== transactionId) {
+          throw new Error(`LEASE_TRANSACTION_ID_MISMATCH: transactionId '${transactionId}' does not match retired lease`);
+        }
+        if (retiredLease.operationIdentity !== operationIdentity) {
+          throw new Error(`LEASE_OPERATION_IDENTITY_MISMATCH: operationIdentity '${operationIdentity}' does not match retired lease`);
+        }
+        if (retiredLease.barrierIdentity !== barrierIdentity) {
+          throw new Error(`LEASE_BARRIER_IDENTITY_MISMATCH: barrierIdentity '${barrierIdentity}' does not match retired lease`);
+        }
+        return { leaseId, status: 'ALREADY_RELEASED' };
+      }
+      throw new Error(`RESOURCE_NOT_FOUND: retry lease '${leaseId}' was never issued or is unknown`);
+    }
+
+    if (activeLease.consumerId !== consumerId) {
+      throw new Error(`UNAUTHORIZED_CROSS_CONSUMER_LEASE_RELEASE: caller consumer ${consumerId} does not own lease ${leaseId} owned by ${activeLease.consumerId}`);
+    }
+    if (activeLease.clientRequestId !== clientRequestId) {
+      throw new Error(`LEASE_CLIENT_REQUEST_MISMATCH: clientRequestId ${clientRequestId} does not match lease ${activeLease.clientRequestId}`);
+    }
+    if (!isEquivalentOwnerToken(activeLease.ownerToken, callerToken)) {
+      throw new Error('UNAUTHORIZED_LEASE_RELEASE_TOKEN_MISMATCH: caller token does not match lease owner token');
+    }
+    if (activeLease.transactionId !== transactionId) {
+      throw new Error(`LEASE_TRANSACTION_ID_MISMATCH: transactionId ${transactionId} does not match lease`);
+    }
+    if (activeLease.operationIdentity !== operationIdentity) {
+      throw new Error(`LEASE_OPERATION_IDENTITY_MISMATCH: operationIdentity ${operationIdentity} does not match lease`);
+    }
+    if (activeLease.barrierIdentity !== barrierIdentity) {
+      throw new Error(`LEASE_BARRIER_IDENTITY_MISMATCH: barrierIdentity ${barrierIdentity} does not match lease`);
+    }
+
+    if (currentRoot.retiredRetryLeases.size > 5000) {
+      throw new Error('RETIRED_LEASES_CAPACITY_CORRUPTED: pre-existing retired leases count exceeds 5000');
+    }
+
+    const candidateActiveLeases = currentRoot.activeRetryLeases.delete(leaseId);
+    const candidateRetiredLeasesMap = new Map(currentRoot.retiredRetryLeases.entries());
+
+    if (candidateRetiredLeasesMap.size === 5000) {
+      const eligibleEntry = this._findOldestEligibleRetiredLease(currentRoot, candidateRetiredLeasesMap);
+      if (!eligibleEntry) {
+        throw new Error('RETIRED_LEASES_CAPACITY_EXHAUSTED_BACKPRESSURE: all 5000 retired leases are protected');
+      }
+      const [oldestLeaseId] = eligibleEntry;
+      candidateRetiredLeasesMap.delete(oldestLeaseId);
+    }
+
+    const retiredRecord: ImmutableRetiredLeaseRecord = Object.freeze({
+      leaseId,
+      generation: activeLease.generation,
+      consumerId,
+      clientRequestId,
+      ownerToken: activeLease.ownerToken,
+      transactionId,
+      operationIdentity,
+      barrierIdentity,
+      releasedAtTimestamp: Date.now(),
+      monotonicReleasedMs: performance.now(),
+      allocatedBootEpoch: activeLease.allocatedBootEpoch,
+    });
+    candidateRetiredLeasesMap.set(leaseId, retiredRecord);
+
+    const candidateRoot: AuthoritativeCustodyRoot = Object.freeze({
+      ...currentRoot,
+      activeRetryLeases: candidateActiveLeases,
+      retiredRetryLeases: new ImmutableMap(candidateRetiredLeasesMap.entries()),
+    });
+
+    // Enforceable Leadership-Fenced Publication (R26-2)
+    return this.#leadershipFence.executeFencedPublication(
+      this.#coordinatorBootEpoch.clusterTerm,
+      candidateRoot,
+      (root) => {
+        this.#custodyRoot = root;
+        return { leaseId, status: 'RELEASED' as const };
+      }
+    );
+  }
+
+  public releaseSettlementPin(pinId: string, settlementEvidence: AuthoritativeSettlementEvidence): { pinId: string; status: 'RELEASED' | 'ALREADY_RELEASED' } {
+    if (pinId.startsWith('lease:')) {
+      throw new Error('PIN_TYPE_MISMATCH: identifier is a retry lease, not a settlement pin');
+    }
+    if (!pinId.startsWith('pin:')) {
+      throw new Error(`RESOURCE_NOT_FOUND: unknown settlement pin identifier '${pinId}'`);
+    }
+
+    SettlementEvidenceFactory.assertAuthoritativeEvidenceProvenance(settlementEvidence);
+
+    const currentRoot = this.#custodyRoot;
+    const activePin = currentRoot.activeSettlementPins.get(pinId);
+
+    if (!activePin) {
+      const retiredPin = currentRoot.retiredSettlementPins.get(pinId);
+      if (retiredPin) {
+        const expectedPrefix = `pin:${retiredPin.allocatedBootEpoch.clusterTerm}.${retiredPin.allocatedBootEpoch.bootGeneration}.${retiredPin.allocatedBootEpoch.bootInstanceId}:`;
+        if (!pinId.startsWith(expectedPrefix)) {
+          throw new Error('RETIRED_PIN_BOOT_EPOCH_MISMATCH: identifier does not match recorded allocation epoch');
+        }
+
+        if (
+          !isEquivalentOwnerToken(retiredPin.ownerToken, settlementEvidence.expectedOwner) ||
+          retiredPin.generation !== settlementEvidence.generation ||
+          retiredPin.transactionId !== settlementEvidence.transactionId ||
+          retiredPin.operationIdentity !== settlementEvidence.operationIdentity ||
+          retiredPin.barrierIdentity !== settlementEvidence.barrierIdentity ||
+          retiredPin.drainerOwnershipGeneration !== settlementEvidence.drainerOwnershipGeneration ||
+          retiredPin.ownerToken.recoveryAttemptId !== settlementEvidence.expectedOwner.recoveryAttemptId
+        ) {
+          throw new Error('SETTLEMENT_EVIDENCE_IDENTITY_MISMATCH: evidence does not match retired pin identity');
+        }
+
+        if (!areEqualByteArrays(retiredPin.evidenceDigest, settlementEvidence.evidenceDigest)) {
+          throw new Error('SETTLEMENT_EVIDENCE_DIGEST_MISMATCH: evidence digest does not match recorded retired pin disposition');
+        }
+
+        return { pinId, status: 'ALREADY_RELEASED' };
+      }
+      throw new Error(`RESOURCE_NOT_FOUND: settlement pin '${pinId}' was never issued or is unknown`);
+    }
+
+    if (
+      !isEquivalentOwnerToken(activePin.ownerToken, settlementEvidence.expectedOwner) ||
+      activePin.generation !== settlementEvidence.generation ||
+      activePin.transactionId !== settlementEvidence.transactionId ||
+      activePin.operationIdentity !== settlementEvidence.operationIdentity ||
+      activePin.barrierIdentity !== settlementEvidence.barrierIdentity ||
+      activePin.drainerOwnershipGeneration !== settlementEvidence.drainerOwnershipGeneration ||
+      activePin.ownerToken.recoveryAttemptId !== settlementEvidence.expectedOwner.recoveryAttemptId
+    ) {
+      throw new Error('SETTLEMENT_EVIDENCE_IDENTITY_MISMATCH');
+    }
+
+    const replayKey = `${settlementEvidence.generation}:${settlementEvidence.barrierIdentity}:${pinId}`;
+    if (currentRoot.consumedSettlementEvidence.has(replayKey)) {
+      throw new Error(`SETTLEMENT_EVIDENCE_REPLAY_DETECTED: evidence for replay key '${replayKey}' already consumed in custody root`);
+    }
+
+    if (currentRoot.retiredSettlementPins.size > 5000) {
+      throw new Error('RETIRED_PINS_CAPACITY_CORRUPTED: pre-existing retired pins count exceeds 5000');
+    }
+    if (currentRoot.consumedSettlementEvidence.size > 5000) {
+      throw new Error('CONSUMED_EVIDENCE_CAPACITY_CORRUPTED: pre-existing consumed evidence count exceeds 5000');
+    }
+
+    const candidatePinsMap = new Map(currentRoot.activeSettlementPins.entries());
+    candidatePinsMap.delete(pinId);
+
+    const retiredPinRecord: ImmutableRetiredPinRecord = Object.freeze({
+      pinId,
+      generation: activePin.generation,
+      barrierIdentity: activePin.barrierIdentity,
+      ownerToken: activePin.ownerToken,
+      transactionId: activePin.transactionId,
+      operationIdentity: activePin.operationIdentity,
+      drainerOwnershipGeneration: activePin.drainerOwnershipGeneration,
+      releasedAtTimestamp: Date.now(),
+      monotonicReleasedMs: performance.now(),
+      evidenceDigest: cloneByteArray(settlementEvidence.evidenceDigest),
+      allocatedBootEpoch: activePin.allocatedBootEpoch,
+    });
+
+    const candidateRetiredPins = new Map(currentRoot.retiredSettlementPins.entries());
+    const candidateConsumed = new Set(currentRoot.consumedSettlementEvidence.values());
+
+    if (candidateRetiredPins.size === 5000) {
+      const eligibleEntry = this._findOldestEligibleRetiredPin(currentRoot, candidateRetiredPins);
+      if (!eligibleEntry) {
+        throw new Error('RETENTION_CAPACITY_EXHAUSTED_BACKPRESSURE: all 5000 retired settlement pins are protected by active leases, pins, or obligations');
+      }
+      const [oldestPinId, oldestRecord] = eligibleEntry;
+      const oldestReplayKey = `${oldestRecord.generation}:${oldestRecord.barrierIdentity}:${oldestPinId}`;
+
+      if (!candidateConsumed.has(oldestReplayKey)) {
+        throw new Error(`REPLAY_KEY_DESYNCHRONIZATION_CORRUPTED: replay key '${oldestReplayKey}' missing for retired pin '${oldestPinId}'`);
+      }
+
+      candidateRetiredPins.delete(oldestPinId);
+      candidateConsumed.delete(oldestReplayKey);
+    }
+
+    candidateRetiredPins.set(pinId, retiredPinRecord);
+    candidateConsumed.add(replayKey);
+
+    const candidateRoot: AuthoritativeCustodyRoot = Object.freeze({
+      ...currentRoot,
+      activeSettlementPins: new ImmutableMap(candidatePinsMap.entries()),
+      retiredSettlementPins: new ImmutableMap(candidateRetiredPins.entries()),
+      consumedSettlementEvidence: new ImmutableSet(candidateConsumed),
+    });
+
+    // Enforceable Leadership-Fenced Publication (R26-2)
+    return this.#leadershipFence.executeFencedPublication(
+      this.#coordinatorBootEpoch.clusterTerm,
+      candidateRoot,
+      (root) => {
+        this.#custodyRoot = root;
+        return { pinId, status: 'RELEASED' as const };
+      }
+    );
+  }
+
+  public publishReleaseAndObligation(
+    preparedEvidence: PreparedEvidenceContext,
+    expectedOwner: CustodyOwnershipToken,
+    barrierIdentity: string,
+    retryContext?: RetryRequestContext,
+  ): PublicationResponse {
+    const currentRoot = this.#custodyRoot;
+    const g = preparedEvidence.releasedCustodyGeneration;
+
+    // Phase 1: Domain Boundary Validation
+    if (!Number.isSafeInteger(g) || g <= 0) {
+      throw new Error(`INVALID_GENERATION_DOMAIN: generation ${g} is out of permitted range [1, MAX_SAFE_INTEGER]`);
+    }
+    if (g === Number.MAX_SAFE_INTEGER) {
+      throw new Error(`GENERATION_SEQUENCE_EXHAUSTED: generation reached theoretical limit ${g}`);
+    }
+
+    const safeOwner = cloneAndFreezeOwnerToken(expectedOwner);
+    const safeTxId = safeOwner.transactionId;
+    const safeOpId = safeOwner.operationIdentity;
+    const safeBarrierId = barrierIdentity;
+
+    // Case 3: Retried Operation
+    if (g <= currentRoot.publishedGeneration) {
+      validateRetryRequestContext(retryContext);
+
+      // Case 3A: Published and In-Flight Barrier Pending
+      if (currentRoot.pendingSettlementObligations.has(g)) {
+        const existingObligation = currentRoot.pendingSettlementObligations.get(g)!;
+        const cachedResult = currentRoot.publicationResults.get(g);
+        if (!cachedResult) {
+          throw new Error('STATE_INCONSISTENT_PENDING_OBLIGATION_MISSING_RESULT');
+        }
+
+        const auditRecord = currentRoot.generationAuditHistory.get(g);
+        if (!auditRecord || auditRecord.kind !== 'PENDING_PUBLICATION') {
+          throw new Error('STATE_INCONSISTENT_PENDING_OBLIGATION_AUDIT_MISMATCH');
+        }
+
+        if (
+          !isEquivalentOwnerToken(existingObligation.ownerToken, safeOwner) ||
+          existingObligation.transactionId !== safeTxId ||
+          existingObligation.operationIdentity !== safeOpId ||
+          existingObligation.barrierIdentity !== safeBarrierId ||
+          existingObligation.drainerOwnershipGeneration !== safeOwner.drainerOwnershipGeneration
+        ) {
+          throw new Error('CUSTODY_PUBLICATION_TOKEN_MISMATCH');
+        }
+
+        const { candidateLeases, leaseId } = this._getOrAllocateRetryLease(
+          currentRoot, g, retryContext.consumerId, retryContext.clientRequestId, safeOwner, safeTxId, safeOpId, safeBarrierId
+        );
+
+        if (candidateLeases !== currentRoot.activeRetryLeases) {
+          const nextRoot: AuthoritativeCustodyRoot = Object.freeze({
+            ...currentRoot,
+            activeRetryLeases: candidateLeases,
+          });
+          this.#leadershipFence.executeFencedPublication(
+            this.#coordinatorBootEpoch.clusterTerm,
+            nextRoot,
+            (root) => {
+              this.#custodyRoot = root;
+            }
+          );
+        }
+
+        return { publicationResult: cachedResult, retryLeaseId: leaseId };
+      }
+
+      // Case 3B: Published and Fully Settled
+      if (currentRoot.publicationResults.has(g)) {
+        const cachedResult = currentRoot.publicationResults.get(g)!;
+
+        const auditRecord = currentRoot.generationAuditHistory.get(g);
+        if (!auditRecord) throw new Error('STATE_INCONSISTENT_SETTLED_RESULT_MISSING_AUDIT');
+
+        if (
+          !isEquivalentOwnerToken(auditRecord.expectedOwner, cachedResult.releaseReceipt.identity) ||
+          auditRecord.generation !== g ||
+          auditRecord.transactionId !== cachedResult.releaseReceipt.identity.transactionId ||
+          auditRecord.operationIdentity !== cachedResult.releaseReceipt.identity.operationIdentity ||
+          auditRecord.barrierIdentity !== cachedResult.obligation.barrierIdentity ||
+          auditRecord.drainerOwnershipGeneration !== cachedResult.releaseReceipt.identity.drainerOwnershipGeneration
+        ) {
+          throw new Error('STATE_INCONSISTENT_AUDIT_RESULT_IDENTITY_MISMATCH');
+        }
+
+        if (auditRecord.kind !== 'TERMINAL_SETTLEMENT' && auditRecord.kind !== 'COMPACT_TOMBSTONE') {
+          throw new Error('STATE_INCONSISTENT_TERMINAL_OUTCOME_CONFLICT');
+        }
+
+        if (
+          !isEquivalentOwnerToken(cachedResult.releaseReceipt.identity, safeOwner) ||
+          cachedResult.releaseReceipt.identity.transactionId !== safeTxId ||
+          cachedResult.releaseReceipt.identity.operationIdentity !== safeOpId ||
+          cachedResult.obligation.barrierIdentity !== safeBarrierId ||
+          cachedResult.releaseReceipt.identity.drainerOwnershipGeneration !== safeOwner.drainerOwnershipGeneration
+        ) {
+          throw new Error('CUSTODY_PUBLICATION_TOKEN_MISMATCH');
+        }
+
+        const { candidateLeases, leaseId } = this._getOrAllocateRetryLease(
+          currentRoot, g, retryContext.consumerId, retryContext.clientRequestId, safeOwner, safeTxId, safeOpId, safeBarrierId
+        );
+
+        if (candidateLeases !== currentRoot.activeRetryLeases) {
+          const nextRoot: AuthoritativeCustodyRoot = Object.freeze({
+            ...currentRoot,
+            activeRetryLeases: candidateLeases,
+          });
+          this.#leadershipFence.executeFencedPublication(
+            this.#coordinatorBootEpoch.clusterTerm,
+            nextRoot,
+            (root) => {
+              this.#custodyRoot = root;
+            }
+          );
+        }
+
+        return { publicationResult: cachedResult, retryLeaseId: leaseId };
+      }
+
+      // Case 3C: Published but Outside Retention Horizon (Evicted / Tombstone Horizon)
+      if (g <= currentRoot.custodyGenerationFloor) {
+        if (g > currentRoot.auditTombstoneFloor) {
+          const tombstone = currentRoot.generationAuditHistory.get(g);
+          if (!tombstone || tombstone.kind !== 'COMPACT_TOMBSTONE') {
+            throw new Error('STATE_INCONSISTENT_TOMBSTONE_MISSING_IN_HORIZON');
+          }
+          if (
+            !isEquivalentOwnerToken(tombstone.expectedOwner, safeOwner) ||
+            tombstone.transactionId !== safeTxId ||
+            tombstone.operationIdentity !== safeOpId ||
+            tombstone.barrierIdentity !== safeBarrierId ||
+            tombstone.drainerOwnershipGeneration !== safeOwner.drainerOwnershipGeneration
+          ) {
+            throw new Error('CUSTODY_RECEIPT_EXPIRED_TOKEN_MISMATCH');
+          }
+          throw new Error(`CUSTODY_RECEIPT_EXPIRED: generation ${g} retained receipt evicted; audit tombstone confirms outcome ${tombstone.terminalOutcome}`);
+        }
+        throw new Error(`CUSTODY_RECEIPT_EXPIRED: generation ${g} has been pruned beyond audit tombstone floor ${currentRoot.auditTombstoneFloor}`);
+      }
+
+      throw new Error(`STATE_INCONSISTENT_RETENTION_INDEX_CORRUPTED: generation ${g} <= published ${currentRoot.publishedGeneration} but missing from results and obligations`);
+    }
+
+    // Case 1: First Publication
+    if (g !== currentRoot.publishedGeneration + 1) {
+      throw new Error(`INVALID_PUBLICATION_SEQUENCE: attempted out-of-order generation ${g}; expected ${currentRoot.publishedGeneration + 1}`);
+    }
+
+    if (currentRoot.inFlightRecord === null) {
+      throw new Error('INVALID_CUSTODY_GATE_STATE_NO_IN_FLIGHT: cannot publish without active in-flight custody');
+    }
+
+    const inFlightToken = currentRoot.inFlightRecord.token;
+    if (
+      !isEquivalentOwnerToken(inFlightToken, safeOwner) ||
+      inFlightToken.transactionId !== safeTxId ||
+      inFlightToken.operationIdentity !== safeOpId ||
+      inFlightToken.barrierIdentity !== safeBarrierId ||
+      inFlightToken.drainerOwnershipGeneration !== safeOwner.drainerOwnershipGeneration
+    ) {
+      throw new Error('CUSTODY_PUBLICATION_IN_FLIGHT_TOKEN_MISMATCH');
+    }
+
+    const { pinId, nextPins: candidatePins } = this._getOrAllocateSettlementPin(
+      currentRoot,
+      g,
+      safeBarrierId,
+      safeOwner,
+      safeOwner.drainerOwnershipGeneration
+    );
+
+    const obligationId = `obl:${this.#coordinatorBootId}:${g}:${safeBarrierId}`;
+    const nowTimestamp = Date.now();
+    const monotonicNow = performance.now();
+
+    const releaseReceipt: DrainerCustodyReleaseReceipt = Object.freeze({
+      [DRAINER_RELEASE_BRAND]: true as const,
+      releasedCustodyGeneration: g,
+      releasedAtTimestamp: nowTimestamp,
+      identity: safeOwner,
+      monotonicReleasedMs: monotonicNow,
+    });
+
+    const obligation: PendingSettlementObligation = Object.freeze({
+      obligationId,
+      generation: g,
+      barrierIdentity: safeBarrierId,
+      ownerToken: safeOwner,
+      transactionId: safeTxId,
+      operationIdentity: safeOpId,
+      drainerOwnershipGeneration: safeOwner.drainerOwnershipGeneration,
+      publishedCustodyGeneration: g,
+      preAllocatedReleaseReceipt: releaseReceipt,
+      preparedReconciliationReceipt: deepCloneAndFreezeValue(preparedEvidence.preparedReconciliationReceipt),
+      preparedArchiveReceipt: deepCloneAndFreezeValue(preparedEvidence.preparedArchiveReceipt),
+      preparedExecutionReceipt: deepCloneAndFreezeValue(preparedEvidence.preparedExecutionReceipt),
+      publishedAtTimestamp: nowTimestamp,
+      monotonicPublishedMs: monotonicNow,
+    });
+
+    const publicationResult: PublicationResult = Object.freeze({
+      releaseReceipt,
+      obligation,
+    });
+
+    const pendingAuditRecord: ImmutablePendingAuditRecord = Object.freeze({
+      kind: 'PENDING_PUBLICATION' as const,
+      generation: g,
+      expectedOwner: safeOwner,
+      transactionId: safeTxId,
+      operationIdentity: safeOpId,
+      barrierIdentity: safeBarrierId,
+      drainerOwnershipGeneration: safeOwner.drainerOwnershipGeneration,
+      publishedAtTimestamp: nowTimestamp,
+      monotonicPublishedMs: monotonicNow,
+    });
+
+    const candidateResultsMap = new Map(currentRoot.publicationResults.entries());
+    const candidateAuditHistory = new Map(currentRoot.generationAuditHistory.entries());
+    let candidateFloor = currentRoot.custodyGenerationFloor;
+    let candidateAuditFloor = currentRoot.auditTombstoneFloor;
+
+    const count = g - 1 - candidateFloor;
+    if (count > 5000) {
+      throw new Error('RETENTION_CAPACITY_CORRUPTED: pre-existing publication count exceeds 5000');
+    }
+
+    if (count === 5000) {
+      const g_oldest = candidateFloor + 1;
+      const oldestResult = candidateResultsMap.get(g_oldest);
+      if (!oldestResult) {
+        throw new Error('STATE_INCONSISTENT_RESULT_EVICTION_GAP');
+      }
+
+      for (const lease of currentRoot.activeRetryLeases.values()) {
+        if (lease.generation === g_oldest && lease.expiresAtMonotonicMs > monotonicNow) {
+          throw new Error('CUSTODY_PUBLICATION_BACKPRESSURE_EXHAUSTED: oldest result protected by active retry lease');
+        }
+      }
+      for (const pin of currentRoot.activeSettlementPins.values()) {
+        if (pin.generation === g_oldest) {
+          throw new Error('CUSTODY_PUBLICATION_BACKPRESSURE_EXHAUSTED: oldest result protected by active settlement pin');
+        }
+      }
+      if (currentRoot.pendingSettlementObligations.has(g_oldest)) {
+        throw new Error('CUSTODY_PUBLICATION_BACKPRESSURE_EXHAUSTED: oldest result protected by pending settlement obligation');
+      }
+
+      const existingAudit = candidateAuditHistory.get(g_oldest);
+      if (!existingAudit) {
+        throw new Error('STATE_INCONSISTENT_AUDIT_RECORD_MISSING_FOR_EVICTION');
+      }
+      if (existingAudit.kind !== 'TERMINAL_SETTLEMENT') {
+        throw new Error('STATE_INCONSISTENT_EVICTION_AUDIT_NOT_SETTLED');
+      }
+
+      const tombstone: ImmutableCompactAuditTombstone = Object.freeze({
+        kind: 'COMPACT_TOMBSTONE' as const,
+        generation: g_oldest,
+        expectedOwner: existingAudit.expectedOwner,
+        transactionId: existingAudit.transactionId,
+        operationIdentity: existingAudit.operationIdentity,
+        barrierIdentity: existingAudit.barrierIdentity,
+        drainerOwnershipGeneration: existingAudit.drainerOwnershipGeneration,
+        terminalOutcome: existingAudit.terminalOutcome,
+        settledAtTimestamp: existingAudit.settledAtTimestamp,
+        monotonicSettledMs: existingAudit.monotonicSettledMs,
+        evidenceDigest: cloneByteArray(computeEvidenceDigest(existingAudit)),
+      });
+
+      candidateResultsMap.delete(g_oldest);
+      candidateAuditHistory.set(g_oldest, tombstone);
+      candidateFloor = g_oldest;
+
+      const tombstoneCount = candidateFloor - candidateAuditFloor;
+      if (tombstoneCount > 5000) {
+        throw new Error('TOMBSTONE_CAPACITY_CORRUPTED: pre-existing tombstone count exceeds 5000');
+      }
+      if (tombstoneCount === 5000) {
+        const g_tomb_oldest = candidateAuditFloor + 1;
+        const tombEntry = candidateAuditHistory.get(g_tomb_oldest);
+        if (!tombEntry || tombEntry.kind !== 'COMPACT_TOMBSTONE') {
+          throw new Error('STATE_INCONSISTENT_TOMBSTONE_RETIREMENT_TYPE_VIOLATION');
+        }
+
+        for (const lease of currentRoot.activeRetryLeases.values()) {
+          if (lease.generation === g_tomb_oldest && lease.expiresAtMonotonicMs > monotonicNow) {
+            throw new Error('TOMBSTONE_CAPACITY_EXHAUSTED: oldest tombstone protected by active retry lease');
+          }
+        }
+        for (const pin of currentRoot.activeSettlementPins.values()) {
+          if (pin.generation === g_tomb_oldest) {
+            throw new Error('TOMBSTONE_CAPACITY_EXHAUSTED: oldest tombstone protected by active settlement pin');
+          }
+        }
+        if (currentRoot.pendingSettlementObligations.has(g_tomb_oldest)) {
+          throw new Error('TOMBSTONE_CAPACITY_EXHAUSTED: oldest tombstone protected by pending settlement obligation');
+        }
+
+        candidateAuditHistory.delete(g_tomb_oldest);
+        candidateAuditFloor = g_tomb_oldest;
+      }
+    }
+
+    candidateResultsMap.set(g, publicationResult);
+    candidateAuditHistory.set(g, pendingAuditRecord);
+
+    const candidateObligations = currentRoot.pendingSettlementObligations.set(g, obligation);
+    const candidateResults = new ImmutableMap(candidateResultsMap.entries());
+    const candidateAudit = new ImmutableMap(candidateAuditHistory.entries());
+
+    AuthoritativeCustodyCoordinator.assertRetentionMapContiguity(candidateResults, candidateFloor, g);
+    AuthoritativeCustodyCoordinator.assertAuditHistoryContiguity(candidateAudit, candidateAuditFloor, g, candidateFloor, candidateResults);
+
+    const candidateRoot: AuthoritativeCustodyRoot = Object.freeze({
+      publishedGeneration: g,
+      custodyGenerationFloor: candidateFloor,
+      auditTombstoneFloor: candidateAuditFloor,
+      inFlightRecord: null,
+      gateState: 'CUSTODY_RELEASED_BARRIER_PENDING',
+      pendingSettlementObligations: candidateObligations,
+      publicationResults: candidateResults,
+      generationAuditHistory: candidateAudit,
+      activeSettlementPins: candidatePins,
+      activeRetryLeases: currentRoot.activeRetryLeases,
+      retiredRetryLeases: currentRoot.retiredRetryLeases,
+      retiredSettlementPins: currentRoot.retiredSettlementPins,
+      consumedSettlementEvidence: currentRoot.consumedSettlementEvidence,
+    });
+
+    // Enforceable Leadership-Fenced Publication (R26-2)
+    return this.#leadershipFence.executeFencedPublication(
+      this.#coordinatorBootEpoch.clusterTerm,
+      candidateRoot,
+      (root) => {
+        this.#custodyRoot = root;
+        return { publicationResult, retryLeaseId: null };
+      }
+    );
+  }
 }
 ```
+
+---
+
 ## 12.13 Acquisition Serialization & Check-Then-Acquire Race Immunity
 
 Under single-realm JavaScript execution:
 - Candidate-root preparation, invariant verification, and reference replacement occur synchronously within one microtask turn.
+- Mutual exclusion is enforced via `#publicationLock`: concurrent calls within the same process fail deterministically with `CONCURRENT_PUBLICATION_LOCK_ACQUISITION_VIOLATION`.
+- Zero async turns exist between leadership lease validation and the reference replacement `this.#custodyRoot = root`.
 - No other event loop callback can observe or mutate `this.#custodyRoot` between the check and the replacement.
 - Retry lease acquisition, settlement pin acquisition, and FIFO eviction are mutually serialized, preventing race conditions that could expose an evicted result as active.
 
@@ -1895,8 +1999,8 @@ Under single-realm JavaScript execution:
 | **Phase 7: Tombstone Staging**| Missing audit record | Fail-closed throw | Root unchanged; no eviction |
 | **Phase 8: Tombstone Retir.**| Tombstone pinned by lease/pin/obligation | Backpressure throw | Root unchanged; capacity preserved |
 | **Phase 9: Post-Contiguity**| Key gap in candidate map | Fail-closed throw | Candidate root discarded |
-| **Phase 10: Atomic Swap** | Pointer replacement | Infallible | Single linearization point |
-| **Phase 11: Return Ref** | Return cached pointer | Infallible | Zero post-publication allocation |
+| **Phase 10: Fenced Swap** | Expired lease / stepdown / lock conflict | Fail-closed throw (`STALE_COORDINATOR_LEADERSHIP_FENCED`) | Root untouched; single-writer fenced |
+| **Phase 11: Return Ref** | Return deeply cached reference | Infallible | Zero post-publication allocation |
 
 ---
 
@@ -1960,7 +2064,7 @@ Protocol B handles cancelled or uncommitted operations:
 
 ---
 
-## 15. Exhaustive Failure and Retry Matrix (48 Deterministic Cases)
+## 15. Exhaustive Failure and Retry Matrix (54 Deterministic Cases)
 
 | Case | Scenario | Gate State | Custody Owner | Barrier State | Correct Action | Forbidden Action |
 |---|---|---|---|---|---|---|
@@ -2012,33 +2116,43 @@ Protocol B handles cancelled or uncommitted operations:
 | **46** | Delayed release of unretired prior-epoch resource | `ANY` | Any | ANY | Throw `RESOURCE_NOT_FOUND` | Authorize release |
 | **47** | Restored retired pin from earlier boot epoch | `SETTLED` | Coordinator | RESOLVED | Verify boot epoch & digest; return `ALREADY_RELEASED` | Reject valid idempotent retry |
 | **48** | Consumer attempts property access on `#inner` | `ANY` | Any | ANY | Rejected at runtime by ECMAScript syntax | Access private backing Map |
+| **49** | Caller attempts property mutation on retrieved `ImmutableMap` value | `ANY` | Any | ANY | Mutation rejected by frozen object / TypeError | In-place mutation of stored custody record |
+| **50** | Caller mutates bytes of retrieved `ownerSignature` or `evidenceDigest` | `ANY` | Any | ANY | Egress defensive cloning keeps internal buffer pristine | Shared buffer corruption of custody root |
+| **51** | Caller attempts collection mutation via `entries()` or `values()` iterator | `ANY` | Any | ANY | Iterators yield deeply frozen defensive clones; root untouched | In-place collection corruption via iterator |
+| **52** | Non-primitive key or element passed to `ImmutableMap` or `ImmutableSet` | `ANY` | Any | ANY | Throw `INVALID_COLLECTION_KEY_TYPE` / `ELEMENT_TYPE` | Admit mutable reference as key/element |
+| **53** | Concurrent publication attempted during active `executeFencedPublication` | `PUBLISHING` | Coordinator | PENDING | Throw `CONCURRENT_PUBLICATION_LOCK_ACQUISITION_VIOLATION` | Interleave concurrent candidate roots |
+| **54** | Expired lease or stepdown during `executeFencedPublication` | `PUBLISHING` | Fenced Leader | PENDING | Throw `STALE_COORDINATOR_LEADERSHIP_FENCED`; root untouched | Commit stale root after lease expiry |
 
 ---
 
 ## 16. Mandatory Barrier, Drain, and Settlement Invariants
 
-1. **The Universal Generation-Scoped Settlement-Barrier Invariant:**
-   $$\mathbf{BARRIER\_RESOLVED}(g) \implies \mathbf{EXECUTION\_SETTLED}(g) \land \mathbf{CUSTODY\_RECONCILED}(g) \land \mathbf{DRAINER\_RELEASED}(g) \land \mathbf{ALL\_RECEIPTS\_MATCH}(g)$$
-2. **Capability-Gated Settlement-Pin Release Invariant:**
-   $$\mathbf{RELEASE\_SETTLEMENT\_PIN}(pinId) \implies \mathbf{AssertAuthoritativeSettlementEvidence}(evidence) \land (\mathbf{pin.identity} \equiv \mathbf{evidence.identity})$$
-3. **Compound Durable Boot Epoch & Consensus Leadership Fencing Invariant:**
-   Every settlement pin and retry lease binds a compound durable fencing token $\mathbf{coordinatorBootEpoch} = \langle \mathbf{clusterTerm},\; \mathbf{bootGeneration},\; \mathbf{bootInstanceId} \rangle$. Monotonic non-reusability across restarts is mathematically guaranteed by consensus-allocated $\mathbf{bootGeneration}$, and split-brain coordinator publication is fenced out by linearizable $\mathbf{clusterTerm}$ lease validation at the mutation linearization point.
-4. **Strict Pre-Existing Overflow Fencing, Eligible Tombstone Eviction & Backpressure Invariant:**
-   Pre-existing collection sizes $> 5000$ in `retiredSettlementPins`, `retiredRetryLeases`, or `consumedSettlementEvidence` fail closed immediately with dedicated corruption errors. At exactly 5,000 entries, eviction selects the oldest *eligible* entry not retained by active retry leases, active settlement pins, or pending settlement obligations; if all 5,000 entries are protected, it fails closed with `RETENTION_CAPACITY_EXHAUSTED_BACKPRESSURE`.
-5. **Replay-Key Bijection Domain & Lockstep Eviction Invariant:**
-   `consumedSettlementEvidence` contains **only** replay deduplication keys corresponding to entries in `retiredSettlementPins`. There exists an exact 1-to-1 bijection between retired pins and replay keys, strictly bounded to $\le 5000$ entries and trimmed in lockstep within a single candidate-root replacement.
-6. **Complete Retired-Resource Identity Invariant:**
-   A resource absent from active collections is recognized as `ALREADY_RELEASED` if and only if its identity matches an authoritative entry in `retiredRetryLeases` or `retiredSettlementPins` across all seven dimensions (`consumerId`, `clientRequestId`, `callerToken`, `transactionId`, `operationIdentity`, `barrierIdentity`) and matches its recorded `allocatedBootEpoch`. Altered identities fail closed.
-7. **Universal Evidence Provenance, Disposition & Qualified Byte-Comparison Invariant:**
-   Both active and retired settlement-pin releases unconditionally require validated `SettlementEvidenceFactory` provenance. A retired pin release verifies that `settlementEvidence.evidenceDigest` matches `retiredPin.evidenceDigest` byte-for-byte via fixed-iteration content-independent comparison `areEqualByteArrays()`.
-8. **Atomic Evidence Consumption Invariant:**
-   Evidence consumption disposition (`consumedSettlementEvidence`) and settlement pin removal must linearize together via single atomic candidate-root replacement. If publication throws, evidence remains unconsumed and retryable.
-9. **Seven-Dimensional Pin Identity Binding Invariant:**
-   Settlement pins bind and enforce exact equality across generation, complete owner token, transaction ID, operation identity, barrier identity, and drainer ownership generation.
-10. **Mandatory Stable Retry Request Identity Invariant:**
-   All retry requests must supply non-empty, string-typed `(consumerId, clientRequestId)` bounded to $\le 256$ characters. The coordinator cannot substitute timestamps or nonces.
-11. **Option A Audit-History Invariant:**
-   `generationAuditHistory` maintains lifecycle-discriminated records (`PENDING_PUBLICATION`, `TERMINAL_SETTLEMENT`, `COMPACT_TOMBSTONE`) such that $\mathbf{generationAuditHistory.keys()} \equiv \{\mathbf{auditTombstoneFloor} + 1, \dots, \mathbf{publishedGeneration}\}$ holds unconditionally.
+1. **Gate Transition Authorization Invariant:**
+   The custody-reconciliation gate can transition **ONLY** when authorized by the active drainer possessing valid monotonic lease ownership.
+2. **Single Primary Drainer Invariant:**
+   At most one active drainer may hold custody across all partitions.
+3. **Irrevocable Commitment Invariant:**
+   Once staged in the archive (`ARCHIVE_COMMITTED`), the transaction is permanent and cannot be rolled back.
+4. **Non-Commitment Proof Invariant:**
+   Destructive cleanup or buffer restore requires Level 3 fencing proof (`TRANSACTION_ABORTED_FENCED`).
+5. **Disposition Exclusivity Invariant:**
+   A transaction ID can be finalized in exactly one disposition state.
+6. **Drainer Ownership Invariant:**
+   Every recovery attempt increments `drainerOwnershipGeneration`. Operations tagged with stale generations are rejected.
+7. **Monotonic Retry Increment Invariant:**
+   Each recovery attempt uses a strictly higher `recoveryAttemptId`.
+8. **Barrier Lifecycle Invariant:**
+   A barrier must be created per operation and cannot be reused across attempts.
+9. **Atomic Settlement Invariant:**
+   Barrier resolution and custody clearance occur in a single atomic step.
+10. **Contiguity Invariant for Active Publications:**
+   `publicationResults` must form an unbroken contiguous sequence:
+   $$\mathbf{keys}(publicationResults) \equiv \{\mathbf{custodyGenerationFloor} + 1, \dots, \mathbf{publishedGeneration}\}$$
+   Gaps within this range throw `STATE_INCONSISTENT_RESULT_MAP_NON_CONTIGUOUS`.
+11. **Strict Contiguity Invariant for Generation Audit History:**
+   `generationAuditHistory` must form an unbroken contiguous sequence:
+   $$\mathbf{keys}(generationAuditHistory) \equiv \{\mathbf{auditTombstoneFloor} + 1, \dots, \mathbf{publishedGeneration}\}$$
+   Any key gap in this range throws `STATE_INCONSISTENT_AUDIT_MAP_NON_CONTIGUOUS`.
 12. **Complete Tombstone Retirement Protection Invariant:**
    Oldest tombstone cannot be retired while any active retry lease, settlement pin, or pending obligation references it.
 13. **Strict Capacity Ceiling Invariant:**
@@ -2050,17 +2164,17 @@ Protocol B handles cancelled or uncommitted operations:
 16. **Watchdog Pin and Lease Immunity Invariant:**
    Watchdog timeouts CANNOT release retention pins or retry leases whose underlying operations remain unresolved.
 17. **Single In-Flight Drain Invariant:** A second drain **CANNOT** dequeue an operation while `this.#custodyRoot.inFlightRecord !== null` ($N_{\text{in-flight}} \le 1$).
-18. **Genuine Runtime Collection Encapsulation & Defensive Immutability Invariant:**
-   Published collections are encapsulated within `ImmutableMap` and `ImmutableSet` wrappers using ECMAScript `#private` fields (`#inner`). Backing collections are inaccessible, native mutating methods are absent, and copy-on-write methods produce new instances. All byte arrays are defensively cloned on ingress and egress.
+18. **Deep Value Immutability & Defensive Egress Invariant:**
+   Published custody root collections (`publicationResults`, `generationAuditHistory`, `activeSettlementPins`, `activeRetryLeases`, `retiredRetryLeases`, `retiredSettlementPins`, `consumedSettlementEvidence`, `pendingSettlementObligations`) enforce runtime `#private` backing storage (`#inner`), strictly primitive keys and elements (`string` or `number`), deep recursive freezing on ingress (`deepCloneAndFreezeValue`), and defensive byte array cloning on egress. No caller can mutate published custody state through any returned reference.
 19. **Complete Structured Owner-Token Identity Invariant:**
    Every active and retired resource binds and verifies the complete structured `CustodyOwnershipToken` (`recoveryAttemptId`, `custodyGeneration`, `drainerOwnershipGeneration`, `transactionId`, `operationIdentity`, `barrierIdentity`, `leaseTerm`, `ownerSignature`) using `isEquivalentOwnerToken()`.
-20. **Linearized Consensus Leadership Fencing Invariant:**
-   Immediately prior to committing any candidate root to `this.#custodyRoot`, the coordinator must validate that its consensus leadership lease for `clusterTerm` remains valid. If leadership was lost, the candidate root is discarded, custody is retained as degraded, and the barrier is left unresolved.
+20. **Serialized Single-Writer Lease-Guarded Fencing Invariant:**
+   All custody root publications execute strictly inside `LeadershipEpochFence.executeFencedPublication()`, guarded by `#publicationLock`. In Step 2, the fence validates that `#isSteppedDown === false`, `#currentTerm === expectedTerm`, and `performance.now() < #leaseExpiresAtMonotonicMs`. Zero async turns exist between verification and assignment, preventing split-brain writes.
 21. **Cross-Restart Retirement Idempotency & Active Boot Isolation Invariant:**
    Active collections initialize empty across process restarts; unreleased active resources from prior epochs fail closed as `RESOURCE_NOT_FOUND`. Retired records restored from persistent checkpoints remain authoritative and return `ALREADY_RELEASED` when presented with matching boot epoch, 7-dimensional identity, and evidence digest.
 
 ### Strict Ordering of Finalization:
-$$\text{1. Settle Promise} \longrightarrow \text{2. Reconcile Custody} \longrightarrow \text{3. Pre-Validate Candidate Root} \longrightarrow \text{4. Assert Leadership Lease} \longrightarrow \text{5. Atomic Pointer Swap} \longrightarrow \text{6. Resolve Barrier With Evidence} \longrightarrow \text{7. Release Settlement Pin}$$
+$$\text{1. Settle Promise} \longrightarrow \text{2. Reconcile Custody} \longrightarrow \text{3. Pre-Validate Candidate Root} \longrightarrow \text{4. Execute Fenced Publication} \longrightarrow \text{5. Atomic Pointer Swap} \longrightarrow \text{6. Resolve Barrier With Evidence} \longrightarrow \text{7. Release Settlement Pin}$$
 
 ---
 ## 17. Removal of Unapproved Emergency Reset Authority
@@ -2084,27 +2198,27 @@ The proposal excises all references to `forceEmergencyReset(capability)`:
 
 ## 19. Deterministic Failure Scenarios and Future Test Requirements
 
-The following forty-eight deterministic future test specifications are formally codified for Sub-Milestone M5.1:
+The following fifty-four deterministic future test specifications are formally codified for Sub-Milestone M5.1:
 
-### Test R18-R25-T01: Retry Acquisition Without Stable Request Context
+### Test R18-R26-T01: Retry Acquisition Without Stable Request Context
 - **Initial Authoritative Root:** Settled result at $g=1$; `activeRetryLeases.size === 0`.
 - **Operation Sequence:** Call `publishReleaseAndObligation` presenting retry token for $g=1$ with `retryContext === undefined`.
 - **Expected Final Root:** Unchanged; zero leases allocated.
 - **Expected Result / Error:** Throws `INVALID_RETRY_REQUEST_CONTEXT`.
 
-### Test R18-R25-T02: Retry Acquisition With Malformed or Empty Request Context
+### Test R18-R26-T02: Retry Acquisition With Malformed or Empty Request Context
 - **Initial Authoritative Root:** Settled result at $g=1$; `activeRetryLeases.size === 0`.
 - **Operation Sequence:** Call `publishReleaseAndObligation` presenting retry token for $g=1$ with `retryContext = { consumerId: "   ", clientRequestId: "" }`.
 - **Expected Final Root:** Unchanged; zero leases allocated.
 - **Expected Result / Error:** Throws `MALFORMED_RETRY_REQUEST_CONTEXT`.
 
-### Test R18-R25-T03: Retry Acquisition With Oversized Request Context
+### Test R18-R26-T03: Retry Acquisition With Oversized Request Context
 - **Initial Authoritative Root:** Settled result at $g=1$; `activeRetryLeases.size === 0`.
 - **Operation Sequence:** Call `publishReleaseAndObligation` with `consumerId` of length 257 characters.
 - **Expected Final Root:** Unchanged; zero leases allocated.
 - **Expected Result / Error:** Throws `RETRY_REQUEST_CONTEXT_OVERSIZED`.
 
-### Test R18-R25-T04: Lost-Response Retransmission Recovers Original Lease Idempotently
+### Test R18-R26-T04: Lost-Response Retransmission Recovers Original Lease Idempotently
 - **Initial Authoritative Root:** Settled result at $g=1$; `activeRetryLeases.size === 0`.
 - **Operation Sequence:**
   1. Consumer 1 acquires lease for $g=1$ with `clientRequestId = "req-101"`; receives `leaseId_A`.
@@ -2112,13 +2226,13 @@ The following forty-eight deterministic future test specifications are formally 
 - **Expected Final Root:** `activeRetryLeases.size === 1`, containing `leaseId_A`.
 - **Expected Result / Error:** Second call returns existing `leaseId_A` idempotently.
 
-### Test R18-R25-T05: Repeated Retry Acquisition With Conflicting Operation Identity
+### Test R18-R26-T05: Repeated Retry Acquisition With Conflicting Operation Identity
 - **Initial Authoritative Root:** Settled result at $g=1$; lease active for `(consumer1, req-101)`.
 - **Operation Sequence:** Consumer 1 submits request with `clientRequestId = "req-101"` but altered `operationIdentity`.
 - **Expected Final Root:** Unchanged.
 - **Expected Result / Error:** Throws `IDEMPOTENT_RETRY_IDENTITY_CONFLICT`.
 
-### Test R18-R25-T06: Two Distinct Consumers Acquire Independent Leases Under Same Recovery Owner Token
+### Test R18-R26-T06: Two Distinct Consumers Acquire Independent Leases Under Same Recovery Owner Token
 - **Initial Authoritative Root:** Settled result at $g=1$; `activeRetryLeases.size === 0`.
 - **Operation Sequence:**
   1. Consumer 1 requests lease for $g=1$ with `consumerId = "c1"`.
@@ -2126,13 +2240,13 @@ The following forty-eight deterministic future test specifications are formally 
 - **Expected Final Root:** `activeRetryLeases.size === 2`, containing `leaseId_1` and `leaseId_2`.
 - **Expected Result / Error:** Both acquire distinct leases successfully.
 
-### Test R18-R25-T07: Consumer 1 Attempting to Release Consumer 2's Lease Fails Closed
+### Test R18-R26-T07: Consumer 1 Attempting to Release Consumer 2's Lease Fails Closed
 - **Initial Authoritative Root:** Active leases for Consumer 1 (`leaseId_1`) and Consumer 2 (`leaseId_2`).
 - **Operation Sequence:** Consumer 1 invokes `releaseRetryLease` passing `leaseId_2` with `consumerId = "c1"`.
 - **Expected Final Root:** Unchanged; both leases remain active.
 - **Expected Result / Error:** Throws `UNAUTHORIZED_CROSS_CONSUMER_LEASE_RELEASE`.
 
-### Test R18-R25-T08: Duplicate Lease Release by Authorized Consumer Against Retired Record Is Idempotent
+### Test R18-R26-T08: Duplicate Lease Release by Authorized Consumer Against Retired Record Is Idempotent
 - **Initial Authoritative Root:** Active lease `leaseId_1` for Consumer 1.
 - **Operation Sequence:**
   1. Consumer 1 calls `releaseRetryLease` with all matching parameters; returns `{ status: 'RELEASED' }`.
@@ -2140,7 +2254,7 @@ The following forty-eight deterministic future test specifications are formally 
 - **Expected Final Root:** `activeRetryLeases.has(leaseId_1) === false`; `retiredRetryLeases.has(leaseId_1) === true`.
 - **Expected Result / Error:** Second call matches retired record and returns `{ status: 'ALREADY_RELEASED' }` idempotently.
 
-### Test R18-R25-T09: First Publication With Option A Lifecycle Model
+### Test R18-R26-T09: First Publication With Option A Lifecycle Model
 - **Initial Authoritative Root:** `publishedGeneration = 0`, `auditTombstoneFloor = 0`, `custodyGenerationFloor = 0`.
 - **Operation Sequence:** Call `publishReleaseAndObligation` for $g=1$.
 - **Expected Final Root:**
@@ -2150,13 +2264,13 @@ The following forty-eight deterministic future test specifications are formally 
   - `generationAuditHistory.get(1).kind === 'PENDING_PUBLICATION'`.
 - **Expected Result / Error:** Success; contiguity invariant holds unconditionally.
 
-### Test R18-R25-T10: Pending-to-Terminal Audit History Transition
+### Test R18-R26-T10: Pending-to-Terminal Audit History Transition
 - **Initial Authoritative Root:** Generation $g=1$ published; audit record is `PENDING_PUBLICATION`.
 - **Operation Sequence:** Barrier for $g=1$ settles with `AuthoritativeSettlementEvidence` (`CONFIRMED_COMMITTED`).
 - **Expected Final Root:** `generationAuditHistory.get(1).kind === 'TERMINAL_SETTLEMENT'`.
 - **Expected Result / Error:** Success; record upgraded in place.
 
-### Test R18-R25-T11: Eviction and Compact Tombstone Conversion
+### Test R18-R26-T11: Eviction and Compact Tombstone Conversion
 - **Initial Authoritative Root:** Result at $g=1$ settled (`TERMINAL_SETTLEMENT`); 1,000 results retained.
 - **Operation Sequence:** Publish $g=1001$; triggers FIFO eviction of $g=1$.
 - **Expected Final Root:**
@@ -2166,25 +2280,25 @@ The following forty-eight deterministic future test specifications are formally 
   - `generationAuditHistory.get(1).evidenceDigest` is 32-byte SHA-256.
 - **Expected Result / Error:** Success.
 
-### Test R18-R25-T12: Tombstone Retirement Blocked by Active Settlement Pin
+### Test R18-R26-T12: Tombstone Retirement Blocked by Active Settlement Pin
 - **Initial Authoritative Root:** 5,000 tombstones retained; oldest tombstone $g=1$ has an active settlement pin.
 - **Operation Sequence:** Next result eviction attempts to retire tombstone $g=1$.
 - **Expected Final Root:** Unchanged; zero tombstones deleted; zero results evicted.
 - **Expected Result / Error:** Throws `TOMBSTONE_CAPACITY_EXHAUSTED`.
 
-### Test R18-R25-T13: Tombstone Retirement Blocked by Active Retry Lease
+### Test R18-R26-T13: Tombstone Retirement Blocked by Active Retry Lease
 - **Initial Authoritative Root:** 5,000 tombstones retained; oldest tombstone $g=1$ has an active retry lease.
 - **Operation Sequence:** Next result eviction attempts to retire tombstone $g=1$.
 - **Expected Final Root:** Unchanged; zero tombstones deleted; zero results evicted.
 - **Expected Result / Error:** Throws `TOMBSTONE_CAPACITY_EXHAUSTED`.
 
-### Test R18-R25-T14: Tombstone Retirement Blocked by Pending Settlement Obligation
+### Test R18-R26-T14: Tombstone Retirement Blocked by Pending Settlement Obligation
 - **Initial Authoritative Root:** 5,000 tombstones retained; oldest tombstone $g=1$ references pending obligation.
 - **Operation Sequence:** Next result eviction attempts to retire tombstone $g=1$.
 - **Expected Final Root:** Unchanged.
 - **Expected Result / Error:** Throws `TOMBSTONE_CAPACITY_EXHAUSTED`.
 
-### Test R18-R25-T15: Normal FIFO Tombstone Retirement at 5,000 Capacity
+### Test R18-R26-T15: Normal FIFO Tombstone Retirement at 5,000 Capacity
 - **Initial Authoritative Root:** 5,000 tombstones retained ($[1 \dots 5000]$); zero pins/leases on $g=1$.
 - **Operation Sequence:** Publish new generation causing eviction and tombstone retirement.
 - **Expected Final Root:**
@@ -2193,85 +2307,85 @@ The following forty-eight deterministic future test specifications are formally 
   - Total tombstones remaining: 5,000 ($[2 \dots 5001]$).
 - **Expected Result / Error:** Success; contiguity preserved over $[2 \dots publishedGeneration]$.
 
-### Test R18-R25-T16: Pre-Existing Tombstone Count Above Cap Fails Closed
+### Test R18-R26-T16: Pre-Existing Tombstone Count Above Cap Fails Closed
 - **Initial Authoritative Root:** Artificially injected root with 5,005 tombstones.
 - **Operation Sequence:** Call `publishReleaseAndObligation`.
 - **Expected Final Root:** Unchanged; zero bulk deletions performed.
 - **Expected Result / Error:** Throws `TOMBSTONE_CAPACITY_CORRUPTED`.
 
-### Test R18-R25-T17: Missing Tombstone Inside Promised Horizon Fails Closed
+### Test R18-R26-T17: Missing Tombstone Inside Promised Horizon Fails Closed
 - **Initial Authoritative Root:** `auditTombstoneFloor = 10`, `custodyGenerationFloor = 20`; tombstone $g=15$ deleted.
 - **Operation Sequence:** Call `assertAuditHistoryContiguity`.
 - **Expected Final Root:** Unchanged.
 - **Expected Result / Error:** Throws `STATE_INCONSISTENT_AUDIT_KEY_GAP`.
 
-### Test R18-R25-T18: Expiry Below Tombstone Floor Returns Historical Expiry
+### Test R18-R26-T18: Expiry Below Tombstone Floor Returns Historical Expiry
 - **Initial Authoritative Root:** `auditTombstoneFloor = 50`.
 - **Operation Sequence:** Query generation $g=30$.
 - **Expected Final Root:** Unchanged.
 - **Expected Result / Error:** Returns `CUSTODY_RECEIPT_EXPIRED` with `horizonExpired: true`.
 
-### Test R18-R25-T19: Floor Order Invariant Violation Fails Closed
+### Test R18-R26-T19: Floor Order Invariant Violation Fails Closed
 - **Initial Authoritative Root:** Artificially set `auditTombstoneFloor = 50`, `custodyGenerationFloor = 40`.
 - **Operation Sequence:** Call `assertAuditHistoryContiguity`.
 - **Expected Final Root:** Unchanged.
 - **Expected Result / Error:** Throws `STATE_INCONSISTENT_FLOOR_ORDER_VIOLATION`.
 
-### Test R18-R25-T20: Audit Record With Mismatched Generation Fails Closed
+### Test R18-R26-T20: Audit Record With Mismatched Generation Fails Closed
 - **Initial Authoritative Root:** Audit history key is 5, but record payload has `generation: 4`.
 - **Operation Sequence:** Call `assertAuditHistoryContiguity`.
 - **Expected Final Root:** Unchanged.
 - **Expected Result / Error:** Throws `AUDIT_RECORD_GENERATION_MISMATCH`.
 
-### Test R18-R25-T21: Audit Record With Mismatched Owner Token Fails Closed
+### Test R18-R26-T21: Audit Record With Mismatched Owner Token Fails Closed
 - **Initial Authoritative Root:** Audit record at $g=1$ has altered `membershipEpoch`.
 - **Operation Sequence:** Call `assertAuditHistoryContiguity` with publicationResults.
 - **Expected Final Root:** Unchanged.
 - **Expected Result / Error:** Throws `STATE_INCONSISTENT_AUDIT_RESULT_IDENTITY_MISMATCH`.
 
-### Test R18-R25-T22: Audit Record With Mismatched Drainer Ownership Generation Fails Closed
+### Test R18-R26-T22: Audit Record With Mismatched Drainer Ownership Generation Fails Closed
 - **Initial Authoritative Root:** Audit record at $g=1$ has altered `drainerOwnershipGeneration`.
 - **Operation Sequence:** Call `assertAuditHistoryContiguity` with publicationResults.
 - **Expected Final Root:** Unchanged.
 - **Expected Result / Error:** Throws `STATE_INCONSISTENT_AUDIT_RESULT_IDENTITY_MISMATCH`.
 
-### Test R18-R25-T23: Cross-Generation Settlement Evidence Replay Rejected
+### Test R18-R26-T23: Cross-Generation Settlement Evidence Replay Rejected
 - **Initial Authoritative Root:** Active pin for $g=2$; evidence constructed for $g=1$.
 - **Operation Sequence:** Call `releaseSettlementPin("pin:...:g2:...", evidence_g1)`.
 - **Expected Final Root:** Unchanged; pin remains active.
 - **Expected Result / Error:** Throws `SETTLEMENT_EVIDENCE_IDENTITY_MISMATCH`.
 
-### Test R18-R25-T24: Cross-Obligation Settlement Evidence Replay Rejected via Atomic In-Root Registry
+### Test R18-R26-T24: Cross-Obligation Settlement Evidence Replay Rejected via Atomic In-Root Registry
 - **Initial Authoritative Root:** Evidence for $g=1$ already consumed on `pin_1`; `consumedSettlementEvidence.has("1:barrier:pin_1") === true`.
 - **Operation Sequence:** Attempt to reuse identical evidence on `pin_2`.
 - **Expected Final Root:** Unchanged; `pin_2` remains active.
 - **Expected Result / Error:** Throws `SETTLEMENT_EVIDENCE_REPLAY_DETECTED`.
 
-### Test R18-R25-T25: Caller-Constructed Mock Evidence Rejected by Provenance Check
+### Test R18-R26-T25: Caller-Constructed Mock Evidence Rejected by Provenance Check
 - **Initial Authoritative Root:** Active pin for $g=1$.
 - **Operation Sequence:** Caller constructs object matching `AuthoritativeSettlementEvidence` schema without factory.
 - **Expected Final Root:** Unchanged; pin remains active.
 - **Expected Result / Error:** Throws `INVALID_SETTLEMENT_EVIDENCE_PROVENANCE`.
 
-### Test R18-R25-T26: Watchdog Timeout Cannot Release Settlement Pin
+### Test R18-R26-T26: Watchdog Timeout Cannot Release Settlement Pin
 - **Initial Authoritative Root:** Barrier pending for $g=1$; watchdog fires after 5,000 ms.
 - **Operation Sequence:** Watchdog handler attempts to call `releaseSettlementPin` with watchdog receipt.
 - **Expected Final Root:** Pin remains active; gate state latches `DEGRADED`.
 - **Expected Result / Error:** Throws `INVALID_SETTLEMENT_EVIDENCE_PROVENANCE`.
 
-### Test R18-R25-T27: Retry Lease ID Passed to Settlement Pin Release Fails Closed
+### Test R18-R26-T27: Retry Lease ID Passed to Settlement Pin Release Fails Closed
 - **Initial Authoritative Root:** Active lease `lease:1:1:c1:1`.
 - **Operation Sequence:** Call `releaseSettlementPin("lease:1:1:c1:1", evidence)`.
 - **Expected Final Root:** Unchanged.
 - **Expected Result / Error:** Throws `PIN_TYPE_MISMATCH`.
 
-### Test R18-R25-T28: Settlement Pin ID Passed to Retry Lease Release Fails Closed
+### Test R18-R26-T28: Settlement Pin ID Passed to Retry Lease Release Fails Closed
 - **Initial Authoritative Root:** Active pin `pin:1:1:b1:1`.
 - **Operation Sequence:** Call `releaseRetryLease({ leaseId: "pin:1:1:b1:1", ... })`.
 - **Expected Final Root:** Unchanged.
 - **Expected Result / Error:** Throws `LEASE_TYPE_MISMATCH`.
 
-### Test R18-R25-T29: Genuinely Unknown Identifier Passed to Release APIs Fails Closed (Blocker B1)
+### Test R18-R26-T29: Genuinely Unknown Identifier Passed to Release APIs Fails Closed (Blocker B1)
 - **Initial Authoritative Root:** Clean root; active and retired maps empty.
 - **Operation Sequence:**
   1. Call `releaseRetryLease` with never-issued `leaseId = "lease:999:unknown"`.
@@ -2279,7 +2393,7 @@ The following forty-eight deterministic future test specifications are formally 
 - **Expected Final Root:** Unchanged.
 - **Expected Result / Error:** Both calls fail closed with `RESOURCE_NOT_FOUND` (neither returns `ALREADY_RELEASED`).
 
-### Test R18-R25-T30: Duplicate Release Against Retired Pin With Matching Provenance and Digest Returns Already Released
+### Test R18-R26-T30: Duplicate Release Against Retired Pin With Matching Provenance and Digest Returns Already Released
 - **Initial Authoritative Root:** Active pin `pin_1` for $g=1$.
 - **Operation Sequence:**
   1. Release `pin_1` with valid evidence; returns `{ status: 'RELEASED' }`.
@@ -2287,13 +2401,13 @@ The following forty-eight deterministic future test specifications are formally 
 - **Expected Final Root:** `activeSettlementPins.has("pin_1") === false`; `retiredSettlementPins.has("pin_1") === true`.
 - **Expected Result / Error:** Second call validates provenance and digest, returning `{ status: 'ALREADY_RELEASED' }` idempotently.
 
-### Test R18-R25-T31: Settlement Pin Release With Mismatched Drainer Generation Fails Closed (Blocker C1)
+### Test R18-R26-T31: Settlement Pin Release With Mismatched Drainer Generation Fails Closed (Blocker C1)
 - **Initial Authoritative Root:** Active pin for $g=1$ with `drainerOwnershipGeneration = 2`.
 - **Operation Sequence:** Caller presents `AuthoritativeSettlementEvidence` with `drainerOwnershipGeneration = 1`.
 - **Expected Final Root:** Unchanged; pin remains active; evidence remains unconsumed.
 - **Expected Result / Error:** Throws `SETTLEMENT_EVIDENCE_IDENTITY_MISMATCH`.
 
-### Test R18-R25-T32: Pre-Publication Throw During Pin Release Leaves Evidence Usable for Retry (Blocker C2)
+### Test R18-R26-T32: Pre-Publication Throw During Pin Release Leaves Evidence Usable for Retry (Blocker C2)
 - **Initial Authoritative Root:** Active pin for $g=1$; `consumedSettlementEvidence.size === 0`.
 - **Operation Sequence:**
   1. Initiate `releaseSettlementPin`; candidate root construction simulates memory allocation exception before pointer swap.
@@ -2301,43 +2415,43 @@ The following forty-eight deterministic future test specifications are formally 
 - **Expected Final Root:** Second call succeeds; `pin_1` retired; evidence replay key added to `consumedSettlementEvidence`.
 - **Expected Result / Error:** First call throws error without consuming evidence in authoritative root; second call completes release cleanly.
 
-### Test R18-R25-T33: Duplicate Release on Retired Lease With Altered Transaction ID Fails Closed (Blocker B1)
+### Test R18-R26-T33: Duplicate Release on Retired Lease With Altered Transaction ID Fails Closed (Blocker B1)
 - **Initial Authoritative Root:** Retired lease `lease_1` recorded for `transactionId = "tx-100"`.
 - **Operation Sequence:** Call `releaseRetryLease` passing `lease_1` with `transactionId = "tx-200"`.
 - **Expected Final Root:** Unchanged.
 - **Expected Result / Error:** Throws `LEASE_TRANSACTION_ID_MISMATCH`.
 
-### Test R18-R25-T34: Duplicate Release on Retired Pin With Unverified Provenance Fails Closed (Blocker C2)
+### Test R18-R26-T34: Duplicate Release on Retired Pin With Unverified Provenance Fails Closed (Blocker C2)
 - **Initial Authoritative Root:** Retired pin `pin_1` recorded for $g=1$.
 - **Operation Sequence:** Caller constructs mock evidence object with matching fields but without factory issuance.
 - **Expected Final Root:** Unchanged.
 - **Expected Result / Error:** Throws `INVALID_SETTLEMENT_EVIDENCE_PROVENANCE`.
 
-### Test R18-R25-T35: Pre-Existing Retired Pins Overflow Rejection
+### Test R18-R26-T35: Pre-Existing Retired Pins Overflow Rejection
 - **Initial Authoritative Root:** Artificially injected root with 5,005 entries in `retiredSettlementPins`.
 - **Operation Sequence:** Call `releaseSettlementPin` for active pin `pin_A`.
 - **Expected Final Root:** Unchanged; zero entries deleted; zero mutations committed.
 - **Expected Result / Error:** Throws `RETIRED_PINS_CAPACITY_CORRUPTED`.
 
-### Test R18-R25-T36: Pre-Existing Retired Leases Overflow Rejection
+### Test R18-R26-T36: Pre-Existing Retired Leases Overflow Rejection
 - **Initial Authoritative Root:** Artificially injected root with 5,005 entries in `retiredRetryLeases`.
 - **Operation Sequence:** Call `releaseRetryLease` for active lease `lease_A`.
 - **Expected Final Root:** Unchanged; zero entries deleted; zero mutations committed.
 - **Expected Result / Error:** Throws `RETIRED_LEASES_CAPACITY_CORRUPTED`.
 
-### Test R18-R25-T37: Pre-Existing Consumed Evidence Overflow Rejection
+### Test R18-R26-T37: Pre-Existing Consumed Evidence Overflow Rejection
 - **Initial Authoritative Root:** Artificially injected root with 5,005 entries in `consumedSettlementEvidence`.
 - **Operation Sequence:** Call `releaseSettlementPin` for active pin `pin_A`.
 - **Expected Final Root:** Unchanged; zero entries deleted.
 - **Expected Result / Error:** Throws `CONSUMED_EVIDENCE_CAPACITY_CORRUPTED`.
 
-### Test R18-R25-T38: Cross-Restart Delayed Release Rejection for Unretired Active Pin (R25-3)
+### Test R18-R26-T38: Cross-Restart Delayed Release Rejection for Unretired Active Pin (R25-3)
 - **Initial Authoritative Root:** Restarted coordinator with `coordinatorBootEpoch = { clusterTerm: 2, bootGeneration: 5, bootInstanceId: "uuid-new" }`. Active collections empty (`size === 0`).
 - **Operation Sequence:** Caller submits delayed release for unretired pin `pinId = "pin:1.4.uuid-old:1:barrier:100"`.
 - **Expected Final Root:** Unchanged.
 - **Expected Result / Error:** Throws `RESOURCE_NOT_FOUND` (unretired active pins from earlier boot generations cannot be released after restart).
 
-### Test R18-R25-T39: Allocation Interruption Discards Counter Without Collision
+### Test R18-R26-T39: Allocation Interruption Discards Counter Without Collision
 - **Initial Authoritative Root:** `_pinSequenceCounter = 10`.
 - **Operation Sequence:**
   1. Call `publishReleaseAndObligation`; sequence increments to 11; candidate allocation throws out-of-memory.
@@ -2345,7 +2459,7 @@ The following forty-eight deterministic future test specifications are formally 
 - **Expected Final Root:** Active pin published with `seq = 12`; zero active records for `seq = 11`.
 - **Expected Result / Error:** Second call succeeds cleanly; discarded sequence 11 causes zero collisions.
 
-### Test R18-R25-T40: Normal Exactly-At-Capacity Lockstep Retirement at 5,000 Entries
+### Test R18-R26-T40: Normal Exactly-At-Capacity Lockstep Retirement at 5,000 Entries
 - **Initial Authoritative Root:** `retiredSettlementPins.size === 5000`, `consumedSettlementEvidence.size === 5000`. Oldest retired pin has zero active references.
 - **Operation Sequence:** Release active pin `pin_new` with valid evidence.
 - **Expected Final Root:**
@@ -2355,49 +2469,49 @@ The following forty-eight deterministic future test specifications are formally 
   - `consumedSettlementEvidence.size === 5000`.
 - **Expected Result / Error:** Release succeeds cleanly with exact capacity preservation and pre-publication candidate-root validation.
 
-### Test R18-R25-T41: All-Protected Retired Pins Exhaustion Triggers Fail-Closed Backpressure
+### Test R18-R26-T41: All-Protected Retired Pins Exhaustion Triggers Fail-Closed Backpressure
 - **Initial Authoritative Root:** `retiredSettlementPins.size === 5000`. Every single entry in `retiredSettlementPins` is retained by an active retry lease or active pin.
 - **Operation Sequence:** Call `releaseSettlementPin` for active pin `pin_new`.
 - **Expected Final Root:** Unchanged; zero pins evicted; zero state mutations committed.
 - **Expected Result / Error:** Throws `RETENTION_CAPACITY_EXHAUSTED_BACKPRESSURE`.
 
-### Test R18-R25-T42: Replay Key Desynchronization on Eviction Fails Closed
+### Test R18-R26-T42: Replay Key Desynchronization on Eviction Fails Closed
 - **Initial Authoritative Root:** `retiredSettlementPins.size === 5000`. The replay key corresponding to the oldest eligible retired pin is artificially absent from `consumedSettlementEvidence`.
 - **Operation Sequence:** Call `releaseSettlementPin` for active pin `pin_new`.
 - **Expected Final Root:** Unchanged; zero mutations committed.
 - **Expected Result / Error:** Throws `REPLAY_KEY_DESYNCHRONIZATION_CORRUPTED`.
 
-### Test R18-R25-T43: Reference-Independent Byte-for-Byte Digest Match Returns Already Released (R25-4)
+### Test R18-R26-T43: Reference-Independent Byte-for-Byte Digest Match Returns Already Released (R25-4)
 - **Initial Authoritative Root:** Pin `pin_retired` is in `retiredSettlementPins` with recorded digest `[0x01, 0x02, ..., 0x20]`.
 - **Operation Sequence:** Caller invokes `releaseSettlementPin` for `pin_retired` with independently allocated `Uint8Array` containing identical bytes (`digestA !== digestB` by reference, but byte-equal).
 - **Expected Final Root:** Unchanged.
 - **Expected Result / Error:** Returns `{ pinId: 'pin_retired', status: 'ALREADY_RELEASED' }`.
 
-### Test R18-R25-T44: Candidate-Root Pre-Publication Invariant Rejection on Desynchronized Replay State (R25-5)
+### Test R18-R26-T44: Candidate-Root Pre-Publication Invariant Rejection on Desynchronized Replay State (R25-5)
 - **Initial Authoritative Root:** Candidate root construction artificially desynchronizes collection sizes (`retiredSettlementPins.size = 5000`, `consumedSettlementEvidence.size = 5001`).
 - **Operation Sequence:** Candidate root passed to `_validateCandidateRootPrePublicationInvariants()`.
 - **Expected Final Root:** Pointer swap rejected; `this.#custodyRoot` remains unchanged.
 - **Expected Result / Error:** Throws `REPLAY_KEY_BIJECTION_CARDINALITY_MISMATCH`.
 
-### Test R18-R25-T45: ECMAScript #inner Backing Storage Inaccessible at Runtime (R25-1)
+### Test R18-R26-T45: ECMAScript #inner Backing Storage Inaccessible at Runtime (R25-1)
 - **Initial Authoritative Root:** Initialized `AuthoritativeCustodyRoot` with `ImmutableMap` instance.
 - **Operation Sequence:** Caller attempts `(root.activeSettlementPins as any).#inner`, `(root.activeSettlementPins as any)._inner`, or `Object.getOwnPropertySymbols(root.activeSettlementPins)`.
 - **Expected Final Root:** Unchanged.
 - **Expected Result / Error:** Throws `SyntaxError` or returns `undefined`; backing Map is strictly inaccessible.
 
-### Test R18-R25-T46: Consensus Leadership Loss Prior to Pointer Swap Discards Candidate Root (R25-2)
+### Test R18-R26-T46: Consensus Leadership Loss Prior to Pointer Swap Discards Candidate Root (R25-2)
 - **Initial Authoritative Root:** `clusterTerm = 2`. Coordinator prepares candidate root for $g = 2$.
 - **Operation Sequence:** Cluster consensus advances to `term = 3` (new leader elected) before Step 2. `this.#consensusLease.assertActiveLeadership(2)` executes.
 - **Expected Final Root:** Unchanged; candidate root discarded; local custody marked degraded; settlement barrier left unresolved.
 - **Expected Result / Error:** Throws `STALE_COORDINATOR_LEADERSHIP_FENCED`.
 
-### Test R18-R25-T47: Cross-Restart Restored Retired Pin Returns Already Released with Verified Epoch (R25-3)
+### Test R18-R26-T47: Cross-Restart Restored Retired Pin Returns Already Released with Verified Epoch (R25-3)
 - **Initial Authoritative Root:** Coordinator restarted under `clusterTerm = 2`, `bootGeneration = 5`. `retiredSettlementPins` restored from persistent checkpoint, containing `pin:1.4.uuid-old:1:barrier:200` with `allocatedBootEpoch = { clusterTerm: 1, bootGeneration: 4, bootInstanceId: "uuid-old" }`.
 - **Operation Sequence:** Caller submits delayed release for `pinId = "pin:1.4.uuid-old:1:barrier:200"` with matching 7-dimensional token and matching evidence digest.
 - **Expected Final Root:** Unchanged.
 - **Expected Result / Error:** Returns `{ pinId: 'pin:1.4.uuid-old:1:barrier:200', status: 'ALREADY_RELEASED' }`.
 
-### Test R18-R25-T48: Pre-Publication Replay-Key Bijection Violation Fails Closed (R25-5)
+### Test R18-R26-T48: Pre-Publication Replay-Key Bijection Violation Fails Closed (R25-5)
 - **Initial Authoritative Root:** Candidate root constructed with a retired pin whose replay key is absent from `candidateConsumed`.
 - **Operation Sequence:** Candidate root evaluated in `_validateCandidateRootPrePublicationInvariants()`.
 - **Expected Final Root:** Pointer swap aborted; candidate root discarded.
@@ -2405,40 +2519,93 @@ The following forty-eight deterministic future test specifications are formally 
 
 ---
 
+### Test R18-R26-T49: Deep Property Mutation Rejection on Retrieved ImmutableMap Value (R26-1)
+- **Initial Authoritative Root:** Initialized root with published result at $g=1$.
+- **Operation Sequence:** Caller retrieves record via `root.publicationResults.get(1)` and attempts in-place property modification: `(record as any).obligation.transactionId = "corrupted"`.
+- **Expected Final Root:** Unchanged; stored record remains intact with original `transactionId`.
+- **Expected Result / Error:** Throws `TypeError` (frozen object property modification) or fails silently without mutating internal state; subsequent `root.publicationResults.get(1)` returns pristine original `transactionId`.
+
+### Test R18-R26-T50: Defensive Byte Array Cloning Prevents Buffer Tampering on Egress (R26-1)
+- **Initial Authoritative Root:** Initialized root with active settlement pin containing `ownerToken.ownerSignature = new Uint8Array([0x01, 0x02, 0x03, 0x04])`.
+- **Operation Sequence:**
+  1. Caller retrieves pin via `const pin = root.activeSettlementPins.get(pinId)!`.
+  2. Caller mutates byte buffer directly: `pin.ownerToken.ownerSignature[0] = 0xFF`.
+- **Expected Final Root:** Internal backing storage unaffected. Subsequent call to `root.activeSettlementPins.get(pinId)` yields buffer with original `ownerSignature[0] === 0x01`.
+- **Expected Result / Error:** Defensive byte cloning on egress ensures caller mutates an isolated detached copy; internal state remains pristine.
+
+### Test R18-R26-T51: Iterator Aliasing and Mutation Immunity on Entries and Values (R26-1)
+- **Initial Authoritative Root:** Published results at $g=1$ and $g=2$ in `publicationResults`.
+- **Operation Sequence:**
+  1. Caller iterates using `for (const [k, v] of root.publicationResults.entries())` or `for (const v of root.publicationResults.values())`.
+  2. Caller attempts in-place property mutation or byte array modification on yielded values.
+- **Expected Final Root:** Unchanged; internal root and subsequent iterations produce identical unmodified records.
+- **Expected Result / Error:** Deep defensive cloning on each yielded element guarantees complete reference isolation across all iterator access paths.
+
+### Test R18-R26-T52: Key and Element Type Invariant Rejection on ImmutableMap and ImmutableSet (R26-1)
+- **Initial Authoritative Root:** Initialized `ImmutableMap` and `ImmutableSet`.
+- **Operation Sequence:**
+  1. Caller attempts to instantiate `ImmutableMap` with an object key: `new ImmutableMap([[({} as any), "val"]])` or call `.set({} as any, "val")`.
+  2. Caller attempts to instantiate `ImmutableSet` with an object element: `new ImmutableSet([({} as any)])` or call `.add({} as any)`.
+- **Expected Final Root:** Unchanged; zero elements inserted.
+- **Expected Result / Error:** Throws `INVALID_COLLECTION_KEY_TYPE: keys must be primitive string or number` and `INVALID_COLLECTION_ELEMENT_TYPE: set elements must be primitive string or number`.
+
+### Test R18-R26-T53: Non-Reentrant Single-Writer Execution Lock Prevents Concurrent Publications (R26-2)
+- **Initial Authoritative Root:** Coordinator initialized with `LeadershipEpochFence`.
+- **Operation Sequence:**
+  1. Primary publication begins executing inside `executeFencedPublication()`.
+  2. While the lock is held, a concurrent callback or reentrant call attempts `executeFencedPublication()`.
+- **Expected Final Root:** Primary publication completes or rolls back; concurrent attempt is rejected upfront before touching candidate roots.
+- **Expected Result / Error:** Throws `CONCURRENT_PUBLICATION_LOCK_ACQUISITION_VIOLATION`.
+
+### Test R18-R26-T54: Synchronous Leadership Stepdown and Lease Expiry Fencing (R26-2)
+- **Initial Authoritative Root:** Coordinator with active lease for Term 1 expiring at monotonic $t_{\text{expire}}$.
+- **Operation Sequence:**
+  1. Case A: Coordinator receives stepdown notification (`leadershipFence.stepDown()`), then attempts `executeFencedPublication(expectedTerm: 1)`.
+  2. Case B: Monotonic clock advances past $t_{\text{expire}}$, then coordinator attempts `executeFencedPublication(expectedTerm: 1)`.
+- **Expected Final Root:** Pointer swap aborted in both cases; `#custodyRoot` untouched; candidate root discarded; barrier remains unresolved.
+- **Expected Result / Error:** Both cases throw `STALE_COORDINATOR_LEADERSHIP_FENCED`.
+
+---
+
 ## 20. Updated Formal Approval Questions for Engineering Authority
 
 ```
 ================================================================================
-ENGINEERING AUTHORITY APPROVAL QUESTIONS (MILESTONE M5.0-R18-R25):
+ENGINEERING AUTHORITY APPROVAL QUESTIONS (MILESTONE M5.0-R18-R26):
 ================================================================================
-1. [RUNTIME #PRIVATE ENCAPSULATION & DEEP IMMUTABILITY]: Does the Engineering Authority
-   approve encapsulating all published custody root collections within ImmutableMap
-   and ImmutableSet classes using ECMAScript #private fields (#inner), strictly
-   omitting native mutating methods and enforcing defensive cloning on ingress and egress?
+1. [DEEP RUNTIME IMMUTABILITY & DEFENSIVE EGRESS CLONING (R26-1)]: Does the
+   Engineering Authority approve enforcing deep recursive freezing
+   (deepCloneAndFreezeValue) on ingress and deep defensive cloning on egress
+   (.get(), .values(), .entries(), iterators) for all collections in
+   AuthoritativeCustodyRoot, completely preventing in-place byte buffer mutations
+   or property alterations through returned references?
 
-2. [LINEARIZABLE CONSENSUS LEADERSHIP FENCING]: Does the Engineering Authority approve
-   executing an atomic consensus leadership lease assertion (assertActiveLeadership)
-   immediately before the atomic pointer replacement in every custody root mutation,
-   discarding candidate roots and leaving barriers degraded upon term loss?
+2. [SERIALIZED SINGLE-WRITER LEASE-GUARDED FENCING (R26-2)]: Does the Engineering
+   Authority approve executing all custody publications within
+   LeadershipEpochFence.executeFencedPublication(), guarded by a non-reentrant
+   single-writer execution lock (#publicationLock), verifying consensus lease
+   validity and non-stepdown synchronously with zero async turns before the atomic
+   pointer assignment?
 
-3. [CROSS-RESTART RETIREMENT IDEMPOTENCY & ACTIVE ISOLATION]: Does the Engineering
-   Authority approve isolating volatile active resources across restarts (unretired
-   prior-epoch pins fail closed as RESOURCE_NOT_FOUND) while authoritatively honoring
-   restored retired records with verified boot epochs (returning ALREADY_RELEASED)?
+3. [CONSENSUS LEASE NON-OVERLAP SAFETY PROOF]: Does the Engineering Authority accept
+   the consensus quorum safety proof establishing that no split-brain leader can
+   be elected or receive a lease until the prior leader's lease has fully elapsed
+   (t_term_new_lease > t_term_old_lease_expire), mathematically preventing concurrent
+   publications?
 
-4. [QUALIFIED BYTE COMPARISON GUARANTEES]: Does the Engineering Authority approve
-   specifying areEqualByteArrays as fixed-iteration, content-independent comparison
-   for equal-length byte arrays with an explicit length-mismatch fail-fast policy and
-   defensive copy boundaries, without claiming hardware constant-time execution?
+4. [KEY AND ELEMENT TYPE ENFORCEMENT]: Does the Engineering Authority approve
+   restricting ImmutableMap keys and ImmutableSet elements strictly to primitive
+   string and number types, rejecting mutable objects and symbols with fail-closed
+   errors?
 
-5. [REPLAY-KEY BIJECTION DOMAIN & PRE-PUBLICATION INVARIANTS]: Does the Engineering
-   Authority approve enforcing an exact 1-to-1 bijection between retiredSettlementPins
-   and consumedSettlementEvidence, validated prior to pointer publication via
-   _validateCandidateRootPrePublicationInvariants?
+5. [EXHAUSTIVE 54-CASE DETERMINISTIC VERIFICATION]: Does the Engineering Authority
+   approve the expanded 54-case failure matrix and 54-case deterministic test
+   specifications covering all access path mutations, typed array tampering,
+   iterator aliasing, and adversarial leadership races?
 
 6. [CLOSURE OF ALL CORRECTNESS GAPS]: Does the Engineering Authority agree that all
-   five review issues are fully resolved, and that the recovery arbitration
-   architecture is ready for holistic M5.0 final acceptance review?
+   review issues are fully resolved, and that the recovery arbitration architecture
+   is ready for holistic M5.0 final acceptance review?
 ================================================================================
 ```
 
@@ -2448,13 +2615,13 @@ ENGINEERING AUTHORITY APPROVAL QUESTIONS (MILESTONE M5.0-R18-R25):
 
 ```
 ================================================================================
-M5.0-R18-R25 ARCHITECTURAL DECISION PROPOSAL VERDICT:
+M5.0-R18-R26 ARCHITECTURAL DECISION PROPOSAL VERDICT:
 CORRECTION COMPLETE — READY FOR HOLISTIC M5.0 FINAL ACCEPTANCE REVIEW
 ================================================================================
 ```
 
-This R18-R25 proposal completes the formal recovery arbitration architecture. It establishes genuine runtime `#private` collection encapsulation, enforces linearizable consensus leadership lease fencing at the exact mutation linearization point, authoritatively unifies cross-restart retirement idempotency with active boot isolation, accurately qualifies byte array comparison guarantees, codifies the replay-key bijection domain with pre-publication validation, and codifies forty-eight deterministic future test specifications.
+This R18-R26 proposal completes the formal recovery arbitration architecture. It establishes genuine deep runtime collection immutability with defensive egress cloning, enforces serialized single-writer lease-guarded consensus fencing at the exact mutation linearization point, mathematically proves split-brain exclusion via the Lease Non-Overlap Invariant, and codifies fifty-four deterministic future test specifications.
 
 ### Mandatory Implementation Authorization Statement
 
-> "M5.0-R18-R25 is a documentation-only architectural correction. No production implementation has been started. M5.1, including M5.1a, remains strictly unauthorized pending holistic M5.0 acceptance and explicit Engineering Authority approval."
+> "M5.0-R18-R26 is a documentation-only architectural correction. No production implementation has been started. M5.1, including M5.1a, remains strictly unauthorized pending holistic M5.0 acceptance and explicit Engineering Authority approval."
