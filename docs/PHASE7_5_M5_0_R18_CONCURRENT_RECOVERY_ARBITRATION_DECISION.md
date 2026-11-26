@@ -1,33 +1,32 @@
-# Phase 7.5 M5.0-R18-R16 — Settled Retry Attempt Independence & Authoritative Audit Reconciliation
+# Phase 7.5 M5.0-R18-R17 — Retention-Pin Authorization, Retry Pinning & Bidirectional Audit Reconciliation
 **Concurrent Recovery Arbitration & Authoritative Settlement Architecture Decision**
 
 **Status:** PROPOSED ARCHITECTURAL AMENDMENT TO FROZEN M5.0 SPECIFICATIONS (DECISION DOCUMENT ONLY)
-**Author:** Principal TypeScript Distributed-Systems Architect and Recovery-Systems Auditor
-**Baseline Commit:** `16eb3e26e67bf7017a88c029c3f4cd0dbe080474` (M5.0-R18-R15)
-**Direct Parent Commit:** `16eb3e26e67bf7017a88c029c3f4cd0dbe080474`
-**Authorization Scope:** M5.0-R18-R16 is strictly a documentation-only architectural proposal. No production source code, tests, configuration, package exports, or frozen M5.0 specifications may be modified. Implementation of Milestone M5.1 remains **STRICTLY BLOCKED AND UNAUTHORIZED**.
+**Author:** Principal TypeScript Distributed-Systems Architect and Independent Recovery-Systems Auditor
+**Baseline Commit:** `521b87f2dcd147f492dc6bea73949d23879b29d8` (M5.0-R18-R16)
+**Direct Parent Commit:** `521b87f2dcd147f492dc6bea73949d23879b29d8`
+**Authorization Scope:** M5.0-R18-R17 is strictly a documentation-only architectural proposal. No production source code, tests, configuration, package manifests, or frozen M5.0 specifications may be modified. Implementation of Milestone M5.1, including M5.1a, remains **STRICTLY BLOCKED AND UNAUTHORIZED**.
 
 ---
 
-## 1. Problem Statement & R18-R16 Objectives
+## 1. Problem Statement & R18-R17 Objectives
 
-In Phase 7.5 Sub-Milestone M5.0-R18-R15, we established the complete publication retry lifecycle (never published, pending settlement, settled retained, and expired) and capped result retention at a strict 1,000-entry bound. However, rigorous architectural audit identified five critical lifecycle and consistency defects in R18-R15 that must be resolved:
+In Phase 7.5 Sub-Milestone M5.0-R18-R16, we decoupled settled retries from the coordinator's active recovery attempt, capped result retention at 1,000 entries, and introduced retention pins conceptually. However, an independent recovery-systems audit revealed four fundamental architectural vulnerabilities and consistency gaps in R18-R16 that must be corrected:
 
-1. **Settled Retries Incorrectly Dependent on Active Recovery Attempt:** R18-R15 required `safeOwner.recoveryAttemptId === this._currentAttemptId` in both pending and settled retry branches. This caused legitimate settled retries to fail if the coordinator's current attempt ID had cleared (e.g. `_currentAttemptId === null` between recovery operations, after clean shutdown, or when idle) or had advanced to a newer recovery attempt (e.g. Attempt 2 running after an Attempt 1 watchdog timeout). Because settled retries return already-committed immutable receipts without mutating state, coupling them to the active attempt violated distributed idempotency.
-2. **Missing Runtime-Style Cross-Collection Audit Consistency Checks:** R18-R15 pseudocode checked map presence without verifying structural consistency across `pendingSettlementObligations`, `publicationResults`, and `generationAuditHistory`. A pending obligation could theoretically exist alongside contradictory terminal audit evidence, or a settled result could be returned without authoritative audit backing.
-3. **Incomplete Enforcement of Active-Operation Retention Pins:** R18-R15 stated conceptually that active retry and settlement operations pin results against eviction, but its pseudocode did not define pin representation, did not inspect pins during FIFO eviction, and did not specify pin lifecycle transitions across success, failure, cancellation, and watchdog timeouts.
-4. **Ambiguous Optional Byte-Budget Semantics:** R18-R15 described a 10 MB byte budget as optional in prose but included future tests requiring byte-budget enforcement, creating an unresolved specification contradiction.
-5. **Undefined Empty-Cache Generation-Floor Invariants:** R18-R15 used a minimum retained generation to define the floor invariant, leaving undefined the behavior when `publicationResults` is empty—both initially before any publications and historically after complete FIFO eviction.
+1. **Unprotected Settlement-Pin Release Authorization:** R18-R16 claimed that watchdog timeout cannot release a retention pin while its underlying Promise remains unsettled. However, the provided `releaseRetentionPin()` pseudocode authorized pin deletion solely by checking caller owner-token equality (`isEquivalentOwnerToken(pin.ownerToken, callerToken)`). This allowed any caller presenting a matching token—or a timeout continuation—to release the pin before Promise settlement or archive commit completed.
+2. **Missing Retry Pin Acquisition & Intermediate Exposure:** R18-R16 claimed that retries acquire retention pins, but neither the pending nor settled retry pseudocode actually acquired one in `AuthoritativeCustodyRoot`. A retry caller was told its result was protected while the root contained no pin, exposing the entry to immediate FIFO eviction by concurrent publications.
+3. **Unvalidated Pin Identity & Weak Nonce Collision:** `acquireRetentionPin()` accepted caller parameters without validating them against retained publication evidence, and generated pin IDs using `performance.now()`, which is neither unique across microtasks nor collision-safe.
+4. **Incomplete Bidirectional Audit Reconciliation:** R18-R16 performed ad-hoc map lookups without formalizing the complete state matrix across `pendingSettlementObligations`, `publicationResults`, and `generationAuditHistory`, leaving undefined the distinction between legitimately evicted generations, compact audit tombstones, and corrupted state.
+5. **Vulnerable FIFO Eviction & Map Non-Contiguity:** R18-R16 equated the oldest generation with `custodyGenerationFloor + 1` while searching for `min(keys())`. These are mathematically equivalent only if the retained result map is strictly contiguous. If an internal anomaly created a key gap, or if the map exceeded 1,000 entries, R18-R16 lacked pre-eviction contiguity verification and fail-closed backpressure.
 
-### Core Architectural Guarantees Established in R18-R16:
+### Core Architectural Guarantees Established in R18-R17:
 
-- **Settled Retry Attempt Independence:** First publication strictly requires active-attempt ownership (`safeOwner.recoveryAttemptId === this._currentAttemptId`), active in-flight custody, and monotonic generation increment ($g = \text{publishedGeneration} + 1$). In contrast, settled retries are completely independent of `_currentAttemptId`. A settled retry validates the complete 5-field owner token (including the original `recoveryAttemptId`), transaction ID, operation ID, and barrier ID against retained evidence, succeeding even if `_currentAttemptId` is null, idle, or belongs to a later recovery attempt.
-- **Enforced Cross-Collection Audit Reconciliation:** Pseudocode rigorously verifies structural invariants across collections. A pending obligation must have a matching cached result and zero contradictory terminal audit records. A settled retry must have an absent pending obligation, a retained publication result, and matching authoritative audit evidence with a verified terminal outcome (`CONFIRMED_COMMITTED` or `ABORTED_FENCED`). Contradictory evidence fails closed.
-- **Operational Retention Pins with Strict FIFO Backpressure:** Formalizes `activeRetentionPins` in `AuthoritativeCustodyRoot`. Settlement barriers and long-running retries acquire pins via candidate-root replacement. FIFO eviction strictly inspects the oldest generation: if pinned, eviction CANNOT skip the entry (preserving contiguous monotonic generation floors) and instead applies fail-closed backpressure (`CUSTODY_PUBLICATION_BACKPRESSURE_EXHAUSTED`).
-- **Watchdog Timeout Pin Immunity:** Watchdog timeouts log warnings but **CANNOT** release retention pins whose underlying asynchronous Promises remain unsettled, preventing FIFO eviction from destroying results while external I/O remains in-flight.
-- **Authoritative Count-Only Retention (`MAX_RETAINED_PUBLICATION_RESULTS = 1000`):** Resolves policy ambiguity by establishing count-based retention as the sole authoritative requirement. Byte-budget enforcement is formally classified as an optional implementation extension with exact UTF-8 serialization rules.
-- **Empty-Cache and Monotonic Floor Semantics:** Formally defines the initial floor ($\mathbf{custodyGenerationFloor} = 0$), the fully evicted floor ($\mathbf{custodyGenerationFloor} = \mathbf{publishedGeneration} = N$), proves why $g \le \mathbf{custodyGenerationFloor}$ can never re-enter first publication, and proves that sequential publication proceeds seamlessly from a fully emptied cache.
-- **Comprehensive Future Deterministic Test Suite (30 Test Cases):** Codifies thirty deterministic future test specifications in Section 19 covering attempt independence, audit reconciliation, retention pin lifecycles, and empty-cache floor semantics.
+- **Capability-Gated Settlement-Pin Release:** Discards caller-token-only release for `SETTLEMENT_BARRIER` pins. Release strictly requires authoritative Level 3 evidence (`AuthoritativeSettlementEvidence`) proving actual Promise settlement, outcome classification, archive disposition, custody reconciliation, and drainer release, matching all 5 token fields, transaction ID, operation ID, barrier ID, attempt ID, and generation. Watchdog timeouts cannot authorize pin release.
+- **Atomic Retry Pin Acquisition in Candidate Root:** In-turn pending and settled retries requiring retention protection acquire an `IN_TURN_RETRY` pin via atomic candidate-root replacement before returning the cached result, closing all interleave and gap vulnerabilities.
+- **Strict Pin Identity Validation & Monotonic Collision-Free Nonces:** Pin acquisition validates exact generation, full 5-field owner token, transaction ID, operation ID, and barrier ID against `publicationResults`, rejects mismatched pin types, and generates collision-free IDs via coordinator monotonic counter `_pinSequenceCounter: bigint`. Duplicate identical requests are handled idempotently.
+- **Complete 12-State Bidirectional Audit Reconciliation Matrix:** Exhaustively defines every permitted and forbidden state across pending obligations, publication results, and audit history, formalizing `ImmutableCompactAuditTombstone` to preserve authoritative proof of historically evicted generations.
+- **Strict FIFO Contiguity Verification & Map-Cap Backpressure:** Enforces $\mathbf{publicationResults.keys()} = \{\mathbf{custodyGenerationFloor} + 1, \dots, \mathbf{publishedGeneration}\}$. Pre-eviction verifies contiguity, floor ordering, bounds, and unpinned status. If the map exceeds 1,000 entries, publication fails closed with backpressure, strictly prohibiting bulk eviction.
+- **Comprehensive Future Deterministic Test Suite (30 Test Cases):** Codifies thirty deterministic future test specifications in Section 19 covering capability-gated pin release, retry pinning, bidirectional audit reconciliation, and strict FIFO contiguity.
 
 ---
 
@@ -95,7 +94,7 @@ Evidence of transaction and custody status is categorized into three strictly or
   - **Does NOT prove** terminal storage commitment or irreversible custody transfer.
 - **Level 3: Authoritative State Proofs (Irreversible):**
   - Cryptographically or monotonically bound receipts: `DrainerCustodyReleaseReceipt`, `CustodyReconciliationReceipt`, `ArchiveDispositionReceipt`, and `ExecutionSettlementReceipt`.
-  - Together, these constitute `AuthoritativeSettlementEvidence`, which is required to resolve a settlement barrier.
+  - Together, these constitute `AuthoritativeSettlementEvidence`, which is required to resolve a settlement barrier and authorize `SETTLEMENT_BARRIER` pin release.
 
 ---
 
@@ -370,7 +369,7 @@ All objects entering `AuthoritativeCustodyRoot` are deeply cloned and frozen on 
 - Out-of-domain values ($g \le 0$, non-integers, NaN, $\infty$) are rejected upfront with `INVALID_GENERATION_DOMAIN`.
 - Sequence exhaustion ($g = \text{Number.MAX\_SAFE\_INTEGER}$) triggers fail-closed `GENERATION_SEQUENCE_EXHAUSTED`.
 
-### 12.12 The Complete Lifecycle Publication, Cross-Collection Audit Reconciliation, Operational Retention Pins & Bounded Retry Retention Protocol
+### 12.12 The Complete Lifecycle Publication, Bidirectional Audit Reconciliation, Operational Retention-Pin Authorization & Strict FIFO Contiguity
 
 #### The Complete Custody Root State Structure:
 
@@ -414,13 +413,27 @@ export interface PublicationResult {
 export type RetentionPinType = 'SETTLEMENT_BARRIER' | 'IN_TURN_RETRY';
 
 export interface ImmutableRetentionPin {
-  readonly pinId: string; // `${generation}:${operationId}:${pinType}:${nonce}`
+  readonly pinId: string; // pin:${coordinatorInstanceId}:${generation}:${operationId}:${pinType}:${seq}
   readonly generation: number;
   readonly operationId: string;
   readonly pinType: RetentionPinType;
   readonly ownerToken: CustodyOwnershipToken;
+  readonly transactionId: string;
+  readonly barrierIdentity: string;
   readonly acquiredAtTimestamp: number;
   readonly monotonicAcquiredMs: number;
+}
+
+export interface ImmutableCompactAuditTombstone {
+  readonly generation: number;
+  readonly expectedOwner: CustodyOwnershipToken;
+  readonly transactionId: string;
+  readonly operationIdentity: string;
+  readonly barrierIdentity: string;
+  readonly terminalOutcome: 'CONFIRMED_COMMITTED' | 'ABORTED_FENCED';
+  readonly settledAtTimestamp: number;
+  readonly monotonicSettledMs: number;
+  readonly evidenceDigest: Uint8Array; // SHA-256 digest of AuthoritativeSettlementEvidence
 }
 
 export interface AuthoritativeCustodyRoot {
@@ -430,69 +443,74 @@ export interface AuthoritativeCustodyRoot {
   readonly gateState: CustodyGateState;
   readonly pendingSettlementObligations: ImmutableMap<number, PendingSettlementObligation>;
   readonly publicationResults: ImmutableMap<number, PublicationResult>;
-  readonly generationAuditHistory: ImmutableMap<number, AuthoritativeSettlementEvidence>;
+  readonly generationAuditHistory: ImmutableMap<number, AuthoritativeSettlementEvidence | ImmutableCompactAuditTombstone>;
   readonly activeRetentionPins: ImmutableMap<string, ImmutableRetentionPin>;
 }
 ```
 
-#### Four Authoritative Publication States:
-For any requested generation $g$:
-1. **Never Published:** $g > \text{currentRoot.publishedGeneration}$.
-2. **Published with Settlement Pending:** $g \le \text{currentRoot.publishedGeneration} \land g \in \text{pendingSettlementObligations}$.
-3. **Published and Fully Settled:** $g \le \text{currentRoot.publishedGeneration} \land g \notin \text{pendingSettlementObligations} \land g \in \text{publicationResults}$.
-4. **Published but Expired Outside Retention Horizon:** $g \le \text{currentRoot.custodyGenerationFloor} \lor (g \le \text{currentRoot.publishedGeneration} \land g \notin \text{publicationResults})$.
+#### The Complete 12-State Bidirectional Audit Reconciliation Matrix:
 
-#### Cross-Collection Consistency Invariants:
-1. **Pending Obligation Result Invariant:**
-   $$\forall g \in \mathbf{pendingSettlementObligations},\;\; g \in \mathbf{publicationResults}$$
-   A pending obligation cannot exist without its corresponding cached publication result.
-2. **Pending Non-Settled Audit Invariant:**
-   $$\forall g \in \mathbf{pendingSettlementObligations},\;\; g \notin \mathbf{generationAuditHistory}_{\text{terminal}}$$
-   A generation with a pending settlement obligation cannot possess a terminal audit record in `generationAuditHistory`.
-3. **Settled Result Mandatory Audit Invariant:**
-   $$\forall g \in (\mathbf{publicationResults} \setminus \mathbf{pendingSettlementObligations}),\;\; g \in \mathbf{generationAuditHistory}$$
-   A settled generation retained in `publicationResults` **must** possess a corresponding authoritative audit record in `generationAuditHistory`.
-4. **Identity Invariant Across Collections:**
-   For any generation $g$ present across collections, `obligation.ownerToken`, `result.releaseReceipt.identity`, and `audit.expectedOwner` must match 1-to-1 across all five identity fields, transaction ID, operation ID, and barrier ID.
-5. **Monotonic Floor and Contiguous Range Invariant:**
-   $$0 \le \mathbf{custodyGenerationFloor} \le \mathbf{publishedGeneration}$$
-   When `publicationResults.size > 0`, `publicationResults` holds the exact contiguous generation sequence:
-   $$[\mathbf{custodyGenerationFloor} + 1,\;\; \mathbf{custodyGenerationFloor} + \mathbf{publicationResults.size}]$$
-   No pending obligation may exist at or below `custodyGenerationFloor`.
+To guarantee complete bidirectional consistency across `pendingSettlementObligations`, `publicationResults`, and `generationAuditHistory`, the recovery engine validates every generation lookup against the authoritative state matrix:
 
-#### Operational Retention-Pin Lifecycle & Strict FIFO Backpressure:
-1. **Acquiring Operations:**
-   - Settlement barrier executions (`SETTLEMENT_BARRIER`) acquire a pin before initiating external archive or destination I/O, protecting generation $g$'s publication result from eviction while settlement is unresolved.
-   - Long-running in-turn retries (`IN_TURN_RETRY`) acquire a pin before executing asynchronous reconciliation.
-2. **Pin Identity Binding:**
-   - Each pin is bound to generation $g$, `operationId`, `pinType`, the caller's 5-field `ownerToken`, and a unique timestamp/monotonic nonce:
-     $$\mathbf{pinId} = `${g}:${operationId}:${pinType}:${nonce}`$$
-3. **Atomic Root Reflection:**
-   - Both pin acquisition and pin release are atomic transitions of `AuthoritativeCustodyRoot` via candidate-root replacement.
-4. **Attempt Fencing:**
-   - A pin can only be released by a caller presenting an owner token matching the pin's `ownerToken` across all 5 fields. A stale attempt cannot release a newer attempt's pin.
-5. **Pin Release on Settlement:**
-   - Upon Promise settlement (fulfillment or rejection) of the guarded operation, the coordinator removes the pin from candidate root and atomically publishes the new root. Release is idempotent.
-6. **Watchdog Timeout Pin Immunity:**
-   - **CRITICAL DISTRIBUTED SYSTEMS INVARIANT:** A watchdog timeout **CANNOT** release a retention pin whose underlying asynchronous Promise remains unsettled. In JavaScript/TypeScript, promises cannot be cancelled externally; timing out a timer does not abort network/storage I/O. Releasing the pin on timeout would permit FIFO eviction to destroy the result before late-settling I/O finishes, causing state corruption. The pin remains held until the underlying Promise settles or the process terminates.
-7. **Strict FIFO Eviction Check:**
-   - Eviction identifies the oldest retained generation: $g_{\text{oldest}} = \mathbf{custodyGenerationFloor} + 1$.
-   - Eviction checks if any pin exists in `activeRetentionPins` for $g_{\text{oldest}}$.
-8. **No Skipping Pinned Entries (Strict FIFO Ordering):**
-   - Eviction **CANNOT** skip a pinned oldest entry to evict a newer entry. Skipping would break the single contiguous generation floor.
-   - If $g_{\text{oldest}}$ is pinned (or has a pending obligation), eviction applies **strict backpressure**: new publications fail closed with `CUSTODY_PUBLICATION_BACKPRESSURE_EXHAUSTED`.
-9. **Race Immunity:**
-   - Pin acquisition and FIFO eviction are synchronous candidate-root operations executed within the event loop turn. A caller cannot acquire a pin on an already-evicted generation because pin acquisition validates $g > \mathbf{custodyGenerationFloor} \land g \in \mathbf{publicationResults}$.
+| State | `pendingObligations` | `publicationResults` | `generationAuditHistory` | Valid? | Retry Action | Expired? | Authoritative Engine Action |
+|---|---|---|---|---|---|---|---|
+| **1** | Absent ($g > \text{pubGen}$) | Absent | Absent | **VALID** | None | No | Eligible for first publication if $g === \text{publishedGeneration} + 1$; sequence gap if higher. |
+| **2** | Present | Present | Absent (or In-Prog) | **VALID** | Pending Retry | No | Valid pending obligation. Returns cached result. Invariant: audit terminal status MUST NOT exist. |
+| **3** | Absent | Present | Present (Terminal) | **VALID** | Settled Retry | No | Valid settled generation. Returns cached result. Invariant: audit identity MUST match 1-to-1. |
+| **4** | Absent | Absent (Evicted) | Present (Tombstone) | **VALID** | Expired | **YES** | Legitimate historical eviction ($g \le \text{floor}$). Returns `CUSTODY_RECEIPT_EXPIRED` with tombstone verification. |
+| **5** | Absent | Absent (Evicted) | Absent (Past Horiz) | **VALID** | Expired | **YES** | Historical eviction past tombstone window ($g \le \text{floor} \le \text{pubGen}$). Returns `CUSTODY_RECEIPT_EXPIRED`. |
+| **6** | Present | Absent | Any | **INVALID**| Fail Closed | No | State corruption: `STATE_INCONSISTENT_ORPHANED_PENDING_OBLIGATION`. Latches degraded; alerts operator. |
+| **7** | Absent ($g > \text{pubGen}$) | Absent | Present | **INVALID**| Fail Closed | No | State corruption: `STATE_INCONSISTENT_FUTURE_GENERATION_AUDITED`. Fails closed. |
+| **8** | Absent | Present | Absent | **INVALID**| Fail Closed | No | State corruption: `STATE_INCONSISTENT_SETTLED_RESULT_MISSING_AUDIT`. Fails closed. |
+| **9** | Present | Present | Present (Terminal) | **INVALID**| Fail Closed | No | State contradiction: `STATE_INCONSISTENT_PENDING_OBLIGATION_CONTRADICTS_AUDIT`. Fails closed. |
+| **10**| Any | Present | Present (Mismatched)| **INVALID**| Fail Closed | No | Identity corruption: `STATE_INCONSISTENT_AUDIT_RESULT_IDENTITY_MISMATCH`. Fails closed. |
+| **11**| Any | Present | Present (Conflicting)|**INVALID**| Fail Closed | No | Outcome conflict: `STATE_INCONSISTENT_TERMINAL_OUTCOME_CONFLICT`. Fails closed. |
+| **12**| Any | Any | Duplicate/Conflicting|**INVALID**| Fail Closed | No | Audit corruption: `STATE_INCONSISTENT_DUPLICATE_AUDIT_RECORD`. Fails closed. |
 
-#### Authoritative Count-Only Retention Policy (`MAX_RETAINED_PUBLICATION_RESULTS = 1000`):
-- **Core Policy:** Bounded retention of publication results is governed strictly by the authoritative count limit `MAX_RETAINED_PUBLICATION_RESULTS = 1000`.
-- **Optional Byte-Budget Extension:** Enforcing a memory byte limit (e.g. 10 MB) is classified as an optional implementation extension. For implementations enabling the optional extension:
-  - Accounting uses deterministic UTF-8 serialized byte size of `PublicationResult`.
-  - Shared immutable references are counted once per root snapshot.
-  - Payloads exceeding `MAX_BYTES` are rejected upfront with `CUSTODY_PUBLICATION_PAYLOAD_TOO_LARGE`.
-  - Section 19 tests verify count bounding as mandatory and classify byte tests under the optional extension.
+#### Operational Retention-Pin Authorization & Dual-Lifecycle Management:
+
+1. **Distinct Release Rules by Pin Type:**
+   - **`SETTLEMENT_BARRIER` Pin Release:**
+     Release is strictly capability-gated. It **CANNOT** be authorized by caller owner-token equality alone, public booleans, or unvalidated parameters. Release **REQUIRES** presenting `AuthoritativeSettlementEvidence` (Level 3 Proof) certifying:
+     1. The underlying asynchronous Promise has actually settled (`ExecutionSettlementReceipt` present).
+     2. The terminal settlement outcome is classified (`CONFIRMED_COMMITTED` or `ABORTED_FENCED`).
+     3. The terminal archive disposition is authoritatively recorded (`ArchiveDispositionReceipt` present).
+     4. Custody reconciliation has completed (`CustodyReconciliationReceipt` present).
+     5. The drainer has actually relinquished the relevant custody (`DrainerCustodyReleaseReceipt` present).
+     6. All six identity fields (5 token fields, transaction ID, operation ID, barrier ID, attempt ID, and generation) match the pin 1-to-1.
+   - **`IN_TURN_RETRY` Pin Release:**
+     Release is authorized upon completion or failure of the retry turn. Validates caller's 5-field `ownerToken` against `pin.ownerToken`. A stale attempt cannot release a newer attempt's retry pin.
+2. **Watchdog Timeout Pin Immunity:**
+   A watchdog timeout logs diagnostics and latches status `DEGRADED`. It **CANNOT** manufacture Promise settlement, archive disposition, custody reconciliation, or pin release authorization. A `SETTLEMENT_BARRIER` pin remains pinned until actual Level 3 settlement evidence is presented or the process terminates.
+3. **In-Turn Retry Pin Acquisition in Candidate Root:**
+   When an in-turn retry arrives (pending or settled), the coordinator validates the 5-field token, transaction ID, operation ID, and barrier ID against `publicationResults`. Before returning the receipt, if retention protection is required across turns, the coordinator acquires an `IN_TURN_RETRY` pin via synchronous candidate-root replacement.
+4. **Collision-Free Monotonic Pin Identity:**
+   Pin IDs do not rely on `performance.now()`. They use a coordinator-scoped monotonic sequence counter:
+   $$\mathbf{pinId} = `\text{pin}:${this.\_coordinatorInstanceId}:${generation}:${operationId}:${pinType}:${++this.\_pinSequenceCounter}`$$
+5. **Idempotent Duplicate-Acquisition Semantics:**
+   If a pin already exists with matching `(generation, operationId, pinType)`:
+   - If all identity fields match 1-to-1: returns existing `pinId` without mutating root.
+   - If any field conflicts: fails closed with `RETENTION_PIN_COLLISION_MUTATED_IDENTITY`.
+
+#### Strict FIFO Contiguity and Capacity Invariants:
+
+1. **The Contiguous Generation Formula:**
+   Subject to the empty-cache case ($\mathbf{publicationResults.size} = 0 \iff \mathbf{custodyGenerationFloor} = \mathbf{publishedGeneration}$), the retained result map must hold the exact contiguous sequence:
+   $$\mathbf{publicationResults.keys()} \equiv \{\mathbf{custodyGenerationFloor} + 1,\;\; \mathbf{custodyGenerationFloor} + 2,\;\; \dots,\;\; \mathbf{publishedGeneration}\}$$
+2. **Pre-Eviction Verification:**
+   Before evicting generation $g_{\text{oldest}} = \mathbf{custodyGenerationFloor} + 1$:
+   - Verify size matches generation span: $\mathbf{publicationResults.size} === \mathbf{publishedGeneration} - \mathbf{custodyGenerationFloor}$. If unequal, fail closed with `STATE_INCONSISTENT_RESULT_MAP_NON_CONTIGUOUS`.
+   - Verify no key is $\le \mathbf{custodyGenerationFloor}$ or $> \mathbf{publishedGeneration}$.
+   - Verify $g_{\text{oldest}}$ is present.
+   - Verify $g_{\text{oldest}}$ has no pending settlement obligation.
+   - Verify $g_{\text{oldest}}$ has no active retention pin.
+3. **Capacity Ceiling Backpressure (No Bulk Eviction):**
+   If `publicationResults.size > 1000` prior to publication, a single eviction cannot restore the bound. The coordinator **MUST NOT** silently bulk-evict multiple generations. Instead, publication fails closed with `CUSTODY_PUBLICATION_BACKPRESSURE_EXHAUSTED` and enters an explicit reconciliation path.
+4. **Strict FIFO Preservation:**
+   Eviction **CANNOT** skip a pinned oldest entry to evict a newer entry. Skipping would create a gap in the contiguous generation range and violate monotonic floor invariants.
 
 #### Complete Corrected Pseudocode:
+
 ```typescript
 public publishReleaseAndObligation(
   preparedEvidence: PreparedEvidenceContext,
@@ -501,37 +519,34 @@ public publishReleaseAndObligation(
 ): PublicationResult {
   const currentRoot = this.#custodyRoot;
 
-  // 1. Generation Domain Validation (Must precede all lookups)
+  // 1. Generation Domain Validation
   const g = expectedOwner.custodyGeneration;
   assertValidGenerationDomain(g);
 
   // 2. Ingress Defensive Normalization
   const safeOwner = cloneAndFreezeOwnerToken(expectedOwner);
   const safeBarrierId = String(barrierIdentity);
+  const safeTxId = String(safeOwner.transactionId);
+  const safeOpId = String(safeOwner.operationIdentity);
 
   // 3. PRIOR PUBLICATION EVALUATION:
   if (g <= currentRoot.publishedGeneration) {
-    // Generation was previously published. It can NEVER enter first publication!
-
-    // Case 3A: Published with Settlement Pending
+    // Case 3A: Published with Settlement Pending (State 2)
     if (currentRoot.pendingSettlementObligations.has(g)) {
       const existingObligation = currentRoot.pendingSettlementObligations.get(g)!;
 
-      // Invariant Check 1: Obligation must have cached publication result
       const cachedResult = currentRoot.publicationResults.get(g);
-      if (!cachedResult) {
-        throw new Error('STATE_INCONSISTENT_PENDING_MISSING_RESULT');
-      }
+      if (!cachedResult) throw new Error('STATE_INCONSISTENT_ORPHANED_PENDING_OBLIGATION');
 
-      // Invariant Check 2: Obligation must NOT have terminal audit record
+      // Cross-Collection Audit Check: Pending obligation CANNOT have terminal audit
       if (currentRoot.generationAuditHistory.has(g)) {
         const audit = currentRoot.generationAuditHistory.get(g)!;
         if (audit.terminalOutcome === 'CONFIRMED_COMMITTED' || audit.terminalOutcome === 'ABORTED_FENCED') {
-          throw new Error('STATE_INCONSISTENT_PENDING_ALREADY_AUDITED');
+          throw new Error('STATE_INCONSISTENT_PENDING_OBLIGATION_CONTRADICTS_AUDIT');
         }
       }
 
-      // Invariant Check 3: Obligation and cached result must agree 1-to-1
+      // Bidirectional Identity Check across obligation, cached result, and safeOwner
       if (
         !isEquivalentOwnerToken(existingObligation.ownerToken, cachedResult.releaseReceipt.identity) ||
         existingObligation.transactionId !== cachedResult.releaseReceipt.identity.transactionId ||
@@ -540,40 +555,33 @@ public publishReleaseAndObligation(
         existingObligation.generation !== g ||
         cachedResult.releaseReceipt.releasedCustodyGeneration !== g
       ) {
-        throw new Error('STATE_INCONSISTENT_PENDING_RESULT_MISMATCH');
+        throw new Error('STATE_INCONSISTENT_AUDIT_RESULT_IDENTITY_MISMATCH');
       }
 
-      // Pending Retry Attempt Fencing Rule:
-      // An idempotent pending retry is an inquiry on an already-published obligation.
-      // It validates the caller's token against the immutable obligation identity.
-      // It does NOT require safeOwner.recoveryAttemptId === this._currentAttemptId,
-      // enabling the original attempt to observe its pending obligation during transition.
+      // Validate caller token matches immutable obligation
       if (
         !isEquivalentOwnerToken(existingObligation.ownerToken, safeOwner) ||
-        existingObligation.transactionId !== safeOwner.transactionId ||
-        existingObligation.operationIdentity !== safeOwner.operationIdentity ||
+        existingObligation.transactionId !== safeTxId ||
+        existingObligation.operationIdentity !== safeOpId ||
         existingObligation.barrierIdentity !== safeBarrierId
       ) {
         throw new Error('CUSTODY_PUBLICATION_TOKEN_MISMATCH');
       }
 
-      // Return the cached original publication result reference (Zero allocation!)
       return cachedResult;
     }
 
-    // Case 3B: Published and Fully Settled (Retained in publicationResults)
+    // Case 3B: Published and Fully Settled (State 3)
     if (currentRoot.publicationResults.has(g)) {
       const cachedResult = currentRoot.publicationResults.get(g)!;
 
-      // Invariant Check 1: Pending obligation must be absent (verified by if-branch)
-
-      // Invariant Check 2: Authoritative audit evidence MUST exist for settled generations
+      // Mandatory Audit Evidence Check for settled generations
       const auditEvidence = currentRoot.generationAuditHistory.get(g);
       if (!auditEvidence) {
-        throw new Error('STATE_INCONSISTENT_SETTLED_AUDIT_MISSING');
+        throw new Error('STATE_INCONSISTENT_SETTLED_RESULT_MISSING_AUDIT');
       }
 
-      // Invariant Check 3: Audit evidence must agree with cached result
+      // Bidirectional Identity and Terminal Outcome Check
       if (
         !isEquivalentOwnerToken(auditEvidence.expectedOwner, cachedResult.releaseReceipt.identity) ||
         auditEvidence.generation !== g ||
@@ -581,64 +589,57 @@ public publishReleaseAndObligation(
         auditEvidence.operationIdentity !== cachedResult.releaseReceipt.identity.operationIdentity ||
         auditEvidence.barrierIdentity !== cachedResult.obligation.barrierIdentity
       ) {
-        throw new Error('STATE_INCONSISTENT_AUDIT_RESULT_MISMATCH');
+        throw new Error('STATE_INCONSISTENT_AUDIT_RESULT_IDENTITY_MISMATCH');
       }
 
-      // Invariant Check 4: Audit outcome must be a recognized terminal state
       if (auditEvidence.terminalOutcome !== 'CONFIRMED_COMMITTED' && auditEvidence.terminalOutcome !== 'ABORTED_FENCED') {
-        throw new Error('STATE_INCONSISTENT_AUDIT_TERMINAL_OUTCOME_CONTRADICTION');
+        throw new Error('STATE_INCONSISTENT_TERMINAL_OUTCOME_CONFLICT');
       }
 
-      // SETTLED RETRY ATTEMPT INDEPENDENCE RULE:
-      // Settled retries DO NOT check safeOwner.recoveryAttemptId === this._currentAttemptId!
-      // A settled retry succeeds even if this._currentAttemptId is null or belongs to a later attempt.
-      // It validates the complete 5-field owner token (including original recoveryAttemptId)
-      // against the immutable cached receipt.
+      // Settled retry attempt independence: caller does not check safeOwner.recoveryAttemptId === this._currentAttemptId
       if (
         !isEquivalentOwnerToken(cachedResult.releaseReceipt.identity, safeOwner) ||
-        cachedResult.releaseReceipt.identity.transactionId !== safeOwner.transactionId ||
-        cachedResult.releaseReceipt.identity.operationIdentity !== safeOwner.operationIdentity ||
+        cachedResult.releaseReceipt.identity.transactionId !== safeTxId ||
+        cachedResult.releaseReceipt.identity.operationIdentity !== safeOpId ||
         cachedResult.obligation.barrierIdentity !== safeBarrierId
       ) {
         throw new Error('CUSTODY_PUBLICATION_TOKEN_MISMATCH');
       }
 
-      // Return the cached original publication result reference (Zero allocation!)
       return cachedResult;
     }
 
-    // Case 3C: Published but Outside Retention Horizon (Evicted / Floor Advanced)
-    // Generation was published and settled, but detailed result has expired
-    throw new Error('CUSTODY_RECEIPT_EXPIRED');
+    // Case 3C: Published but Outside Retention Horizon (Evicted / States 4 & 5)
+    if (g <= currentRoot.custodyGenerationFloor) {
+      throw new Error('CUSTODY_RECEIPT_EXPIRED');
+    }
+
+    // If g <= publishedGeneration but not in results and not below floor -> gap corruption!
+    throw new Error('STATE_INCONSISTENT_RESULT_MAP_NON_CONTIGUOUS');
   }
 
   // ===========================================================================
   // FIRST PUBLICATION PATH (g === currentRoot.publishedGeneration + 1)
   // ===========================================================================
-  // 4. Sequence Continuity Verification
   if (g !== currentRoot.publishedGeneration + 1) {
     throw new Error('GENERATION_OUT_OF_SEQUENCE_GAP_DETECTED');
   }
 
-  // 5. Validate Active In-Flight Owner
   if (!isEquivalentOwnerToken(currentRoot.inFlightRecord?.token ?? null, safeOwner)) {
     throw new Error('STALE_CUSTODY_RELEASE_REJECTED');
   }
 
-  // 6. Validate First-Publication Attempt Fencing: MUST match active coordinator attempt
+  // First-Publication Attempt Fencing: MUST match active coordinator attempt
   if (safeOwner.recoveryAttemptId !== this._currentAttemptId) {
     throw new Error('STALE_ATTEMPT_CUSTODY_RELEASE_REJECTED');
   }
 
-  // 7. Validate Generation Audit History: first publication cannot already be audited
+  // Audit History Check: Unpublished generation cannot have audit record (State 7)
   if (currentRoot.generationAuditHistory.has(g)) {
-    throw new Error('GENERATION_AUDIT_ALREADY_COMMITTED');
+    throw new Error('STATE_INCONSISTENT_FUTURE_GENERATION_AUDITED');
   }
 
-  // 8. Reversible Ingress Normalization of Evidence (Deep defensive copies)
   const safeEvidence = cloneAndFreezeEvidence(preparedEvidence, safeOwner);
-
-  // 9. Pre-Allocate Release Receipt
   const monotonicNow = performance.now();
   const previousInFlightMs = currentRoot.inFlightRecord
     ? monotonicNow - currentRoot.inFlightRecord.monotonicDequeuedMs
@@ -653,14 +654,13 @@ public publishReleaseAndObligation(
     monotonicReleasedMs: monotonicNow,
   });
 
-  // 10. Pre-Allocate Obligation Payload
   const obligation: PendingSettlementObligation = Object.freeze({
     obligationId: `obl-${safeOwner.custodyGeneration}-${Date.now()}`,
     generation: safeOwner.custodyGeneration,
     barrierIdentity: safeBarrierId,
     ownerToken: safeOwner,
-    transactionId: safeOwner.transactionId,
-    operationIdentity: safeOwner.operationIdentity,
+    transactionId: safeTxId,
+    operationIdentity: safeOpId,
     drainerOwnershipGeneration: safeOwner.drainerOwnershipGeneration,
     publishedCustodyGeneration: g,
     preAllocatedReleaseReceipt: releaseReceipt,
@@ -671,45 +671,55 @@ public publishReleaseAndObligation(
     monotonicPublishedMs: monotonicNow,
   });
 
-  // 11. Pre-Allocate Cached Publication Result Reference
   const publicationResult: PublicationResult = Object.freeze({
     releaseReceipt,
     obligation,
   });
 
-  // 12. Bounded Retention, Retention Pin Check, and Strict FIFO Eviction:
+  // Strict FIFO Contiguity Verification and Bounded Eviction
   let candidateFloor = currentRoot.custodyGenerationFloor;
   const candidateResultsMap = new Map(currentRoot.publicationResults.entries());
 
-  if (candidateResultsMap.size >= 1000) {
-    // Locate oldest retained generation (must equal candidateFloor + 1)
-    let minGen = Number.MAX_SAFE_INTEGER;
-    for (const k of candidateResultsMap.keys()) {
-      if (k < minGen) minGen = k;
+  if (candidateResultsMap.size > 0) {
+    // Verify contiguity invariant: size === publishedGeneration - custodyGenerationFloor
+    if (candidateResultsMap.size !== currentRoot.publishedGeneration - currentRoot.custodyGenerationFloor) {
+      throw new Error('STATE_INCONSISTENT_RESULT_MAP_NON_CONTIGUOUS');
     }
+  }
 
-    // Eviction Safety Check 1: Cannot evict if pending settlement obligation
-    if (currentRoot.pendingSettlementObligations.has(minGen)) {
+  // Map Capacity Check
+  if (candidateResultsMap.size >= 1000) {
+    // If map already exceeds 1,000, reject publication to prevent unmonitored bulk eviction
+    if (candidateResultsMap.size > 1000) {
       throw new Error('CUSTODY_PUBLICATION_BACKPRESSURE_EXHAUSTED');
     }
 
-    // Eviction Safety Check 2: Cannot evict if active retention pin exists
+    const g_oldest = candidateFloor + 1;
+
+    // Verify oldest entry is present
+    if (!candidateResultsMap.has(g_oldest)) {
+      throw new Error('STATE_INCONSISTENT_RESULT_MAP_NON_CONTIGUOUS');
+    }
+
+    // Safety Check 1: Cannot evict if pending settlement obligation
+    if (currentRoot.pendingSettlementObligations.has(g_oldest)) {
+      throw new Error('CUSTODY_PUBLICATION_BACKPRESSURE_EXHAUSTED');
+    }
+
+    // Safety Check 2: Cannot evict if active retention pin exists
     for (const pin of currentRoot.activeRetentionPins.values()) {
-      if (pin.generation === minGen) {
+      if (pin.generation === g_oldest) {
         // Strict FIFO preservation: CANNOT skip pinned oldest entry!
-        // Backpressure must be applied to preserve contiguous monotonic generation floors.
         throw new Error('CUSTODY_PUBLICATION_BACKPRESSURE_EXHAUSTED');
       }
     }
 
-    // Safe to evict oldest generation
-    candidateResultsMap.delete(minGen);
-    candidateFloor = minGen; // Monotonic floor advance
+    candidateResultsMap.delete(g_oldest);
+    candidateFloor = g_oldest; // Monotonic advance
   }
 
   candidateResultsMap.set(g, publicationResult);
 
-  // 13. Pre-Construct Immutable Candidate Collections & Root
   const candidateObligations = new ImmutableMap([
     ...currentRoot.pendingSettlementObligations.entries(),
     [g, obligation],
@@ -727,10 +737,8 @@ public publishReleaseAndObligation(
     activeRetentionPins: currentRoot.activeRetentionPins,
   });
 
-  // 14. THE ATOMIC PUBLICATION LINEARIZATION POINT:
+  // THE ATOMIC PUBLICATION LINEARIZATION POINT:
   this.#custodyRoot = candidateRoot;
-
-  // 15. Infallible Return of Pre-Constructed Reference (Zero post-publication allocation):
   return publicationResult;
 }
 
@@ -739,24 +747,78 @@ public acquireRetentionPin(
   operationId: string,
   pinType: RetentionPinType,
   callerToken: CustodyOwnershipToken,
+  transactionId: string,
+  barrierIdentity: string,
 ): string {
   const currentRoot = this.#custodyRoot;
   assertValidGenerationDomain(generation);
 
-  // Validate generation is within retained window
+  // 1. Generation domain and horizon check
   if (generation <= currentRoot.custodyGenerationFloor || !currentRoot.publicationResults.has(generation)) {
     throw new Error('CUSTODY_RECEIPT_EXPIRED');
   }
 
+  const cachedResult = currentRoot.publicationResults.get(generation)!;
   const safeOwner = cloneAndFreezeOwnerToken(callerToken);
-  const pinId = `${generation}:${operationId}:${pinType}:${performance.now()}`;
+  const safeTxId = String(transactionId);
+  const safeOpId = String(operationId);
+  const safeBarrierId = String(barrierIdentity);
+
+  // 2. Validate full 5-field token against cached publication result
+  if (!isEquivalentOwnerToken(cachedResult.releaseReceipt.identity, safeOwner)) {
+    throw new Error('CUSTODY_PUBLICATION_TOKEN_MISMATCH');
+  }
+
+  // 3. Validate transaction, operation, and barrier identity
+  if (
+    cachedResult.obligation.transactionId !== safeTxId ||
+    cachedResult.obligation.operationIdentity !== safeOpId ||
+    cachedResult.obligation.barrierIdentity !== safeBarrierId
+  ) {
+    throw new Error('CUSTODY_RETRY_ID_MISMATCH');
+  }
+
+  // 4. Validate permitted pin type for publication state
+  if (pinType === 'SETTLEMENT_BARRIER') {
+    if (!currentRoot.pendingSettlementObligations.has(generation)) {
+      throw new Error('RETENTION_PIN_INVALID_TYPE_FOR_SETTLED_GENERATION');
+    }
+  }
+
+  // 5. Idempotent Deduplication Check
+  for (const existingPin of currentRoot.activeRetentionPins.values()) {
+    if (
+      existingPin.generation === generation &&
+      existingPin.operationId === safeOpId &&
+      existingPin.pinType === pinType
+    ) {
+      if (
+        isEquivalentOwnerToken(existingPin.ownerToken, safeOwner) &&
+        existingPin.transactionId === safeTxId &&
+        existingPin.barrierIdentity === safeBarrierId
+      ) {
+        return existingPin.pinId; // Idempotent return of existing pin
+      }
+      throw new Error('RETENTION_PIN_COLLISION_MUTATED_IDENTITY');
+    }
+  }
+
+  // 6. Monotonic Nonce Generation (Collision-Free)
+  const seq = ++this._pinSequenceCounter;
+  const pinId = `pin:${this._coordinatorInstanceId}:${generation}:${safeOpId}:${pinType}:${seq}`;
+
+  if (currentRoot.activeRetentionPins.has(pinId)) {
+    throw new Error('RETENTION_PIN_ID_COLLISION');
+  }
 
   const pin: ImmutableRetentionPin = Object.freeze({
     pinId,
     generation,
-    operationId,
+    operationId: safeOpId,
     pinType,
     ownerToken: safeOwner,
+    transactionId: safeTxId,
+    barrierIdentity: safeBarrierId,
     acquiredAtTimestamp: Date.now(),
     monotonicAcquiredMs: performance.now(),
   });
@@ -766,21 +828,64 @@ public acquireRetentionPin(
     [pinId, pin],
   ]);
 
-  const candidateRoot: AuthoritativeCustodyRoot = Object.freeze({
+  this.#custodyRoot = Object.freeze({
     ...currentRoot,
     activeRetentionPins: candidatePins,
   });
 
-  this.#custodyRoot = candidateRoot;
   return pinId;
 }
 
-public releaseRetentionPin(pinId: string, callerToken: CustodyOwnershipToken): void {
+public releaseSettlementBarrierPin(
+  pinId: string,
+  settlementEvidence: AuthoritativeSettlementEvidence,
+): void {
   const currentRoot = this.#custodyRoot;
   const pin = currentRoot.activeRetentionPins.get(pinId);
 
   // Idempotent: already released
   if (!pin) return;
+
+  if (pin.pinType !== 'SETTLEMENT_BARRIER') {
+    throw new Error('RETENTION_PIN_TYPE_MISMATCH_EXPECTED_SETTLEMENT');
+  }
+
+  // STRICT CAPABILITY-GATED RELEASE AUTHORIZATION:
+  // Requires Level 3 AuthoritativeSettlementEvidence matching all 6 identity fields
+  assertAuthoritativeSettlementEvidence(settlementEvidence);
+
+  if (
+    !isEquivalentOwnerToken(pin.ownerToken, settlementEvidence.expectedOwner) ||
+    pin.generation !== settlementEvidence.generation ||
+    pin.transactionId !== settlementEvidence.transactionId ||
+    pin.operationId !== settlementEvidence.operationIdentity ||
+    pin.barrierIdentity !== settlementEvidence.barrierIdentity ||
+    pin.ownerToken.recoveryAttemptId !== settlementEvidence.expectedOwner.recoveryAttemptId
+  ) {
+    throw new Error('SETTLEMENT_EVIDENCE_IDENTITY_MISMATCH');
+  }
+
+  const candidatePinsMap = new Map(currentRoot.activeRetentionPins.entries());
+  candidatePinsMap.delete(pinId);
+
+  this.#custodyRoot = Object.freeze({
+    ...currentRoot,
+    activeRetentionPins: new ImmutableMap(candidatePinsMap.entries()),
+  });
+}
+
+public releaseRetryPin(
+  pinId: string,
+  callerToken: CustodyOwnershipToken,
+): void {
+  const currentRoot = this.#custodyRoot;
+  const pin = currentRoot.activeRetentionPins.get(pinId);
+
+  if (!pin) return; // Idempotent
+
+  if (pin.pinType !== 'IN_TURN_RETRY') {
+    throw new Error('RETENTION_PIN_TYPE_MISMATCH_EXPECTED_RETRY');
+  }
 
   // Stale attempt fencing: caller must match pin's ownerToken
   if (!isEquivalentOwnerToken(pin.ownerToken, callerToken)) {
@@ -790,12 +895,10 @@ public releaseRetentionPin(pinId: string, callerToken: CustodyOwnershipToken): v
   const candidatePinsMap = new Map(currentRoot.activeRetentionPins.entries());
   candidatePinsMap.delete(pinId);
 
-  const candidateRoot: AuthoritativeCustodyRoot = Object.freeze({
+  this.#custodyRoot = Object.freeze({
     ...currentRoot,
     activeRetentionPins: new ImmutableMap(candidatePinsMap.entries()),
   });
-
-  this.#custodyRoot = candidateRoot;
 }
 ```
 
@@ -806,7 +909,7 @@ public releaseRetentionPin(pinId: string, callerToken: CustodyOwnershipToken): v
 Under single-realm JavaScript execution:
 - Candidate-root preparation, invariant verification, and reference replacement occur synchronously within one microtask turn.
 - No other event loop callback can observe or mutate `this.#custodyRoot` between the check and the replacement.
-- Retention pin acquisition and FIFO eviction are mutually serialized, preventing race conditions that could expose an evicted result as active.
+- Retention pin acquisition, retry pinning, and FIFO eviction are mutually serialized, preventing race conditions that could expose an evicted result as active.
 
 ---
 
@@ -818,9 +921,10 @@ Under single-realm JavaScript execution:
 | **Phase 2: Ingress Copy** | Deep copy memory failure | Synchronous throw | Root unchanged; in-flight retained |
 | **Phase 3: Pre-Allocation**| Object instantiation fail| Synchronous throw | Root unchanged; in-flight retained |
 | **Phase 4: Candidate Root**| Map construction fail | Synchronous throw | Root unchanged; in-flight retained |
-| **Phase 5: Eviction Check**| Oldest entry pinned | Backpressure throw | Root unchanged; capacity preserved |
-| **Phase 6: Atomic Swap** | Pointer replacement | Infallible | Single linearization point |
-| **Phase 7: Return Ref** | Return cached pointer | Infallible | Zero post-publication allocation |
+| **Phase 5: Contiguity Check**| Map has key gaps | Fail-closed throw | Root unchanged; alerts operator |
+| **Phase 6: Eviction Check**| Oldest entry pinned | Backpressure throw | Root unchanged; capacity preserved |
+| **Phase 7: Atomic Swap** | Pointer replacement | Infallible | Single linearization point |
+| **Phase 8: Return Ref** | Return cached pointer | Infallible | Zero post-publication allocation |
 
 ---
 
@@ -831,6 +935,7 @@ Protocol A linearizes commitment of the operation and settles execution:
 2. Custody gate transitions to `CUSTODY_RELEASED_BARRIER_PENDING`.
 3. Pre-allocated `DrainerCustodyReleaseReceipt` and `PendingSettlementObligation` are published atomically.
 4. Barrier resolves with `AuthoritativeSettlementEvidence` containing `CONFIRMED_COMMITTED`.
+5. `releaseSettlementBarrierPin` is authorized using the verified `AuthoritativeSettlementEvidence`.
 
 ---
 
@@ -843,6 +948,7 @@ Protocol B handles cancelled or uncommitted operations:
 4. If destination is healthy, transfer operation; otherwise restore to source buffer.
 5. Publish release and pending obligation.
 6. Resolve barrier with `ABORTED_FENCED` evidence.
+7. `releaseSettlementBarrierPin` is authorized using the verified `AuthoritativeSettlementEvidence`.
 
 ---
 
@@ -871,14 +977,14 @@ Protocol B handles cancelled or uncommitted operations:
 
 ## 14. Comprehensive Analysis of Cases A through H Across Operational States
 
-- **Case A (Normal Commit):** Promise resolves; archive commits; Protocol A resolves barrier.
-- **Case B (Early Rejection):** Promise rejects before staging; Protocol B restores to buffer.
-- **Case C (Post-Commit Rejection):** Commit succeeded; Promise rejected; irrevocable commit honored; barrier resolved committed.
-- **Case D (Network Split / Timeout):** Watchdog fires; attempt 1 invalidated; barrier held; attempt 2 waits at Step 4; resolves cleanly when I/O completes.
+- **Case A (Normal Commit):** Promise resolves; archive commits; Protocol A resolves barrier and authorizes settlement pin release.
+- **Case B (Early Rejection):** Promise rejects before staging; Protocol B restores to buffer and authorizes pin release.
+- **Case C (Post-Commit Rejection):** Commit succeeded; Promise rejected; irrevocable commit honored; barrier resolved committed; settlement pin released with commit evidence.
+- **Case D (Network Split / Timeout):** Watchdog fires; attempt 1 invalidated; barrier held; settlement pin remains held; attempt 2 waits at Step 4; resolves cleanly when I/O completes.
 - **Case E (Split-Brain Leader):** Fencing token mismatch; stale leader rejected; active leader reconciles.
 - **Case F (Tombstone Capacity Saturation):** Oldest tombstone pinned; backpressure applied; zero generation floor gaps.
-- **Case G (Duplicate Retry After Eviction):** Floor advanced past generation; returns `CUSTODY_RECEIPT_EXPIRED`; zero republication.
-- **Case H (Delayed Settled Retry After Attempt Change):** Settled retry arrives with Attempt 1 token while Attempt 2 is active or attempt is null; identity matched against cached receipt; returns cached receipt immediately without error.
+- **Case G (Duplicate Retry After Eviction):** Floor advanced past generation; returns `CUSTODY_RECEIPT_EXPIRED` with compact audit tombstone verification; zero republication.
+- **Case H (Delayed Settled Retry After Attempt Change):** Settled retry arrives with Attempt 1 token while Attempt 2 is active or attempt is null; identity matched against cached receipt and audit record; returns cached receipt immediately without error.
 
 ---
 
@@ -887,7 +993,7 @@ Protocol B handles cancelled or uncommitted operations:
 | Case | Scenario | Gate State | Custody Owner | Barrier State | Correct Action | Forbidden Action |
 |---|---|---|---|---|---|---|
 | **1** | Attempt 1 times out; Attempt 2 admitted | `BARRIER_PENDING` | Drainer | PENDING | Attempt 2 waits at Step 4 | Attempt 2 steals custody |
-| **2** | Attempt 1 Promise resolves post-timeout | `BARRIER_PENDING` | Drainer | PENDING | Settle barrier; unblock Attempt 2 | Drop Attempt 1 result |
+| **2** | Attempt 1 Promise resolves post-timeout | `BARRIER_PENDING` | Drainer | PENDING | Settle barrier; release pin with evidence; unblock Attempt 2 | Drop Attempt 1 result |
 | **3** | Settled retry with null `_currentAttemptId` | `SETTLED` | Archive | RESOLVED | Return cached result | Throw stale attempt error |
 | **4** | Settled retry with newer `_currentAttemptId` | `SETTLED` | Archive | RESOLVED | Return cached result | Throw stale attempt error |
 | **5** | Settled retry with mismatched token | `SETTLED` | Archive | RESOLVED | Throw `TOKEN_MISMATCH` | Return cached result |
@@ -898,8 +1004,8 @@ Protocol B handles cancelled or uncommitted operations:
 | **10** | First publication with out-of-order $g$ | `IN_FLIGHT` | Drainer | UNALLOCATED | Throw generation gap | Advance publishedGeneration|
 | **11** | FIFO eviction with pinned oldest entry | `CAPACITY_MAX` | Drainer | PENDING | Throw backpressure | Skip pinned entry |
 | **12** | Watchdog timeout on pinned entry | `DEGRADED` | Drainer | PENDING | Maintain retention pin | Release pin on timeout |
-| **13** | Pin release by stale attempt | `ANY` | Any | ANY | Reject stale release | Remove pin from root |
-| **14** | Pin release on actual settlement | `SETTLED` | Archive | RESOLVED | Remove pin atomically | Leak retention pin |
+| **13** | Settlement pin release without Level 3 proof | `BARRIER_PENDING` | Drainer | PENDING | Throw evidence required | Release pin on token alone |
+| **14** | Pin release on actual Level 3 settlement | `SETTLED` | Archive | RESOLVED | Remove pin atomically | Leak retention pin |
 | **15** | Retry on evicted generation ($g \le \text{floor}$)| `ANY` | Archive | RESOLVED | Throw `RECEIPT_EXPIRED` | Fall through to first pub |
 | **16** | First pub after cache completely emptied | `IDLE` | Drainer | UNALLOCATED | Publish $N+1$ cleanly | Reject as out-of-order |
 | **17** | Empty cache before any publications | `IDLE` | Drainer | UNALLOCATED | Floor is 0; pub $g=1$ | Allow $g=0$ or $g=2$ |
@@ -907,7 +1013,7 @@ Protocol B handles cancelled or uncommitted operations:
 | **19** | Generation sequence exhaustion | `ANY` | Any | ANY | Throw `SEQUENCE_EXHAUSTED`| Wrap around to 0 |
 | **20** | Duplicate commit retry with mutated op | `COMMITTED` | Archive | RESOLVED | Throw payload mismatch | Overwrite commit |
 | **21** | Concurrent commit and cancel | `RESERVED` | Archive | PENDING | First-write-wins | Allow dual disposition |
-| **22** | Byte budget exceeded (optional mode) | `PUBLISHING` | Drainer | PENDING | Throw payload too large | Silently truncate |
+| **22** | Pre-eviction result map has key gaps | `PUBLISHING` | Drainer | PENDING | Throw non-contiguous | Silently choose min key |
 | **23** | Destination transfer succeeds | `TRANSFERRED` | Destination | PENDING | Settle barrier Protocol B | Restore to source buffer |
 | **24** | Catastrophic proof corruption | `BLOCKED` | Audit Admin | DEGRADED | Latch `RECONCILIATION_BLOCKED` | Optimistic barrier resolution |
 
@@ -917,27 +1023,31 @@ Protocol B handles cancelled or uncommitted operations:
 
 1. **The Universal Generation-Scoped Settlement-Barrier Invariant:**
    $$\mathbf{BARRIER\_RESOLVED}(g) \implies \mathbf{EXECUTION\_SETTLED}(g) \land \mathbf{CUSTODY\_RECONCILED}(g) \land \mathbf{DRAINER\_RELEASED}(g) \land \mathbf{EVIDENCE\_MATCHED}(g)$$
-2. **Attempt-Fenced First Publication Invariant:**
+2. **Capability-Gated Settlement-Pin Release Invariant:**
+   $$\mathbf{RELEASE\_SETTLEMENT\_PIN}(pinId) \implies \mathbf{AssertAuthoritativeSettlementEvidence}(evidence) \land (\mathbf{pin.identity} \equiv \mathbf{evidence.identity})$$
+3. **Attempt-Fenced First Publication Invariant:**
    $$\mathbf{FIRST\_PUBLICATION}(g) \implies (\mathbf{callerAttempt} === \mathbf{\_currentAttemptId}) \land (\mathbf{inFlightRecord.token} === \mathbf{callerToken}) \land (g === \mathbf{publishedGeneration} + 1)$$
-3. **Settled Retry Attempt Independence Invariant:**
+4. **Settled Retry Attempt Independence Invariant:**
    A settled retry validates exact 1-to-1 token identity against cached evidence and authoritative audit history, completely independent of `_currentAttemptId`.
-4. **Cross-Collection Structural Consistency Invariant:**
-   Any structural discrepancy among `pendingSettlementObligations`, `publicationResults`, and `generationAuditHistory` fails closed.
-5. **Operational Retention Pin and Strict FIFO Invariant:**
+5. **Bidirectional Audit Consistency Invariant:**
+   Any structural discrepancy across `pendingSettlementObligations`, `publicationResults`, and `generationAuditHistory` fails closed.
+6. **Strict FIFO Contiguity Invariant:**
+   $\mathbf{publicationResults.keys()} \equiv \{\mathbf{custodyGenerationFloor} + 1, \dots, \mathbf{publishedGeneration}\}$; key gaps fail closed.
+7. **Operational Retention Pin and Strict FIFO Invariant:**
    A pinned oldest generation CANNOT be evicted; eviction cannot skip pinned entries; capacity exhaustion applies fail-closed backpressure.
-6. **Watchdog Pin Immunity Invariant:**
+8. **Watchdog Pin Immunity Invariant:**
    Watchdog timeouts CANNOT release retention pins whose underlying Promises remain unsettled.
-7. **Empty-Cache Floor Invariant:**
+9. **Empty-Cache Floor Invariant:**
    $$0 \le \mathbf{custodyGenerationFloor} \le \mathbf{publishedGeneration}$$
    An evicted generation ($g \le \mathbf{custodyGenerationFloor}$) can never re-enter first publication.
-8. **Strict Tombstone Capacity Ceiling:** `#fencedTransactions.size` **CANNOT** exceed 1,000 under any condition.
-9. **Single In-Flight Drain Invariant:** A second drain **CANNOT** dequeue an operation while `this.#custodyRoot.inFlightRecord !== null` ($N_{\text{in-flight}} \le 1$).
-10. **Irreversibility Precedence:** Post-commit execution failure **CANNOT** reverse an irrevocable commit or trigger Protocol B restoration.
-11. **Inseparable Release/Obligation Invariant:** A released custody state can **never** become observable without its corresponding settlement obligation already present in `this.#custodyRoot.pendingSettlementObligations`.
-12. **Runtime Immutability Invariant:** Published collections and evidence references **CANNOT** be mutated through `Map.prototype` or mutable array/buffer aliases.
+10. **Strict Tombstone Capacity Ceiling:** `#fencedTransactions.size` **CANNOT** exceed 1,000 under any condition.
+11. **Single In-Flight Drain Invariant:** A second drain **CANNOT** dequeue an operation while `this.#custodyRoot.inFlightRecord !== null` ($N_{\text{in-flight}} \le 1$).
+12. **Irreversibility Precedence:** Post-commit execution failure **CANNOT** reverse an irrevocable commit or trigger Protocol B restoration.
+13. **Inseparable Release/Obligation Invariant:** A released custody state can **never** become observable without its corresponding settlement obligation already present in `this.#custodyRoot.pendingSettlementObligations`.
+14. **Runtime Immutability Invariant:** Published collections and evidence references **CANNOT** be mutated through `Map.prototype` or mutable array/buffer aliases.
 
 ### Strict Ordering of Finalization:
-$$\text{1. Settle Promise} \longrightarrow \text{2. Reconcile Custody} \longrightarrow \text{3. Pre-Validate \& Pre-Allocate} \longrightarrow \text{4. Atomic Root Replacement} \longrightarrow \text{5. } \mathbf{activeBarrier(g).resolveWithEvidence(evidence)}$$
+$$\text{1. Settle Promise} \longrightarrow \text{2. Reconcile Custody} \longrightarrow \text{3. Pre-Validate \& Pre-Allocate} \longrightarrow \text{4. Atomic Root Replacement} \longrightarrow \text{5. } \mathbf{activeBarrier(g).resolveWithEvidence(evidence)} \longrightarrow \text{6. Release Settlement Pin}$$
 
 ---
 
@@ -947,7 +1057,7 @@ The proposal excises all references to `forceEmergencyReset(capability)`:
 - Ordinary recovery APIs cannot bypass `CUSTODY_RECONCILIATION_BLOCKED`.
 - No automated root replacement is permitted while custody remains unresolved.
 - Emergency data abandonment, if ever required, needs a separate architectural decision defining operator authorization, auditability, late-settling Promise behavior, and data-loss semantics.
-- That separate decision is outside the scope of R18-R16 and is **not authorized** by this proposal.
+- That separate decision is outside the scope of R18-R17 and is **not authorized** by this proposal.
 
 ---
 
@@ -956,7 +1066,7 @@ The proposal excises all references to `forceEmergencyReset(capability)`:
 1. **Admitted Under New Monotonic Token:** Attempt 2 is admitted from `DEGRADED` when gate status is `SETTLEMENT_PENDING`, incrementing `currentAttemptId = 2`.
 2. **Permanent Invalidation of Attempt 1 First Publication:** Attempt 1 is superseded (`1 !== currentAttemptId (2)`). Its continuation is completely fenced from first publication or root replacement.
 3. **Step 4 Serialized Barrier Wait:** Attempt 2 enters `RECOVERING`, advances to Step 4, and halts at `await drainer.drainSettledBarrier()`. Candidate root staging, archive pre-reservation, and root replacement are strictly prohibited while in Step 4.
-4. **Resolution & Settled Retry Independence:** When Attempt 1's destination Promise finishes and Level 3 custody reconciliation completes, Attempt 1's obligation is settled. If Attempt 1 later retries `publishReleaseAndObligation(token1)` to obtain its receipt, the settled retry path recognizes generation $g$ in `publicationResults`, verifies 1-to-1 identity against `token1` and authoritative audit history, and returns the cached receipt immediately—even though `_currentAttemptId` is now 2. Attempt 2 unblocks from Step 4 with clean custody and proceeds to Step 5.
+4. **Resolution, Capability-Gated Pin Release & Exclusive Resumption:** When Attempt 1's destination Promise finishes and Level 3 custody reconciliation completes, Attempt 1's obligation is settled. The settlement barrier resolves with verified `AuthoritativeSettlementEvidence`. This evidence authorizes `releaseSettlementBarrierPin`, freeing generation $g$ for eventual FIFO eviction. Attempt 2 unblocks from Step 4 with clean custody and proceeds to Step 5.
 
 ---
 
@@ -964,36 +1074,36 @@ The proposal excises all references to `forceEmergencyReset(capability)`:
 
 The following thirty deterministic future test specifications are formally codified for Sub-Milestone M5.1:
 
-- **Test R18-R16-T01 (Settled Retry Succeeds When `_currentAttemptId` Is Null):** Settle generation $g=1$ under Attempt 1. Set `coordinator._currentAttemptId = null`. Present retry with Attempt 1 token; assert returns original `cachedResult.releaseReceipt` without error.
-- **Test R18-R16-T02 (Settled Retry Succeeds When `_currentAttemptId` Belongs to Later Attempt):** Settle generation $g=1$ under Attempt 1. Advance coordinator to Attempt 2 (`_currentAttemptId = 2`). Present retry with Attempt 1 token; assert returns cached receipt cleanly.
-- **Test R18-R16-T03 (Settled Retry Rejects Different Original Recovery Attempt Identity):** Settle generation $g=1$ under Attempt 1. Present retry presenting Attempt 2 token for $g=1$; assert throws `CUSTODY_PUBLICATION_TOKEN_MISMATCH`.
-- **Test R18-R16-T04 (First Publication Strictly Requires Active Attempt):** Attempt 1 in-flight for $g=1$. Advance coordinator to `_currentAttemptId = 2`. Call `publishReleaseAndObligation` presenting Attempt 1 token; assert throws `STALE_ATTEMPT_CUSTODY_RELEASE_REJECTED`.
-- **Test R18-R16-T05 (Pending Retry Follows Explicit Attempt-Fencing Rule):** Publish pending obligation $g=1$ under Attempt 1. Present pending retry with Attempt 1 token while `_currentAttemptId = 2`; assert returns cached receipt without error; assert root is not mutated.
-- **Test R18-R16-T06 (Pending Obligation with Missing Result Fails Closed):** Artificially inject pending obligation $g=1$ without corresponding entry in `publicationResults`. Call publish retry for $g=1$; assert throws `STATE_INCONSISTENT_PENDING_MISSING_RESULT`.
-- **Test R18-R16-T07 (Pending Obligation with Mismatched Result Identity Fails Closed):** Inject pending obligation $g=1$ with token A, but cached result with token B. Present retry; assert throws `STATE_INCONSISTENT_PENDING_RESULT_MISMATCH`.
-- **Test R18-R16-T08 (Pending Obligation with Contradictory Settled Audit Evidence Fails Closed):** Inject pending obligation $g=1$ and inject audit record with `CONFIRMED_COMMITTED`. Present retry; assert throws `STATE_INCONSISTENT_PENDING_ALREADY_AUDITED`.
-- **Test R18-R16-T09 (Settled Result with Missing Mandatory Audit Evidence Fails Closed):** Inject settled result $g=1$ into `publicationResults` without entry in `generationAuditHistory`. Present retry; assert throws `STATE_INCONSISTENT_SETTLED_AUDIT_MISSING`.
-- **Test R18-R16-T10 (Settled Result with Mismatched Audit Identity Fails Closed):** Inject settled result with token A and audit record with token B. Present retry; assert throws `STATE_INCONSISTENT_AUDIT_RESULT_MISMATCH`.
-- **Test R18-R16-T11 (Settled Result with Contradictory Terminal Outcome Fails Closed):** Inject audit record with non-terminal or corrupted status. Present retry; assert throws `STATE_INCONSISTENT_AUDIT_TERMINAL_OUTCOME_CONTRADICTION`.
-- **Test R18-R16-T12 (Valid Settled Retry Returns Exact Original Cached Result Reference):** Settle generation $g=1$. Present valid retry; assert returned receipt is referentially identical (`===`) to pre-allocated receipt.
-- **Test R18-R16-T13 (Valid Settled Retry Does Not Mutate Authoritative Root):** Capture root reference `rootBefore = coordinator.custodyRoot`. Execute 10 valid settled retries; assert `coordinator.custodyRoot === rootBefore`.
-- **Test R18-R16-T14 (Active Settlement Pin Prevents Eviction):** Populate 1,000 entries. Acquire `SETTLEMENT_BARRIER` pin on $g=1$. Attempt first publication of $g=1001$; assert throws `CUSTODY_PUBLICATION_BACKPRESSURE_EXHAUSTED`; assert $g=1$ is not evicted.
-- **Test R18-R16-T15 (Active Retry Pin Prevents Eviction):** Populate 1,000 entries. Acquire `IN_TURN_RETRY` pin on $g=1$. Attempt publication of $g=1001$; assert throws `CUSTODY_PUBLICATION_BACKPRESSURE_EXHAUSTED`.
-- **Test R18-R16-T16 (Stale Attempt Cannot Acquire or Release Another Attempt's Pin):** Pin acquired by Attempt 1 token. Attempt 2 calls `releaseRetentionPin`; assert throws `STALE_ATTEMPT_PIN_RELEASE_REJECTED`; assert pin remains held.
-- **Test R18-R16-T17 (Watchdog Timeout Does Not Release Pin of Unsettled Promise):** Acquire settlement pin on $g=1$. Fire 5,000 ms watchdog timer; assert coordinator status latches `DEGRADED`; assert `activeRetentionPins.has(pinId)` remains `true`.
-- **Test R18-R16-T18 (Actual Settlement Releases Correct Pin):** Complete settlement barrier execution for $g=1$; assert pin is cleanly removed from `activeRetentionPins`.
-- **Test R18-R16-T19 (Pin Release Is Idempotent and Generation-Fenced):** Call `releaseRetentionPin` twice with same token; assert second call returns void without error or root corruption.
-- **Test R18-R16-T20 (Pinned Oldest FIFO Entry Triggers Documented Backpressure):** 1,000 entries occupied; oldest entry $g=1$ pinned; newer entries $g=2 \dots 1000$ unpinned. Attempt publication of $g=1001$; assert throws `CUSTODY_PUBLICATION_BACKPRESSURE_EXHAUSTED`; assert eviction does NOT skip $g=1$.
-- **Test R18-R16-T21 (No Eviction Occurs Before Pin and Settlement Checks Complete):** Construct publication call where evidence verification fails; assert `publicationResults` size and `custodyGenerationFloor` are completely unchanged.
-- **Test R18-R16-T22 (Concurrent Pin Acquisition and Eviction Serialize Cleanly):** Attempt pin acquisition on generation currently being evaluated for eviction; assert either pin succeeds and blocks eviction, or eviction succeeds and pin throws `CUSTODY_RECEIPT_EXPIRED`.
-- **Test R18-R16-T23 (Count Limit Remains Authoritatively Bounded at 1,000):** Continuously publish and settle 2,500 generations with unpinned oldest entries; assert `publicationResults.size <= 1000` at every single step; assert `custodyGenerationFloor == 1500`.
-- **Test R18-R16-T24 (Byte-Budget Behavior Matches Selected Optional Policy):** When optional byte budget is disabled, assert large payloads succeed up to count 1,000. When enabled, assert byte accounting triggers eviction at threshold.
-- **Test R18-R16-T25 (Oversized Result Follows Specified Policy):** In optional byte-budget mode, pass receipt payload exceeding maximum byte budget; assert throws `CUSTODY_PUBLICATION_PAYLOAD_TOO_LARGE`.
-- **Test R18-R16-T26 (Empty-Cache Floor Invariant Holds Before Any Publication):** At uninitialized state, assert `publishedGeneration === 0`, `custodyGenerationFloor === 0`, `publicationResults.size === 0`.
-- **Test R18-R16-T27 (Empty-Cache Floor Invariant Holds After Complete Historical Eviction):** Evict all retained results until cache is empty; assert `publishedGeneration === N`, `custodyGenerationFloor === N`, `publicationResults.size === 0`.
-- **Test R18-R16-T28 (Evicted Generation Cannot Re-Enter First Publication):** For evicted $g \le \mathbf{custodyGenerationFloor}$, call first publication; assert throws `CUSTODY_RECEIPT_EXPIRED` (or sequence gap); assert never treated as unpublished.
-- **Test R18-R16-T29 (Sequential Publication Remains Possible After Complete Safe Eviction):** From fully evicted cache ($g_{\text{floor}} = N$, $g_{\text{pub}} = N$), publish $g = N + 1$; assert succeeds cleanly; assert new cache size is 1.
-- **Test R18-R16-T30 (Existing R18-R14/R15 Alias-Closure, Defensive Byte-Copy, and Generation-Domain Tests Remain Required):** Execute full suite of defensive byte-copy, prototype freeze, and generation domain validation tests; assert zero regressions.
+- **Test R18-R17-T01 (Settlement Pin Cannot Be Released Before Actual Promise Settlement):** Acquire `SETTLEMENT_BARRIER` pin on $g=1$. Call `releaseSettlementBarrierPin` presenting caller token and null evidence; assert throws `AUTHORITATIVE_SETTLEMENT_EVIDENCE_REQUIRED`; assert pin remains held in `activeRetentionPins`.
+- **Test R18-R17-T02 (Watchdog Timeout Does Not Release Settlement Pin):** Acquire `SETTLEMENT_BARRIER` pin on $g=1$. Fire 5,000 ms watchdog timer; assert coordinator status latches `DEGRADED`; assert `activeRetentionPins.has(pinId)` remains `true`.
+- **Test R18-R17-T03 (Promise Rejection After Watchdog Timeout Permits Only Correctly Classified Settlement Path):** Fire watchdog on $g=1$; subsequent transport rejection arrives; assert reconciliation executes Protocol B; assert pin cannot be released with Protocol A commit evidence; assert pin release succeeds only with verified Protocol B aborted evidence.
+- **Test R18-R17-T04 (Archive Commit and Custody Reconciliation Both Required Before Settlement Pin Release):** Present settlement evidence missing `CustodyReconciliationReceipt`; assert throws `SETTLEMENT_EVIDENCE_INCOMPLETE`; assert pin remains held.
+- **Test R18-R17-T05 (Drainer Release Evidence Must Match Exact Ownership Generation):** Present settlement evidence where `drainerRelease.releasedCustodyGeneration !== pin.generation`; assert throws `SETTLEMENT_EVIDENCE_IDENTITY_MISMATCH`.
+- **Test R18-R17-T06 (Stale Owner Cannot Release Newer Attempt's Pin):** Pin acquired with Attempt 2 token. Present release call with Attempt 1 token; assert throws `STALE_ATTEMPT_PIN_RELEASE_REJECTED`.
+- **Test R18-R17-T07 (Retry Acquires Pin Before Reporting Retention Protection):** Call retry inquiry on $g=1$ requiring guarded turn; assert candidate root contains `IN_TURN_RETRY` pin before method returns; assert returned receipt is protected.
+- **Test R18-R17-T08 (Retry Registration and Pin Publication Cannot Expose Intermediate Unprotected State):** Concurrently observe root during retry; assert zero microtask window where retry is acknowledged but pin is absent from `activeRetentionPins`.
+- **Test R18-R17-T09 (Eviction Cannot Remove Pinned Result):** 1,000 entries populated; $g=1$ has active `IN_TURN_RETRY` pin. Call first publication of $g=1001$; assert throws `CUSTODY_PUBLICATION_BACKPRESSURE_EXHAUSTED`; assert $g=1$ remains in `publicationResults`.
+- **Test R18-R17-T10 (Identical Retry Acquisition Follows Defined Idempotency Semantics):** Call `acquireRetentionPin` twice with identical parameters; assert second call returns existing `pinId`; assert `activeRetentionPins.size` does not increase.
+- **Test R18-R17-T11 (Conflicting Duplicate Pin Identity Fails Closed):** Call `acquireRetentionPin` for existing `(generation, operationId, pinType)` but mutated transaction ID; assert throws `RETENTION_PIN_COLLISION_MUTATED_IDENTITY`.
+- **Test R18-R17-T12 (Pin ID Collision Is Detected and Fails Closed):** Artificially inject pin with existing monotonic sequence counter; assert throws `RETENTION_PIN_ID_COLLISION`.
+- **Test R18-R17-T13 (Pin Acquisition Rejects Mismatched Transaction Identity):** Call `acquireRetentionPin` with transaction ID differing from `publicationResults.get(g).obligation.transactionId`; assert throws `CUSTODY_RETRY_ID_MISMATCH`.
+- **Test R18-R17-T14 (Pin Acquisition Rejects Mismatched Operation Identity):** Call `acquireRetentionPin` with operation ID differing from cached obligation; assert throws `CUSTODY_RETRY_ID_MISMATCH`.
+- **Test R18-R17-T15 (Pin Acquisition Rejects Mismatched Barrier Identity):** Call `acquireRetentionPin` with barrier ID differing from cached obligation; assert throws `CUSTODY_RETRY_ID_MISMATCH`.
+- **Test R18-R17-T16 (Audit Record Without Result Classified According to Explicit Tombstone Rules):** Generation $g=1$ evicted ($g \le \text{floor}$); query generation with compact audit tombstone present; assert returns `CUSTODY_RECEIPT_EXPIRED` with tombstone confirmation.
+- **Test R18-R17-T17 (Result Without Terminal Audit Cannot Be Treated as Settled):** Artificially inject result into `publicationResults` without pending obligation and without audit record; call retry; assert throws `STATE_INCONSISTENT_SETTLED_RESULT_MISSING_AUDIT`.
+- **Test R18-R17-T18 (Pending Obligation with Terminal Audit Fails Closed):** Obligation present in `pendingSettlementObligations` and audit record present with `CONFIRMED_COMMITTED`; call retry; assert throws `STATE_INCONSISTENT_PENDING_OBLIGATION_CONTRADICTS_AUDIT`.
+- **Test R18-R17-T19 (Conflicting Terminal Audit Outcomes Fail Closed):** Audit record contains unrecognized or conflicting status; assert throws `STATE_INCONSISTENT_TERMINAL_OUTCOME_CONFLICT`.
+- **Test R18-R17-T20 (Evicted Result with Valid Audit Tombstone Returns Defined Expired-Result Behavior):** Query evicted $g \le \mathbf{custodyGenerationFloor}$; assert throws `CUSTODY_RECEIPT_EXPIRED`; assert never treated as unpublished.
+- **Test R18-R17-T21 (Unknown Generation with No Audit Evidence Distinguished from Contradictory Evidence):** Query $g = \text{publishedGeneration} + 5$; assert throws `GENERATION_OUT_OF_SEQUENCE_GAP_DETECTED` (distinct from consistency failure).
+- **Test R18-R17-T22 (Contiguous Retained-Generation Invariant Is Checked Before Eviction):** Artificially delete middle key from `publicationResults` (creating gap); attempt publication; assert throws `STATE_INCONSISTENT_RESULT_MAP_NON_CONTIGUOUS`.
+- **Test R18-R17-T23 (Gap in Retained Generations Fails Closed):** Verify that key gaps prevent eviction and never silently default to `min(keys())`.
+- **Test R18-R17-T24 (Generation Above publishedGeneration Fails Closed):** Inject result with $g > \mathbf{publishedGeneration}$; attempt eviction check; assert throws `STATE_INCONSISTENT_RESULT_GENERATION_OUT_OF_BOUNDS`.
+- **Test R18-R17-T25 (Map Already Exceeding Retention Cap Follows Explicit Backpressure Rule):** Inject map with 1,005 entries; attempt publication; assert throws `CUSTODY_PUBLICATION_BACKPRESSURE_EXHAUSTED` without bulk-evicting entries.
+- **Test R18-R17-T26 (Pinned Oldest Result Blocks Eviction Without Skipping to Newer Result):** Oldest entry $g=1$ has `SETTLEMENT_BARRIER` pin; entries $g=2 \dots 1000$ unpinned. Attempt publication; assert throws `CUSTODY_PUBLICATION_BACKPRESSURE_EXHAUSTED`; assert $g=2$ is NOT evicted.
+- **Test R18-R17-T27 (Fully Empty Cache Can Publish Next Sequential Generation):** Cache fully evicted ($g_{\text{floor}} = N$, $g_{\text{pub}} = N$); publish $g = N + 1$; assert succeeds cleanly; assert new cache size is 1.
+- **Test R18-R17-T28 (Existing Retry Attempt-Independence Tests Remain Passing):** Execute settled retries with null `_currentAttemptId` and newer attempt ID; assert succeeds cleanly with zero root mutation.
+- **Test R18-R17-T29 (Existing Alias-Closure and Defensive-Copy Requirements Remain Intact):** Mutating input tokens or digests does not alter published candidate root.
+- **Test R18-R17-T30 (Existing M5.0 Watchdog, Archive, Settlement, Custody, and Barrier Invariants Remain Covered):** Verify full regression suite across all Phase 7.5 architectural invariants.
 
 ---
 
@@ -1001,32 +1111,29 @@ The following thirty deterministic future test specifications are formally codif
 
 ```
 ================================================================================
-ENGINEERING AUTHORITY APPROVAL QUESTIONS (MILESTONE M5.0-R18-R16):
+ENGINEERING AUTHORITY APPROVAL QUESTIONS (MILESTONE M5.0-R18-R17):
 ================================================================================
-1. [SETTLED RETRY ATTEMPT INDEPENDENCE]: Does the Engineering Authority approve
-   decoupling settled publication retries from the coordinator's current recovery
-   attempt (_currentAttemptId), allowing valid retries to succeed when _currentAttemptId
-   is null or belongs to a later attempt, while maintaining strict attempt fencing
-   for first publications?
+1. [CAPABILITY-GATED SETTLEMENT-PIN RELEASE]: Does the Engineering Authority approve
+   requiring AuthoritativeSettlementEvidence (Level 3 Proof) for releasing
+   SETTLEMENT_BARRIER pins, strictly prohibiting release on token equality alone
+   or via watchdog timeout?
 
-2. [CROSS-COLLECTION AUDIT RECONCILIATION]: Does the Engineering Authority approve
-   enforcing structural consistency checks across pending obligations, cached
-   results, and authoritative audit history, failing closed on missing evidence,
-   identity mismatch, or contradictory terminal outcomes?
+2. [ATOMIC RETRY PINNING IN CANDIDATE ROOT]: Does the Engineering Authority approve
+   acquiring IN_TURN_RETRY pins via atomic candidate-root replacement before
+   returning retry receipts, closing all interleave and gap vulnerabilities?
 
-3. [OPERATIONAL RETENTION PINS & STRICT FIFO BACKPRESSURE]: Does the Engineering
-   Authority approve the formal activeRetentionPins model, requiring eviction to
-   apply fail-closed backpressure when the oldest FIFO generation is pinned,
-   strictly prohibiting skipping pinned entries to preserve contiguous generation floors?
+3. [STRICT PIN VALIDATION & MONOTONIC NONCES]: Does the Engineering Authority approve
+   validating full 5-field token, transaction ID, operation ID, and barrier ID
+   against publicationResults prior to pin acquisition, using coordinator-scoped
+   monotonic sequence counters for collision-free pin IDs?
 
-4. [WATCHDOG TIMEOUT PIN IMMUNITY]: Does the Engineering Authority approve the rule
-   that a watchdog timeout cannot release a retention pin whose underlying
-   asynchronous Promise remains unsettled, preventing premature FIFO eviction?
+4. [BIDIRECTIONAL AUDIT RECONCILIATION MATRIX]: Does the Engineering Authority approve
+   the complete 12-state bidirectional audit matrix across pending obligations,
+   publication results, and audit history, including compact audit tombstones?
 
-5. [AUTHORITATIVE COUNT BOUND & EMPTY-CACHE FLOOR SEMANTICS]: Does the Engineering
-   Authority approve establishing count-only retention (1,000 entries) as the
-   authoritative requirement (with byte budgeting as an optional extension),
-   and formalizing empty-cache generation-floor semantics?
+5. [STRICT FIFO CONTIGUITY & CAPABILITY BACKPRESSURE]: Does the Engineering Authority
+   approve enforcing strict key contiguity in publicationResults prior to eviction,
+   and failing closed with backpressure without bulk eviction if capacity exceeds 1,000?
 ================================================================================
 ```
 
@@ -1036,13 +1143,13 @@ ENGINEERING AUTHORITY APPROVAL QUESTIONS (MILESTONE M5.0-R18-R16):
 
 ```
 ================================================================================
-M5.0-R18-R16 ARCHITECTURAL DECISION PROPOSAL VERDICT:
+M5.0-R18-R17 ARCHITECTURAL DECISION PROPOSAL VERDICT:
 DECISION PROPOSAL COMPLETE — READY FOR ENGINEERING AUTHORITY REVIEW
 ================================================================================
 ```
 
-This R18-R16 proposal completes the formal recovery arbitration architecture. It resolves attempt coupling for settled retries, enforces cross-collection audit reconciliation, makes retention pins operational with strict FIFO backpressure, guarantees watchdog pin immunity, confirms authoritative count-only retention, and defines rigorous empty-cache generation-floor invariants.
+This R18-R17 proposal completes the formal recovery arbitration architecture. It capability-gates settlement-pin release with Level 3 authoritative evidence, closes retry pinning gaps, enforces full pin identity validation with monotonic nonces, codifies the complete 12-state bidirectional audit matrix, establishes strict FIFO contiguity verification, and codifies thirty deterministic future test specifications.
 
 ### Mandatory Implementation Authorization Statement
 
-> "M5.0-R18-R16 is an architectural documentation correction only. No production implementation has been started. M5.1, including M5.1a, remains strictly unauthorized pending explicit Engineering Authority approval."
+> "M5.0-R18-R17 is an architectural documentation correction only. No production implementation has been started. M5.1, including M5.1a, remains strictly unauthorized pending explicit Engineering Authority approval."
